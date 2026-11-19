@@ -801,6 +801,19 @@ fn parse_psin(data: &[u8]) -> String {
     out
 }
 
+fn format_size(bytes: u64) -> String {
+    let b = bytes as f64;
+    if b >= 1_073_741_824.0 {
+        format!("{:.2} GB", b / 1_073_741_824.0)
+    } else if b >= 1_048_576.0 {
+        format!("{:.1} MB", b / 1_048_576.0)
+    } else if b >= 1024.0 {
+        format!("{:.1} KB", b / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 fn format_hex(data: &[u8]) -> String {
     let mut out = String::new();
     for (row, chunk) in data.chunks(16).enumerate() {
@@ -1181,10 +1194,11 @@ impl eframe::App for Rpf9App {
                 for &(idx, ref e) in &filtered[range] {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(format!("{:<4}", e.kind)).strong().size(11.5).color(kind_color(e.kind)));
+                        let sz_s = format_size(e.raw_size);
                         let label = if self.is_folder {
-                            format!("{} / {}  ({:.1} KB)", e.rpf_name, e.name, (e.raw_size as f64) / 1024.0)
+                            format!("{} / {}  ({})", e.rpf_name, e.name, sz_s)
                         } else {
-                            format!("{}  ({:.1} KB)", e.name, (e.raw_size as f64) / 1024.0)
+                            format!("{}  ({})", e.name, sz_s)
                         };
                         if ui.selectable_label(self.selected == Some(idx), RichText::new(label).size(12.5)).clicked() {
                             self.select_entry(idx);
