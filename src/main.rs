@@ -138,6 +138,7 @@ struct Rpf9App {
     bink_proc: Option<Child>,
     parent_hwnd: isize,
     last_dock_rect: [i32; 4],
+    clip_seq: u64,
 }
 
 impl Rpf9App {
@@ -172,6 +173,7 @@ impl Rpf9App {
             bink_proc: None,
             parent_hwnd: 0,
             last_dock_rect: [0; 4],
+            clip_seq: 0,
         };
         if let Some(last) = load_last_folder() {
             if last.is_dir() {
@@ -397,7 +399,14 @@ impl Rpf9App {
         if e.kind == "BK2" {
             let tmp = std::env::temp_dir().join("rpf9_preview_bk2");
             let _ = fs::create_dir_all(&tmp);
-            let bk2_p = tmp.join("clip.bk2");
+            // Best-effort cleanup of old clip files; unique name avoids OS error 32 lock
+            if let Ok(rd) = fs::read_dir(&tmp) {
+                for old in rd.flatten() {
+                    let _ = fs::remove_file(old.path());
+                }
+            }
+            self.clip_seq += 1;
+            let bk2_p = tmp.join(format!("clip_{}.bk2", self.clip_seq));
             match read_entry_bytes(&e) {
                 Ok(bytes) => {
                     if let Err(err) = fs::write(&bk2_p, &bytes) {
