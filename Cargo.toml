@@ -1,0 +1,14 @@
+[package]
+name = "rpf9_explorer"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "PercyStar"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.31"
+flate2 = "1.0"
+rfd = "0.15"
+image = { version = "0.25", default-features = false, features = ["png", "bmp"] }
