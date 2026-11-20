@@ -1,4 +1,4 @@
-"""GTA 6 ADAT (.awc) v1 audio extractor to playable .wav via Ogg Opus + ffmpeg."""
+"""decode gta 6 adat v1 awc audio into playable wav streams"""
 import glob
 import os
 import struct
@@ -6,125 +6,112 @@ import subprocess
 import sys
 
 
-def ogg_crc(page: bytes) -> int:
+def crc32_ogg(data: bytes) -> int:
     crc = 0
-    for b in page:
-        crc ^= b << 24
+    for byte in data:
+        crc ^= byte << 24
         for _ in range(8):
             crc = ((crc << 1) ^ 0x04C11DB7) & 0xFFFFFFFF if (crc & 0x80000000) else (crc << 1) & 0xFFFFFFFF
     return crc
 
 
-def make_ogg_page(serial: int, seq: int, granule: int, flags: int, packets: list[bytes]) -> bytes:
-    segs = []
+def ogg_page(serial: int, seq: int, header_type: int, granule: int, packets: list[bytes]) -> bytes:
+    seg_table = bytearray()
     body = bytearray()
     for p in packets:
-        n = len(p)
-        while n >= 255:
-            segs.append(255)
-            n -= 255
-        segs.append(n)
+        rem = len(p)
+        while rem >= 255:
+            seg_table.append(255)
+            rem -= 255
+        seg_table.append(rem)
         body.extend(p)
-    hdr = bytearray(struct.pack("<4sBBqIIIB", b"OggS", 0, flags, granule, serial, seq, 0, len(segs)))
-    hdr.extend(segs)
-    hdr.extend(body)
-    struct.pack_into("<I", hdr, 22, ogg_crc(hdr))
-    return bytes(hdr)
+    hdr = struct.pack(
+        "<4sBBqIIIB",
+        b"OggS", 0, header_type, granule, serial, seq, 0, len(seg_table),
+    ) + seg_table
+    full = bytearray(hdr + body)
+    crc = crc32_ogg(full)
+    struct.pack_into("<I", full, 22, crc)
+    return bytes(full)
 
 
-def write_opus_ogg(packets: list[bytes], out_opus: str, rate: int = 48000, channels: int = 1) -> None:
-    serial = 0x12345678
-    opus_head = struct.pack("<8sBBHIhB", b"OpusHead", 1, channels, 312, rate, 0, 0)
-    opus_tags = struct.pack("<8sI", b"OpusTags", 8) + b"gta6-awc" + struct.pack("<I", 0)
-    with open(out_opus, "wb") as f:
-        f.write(make_ogg_page(serial, 0, 0, 2, [opus_head]))
-        f.write(make_ogg_page(serial, 1, 0, 0, [opus_tags]))
-        granule, seq = 0, 2
+def extract_awc(awc_path: str, out_dir: str) -> list[str]:
+    with open(awc_path, "rb") as f:
+        data = f.read()
+    if len(data) < 16 or data[:4] != b"ADAT":
+        return []
+    ver, flags, sc, hdr_sz = struct.unpack_from("<HHII", data, 4)
+    if sc == 0 or sc > 4096:
+        return []
+
+    chunk_table_start = 16 + sc * 4
+    off = chunk_table_start
+    data_chunks = []
+    # unpack 64bit tag size offset entries lookign for data chunks 0x55
+    while off + 8 <= len(data) and off < hdr_sz:
+        val = struct.unpack_from("<Q", data, off)[0]
+        tag = val >> 56
+        sz = (val >> 28) & 0x0FFFFFFF
+        coff = val & 0x0FFFFFFF
+        if tag == 0x55 and 0 < sz <= len(data) - coff and coff >= 0x20:
+            data_chunks.append((coff, sz))
+        if tag == 0 and coff == 0:
+            break
+        off += 8
+
+    base = os.path.splitext(os.path.basename(awc_path))[0]
+    os.makedirs(out_dir, exist_ok=True)
+    out_wavs = []
+    for idx, (coff, csz) in enumerate(data_chunks):
+        blob = data[coff : coff + csz]
+        packets = []
+        # rage opus streams split into 2048 byte blocks of u16 prefixed frams
+        for bpos in range(0, len(blob), 2048):
+            blk = blob[bpos : bpos + 2048]
+            p = 0
+            while p + 2 <= len(blk):
+                plen = struct.unpack_from("<H", blk, p)[0]
+                if plen == 0 or p + 2 + plen > len(blk):
+                    break
+                packets.append(blk[p + 2 : p + 2 + plen])
+                p += 2 + plen
+        if not packets:
+            continue
+
+        ogg_p = os.path.join(out_dir, f"{base}_s{idx:02d}.opus")
+        wav_p = os.path.join(out_dir, f"{base}_s{idx:02d}.wav")
+        serial = 0x50530001 + idx
+        opus_head = struct.pack("<8sBBHIhB", b"OpusHead", 1, 1, 0, 48000, 0, 0)
+        opus_tags = b"OpusTags" + struct.pack("<I", 9) + b"PercyStar" + struct.pack("<I", 0)
+        ogg = bytearray()
+        ogg.extend(ogg_page(serial, 0, 2, 0, [opus_head]))
+        ogg.extend(ogg_page(serial, 1, 0, 0, [opus_tags]))
+        granule = 0
+        seq = 2
         for i in range(0, len(packets), 50):
             batch = packets[i : i + 50]
             granule += len(batch) * 960
-            flag = 4 if i + 50 >= len(packets) else 0
-            f.write(make_ogg_page(serial, seq, granule, flag, batch))
+            ht = 4 if (i + 50 >= len(packets)) else 0
+            ogg.extend(ogg_page(serial, seq, ht, granule, batch))
             seq += 1
-
-
-def parse_awc(data: bytes):
-    if len(data) < 16 or data[:4] != b"ADAT":
-        return []
-    _, ver, flags, scount, hsz = struct.unpack_from("<4sHHII", data, 0)
-    if hsz > len(data) or scount == 0:
-        return []
-    pos = 0x10
-    if flags & 1:
-        pos += scount * 2
-    stream_ids = struct.unpack_from(f"<{scount}I", data, pos)
-    pos += scount * 4
-    # Align chunk table to end of header (hsz - total_chunks * 8)
-    rem = hsz - pos
-    cbase = pos + (rem % 8)
-    total_chunks = (hsz - cbase) // 8
-    chunks = [struct.unpack_from("<Q", data, cbase + i * 8)[0] for i in range(total_chunks)]
-    if flags & 1:
-        idxs = list(struct.unpack_from(f"<{scount}H", data, 0x10)) + [total_chunks]
-    else:
-        step = total_chunks // scount
-        idxs = [i * step for i in range(scount + 1)]
-    streams = []
-    for s in range(scount):
-        s_chunks = []
-        for c in range(idxs[s], min(idxs[s + 1], total_chunks)):
-            val = chunks[c]
-            s_chunks.append((val >> 56, (val >> 28) & 0x0FFFFFFF, val & 0x0FFFFFFF))
-        streams.append((stream_ids[s], s_chunks))
-    return streams
-
-
-def extract_opus_packets(data: bytes, off: int, sz: int) -> list[bytes]:
-    pkts = []
-    end = min(off + sz, len(data))
-    for blk in range(off, end, 0x800):
-        pos = blk
-        blk_end = min(blk + 0x800, end)
-        while pos + 2 <= blk_end:
-            plen = struct.unpack_from("<H", data, pos)[0]
-            if plen == 0 or plen > 1500 or pos + 2 + plen > blk_end:
-                break
-            pkts.append(data[pos + 2 : pos + 2 + plen])
-            pos += 2 + plen
-    return pkts
-
-
-def main():
-    if len(sys.argv) < 3:
-        print("Usage: python awc_extract.py <input_awc_dir> <output_wav_dir>")
-        sys.exit(1)
-    in_dir = sys.argv[1]
-    out_dir = sys.argv[2]
-    os.makedirs(out_dir, exist_ok=True)
-    exported = 0
-    for awc_path in sorted(glob.glob(os.path.join(in_dir, "*.awc"))):
-        base_name = os.path.splitext(os.path.basename(awc_path))[0]
-        with open(awc_path, "rb") as f:
-            data = f.read()
-        for sid, s_chunks in parse_awc(data):
-            data_chunks = [c for c in s_chunks if c[0] == 0x55]
-            if not data_chunks:
-                continue
-            _, sz, off = data_chunks[0]
-            if off + sz > len(data):
-                continue
-            pkts = extract_opus_packets(data, off, sz)
-            if len(pkts) < 2:
-                continue
-            ch = 2 if (pkts[0][0] & 0x04) else 1
-            ogg_p = os.path.join(out_dir, f"{base_name}_0x{sid:08x}.opus")
-            wav_p = os.path.join(out_dir, f"{base_name}_0x{sid:08x}.wav")
-            write_opus_ogg(pkts, ogg_p, 48000, ch)
-            subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", ogg_p, wav_p], check=True)
+        with open(ogg_p, "wb") as wf:
+            wf.write(ogg)
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", ogg_p, wav_p], check=False)
+        try:
             os.remove(ogg_p)
-            exported += 1
-    print(f"Exported {exported} playable .wav files -> {out_dir}")
+        except OSError:
+            pass
+        if os.path.exists(wav_p) and os.path.getsize(wav_p) > 44:
+            out_wavs.append(wav_p)
+    return out_wavs
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) < 3:
+        print("Usage: python awc_extract.py <input_awc_dir> <output_wav_dir>")
+        sys.exit(1)
+    in_dir, out_dir = sys.argv[1], sys.argv[2]
+    total = 0
+    for p in sorted(glob.glob(os.path.join(in_dir, "*.awc"))):
+        total += len(extract_awc(p, out_dir))
+    print(f"Done: {total} playable .wav files extracted to {out_dir}")

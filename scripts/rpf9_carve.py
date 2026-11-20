@@ -1,6 +1,5 @@
-"""GTA 6 RPF9 (9FPR) unencrypted payload carver (zlib, ADAT .awc, KB2 .bk2)."""
+"""carve unencrypted bk2 awc and zlib paylaods from rpf9 archives"""
 import os
-import re
 import struct
 import sys
 import zlib
@@ -17,16 +16,16 @@ def carve_rpf(rpf_path: str, out_dir: str, max_bytes: int | None = None) -> dict
         magic = hdr[:4]
         print(f"RPF: {os.path.basename(rpf_path)} | size={sz:,} | magic={magic!r} | hdr[4:16]={hdr[4:16].hex()}")
         if magic != b"9FPR":
-            print("  Warning: not 9FPR (incomplete or zeroed header); scanning anyway...")
+            print("  Warning: not 9FPR; scanning anyway...")
 
-        # Pass 1: Page-aligned (0x1000) ADAT & KB2 headers in 16MB chunks
         awc_offsets = []
         bk2_ranges = []
         f.seek(0)
         off = 0
-        CHUNK = 16 * 1024 * 1024
+        chunk_sz = 16 * 1024 * 1024
+        # scan 4kb page boundries for adat and bink2 magics
         while off < limit:
-            buf = f.read(min(CHUNK, limit - off))
+            buf = f.read(min(chunk_sz, limit - off))
             if not buf:
                 break
             for p in range(0, len(buf) - 44, 0x1000):
@@ -34,13 +33,12 @@ def carve_rpf(rpf_path: str, out_dir: str, max_bytes: int | None = None) -> dict
                 if tag == b"ADAT":
                     awc_offsets.append(off + p)
                 elif tag[:3] == b"KB2" and 0x61 <= tag[3] <= 0x7A:
-                    _, fsize, frames, _, frames2, w, h, fn, fd, _, _ = struct.unpack_from("<4sIIIIIIIIII", buf, p)
+                    _, fsize, frames, _, frames2, w, h, _, _, _, _ = struct.unpack_from("<4sIIIIIIIIII", buf, p)
                     total = fsize + 8
                     if 1 <= frames <= 500000 and frames == frames2 and 64 <= w <= 8192 and 64 <= h <= 8192 and 1024 <= total <= sz - (off + p):
                         bk2_ranges.append((off + p, total, w, h, frames))
             off += len(buf)
 
-        # Extract KB2
         if bk2_ranges:
             bdir = os.path.join(out_dir, "bk2")
             os.makedirs(bdir, exist_ok=True)
@@ -57,21 +55,17 @@ def carve_rpf(rpf_path: str, out_dir: str, max_bytes: int | None = None) -> dict
                         rem -= len(c)
                 counts["bk2"] += 1
 
-        # Extract ADAT (.awc) using headerSize + chunk extents
         if awc_offsets:
             adir = os.path.join(out_dir, "awc")
             os.makedirs(adir, exist_ok=True)
             for idx, aoff in enumerate(awc_offsets, 1):
                 next_off = awc_offsets[idx] if idx < len(awc_offsets) else limit
-                read_sz = min(next_off - aoff, 32 * 1024 * 1024)
                 f.seek(aoff)
-                chunk = f.read(read_sz)
-                out_p = os.path.join(adir, f"sound_{idx:04d}_0x{aoff:08x}.awc")
-                with open(out_p, "wb") as wf:
-                    wf.write(chunk)
+                with open(os.path.join(adir, f"sound_{idx:04d}_0x{aoff:08x}.awc"), "wb") as wf:
+                    wf.write(f.read(min(next_off - aoff, 32 * 1024 * 1024)))
                 counts["awc"] += 1
 
-        # Pass 2: Zlib streams (only if file <= 512MB or max_bytes set, to keep fast)
+        # carve plain zlib chunks on smaller archves
         if limit <= 512 * 1024 * 1024:
             zdir = os.path.join(out_dir, "zlib")
             os.makedirs(zdir, exist_ok=True)

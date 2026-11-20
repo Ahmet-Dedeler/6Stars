@@ -1,14 +1,20 @@
 mod model3d;
-use model3d::{Mesh3D, decode_rage9_model_from_rpf, extract_0drpz_mesh, extract_rage9_model_name, is_vehicle_virtual, parse_obj, probe_large_rage9_model_in_buf, render_mesh3d_viewport};
+use model3d::{
+    Mesh3D, decode_rage9_model_from_rpf, extract_0drpz_mesh, extract_rage9_model_name,
+    is_vehicle_virtual, is_zlib_head, parse_obj, probe_large_rage9_model_in_buf, render_mesh3d_viewport,
+};
 use eframe::egui::{self, Color32, ColorImage, CornerRadius, FontData, FontDefinitions, FontFamily, RichText, Stroke, TextureHandle, TextureOptions};
 use flate2::{Decompress, FlushDecompress, Status};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+// threshold in levels rpf where vehicle fragtypes begin
+const VEH_ZONE_OFF: u64 = 0x10b2_0000_00;
 
 #[link(name = "winmm")]
 extern "system" {
@@ -46,9 +52,10 @@ unsafe extern "system" fn enum_cb(hwnd: isize, lparam: isize) -> i32 {
 fn find_hwnd_for_pid(pid: u32) -> Option<isize> {
     let mut ctx = EnumCtx { pid, hwnd: 0 };
     unsafe { EnumWindows(enum_cb, &mut ctx as *mut _ as isize); }
-    if ctx.hwnd != 0 { Some(ctx.hwnd) } else { None }
+    (ctx.hwnd != 0).then_some(ctx.hwnd)
 }
 
+// strips popup frame so binkplay docks cleanly insid egui panel
 fn dock_child_hwnd(child_hwnd: isize, parent_hwnd: isize, x: i32, y: i32, w: i32, h: i32) {
     const GWL_STYLE: i32 = -16;
     const WS_CHILD: i32 = 0x4000_0000;
@@ -63,7 +70,15 @@ fn dock_child_hwnd(child_hwnd: isize, parent_hwnd: isize, x: i32, y: i32, w: i32
     }
 }
 
-fn play_wav_async(path: &std::path::Path) {
+fn find_binkplay() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("binkplay.exe")))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files (x86)\RADVideo\binkplay.exe"))
+}
+
+fn play_wav_async(path: &Path) {
     let mut wide: Vec<u16> = path.to_string_lossy().encode_utf16().collect();
     wide.push(0);
     unsafe { PlaySoundW(wide.as_ptr(), 0, 0x00020000 | 0x0001); }
@@ -94,7 +109,6 @@ struct RpfEntry {
     offset: u64,
     comp_size: u64,
     raw_size: u64,
-    fps: f32,
     tracks: u32,
     chunks: Vec<(u64, u64)>,
 }
@@ -107,7 +121,6 @@ struct ScanState {
     entries: Vec<RpfEntry>,
     rpf_names: Vec<String>,
     file_sig: HashMap<PathBuf, (u64, Option<SystemTime>)>,
-    /// Bumped on every entries change so the UI only re-filters when needed.
     ver: u64,
 }
 
@@ -115,9 +128,6 @@ struct ScanState {
 struct MediaState {
     loading: bool,
     status: String,
-    frames: Vec<ColorImage>,
-    fps: f32,
-    wav_path: Option<PathBuf>,
     awc_streams: Vec<(u32, PathBuf)>,
     bink_child_pid: Option<u32>,
     bink_hwnd: Option<isize>,
@@ -136,10 +146,6 @@ struct Rpf9App {
     preview: String,
     filter: String,
     logo_tex: Option<TextureHandle>,
-    textures: Vec<TextureHandle>,
-    playing: bool,
-    frame_idx: usize,
-    last_frame_time: Instant,
     watch_gen: Arc<Mutex<u64>>,
     bink_proc: Option<Child>,
     parent_hwnd: isize,
@@ -148,21 +154,21 @@ struct Rpf9App {
     mesh3d: Option<Mesh3D>,
     show_3d: bool,
     vehicles_only: bool,
-    // Cached filtered view: rebuilt only when entries/filter/category change, never per frame.
+    // cachd ui list so huge scans never re filter or clone evry fram
     view: Vec<usize>,
     view_key: Option<(u64, String, Category, String, bool)>,
     hay: Vec<String>,
     hay_ver: u64,
     counts: [usize; 8],
+    cached_rpf_names: Vec<String>,
     last_rebuild: Instant,
 }
 
 impl Rpf9App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, logo_rgba: Option<(Vec<u8>, u32, u32)>) -> Self {
         setup_style(&cc.egui_ctx);
-        let logo_tex = image::load_from_memory(include_bytes!("../assets/logo.png")).ok().map(|img| {
-            let rgba = img.to_rgba8();
-            let ci = ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], rgba.as_raw());
+        let logo_tex = logo_rgba.map(|(raw, w, h)| {
+            let ci = ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &raw);
             cc.egui_ctx.load_texture("percystar_logo", ci, TextureOptions::LINEAR)
         });
         let mut app = Self {
@@ -171,7 +177,7 @@ impl Rpf9App {
             selected_rpf: "All RPFs".into(),
             state: Arc::new(Mutex::new(ScanState {
                 header_info: "No archive or folder loaded".into(),
-                status: "Open an .rpf or select the GTA6 folder".into(),
+                status: "Open an .rpf or select a game folder".into(),
                 ..Default::default()
             })),
             media: Arc::new(Mutex::new(MediaState::default())),
@@ -180,10 +186,6 @@ impl Rpf9App {
             preview: String::new(),
             filter: String::new(),
             logo_tex,
-            textures: Vec::new(),
-            playing: false,
-            frame_idx: 0,
-            last_frame_time: Instant::now(),
             watch_gen: Arc::new(Mutex::new(0)),
             bink_proc: None,
             parent_hwnd: 0,
@@ -197,6 +199,7 @@ impl Rpf9App {
             hay: Vec::new(),
             hay_ver: u64::MAX,
             counts: [0; 8],
+            cached_rpf_names: Vec::new(),
             last_rebuild: Instant::now(),
         };
         load_ui_state(&mut app);
@@ -219,20 +222,33 @@ impl Rpf9App {
         m.bink_clip = None;
     }
 
+    fn reset_selection(&mut self) {
+        self.selected = None;
+        self.preview.clear();
+        self.last_dock_rect = [0; 4];
+        self.mesh3d = None;
+        self.show_3d = false;
+        stop_wav();
+        self.stop_bink_player();
+        let mut m = self.media.lock().unwrap();
+        m.awc_streams.clear();
+        m.status.clear();
+        m.loading = false;
+        m.loaded_mesh = None;
+    }
+
+    fn bump_gen(&self) -> u64 {
+        let mut g = self.watch_gen.lock().unwrap();
+        *g += 1;
+        *g
+    }
+
     fn start_single_scan(&mut self, path: PathBuf) {
         self.target_path = Some(path.clone());
         self.is_folder = false;
         self.selected_rpf = "All RPFs".into();
-        self.selected = None;
-        self.preview.clear();
-        self.textures.clear();
-        self.playing = false;
-        stop_wav();
-        let gen = {
-            let mut g = self.watch_gen.lock().unwrap();
-            *g += 1;
-            *g
-        };
+        self.reset_selection();
+        let _gen = self.bump_gen();
         {
             let mut st = self.state.lock().unwrap();
             st.scanning = true;
@@ -264,28 +280,18 @@ impl Rpf9App {
                     st.status = format!("Error: {e}");
                 }
             }
-            let _ = gen;
         });
     }
 
     fn start_folder_scan(&mut self, folder: PathBuf) {
-        // Keep the restored archive filter when reopening the same folder
         if load_last_folder().as_ref() != Some(&folder) {
             self.selected_rpf = "All RPFs".into();
         }
         save_last_folder(&folder);
         self.target_path = Some(folder.clone());
         self.is_folder = true;
-        self.selected = None;
-        self.preview.clear();
-        self.textures.clear();
-        self.playing = false;
-        stop_wav();
-        let gen = {
-            let mut g = self.watch_gen.lock().unwrap();
-            *g += 1;
-            *g
-        };
+        self.reset_selection();
+        let gen = self.bump_gen();
         {
             let mut st = self.state.lock().unwrap();
             st.entries.clear();
@@ -302,17 +308,16 @@ impl Rpf9App {
         std::thread::spawn(move || {
             let mut disk_cache = load_disk_cache();
             loop {
-                if *watch_gen.lock().unwrap() != gen {
-                    break;
-                }
+                if *watch_gen.lock().unwrap() != gen { break; }
                 let mut rpfs = Vec::new();
                 collect_rpfs(&folder, &mut rpfs);
-                // Fast-path: scan levels.rpf vehicle zone (71.71GB..EOF) FIRST so searching "itali" / vehicles works within seconds!
+
+                // scan levels veh zone first so cars show up fast
                 if let Some(levels_p) = rpfs.iter().find(|p| {
                     p.file_name().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("levels.rpf")).unwrap_or(false)
                 }).cloned() {
                     if let Ok(meta) = fs::metadata(&levels_p) {
-                        if meta.len() > 0x10b2_0000_00 {
+                        if meta.len() > VEH_ZONE_OFF {
                             let mtime_s = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
                             let vkey = format!("VEHZONE|{}|{}|{}", levels_p.display(), meta.len(), mtime_s);
                             let already_loaded = state.lock().unwrap().entries.iter().any(|e| e.kind == "VEH" && e.source_rpf == levels_p);
@@ -325,9 +330,9 @@ impl Rpf9App {
                                         st.rpf_names.push("levels.rpf".into());
                                         st.rpf_names.sort();
                                     }
-                                    st.status = format!("Loaded {} cached GTA 6 vehicles!", cached_vehs.len());
+                                    st.status = format!("Loaded {} cached vehicles!", cached_vehs.len());
                                 } else {
-                                    state.lock().unwrap().status = "Fast-indexing GTA 6 Vehicles (levels.rpf)...".into();
+                                    state.lock().unwrap().status = "Fast-indexing Vehicles (levels.rpf)...".into();
                                     let veh_entries = scan_levels_vehicle_zone(&levels_p, Some(&state));
                                     if !veh_entries.is_empty() {
                                         {
@@ -336,7 +341,7 @@ impl Rpf9App {
                                                 st.rpf_names.push("levels.rpf".into());
                                                 st.rpf_names.sort();
                                             }
-                                            st.status = format!("Indexed {} vehicle/mod models from levels.rpf!", veh_entries.len());
+                                            st.status = format!("Indexed {} vehicle/mod models!", veh_entries.len());
                                         }
                                         disk_cache.insert(vkey, veh_entries);
                                         save_disk_cache(&disk_cache);
@@ -346,7 +351,8 @@ impl Rpf9App {
                         }
                     }
                 }
-                // Smallest RPFs first so XMLs/scripts/minigame audio appear in <2s
+
+                // smallest archives first so xmls and audio pop in under 2 secs
                 rpfs.sort_by_key(|p| fs::metadata(p).map(|m| m.len()).unwrap_or(u64::MAX));
 
                 let mut changed = Vec::new();
@@ -361,7 +367,7 @@ impl Rpf9App {
                                 let key = format!("{}|{}|{}", p.display(), meta.len(), mtime_s);
                                 if let Some(cached_entries) = disk_cache.get(&key) {
                                     let is_levels = p.file_name().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("levels.rpf")).unwrap_or(false);
-                                    st.entries.retain(|e| &e.source_rpf != p || (is_levels && e.offset >= 0x10b2_0000_00));
+                                    st.entries.retain(|e| &e.source_rpf != p || (is_levels && e.offset >= VEH_ZONE_OFF));
                                     st.entries.extend(cached_entries.iter().cloned());
                                     st.ver += 1;
                                     st.file_sig.insert(p.clone(), sig);
@@ -395,27 +401,22 @@ impl Rpf9App {
                             let cache_arc = Arc::clone(&cache_arc);
                             let changed = &changed;
                             s.spawn(move || loop {
-                                if *watch_gen.lock().unwrap() != gen {
-                                    return;
-                                }
+                                if *watch_gen.lock().unwrap() != gen { return; }
                                 let idx = {
                                     let mut g = next_idx.lock().unwrap();
                                     let i = *g;
                                     *g += 1;
                                     i
                                 };
-                                if idx >= total {
-                                    return;
-                                }
+                                if idx >= total { return; }
                                 let (p, sig, key) = &changed[idx];
                                 let rname = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
                                 state.lock().unwrap().status = format!("Scanning [{}/{}] {}...", idx + 1, total, rname);
                                 if let Ok((_, new_entries)) = scan_single_rpf(p, None) {
                                     {
                                         let mut st = state.lock().unwrap();
-                                        // Keep vehicle-zone entries from levels.rpf intact when refreshing base levels.rpf
                                         let is_levels = rname.eq_ignore_ascii_case("levels.rpf");
-                                        st.entries.retain(|e| &e.source_rpf != p || (is_levels && e.offset >= 0x10b2_0000_00));
+                                        st.entries.retain(|e| &e.source_rpf != p || (is_levels && e.offset >= VEH_ZONE_OFF));
                                         st.entries.extend(new_entries.iter().cloned());
                                         st.ver += 1;
                                         st.file_sig.insert(p.clone(), *sig);
@@ -424,7 +425,6 @@ impl Rpf9App {
                                             st.rpf_names.sort();
                                         }
                                     }
-                                    // Save cache incrementally so completed RPFs are never re-scanned
                                     let mut c = cache_arc.lock().unwrap();
                                     c.insert(key.clone(), new_entries);
                                     save_disk_cache(&c);
@@ -445,9 +445,7 @@ impl Rpf9App {
                 }
 
                 for _ in 0..20 {
-                    if *watch_gen.lock().unwrap() != gen {
-                        return;
-                    }
+                    if *watch_gen.lock().unwrap() != gen { return; }
                     std::thread::sleep(Duration::from_millis(500));
                 }
             }
@@ -456,26 +454,8 @@ impl Rpf9App {
 
     fn select_entry(&mut self, idx: usize) {
         let Some(e) = self.state.lock().unwrap().entries.get(idx).cloned() else { return };
+        self.reset_selection();
         self.selected = Some(idx);
-        self.preview.clear();
-        self.textures.clear();
-        self.playing = false;
-        self.frame_idx = 0;
-        self.last_dock_rect = [0; 4];
-        self.mesh3d = None;
-        self.show_3d = false;
-        stop_wav();
-        self.stop_bink_player();
-
-        {
-            let mut m = self.media.lock().unwrap();
-            m.frames.clear();
-            m.awc_streams.clear();
-            m.wav_path = None;
-            m.status.clear();
-            m.loading = false;
-            m.loaded_mesh = None;
-        }
 
         if e.kind == "MODEL" || e.kind == "VEH" {
             let media = Arc::clone(&self.media);
@@ -508,12 +488,12 @@ impl Rpf9App {
         if e.kind == "BK2" {
             let tmp = std::env::temp_dir().join("rpf9_preview_bk2");
             let _ = fs::create_dir_all(&tmp);
-            // Best-effort cleanup of old clip files; unique name avoids OS error 32 lock
             if let Ok(rd) = fs::read_dir(&tmp) {
                 for old in rd.flatten() {
                     let _ = fs::remove_file(old.path());
                 }
             }
+            // bump seq name so windows file locks never block switching vids
             self.clip_seq += 1;
             let bk2_p = tmp.join(format!("clip_{}.bk2", self.clip_seq));
             match read_entry_bytes(&e) {
@@ -528,12 +508,7 @@ impl Rpf9App {
                     return;
                 }
             }
-            let binkplay = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.join("binkplay.exe")))
-                .filter(|p| p.exists())
-                .unwrap_or_else(|| PathBuf::from(r"C:\Program Files (x86)\RADVideo\binkplay.exe"));
-            match Command::new(binkplay)
+            match Command::new(find_binkplay())
                 .args([bk2_p.to_str().unwrap(), "/NoBorder", "/DrawD3D11", "/L", "/W640", "/H360"])
                 .spawn()
             {
@@ -563,16 +538,14 @@ impl Rpf9App {
                     let sample = &data[..data.len().min(200)];
                     let is_text = e.kind == "XML"
                         || (!sample.is_empty()
-                            && sample.iter().all(|&b| (32..127).contains(&b) || b == 9 || b == 10 || b == 13 || b >= 0x80));
+                            && sample.iter().all(|&b| (32..127).contains(&b) || matches!(b, 9 | 10 | 13 | 0x80..)));
                     if e.kind == "PSIN" {
                         self.preview = parse_psin(&data);
                     } else if is_text {
                         self.preview = String::from_utf8_lossy(&data[..data.len().min(250_000)]).into_owned();
                     } else {
                         if data.len() >= 24 && &data[16..21] == b"0DRPz" {
-                            if let Some(m) = extract_0drpz_mesh(&e.name, &data) {
-                                self.mesh3d = Some(m);
-                            }
+                            self.mesh3d = extract_0drpz_mesh(&e.name, &data);
                         }
                         self.preview = format_hex(&data[..data.len().min(2048)]);
                     }
@@ -582,18 +555,19 @@ impl Rpf9App {
         }
     }
 
-    /// Re-filter only when something changed; while scanning, entry churn is throttled to 4x/sec.
+    // throtled view rebuilder runs 4x a sec during live scans
     fn refresh_view(&mut self) {
         let ver = self.state.lock().unwrap().ver;
         let key = (ver, self.filter.clone(), self.category.clone(), self.selected_rpf.clone(), self.vehicles_only);
-        let Some(old) = &self.view_key else { return self.rebuild_view(key) };
-        if *old == key { return; }
-        let only_ver = old.1 == key.1 && old.2 == key.2 && old.3 == key.3 && old.4 == key.4;
-        if only_ver && self.last_rebuild.elapsed() < Duration::from_millis(250) {
-            return;
-        }
-        if !only_ver {
-            save_ui_state(self);
+        if let Some(old) = &self.view_key {
+            if *old == key { return; }
+            let only_ver = old.1 == key.1 && old.2 == key.2 && old.3 == key.3 && old.4 == key.4;
+            if only_ver && self.last_rebuild.elapsed() < Duration::from_millis(250) {
+                return;
+            }
+            if !only_ver {
+                save_ui_state(self);
+            }
         }
         self.rebuild_view(key);
     }
@@ -602,6 +576,7 @@ impl Rpf9App {
         let st = self.state.lock().unwrap();
         if self.hay_ver != st.ver {
             self.hay = st.entries.iter().map(|e| format!("{}|{}|{}", e.name, e.rpf_name, e.kind).to_lowercase()).collect();
+            self.cached_rpf_names = st.rpf_names.clone();
             self.hay_ver = st.ver;
             let mut c = [0usize; 8];
             for e in &st.entries {
@@ -638,7 +613,6 @@ impl Rpf9App {
             .map(|(i, _)| i)
             .collect();
         drop(st);
-        // Smart ranking: names starting with the first term first, then shorter (closer) names.
         if let Some(first) = inc.first() {
             view.sort_by_key(|&i| (!self.hay[i].starts_with(first), self.hay[i].len()));
         }
@@ -657,8 +631,7 @@ impl Rpf9App {
         for e in entries {
             if e.kind == "MODEL" || e.kind == "VEH" {
                 if let Ok(mesh) = decode_rage9_model_from_rpf(&e.source_rpf, e.offset, &e.name) {
-                    let safe = e.name.replace('#', "");
-                    let fname = format!("{safe}.obj");
+                    let fname = format!("{}.obj", e.name.replace('#', ""));
                     if mesh.export_obj(&out_dir.join(fname)).is_ok() {
                         ok += 1;
                     }
@@ -674,27 +647,25 @@ impl Rpf9App {
     }
 }
 
+fn app_data_dir() -> Option<PathBuf> {
+    std::env::var("LOCALAPPDATA").ok().map(|d| PathBuf::from(d).join("PercyStar"))
+}
+
 fn cache_file_path() -> Option<PathBuf> {
-    std::env::var("LOCALAPPDATA").ok().map(|d| PathBuf::from(d).join("PercyStar").join("scan_cache_v4.tsv"))
+    app_data_dir().map(|d| d.join("scan_cache_v4.tsv"))
 }
 
 fn load_last_folder() -> Option<PathBuf> {
-    let p = std::env::var("LOCALAPPDATA").ok().map(|d| PathBuf::from(d).join("PercyStar").join("last_folder.txt"))?;
-    let s = fs::read_to_string(p).ok()?;
-    let trimmed = s.trim();
-    if trimmed.is_empty() { None } else { Some(PathBuf::from(trimmed)) }
+    let s = fs::read_to_string(app_data_dir()?.join("last_folder.txt")).ok()?;
+    let t = s.trim();
+    (!t.is_empty()).then(|| PathBuf::from(t))
 }
 
-fn save_last_folder(folder: &PathBuf) {
-    if let Ok(d) = std::env::var("LOCALAPPDATA") {
-        let dir = PathBuf::from(d).join("PercyStar");
+fn save_last_folder(folder: &Path) {
+    if let Some(dir) = app_data_dir() {
         let _ = fs::create_dir_all(&dir);
         let _ = fs::write(dir.join("last_folder.txt"), folder.display().to_string());
     }
-}
-
-fn ui_state_path() -> Option<PathBuf> {
-    std::env::var("LOCALAPPDATA").ok().map(|d| PathBuf::from(d).join("PercyStar").join("ui_state.txt"))
 }
 
 const CATS: [Category; 8] = [
@@ -703,16 +674,14 @@ const CATS: [Category; 8] = [
 ];
 
 fn save_ui_state(app: &Rpf9App) {
-    let Some(p) = ui_state_path() else { return };
-    if let Some(d) = p.parent() {
-        let _ = fs::create_dir_all(d);
-    }
+    let Some(dir) = app_data_dir() else { return };
+    let _ = fs::create_dir_all(&dir);
     let cat = CATS.iter().position(|c| *c == app.category).unwrap_or(0);
-    let _ = fs::write(p, format!("{cat}\n{}\n{}\n{}", app.vehicles_only as u8, app.selected_rpf, app.filter));
+    let _ = fs::write(dir.join("ui_state.txt"), format!("{cat}\n{}\n{}\n{}", app.vehicles_only as u8, app.selected_rpf, app.filter));
 }
 
 fn load_ui_state(app: &mut Rpf9App) {
-    let Some(s) = ui_state_path().and_then(|p| fs::read_to_string(p).ok()) else { return };
+    let Some(s) = app_data_dir().and_then(|d| fs::read_to_string(d.join("ui_state.txt")).ok()) else { return };
     let mut l = s.splitn(4, '\n');
     if let Some(c) = l.next().and_then(|x| x.parse::<usize>().ok()).and_then(|i| CATS.get(i)) {
         app.category = c.clone();
@@ -732,11 +701,7 @@ fn load_disk_cache() -> HashMap<String, Vec<RpfEntry>> {
     let Ok(f) = File::open(p) else { return map };
     for line in BufReader::new(f).lines().flatten() {
         let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() < 10 { continue; }
-        let key = cols[0].to_string();
-        let src = PathBuf::from(cols[1]);
-        let rname = cols[2].to_string();
-        let name = cols[3].to_string();
+        if cols.len() < 9 { continue; }
         let kind: &'static str = match cols[4] {
             "VEH" => "VEH",
             "MODEL" => "MODEL",
@@ -746,32 +711,38 @@ fn load_disk_cache() -> HashMap<String, Vec<RpfEntry>> {
             "PSIN" => "PSIN",
             _ => "ZLIB",
         };
-        let offset = cols[5].parse().unwrap_or(0);
-        let comp_size = cols[6].parse().unwrap_or(0);
-        let raw_size = cols[7].parse().unwrap_or(0);
-        let fps = cols[8].parse().unwrap_or(0.0);
-        let tracks = cols[9].parse().unwrap_or(0);
-        let chunks = if cols.len() > 10 && !cols[10].is_empty() {
-            cols[10].split(';').filter_map(|pair| {
+        // tolerate old 11 col cache rows and newer 10 col ones
+        let tracks_col = if cols.len() >= 11 { 9 } else { 8 };
+        let chunks_col = tracks_col + 1;
+        let chunks = if cols.len() > chunks_col && !cols[chunks_col].is_empty() {
+            cols[chunks_col].split(';').filter_map(|pair| {
                 let mut it = pair.split(',');
                 Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
             }).collect()
         } else {
             Vec::new()
         };
-        map.entry(key).or_default().push(RpfEntry {
-            source_rpf: src, rpf_name: rname, name, kind, offset, comp_size, raw_size, fps, tracks, chunks,
+        map.entry(cols[0].to_string()).or_default().push(RpfEntry {
+            source_rpf: PathBuf::from(cols[1]),
+            rpf_name: cols[2].to_string(),
+            name: cols[3].to_string(),
+            kind,
+            offset: cols[5].parse().unwrap_or(0),
+            comp_size: cols[6].parse().unwrap_or(0),
+            raw_size: cols[7].parse().unwrap_or(0),
+            tracks: cols[tracks_col].parse().unwrap_or(0),
+            chunks,
         });
     }
     map
 }
 
+// atomic write via tmp file so ctrl c never corrupts the cahce
 fn save_disk_cache(map: &HashMap<String, Vec<RpfEntry>>) {
     let Some(p) = cache_file_path() else { return };
     if let Some(parent) = p.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    // Write to .tmp then rename: closing the app mid-save must never wipe the cache
     let tmp = p.with_extension("tmp");
     let Ok(f) = File::create(&tmp) else { return };
     let mut w = BufWriter::new(f);
@@ -780,9 +751,9 @@ fn save_disk_cache(map: &HashMap<String, Vec<RpfEntry>>) {
             let chunks_s: String = e.chunks.iter().map(|(a, b)| format!("{a},{b}")).collect::<Vec<_>>().join(";");
             let _ = writeln!(
                 w,
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 key, e.source_rpf.display(), e.rpf_name, e.name, e.kind,
-                e.offset, e.comp_size, e.raw_size, e.fps, e.tracks, chunks_s
+                e.offset, e.comp_size, e.raw_size, e.tracks, chunks_s
             );
         }
     }
@@ -792,7 +763,7 @@ fn save_disk_cache(map: &HashMap<String, Vec<RpfEntry>>) {
     }
 }
 
-fn collect_rpfs(dir: &PathBuf, out: &mut Vec<PathBuf>) {
+fn collect_rpfs(dir: &Path, out: &mut Vec<PathBuf>) {
     if let Ok(rd) = fs::read_dir(dir) {
         for entry in rd.flatten() {
             let p = entry.path();
@@ -809,19 +780,16 @@ fn decode_awc_for_player(e: &RpfEntry, media: &Arc<Mutex<MediaState>>) {
     let tmp = std::env::temp_dir().join("rpf9_preview_awc");
     let _ = fs::remove_dir_all(&tmp);
     let _ = fs::create_dir_all(&tmp);
-    let awc_p = tmp.join("sound.awc");
     if let Ok(bytes) = read_entry_bytes(e) {
-        let _ = fs::write(&awc_p, &bytes);
+        let _ = fs::write(tmp.join("sound.awc"), &bytes);
     }
     let awc_py = std::env::current_exe()
         .ok()
         .and_then(|p| {
             let d = p.parent()?;
-            let c1 = d.join("awc_extract.py");
-            if c1.exists() { return Some(c1); }
-            let c2 = d.join("scripts").join("awc_extract.py");
-            if c2.exists() { return Some(c2); }
-            None
+            [d.join("awc_extract.py"), d.join("scripts").join("awc_extract.py")]
+                .into_iter()
+                .find(|c| c.exists())
         })
         .unwrap_or_else(|| PathBuf::from("scripts/awc_extract.py"));
     let _ = Command::new("python")
@@ -904,51 +872,40 @@ fn kind_color(kind: &str) -> Color32 {
 }
 
 fn parse_psin(data: &[u8]) -> String {
-    let mut out = String::new();
     if data.len() < 16 || &data[..4] != b"PSIN" {
         return format_hex(&data[..data.len().min(2048)]);
     }
+    let mut out = String::new();
     let data_sz = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
     let root_hash = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
     let flags = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
     out.push_str("=== RAGE PSIN (PSO Serialized Metadata) ===\n");
     out.push_str(&format!("Total Size: {} B | PSIN Block: {} B | RootHash: 0x{:08x} | Flags: 0x{:08x}\n\n", data.len(), data_sz, root_hash, flags));
-
     out.push_str("--- PSO Sections ---\n");
     for tag in [b"LSCH", b"LENM", b"LSNS", b"LGID", b"LRSC", b"CHKS", b"PSCH", b"PMAP", b"STRF", b"STRS"] {
         let mut pos = 0usize;
         while let Some(rel) = data[pos..].windows(4).position(|w| w == tag) {
             let off = pos + rel;
-            let sz = if off + 8 <= data.len() {
-                u32::from_be_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]])
-            } else {
-                0
-            };
+            let sz = if off + 8 <= data.len() { u32::from_be_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]]) } else { 0 };
             out.push_str(&format!("  {} @ 0x{:06x} (be_len={})\n", std::str::from_utf8(tag).unwrap_or("?"), off, sz));
             pos = off + 4;
         }
     }
-
     out.push_str("\n--- Readable Strings ---\n");
     let mut cur = Vec::new();
-    let mut strs = Vec::new();
+    let mut count = 0usize;
     for &b in data {
         if (32..127).contains(&b) {
             cur.push(b);
-        } else {
+        } else if !cur.is_empty() {
             if cur.len() >= 4 && !cur.iter().all(|&c| c == b'p' || c == b'a') {
-                strs.push(String::from_utf8_lossy(&cur).into_owned());
+                out.push_str(&format!("  {}\n", String::from_utf8_lossy(&cur)));
+                count += 1;
+                if count >= 120 { break; }
             }
             cur.clear();
         }
     }
-    if cur.len() >= 4 && !cur.iter().all(|&c| c == b'p' || c == b'a') {
-        strs.push(String::from_utf8_lossy(&cur).into_owned());
-    }
-    for s in strs.iter().take(120) {
-        out.push_str(&format!("  {s}\n"));
-    }
-
     out.push_str("\n--- Header Hex (first 512 B) ---\n");
     out.push_str(&format_hex(&data[..data.len().min(512)]));
     out
@@ -971,12 +928,8 @@ fn format_hex(data: &[u8]) -> String {
     let mut out = String::new();
     for (row, chunk) in data.chunks(16).enumerate() {
         out.push_str(&format!("{:04x}: ", row * 16));
-        for b in chunk {
-            out.push_str(&format!("{b:02x} "));
-        }
-        for _ in chunk.len()..16 {
-            out.push_str("   ");
-        }
+        for b in chunk { out.push_str(&format!("{b:02x} ")); }
+        for _ in chunk.len()..16 { out.push_str("   "); }
         out.push(' ');
         for &b in chunk {
             out.push(if (32..127).contains(&b) { b as char } else { '.' });
@@ -995,8 +948,7 @@ fn read_entry_bytes(e: &RpfEntry) -> std::io::Result<Vec<u8>> {
             f.seek(SeekFrom::Start(coff))?;
             let mut raw = vec![0u8; clen as usize];
             f.read_exact(&mut raw)?;
-            let mut dec = ZlibDecoder::new(&raw[..]);
-            dec.read_to_end(&mut combined)?;
+            ZlibDecoder::new(&raw[..]).read_to_end(&mut combined)?;
         }
         Ok(combined)
     } else {
@@ -1004,9 +956,8 @@ fn read_entry_bytes(e: &RpfEntry) -> std::io::Result<Vec<u8>> {
         let mut raw = vec![0u8; e.comp_size as usize];
         f.read_exact(&mut raw)?;
         if matches!(e.kind, "XML" | "PSIN" | "ZLIB") {
-            let mut dec = ZlibDecoder::new(&raw[..]);
             let mut out = Vec::new();
-            dec.read_to_end(&mut out)?;
+            ZlibDecoder::new(&raw[..]).read_to_end(&mut out)?;
             Ok(out)
         } else {
             Ok(raw)
@@ -1025,10 +976,59 @@ fn extract_xml_tag(bytes: &[u8]) -> Option<String> {
     None
 }
 
-/// Sequential 16MB streaming scanner for levels.rpf's 4.45 GB vehicle zone (zero HDD seek thrashing!).
+// shared rage9 page detector used by both veh scanner and full archive pass
+fn probe_rage9_page(
+    buf: &[u8],
+    pos: usize,
+    read_n: usize,
+    off: u64,
+    path: &Path,
+    rname: &str,
+    probe_dec: &mut Decompress,
+    probe_out: &mut [u8],
+) -> Option<RpfEntry> {
+    let h0 = u64::from_le_bytes(buf[pos..pos + 8].try_into().ok()?);
+    let h1 = u64::from_le_bytes(buf[pos + 8..pos + 16].try_into().ok()?);
+    if h0 != 0 || h1 != 0 {
+        return None;
+    }
+    let p = pos + 0x10;
+    if !is_zlib_head(&buf[p..read_n]) {
+        return None;
+    }
+    let end = (p + 32768).min(read_n);
+    probe_dec.reset(true);
+    let _ = probe_dec.decompress(&buf[p..end], probe_out, FlushDecompress::None);
+    let olen = probe_dec.total_out() as usize;
+    if olen < 0x80 { return None; }
+    let vft = u64::from_le_bytes(probe_out[0..8].try_into().ok()?);
+    let bmap = u64::from_le_bytes(probe_out[8..16].try_into().ok()?);
+    if vft != 0 || !(0x5000_0000..0x5800_0000).contains(&bmap) || &probe_out[0x10..0x15] == b"0DRPz" {
+        return None;
+    }
+    let (mname, is_veh, vlen) = if (bmap - 0x5000_0000) >= 32768 {
+        probe_large_rage9_model_in_buf(&buf[p..read_n], path, off + p as u64)?
+    } else {
+        let (mname, _) = extract_rage9_model_name(&probe_out[..olen])?;
+        (mname.clone(), is_vehicle_virtual(&probe_out[..olen], &mname), olen)
+    };
+    Some(RpfEntry {
+        source_rpf: path.to_path_buf(),
+        rpf_name: rname.to_string(),
+        name: mname,
+        kind: if is_veh { "VEH" } else { "MODEL" },
+        offset: off + p as u64,
+        comp_size: probe_dec.total_in(),
+        raw_size: vlen as u64,
+        tracks: 0,
+        chunks: Vec::new(),
+    })
+}
+
+// single 16mb sequntial stream avoids hdd seek thrash while indexing vehicles
 fn scan_levels_vehicle_zone(levels_rpf: &PathBuf, live_state: Option<&Arc<Mutex<ScanState>>>) -> Vec<RpfEntry> {
     let sz = fs::metadata(levels_rpf).map(|m| m.len()).unwrap_or(0);
-    let start_off: u64 = 0x10b2_0000_00u64.min(sz);
+    let start_off = VEH_ZONE_OFF.min(sz);
     let total_len = sz.saturating_sub(start_off);
     if total_len == 0 { return Vec::new(); }
     let rname = levels_rpf.file_name().unwrap_or_default().to_string_lossy().into_owned();
@@ -1048,52 +1048,15 @@ fn scan_levels_vehicle_zone(levels_rpf: &PathBuf, live_state: Option<&Arc<Mutex<
         if n == 0 { break; }
         let mut pos = 0usize;
         while pos + 44 <= n {
-            let h0 = u64::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3], buf[pos+4], buf[pos+5], buf[pos+6], buf[pos+7]]);
-            let h1 = u64::from_le_bytes([buf[pos+8], buf[pos+9], buf[pos+10], buf[pos+11], buf[pos+12], buf[pos+13], buf[pos+14], buf[pos+15]]);
-            if h0 == 0 && h1 == 0 && buf[pos + 0x10] == 0x78 && matches!(buf[pos + 0x11], 0x9c | 0xda) && (buf[pos + 0x12] & 0x06) != 0x06 {
-                let p = pos + 0x10;
-                let end = (p + 32768).min(n);
-                probe_dec.reset(true);
-                let _ = probe_dec.decompress(&buf[p..end], &mut probe_out, FlushDecompress::None);
-                let olen = probe_dec.total_out() as usize;
-                if olen >= 0x80 {
-                    let vft = u64::from_le_bytes([probe_out[0], probe_out[1], probe_out[2], probe_out[3], probe_out[4], probe_out[5], probe_out[6], probe_out[7]]);
-                    let bmap = u64::from_le_bytes([probe_out[8], probe_out[9], probe_out[10], probe_out[11], probe_out[12], probe_out[13], probe_out[14], probe_out[15]]);
-                    if vft == 0 && (0x5000_0000..0x5800_0000).contains(&bmap) && &probe_out[0x10..0x15] != b"0DRPz" {
-                        let bmap_off = bmap - 0x5000_0000;
-                        // ALWAYS read full multi-chunk virtual header if bmap_off >= 32KB so vehicle bones & names aren't missed!
-                        let model_hit = if bmap_off >= 32768 {
-                            probe_large_rage9_model_in_buf(&buf[p..n], levels_rpf, off + p as u64)
-                        } else if let Some((mname, _)) = extract_rage9_model_name(&probe_out[..olen]) {
-                            let is_veh = is_vehicle_virtual(&probe_out[..olen], &mname);
-                            Some((mname, is_veh, olen))
-                        } else {
-                            None
-                        };
-                        if let Some((mname, is_veh, vlen)) = model_hit {
-                            let kind = if is_veh { "VEH" } else { "MODEL" };
-                            local_batch.push(RpfEntry {
-                                source_rpf: levels_rpf.clone(),
-                                rpf_name: rname.clone(),
-                                name: mname,
-                                kind,
-                                offset: off + p as u64,
-                                comp_size: probe_dec.total_in(),
-                                raw_size: vlen as u64,
-                                fps: 0.0,
-                                tracks: 0,
-                                chunks: Vec::new(),
-                            });
-                            if local_batch.len() >= 15 {
-                                if let Some(st) = live_state {
-                                    let mut g = st.lock().unwrap();
-                                    g.entries.extend(local_batch.iter().cloned());
-                                    g.ver += 1;
-                                }
-                                all_entries.extend(local_batch.drain(..));
-                            }
-                        }
+            if let Some(entry) = probe_rage9_page(&buf, pos, n, off, levels_rpf, &rname, &mut probe_dec, &mut probe_out) {
+                local_batch.push(entry);
+                if local_batch.len() >= 15 {
+                    if let Some(st) = live_state {
+                        let mut g = st.lock().unwrap();
+                        g.entries.extend(local_batch.iter().cloned());
+                        g.ver += 1;
                     }
+                    all_entries.extend(local_batch.drain(..));
                 }
             }
             pos += 0x1000;
@@ -1105,7 +1068,7 @@ fn scan_levels_vehicle_zone(levels_rpf: &PathBuf, live_state: Option<&Arc<Mutex<
                 last_pct = pct;
                 let mut g = st.lock().unwrap();
                 let vcnt = g.entries.iter().filter(|e| e.kind == "VEH").count();
-                g.status = format!("Fast-indexing GTA 6 Vehicles: {pct}% ({vcnt} vehicles found)...");
+                g.status = format!("Fast-indexing Vehicles: {pct}% ({vcnt} vehicles found)...");
             }
         }
     }
@@ -1142,11 +1105,8 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
     let mut awc_idx = 0usize;
     let mut last_ui_mb = 0u64;
     let mut need_seek = true;
-    let scan_limit = if rname.eq_ignore_ascii_case("levels.rpf") && sz > 0x10b2_0000_00 {
-        0x10b2_0000_00
-    } else {
-        sz
-    };
+    let scan_limit = if rname.eq_ignore_ascii_case("levels.rpf") && sz > VEH_ZONE_OFF { VEH_ZONE_OFF } else { sz };
+
     while off < scan_limit {
         if let Some(st) = progress_state {
             let cur_mb = off / (64 * 1024 * 1024);
@@ -1164,46 +1124,8 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
         let mut pos = 0usize;
         let mut jumped = false;
         while pos + 44 <= read_n {
-            // Fast 16-byte check for zero-prefixed RAGE9 resource at +0x10
-            let h0 = u64::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3], buf[pos+4], buf[pos+5], buf[pos+6], buf[pos+7]]);
-            let h1 = u64::from_le_bytes([buf[pos+8], buf[pos+9], buf[pos+10], buf[pos+11], buf[pos+12], buf[pos+13], buf[pos+14], buf[pos+15]]);
-            if h0 == 0 && h1 == 0 {
-                if buf[pos + 0x10] == 0x78 && matches!(buf[pos + 0x11], 0x9c | 0xda) && (buf[pos + 0x12] & 0x06) != 0x06 {
-                    let p = pos + 0x10;
-                    let end = (p + 32768).min(read_n);
-                    probe_dec.reset(true);
-                    let _ = probe_dec.decompress(&buf[p..end], &mut probe_out, FlushDecompress::None);
-                    let olen = probe_dec.total_out() as usize;
-                    if olen >= 0x80 {
-                        let vft = u64::from_le_bytes([probe_out[0], probe_out[1], probe_out[2], probe_out[3], probe_out[4], probe_out[5], probe_out[6], probe_out[7]]);
-                        let bmap = u64::from_le_bytes([probe_out[8], probe_out[9], probe_out[10], probe_out[11], probe_out[12], probe_out[13], probe_out[14], probe_out[15]]);
-                        if vft == 0 && (0x5000_0000..0x5800_0000).contains(&bmap) && &probe_out[0x10..0x15] != b"0DRPz" {
-                            let model_hit = if (bmap - 0x5000_0000) >= 32768 {
-                                probe_large_rage9_model_in_buf(&buf[p..read_n], path, off + p as u64)
-                            } else if let Some((mname, _ext)) = extract_rage9_model_name(&probe_out[..olen]) {
-                                let is_veh = is_vehicle_virtual(&probe_out[..olen], &mname);
-                                Some((mname, is_veh, olen))
-                            } else {
-                                None
-                            };
-                            if let Some((mname, is_veh, vlen)) = model_hit {
-                                let kind = if is_veh { "VEH" } else { "MODEL" };
-                                found.push(RpfEntry {
-                                    source_rpf: path.clone(),
-                                    rpf_name: rname.clone(),
-                                    name: mname,
-                                    kind,
-                                    offset: off + p as u64,
-                                    comp_size: probe_dec.total_in(),
-                                    raw_size: vlen as u64,
-                                    fps: 0.0,
-                                    tracks: 0,
-                                    chunks: Vec::new(),
-                                });
-                            }
-                        }
-                    }
-                }
+            if let Some(entry) = probe_rage9_page(&buf, pos, read_n, off, path, &rname, &mut probe_dec, &mut probe_out) {
+                found.push(entry);
                 pos += 0x1000;
                 continue;
             }
@@ -1219,7 +1141,6 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
                     offset: off + pos as u64,
                     comp_size: 0,
                     raw_size: 0,
-                    fps: 0.0,
                     tracks: sc,
                     chunks: Vec::new(),
                 });
@@ -1244,7 +1165,6 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
                         offset: abs_off,
                         comp_size: tot,
                         raw_size: tot,
-                        fps: (fn_ as f32) / (fd_ as f32),
                         tracks,
                         chunks: Vec::new(),
                     });
@@ -1288,7 +1208,7 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
         let mut out = vec![0u8; 131072];
 
         while i + 8 < data.len() {
-            if data[i] == 0x78 && matches!(data[i + 1], 0x01 | 0x5e | 0x9c | 0xda) && (data[i + 2] & 0x06) != 0x06 {
+            if is_zlib_head(&data[i..]) {
                 decomp.reset(true);
                 let end = (i + 1024 * 1024).min(data.len());
                 if let Ok(Status::StreamEnd) = decomp.decompress(&data[i..end], &mut out, FlushDecompress::Finish) {
@@ -1301,6 +1221,7 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
                         stitch_chunks.push((i as u64, clen as u64));
                         stitch_raw += out_len as u64;
 
+                        // rpf9 splits xml and config streams on exact 64kb pages
                         if out_len != 65536 {
                             z_idx += 1;
                             let trimmed = stitch_head.iter().position(|&b| !matches!(b, 0xef | 0xbb | 0xbf | b' ' | b'\t' | b'\r' | b'\n')).unwrap_or(0);
@@ -1321,7 +1242,6 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
                                 offset: stitch_chunks[0].0,
                                 comp_size: clen as u64,
                                 raw_size: stitch_raw,
-                                fps: 0.0,
                                 tracks: 0,
                                 chunks: std::mem::take(&mut stitch_chunks),
                             });
@@ -1341,36 +1261,14 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
 
 impl eframe::App for Rpf9App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let (media_loading, media_status, wav_path, awc_streams, fps) = {
+        let (media_loading, media_status, awc_streams) = {
             let mut m = self.media.lock().unwrap();
             if let Some(mesh) = m.loaded_mesh.take() {
                 self.mesh3d = Some(mesh);
                 self.show_3d = true;
             }
-            if self.textures.is_empty() && !m.frames.is_empty() {
-                for (i, img) in m.frames.drain(..).enumerate() {
-                    self.textures.push(ctx.load_texture(format!("f_{i}"), img, TextureOptions::LINEAR));
-                }
-                if !self.textures.is_empty() {
-                    self.playing = true;
-                    self.frame_idx = 0;
-                    self.last_frame_time = Instant::now();
-                    if let Some(w) = &m.wav_path {
-                        play_wav_async(w);
-                    }
-                }
-            }
-            (m.loading, m.status.clone(), m.wav_path.clone(), m.awc_streams.clone(), m.fps)
+            (m.loading, m.status.clone(), m.awc_streams.clone())
         };
-
-        if self.playing && !self.textures.is_empty() {
-            let step = 1.0 / fps.max(1.0);
-            if self.last_frame_time.elapsed().as_secs_f32() >= step {
-                self.frame_idx = (self.frame_idx + 1) % self.textures.len();
-                self.last_frame_time = Instant::now();
-            }
-            ctx.request_repaint();
-        }
 
         egui::TopBottomPanel::top("top").frame(egui::Frame::new().fill(Color32::from_rgb(20, 21, 27)).inner_margin(10.0)).show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -1387,10 +1285,7 @@ impl eframe::App for Rpf9App {
                     }
                 }
                 if ui.button("Open .RPF").clicked() {
-                    if let Some(p) = rfd::FileDialog::new()
-                        .add_filter("RPF Archives", &["rpf"])
-                        .pick_file()
-                    {
+                    if let Some(p) = rfd::FileDialog::new().add_filter("RPF Archives", &["rpf"]).pick_file() {
                         self.start_single_scan(p);
                     }
                 }
@@ -1403,11 +1298,9 @@ impl eframe::App for Rpf9App {
                         }
                     }
                 }
-                if self.is_folder {
-                    if ui.button("Rescan").clicked() {
-                        if let Some(folder) = self.target_path.clone() {
-                            self.start_folder_scan(folder);
-                        }
+                if self.is_folder && ui.button("Rescan").clicked() {
+                    if let Some(folder) = self.target_path.clone() {
+                        self.start_folder_scan(folder);
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1448,7 +1341,6 @@ impl eframe::App for Rpf9App {
 
         egui::SidePanel::left("tree").default_width(195.0).frame(egui::Frame::new().fill(Color32::from_rgb(16, 17, 21)).inner_margin(8.0)).show(ctx, |ui| {
             self.refresh_view();
-            let rpf_names = self.state.lock().unwrap().rpf_names.clone();
             let c = self.counts;
             ui.label(RichText::new("ARCHIVE TREE").size(11.0).color(Color32::from_rgb(110, 118, 134)));
             ui.add_space(4.0);
@@ -1466,7 +1358,7 @@ impl eframe::App for Rpf9App {
                     self.category = cat;
                 }
             }
-            if rpf_names.len() > 1 {
+            if self.cached_rpf_names.len() > 1 {
                 ui.add_space(10.0);
                 ui.label(RichText::new("ARCHIVES").size(11.0).color(Color32::from_rgb(110, 118, 134)));
                 ui.add_space(4.0);
@@ -1474,7 +1366,7 @@ impl eframe::App for Rpf9App {
                     if ui.selectable_label(self.selected_rpf == "All RPFs", "All RPFs").clicked() {
                         self.selected_rpf = "All RPFs".into();
                     }
-                    for rn in &rpf_names {
+                    for rn in &self.cached_rpf_names {
                         if ui.selectable_label(&self.selected_rpf == rn, rn).clicked() {
                             self.selected_rpf = rn.clone();
                         }
@@ -1502,13 +1394,11 @@ impl eframe::App for Rpf9App {
             ui.label(RichText::new(format!("{} results", self.view.len())).size(11.0).color(Color32::from_rgb(110, 118, 134)));
             let mut clicked = None;
             egui::ScrollArea::vertical().show_rows(ui, 24.0, self.view.len(), |ui, range| {
-                // Only the visible rows are cloned out of the shared state
                 let rows: Vec<(usize, RpfEntry)> = {
                     let st = self.state.lock().unwrap();
                     self.view[range].iter().filter_map(|&i| st.entries.get(i).map(|e| (i, e.clone()))).collect()
                 };
                 for (idx, e) in &rows {
-                    let idx = *idx;
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(format!("{:<4}", e.kind)).strong().size(11.5).color(kind_color(e.kind)));
                         let sz_s = format_size(e.raw_size);
@@ -1517,8 +1407,8 @@ impl eframe::App for Rpf9App {
                         } else {
                             format!("{}  ({})", e.name, sz_s)
                         };
-                        if ui.selectable_label(self.selected == Some(idx), RichText::new(label).size(12.5)).clicked() {
-                            clicked = Some(idx);
+                        if ui.selectable_label(self.selected == Some(*idx), RichText::new(label).size(12.5)).clicked() {
+                            clicked = Some(*idx);
                         }
                     });
                 }
@@ -1547,22 +1437,14 @@ impl eframe::App for Rpf9App {
                     if ui.button("Pop-out").clicked() {
                         if let Some(cp) = bink_clip_opt {
                             self.stop_bink_player();
-                            let binkplay = std::env::current_exe()
-                                .ok()
-                                .and_then(|p| p.parent().map(|d| d.join("binkplay.exe")))
-                                .filter(|p| p.exists())
-                                .unwrap_or_else(|| PathBuf::from(r"C:\Program Files (x86)\RADVideo\binkplay.exe"));
-                            let _ = Command::new(binkplay).arg(&cp).spawn();
+                            let _ = Command::new(find_binkplay()).arg(&cp).spawn();
                         }
                     }
                 });
                 ui.add_space(6.0);
                 let rect = ui.available_rect_before_wrap();
                 let ppp = ctx.pixels_per_point();
-                let rx = (rect.min.x * ppp) as i32;
-                let ry = (rect.min.y * ppp) as i32;
-                let rw = (rect.width() * ppp) as i32;
-                let rh = (rect.height() * ppp) as i32;
+                let (rx, ry, rw, rh) = ((rect.min.x * ppp) as i32, (rect.min.y * ppp) as i32, (rect.width() * ppp) as i32, (rect.height() * ppp) as i32);
                 if let Some(bh) = bink_hwnd_opt {
                     let cur = [rx, ry, rw, rh];
                     if cur != self.last_dock_rect {
@@ -1583,49 +1465,15 @@ impl eframe::App for Rpf9App {
                     draw_percystar_spinner(ui, 24.0);
                     ui.label(RichText::new(&media_status).color(Color32::from_rgb(252, 175, 23)));
                 });
-            } else if !self.textures.is_empty() {
-                ui.horizontal(|ui| {
-                    if ui.button(if self.playing { "Pause" } else { "Play" }).clicked() {
-                        self.playing = !self.playing;
-                        if self.playing {
-                            if let Some(w) = &wav_path { play_wav_async(w); }
-                        } else {
-                            stop_wav();
-                        }
-                    }
-                    if ui.button("Restart").clicked() {
-                        self.frame_idx = 0;
-                        self.playing = true;
-                        if let Some(w) = &wav_path { play_wav_async(w); }
-                    }
-                    if ui.button("Pop-out BinkPlay").clicked() {
-                        let bk2_p = std::env::temp_dir().join("rpf9_preview_bk2").join("clip.bk2");
-                        if bk2_p.exists() {
-                            let _ = Command::new(r"C:\Program Files (x86)\RADVideo\binkplay.exe").arg(&bk2_p).spawn();
-                        }
-                    }
-                    ui.add(egui::Slider::new(&mut self.frame_idx, 0..=self.textures.len() - 1).text("Frame"));
-                    ui.label(RichText::new(&media_status).size(12.0).color(Color32::from_rgb(140, 148, 164)));
-                });
-                ui.add_space(8.0);
-                let tex = &self.textures[self.frame_idx];
-                let avail = ui.available_size();
-                let tsz = tex.size_vec2();
-                let scale = (avail.x / tsz.x).min(avail.y / tsz.y).min(1.0);
-                ui.image((tex.id(), tsz * scale));
             } else if !awc_streams.is_empty() {
                 ui.label(RichText::new(&media_status).strong().color(Color32::WHITE));
                 ui.add_space(8.0);
-                if ui.button("Stop Audio").clicked() {
-                    stop_wav();
-                }
+                if ui.button("Stop Audio").clicked() { stop_wav(); }
                 ui.separator();
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for (idx, wp) in &awc_streams {
                         ui.horizontal(|ui| {
-                            if ui.button("Play").clicked() {
-                                play_wav_async(wp);
-                            }
+                            if ui.button("Play").clicked() { play_wav_async(wp); }
                             ui.label(format!("Stream #{idx}: {}", wp.file_name().unwrap_or_default().to_string_lossy()));
                         });
                     }
@@ -1656,72 +1504,50 @@ impl eframe::App for Rpf9App {
     }
 }
 
-fn batch_extract_vehicles(levels_rpf: &PathBuf, out_dir: &PathBuf) {
-    let _ = fs::create_dir_all(out_dir);
-    eprintln!("Sequential fast-scan of vehicle zone in {}...", levels_rpf.display());
-    let entries = scan_levels_vehicle_zone(levels_rpf, None);
-    let mut best: HashMap<String, (u64, String, bool)> = HashMap::new();
-    for e in entries {
-        if e.kind != "VEH" { continue; }
-        let lo = e.name.to_ascii_lowercase();
-        if lo.contains("_mid.") { continue; }
-        let stem_raw = e.name.trim_end_matches(".#ft");
-        let is_hi = stem_raw.ends_with("_hi");
-        let base = stem_raw.trim_end_matches("_hi").to_ascii_lowercase();
-        match best.get(&base) {
-            Some((_, _, prev_hi)) if *prev_hi && !is_hi => {}
-            _ => {
-                best.insert(base, (e.offset, e.name.clone(), is_hi));
-            }
-        }
-    }
-    let mut list: Vec<(String, u64, String)> = best.into_iter().map(|(b, (o, n, _))| (b, o, n)).collect();
-    list.sort_by(|a, b| a.0.cmp(&b.0));
-    eprintln!("Found {} unique full GTA 6 vehicles! Extracting .OBJs (with UVs)...", list.len());
-
-    let mut ok_cnt = 0usize;
-    for (idx, (base, off, name)) in list.iter().enumerate() {
-        if let Ok(mesh) = decode_rage9_model_from_rpf(levels_rpf, *off, name) {
-            let out_p = out_dir.join(format!("{base}.obj"));
-            if mesh.export_obj(&out_p).is_ok() {
-                ok_cnt += 1;
-                if ok_cnt <= 30 || ok_cnt % 25 == 0 {
-                    eprintln!("  [{}/{}] {} ({} v, {} f)", idx + 1, list.len(), base, mesh.verts.len(), mesh.tris.len());
-                }
-            }
-        }
-    }
-    eprintln!("DONE: Exported {ok_cnt}/{} vehicles to {}", list.len(), out_dir.display());
-}
-
-fn batch_extract_models(rpf_path: &PathBuf, out_dir: &PathBuf, filter: &str) {
+fn export_models_cli(rpf_path: &PathBuf, out_dir: &PathBuf, filter: &str, vehicles_only: bool) {
     let _ = fs::create_dir_all(out_dir);
     let q = filter.to_ascii_lowercase();
-    eprintln!("Scanning {} for models (filter={:?})...", rpf_path.display(), filter);
-    let Ok((_, entries)) = scan_single_rpf(rpf_path, None) else {
-        eprintln!("Failed to scan {}", rpf_path.display());
-        return;
-    };
-    let mut best: HashMap<String, (u64, String)> = HashMap::new();
-    for e in entries {
-        if e.kind != "MODEL" && e.kind != "VEH" { continue; }
-        let lo = e.name.to_ascii_lowercase();
-        if !q.is_empty() && !q.split(',').any(|tok| !tok.is_empty() && lo.contains(tok)) {
-            continue;
+    eprintln!("Scanning {}...", rpf_path.display());
+    let entries = if vehicles_only {
+        scan_levels_vehicle_zone(rpf_path, None)
+    } else {
+        match scan_single_rpf(rpf_path, None) {
+            Ok((_, e)) => e,
+            Err(err) => {
+                eprintln!("Scan failed: {err}");
+                return;
+            }
         }
-        best.entry(lo).or_insert((e.offset, e.name));
+    };
+    let mut best: HashMap<String, (u64, String, bool)> = HashMap::new();
+    for e in entries {
+        if vehicles_only {
+            if e.kind != "VEH" || e.name.to_ascii_lowercase().contains("_mid.") { continue; }
+            let stem = e.name.trim_end_matches(".#ft");
+            let is_hi = stem.ends_with("_hi");
+            let base = stem.trim_end_matches("_hi").to_ascii_lowercase();
+            match best.get(&base) {
+                Some((_, _, prev_hi)) if *prev_hi && !is_hi => {}
+                _ => { best.insert(base, (e.offset, e.name, is_hi)); }
+            }
+        } else {
+            if e.kind != "MODEL" && e.kind != "VEH" { continue; }
+            let lo = e.name.to_ascii_lowercase();
+            if !q.is_empty() && !q.split(',').any(|tok| !tok.is_empty() && lo.contains(tok)) { continue; }
+            best.entry(lo).or_insert((e.offset, e.name, false));
+        }
     }
-    let mut list: Vec<(String, u64, String)> = best.into_iter().map(|(k, (o, n))| (k, o, n)).collect();
+    let mut list: Vec<(String, u64, String)> = best.into_iter().map(|(k, (o, n, _))| (k, o, n)).collect();
     list.sort_by(|a, b| a.0.cmp(&b.0));
-    eprintln!("Found {} matching models! Exporting .OBJs...", list.len());
+    eprintln!("Found {} models -> exporting .OBJs...", list.len());
     let mut ok = 0usize;
-    for (idx, (_, off, name)) in list.iter().enumerate() {
+    for (idx, (key, off, name)) in list.iter().enumerate() {
         if let Ok(mesh) = decode_rage9_model_from_rpf(rpf_path, *off, name) {
-            let safe = name.replace('#', "").replace('.', "_");
-            if mesh.export_obj(&out_dir.join(format!("{safe}.obj"))).is_ok() {
+            let fname = if vehicles_only { format!("{key}.obj") } else { format!("{}.obj", name.replace('#', "").replace('.', "_")) };
+            if mesh.export_obj(&out_dir.join(fname)).is_ok() {
                 ok += 1;
                 if ok <= 25 || ok % 50 == 0 {
-                    eprintln!("  [{}/{}] {} ({} v, {} f)", idx + 1, list.len(), name, mesh.verts.len(), mesh.tris.len());
+                    eprintln!("  [{}/{}] {} ({} v, {} f)", idx + 1, list.len(), key, mesh.verts.len(), mesh.tris.len());
                 }
             }
         }
@@ -1732,26 +1558,26 @@ fn batch_extract_models(rpf_path: &PathBuf, out_dir: &PathBuf, filter: &str) {
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 4 && args[1] == "--extract-vehicles" {
-        batch_extract_vehicles(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]));
+        export_models_cli(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), "", true);
         return Ok(());
     }
     if args.len() >= 4 && args[1] == "--extract-models" {
         let filt = args.get(4).map(|s| s.as_str()).unwrap_or("");
-        batch_extract_models(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), filt);
+        export_models_cli(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), filt, false);
         return Ok(());
     }
-    let mut vb = egui::ViewportBuilder::default().with_inner_size([1320.0, 800.0]);
-    if let Ok(img) = image::load_from_memory(include_bytes!("../assets/logo.png")) {
-        let rgba = img.to_rgba8();
-        vb = vb.with_icon(egui::IconData {
-            rgba: rgba.as_raw().to_vec(),
-            width: rgba.width(),
-            height: rgba.height(),
+
+    // decod embedded logo once and share bytes across window icon and topbar
+    let logo_rgba = image::load_from_memory(include_bytes!("../assets/logo.png"))
+        .ok()
+        .map(|img| {
+            let rgba = img.to_rgba8();
+            (rgba.as_raw().to_vec(), rgba.width(), rgba.height())
         });
+    let mut vb = egui::ViewportBuilder::default().with_inner_size([1320.0, 800.0]);
+    if let Some((ref raw, w, h)) = logo_rgba {
+        vb = vb.with_icon(egui::IconData { rgba: raw.clone(), width: w, height: h });
     }
-    let opts = eframe::NativeOptions {
-        viewport: vb,
-        ..Default::default()
-    };
-    eframe::run_native("PercyStar RPF9 Explorer", opts, Box::new(|cc| Ok(Box::new(Rpf9App::new(cc)))))
+    let opts = eframe::NativeOptions { viewport: vb, ..Default::default() };
+    eframe::run_native("PercyStar RPF9 Explorer", opts, Box::new(move |cc| Ok(Box::new(Rpf9App::new(cc, logo_rgba)))))
 }

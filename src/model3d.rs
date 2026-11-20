@@ -3,20 +3,15 @@ use flate2::{Decompress, FlushDecompress, Status};
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum ShadeMode {
+    #[default]
     Textured,
     Solid,
     SolidWire,
     Wireframe,
-}
-
-impl Default for ShadeMode {
-    fn default() -> Self {
-        Self::Textured
-    }
 }
 
 pub struct Texture2D {
@@ -31,10 +26,8 @@ impl Texture2D {
         if self.w == 0 || self.h == 0 {
             return Color32::WHITE;
         }
-        let uu = u.rem_euclid(1.0);
-        let vv = v.rem_euclid(1.0);
-        let x = ((uu * (self.w as f32)) as usize).min(self.w - 1);
-        let y = ((vv * (self.h as f32)) as usize).min(self.h - 1);
+        let x = ((u.rem_euclid(1.0) * (self.w as f32)) as usize).min(self.w - 1);
+        let y = ((v.rem_euclid(1.0) * (self.h as f32)) as usize).min(self.h - 1);
         self.pixels[y * self.w + x]
     }
 }
@@ -64,7 +57,7 @@ pub struct Mesh3D {
     pub pan_y: f32,
     pub shade_mode: ShadeMode,
     pub auto_spin: bool,
-    // Reused zero-alloc rasterizer buffers
+    // reused softwre rasterizer buffrs zero allocs per fram
     fb_w: usize,
     fb_h: usize,
     color_buf: Vec<Color32>,
@@ -110,12 +103,11 @@ impl Mesh3D {
             let dx = v[0] - center[0];
             let dy = v[1] - center[1];
             let dz = v[2] - center[2];
-            let d2 = dx * dx + dy * dy + dz * dz;
-            if d2 > r2 { r2 = d2; }
+            r2 = r2.max(dx * dx + dy * dy + dz * dz);
         }
         let radius = r2.sqrt().max(1e-3);
 
-        // Precompute unit face normals once
+        // precomput unit face normals once so drag stays fast
         let mut normals = Vec::with_capacity(tris.len());
         for t in &tris {
             let a = verts[t[0] as usize];
@@ -168,8 +160,7 @@ impl Mesh3D {
     }
 
     pub fn export_obj(&self, path: &Path) -> std::io::Result<()> {
-        let f = File::create(path)?;
-        let mut w = BufWriter::new(f);
+        let mut w = BufWriter::new(File::create(path)?);
         writeln!(w, "# PercyStar RAGE9 Model Export: {}", self.name)?;
         writeln!(w, "o {}", self.name)?;
         for v in &self.verts {
@@ -193,7 +184,7 @@ impl Mesh3D {
     }
 }
 
-pub fn parse_obj(path: &PathBuf) -> Option<Mesh3D> {
+pub fn parse_obj(path: &Path) -> Option<Mesh3D> {
     let txt = fs::read_to_string(path).ok()?;
     let mut verts = Vec::new();
     let mut tris = Vec::new();
@@ -212,7 +203,7 @@ pub fn parse_obj(path: &PathBuf) -> Option<Mesh3D> {
             }
             Some("f") => {
                 let idxs: Vec<u32> = it
-                    .filter_map(|tok| tok.split('/').next()?.parse::<usize>().ok().and_then(|i| i.checked_sub(1)))
+                    .filter_map(|tok| tok.split('/').next()?.parse::<usize>().ok()?.checked_sub(1))
                     .filter(|&i| i < verts.len())
                     .map(|i| i as u32)
                     .collect();
@@ -228,6 +219,7 @@ pub fn parse_obj(path: &PathBuf) -> Option<Mesh3D> {
         }
     }
     if verts.is_empty() { return None; }
+    // flip external y up obj files into z up turntabl space
     if !txt.starts_with("# PercyStar") {
         for v in &mut verts {
             *v = [v[0], -v[2], v[1]];
@@ -242,9 +234,9 @@ pub fn extract_0drpz_mesh(name: &str, data: &[u8]) -> Option<Mesh3D> {
     let mut verts = Vec::new();
     let mut off = 0x40usize;
     while off + 12 <= data.len() && verts.len() < 12000 {
-        let x = f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
-        let y = f32::from_le_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]]);
-        let z = f32::from_le_bytes([data[off + 8], data[off + 9], data[off + 10], data[off + 11]]);
+        let x = rf32(data, off);
+        let y = rf32(data, off + 4);
+        let z = rf32(data, off + 8);
         if x.is_finite() && y.is_finite() && z.is_finite()
             && x.abs() < 250.0 && y.abs() < 250.0 && z.abs() < 250.0
             && (x.abs() > 1e-4 || y.abs() > 1e-4 || z.abs() > 1e-4)
@@ -276,7 +268,45 @@ fn rf32(b: &[u8], o: usize) -> f32 {
     f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
 }
 
-/// Decompress one zlib stream starting at `file_off`, returning `(decompressed_bytes, next_file_off)`.
+#[inline]
+pub fn is_zlib_head(b: &[u8]) -> bool {
+    b.len() >= 3 && b[0] == 0x78 && matches!(b[1], 0x01 | 0x5e | 0x9c | 0xda) && (b[2] & 0x06) != 0x06
+}
+
+#[inline]
+fn vptr(q: u64) -> Option<usize> {
+    (0x5000_0000..0x5800_0000).contains(&q).then(|| (q - 0x5000_0000) as usize)
+}
+
+#[inline]
+fn pptr(q: u64) -> Option<usize> {
+    (0x6000_0000..0x7000_0000).contains(&q).then(|| (q - 0x6000_0000) as usize)
+}
+
+// decomprss one zlib stream from memory slice returns false if incomplete
+fn decompress_zlib_slice(src: &[u8], dec: &mut Decompress, out: &mut Vec<u8>) -> Option<usize> {
+    dec.reset(true);
+    let mut tmp = [0u8; 65536];
+    let mut pos = 0usize;
+    loop {
+        let bi = dec.total_in();
+        let bo = dec.total_out();
+        let st = dec.decompress(&src[pos..], &mut tmp, FlushDecompress::None).ok()?;
+        let cin = (dec.total_in() - bi) as usize;
+        let cout = (dec.total_out() - bo) as usize;
+        pos += cin;
+        if cout > 0 {
+            out.extend_from_slice(&tmp[..cout]);
+        }
+        if st == Status::StreamEnd {
+            return Some(pos);
+        }
+        if cin == 0 && cout == 0 {
+            return None;
+        }
+    }
+}
+
 fn decompress_zlib_at(f: &mut File, file_off: u64, max_out: usize) -> std::io::Result<(Vec<u8>, u64)> {
     f.seek(SeekFrom::Start(file_off))?;
     let mut dec = Decompress::new(true);
@@ -289,13 +319,13 @@ fn decompress_zlib_at(f: &mut File, file_off: u64, max_out: usize) -> std::io::R
         if n == 0 { break; }
         let mut pos = 0usize;
         while pos < n {
-            let before_in = dec.total_in();
-            let before_out = dec.total_out();
+            let bi = dec.total_in();
+            let bo = dec.total_out();
             let status = dec
                 .decompress(&in_buf[pos..n], &mut out_chunk, FlushDecompress::None)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            let cin = (dec.total_in() - before_in) as usize;
-            let cout = (dec.total_out() - before_out) as usize;
+            let cin = (dec.total_in() - bi) as usize;
+            let cout = (dec.total_out() - bo) as usize;
             pos += cin;
             total_consumed += cin as u64;
             if cout > 0 {
@@ -315,31 +345,66 @@ fn decompress_zlib_at(f: &mut File, file_off: u64, max_out: usize) -> std::io::R
     Ok((out, file_off + total_consumed))
 }
 
-/// Find the next zlib header (0x78 + 0x01|0x5e|0x9c|0xda) starting at or after `start_off` within 64KB.
 fn find_next_zlib(f: &mut File, start_off: u64) -> std::io::Result<Option<u64>> {
     f.seek(SeekFrom::Start(start_off))?;
     let mut buf = [0u8; 4096];
     let n = f.read(&mut buf)?;
     for i in 0..n.saturating_sub(3) {
-        if buf[i] == 0x78 && matches!(buf[i + 1], 0x01 | 0x5e | 0x9c | 0xda) && (buf[i + 2] & 0x06) != 0x06 {
+        if is_zlib_head(&buf[i..n]) {
             return Ok(Some(start_off + i as u64));
         }
     }
     Ok(None)
 }
 
-/// Extract model name from a decompressed virtual buffer (`.#dr`, `.#ft`, `.#dd`).
+// reads all virtual chnks from a rage9 resource stopping right after blockmap
+fn read_virtual_from_file(f: &mut File, file_off: u64) -> Result<(Vec<u8>, u64, usize), String> {
+    let (mut v, mut next_off) = decompress_zlib_at(f, file_off, 16 * 1024 * 1024)
+        .map_err(|e| format!("Virtual chunk 0 error: {e}"))?;
+    if v.len() < 0x80 {
+        return Err("Virtual chunk too small".into());
+    }
+    let Some(bmap_off) = vptr(ru64(&v, 8)) else {
+        return Err("Not a valid RAGE9 resource (missing BlockMap)".into());
+    };
+    let mut v_chunks_read = 1usize;
+    while v.len() <= bmap_off + 10 && v_chunks_read < 32 {
+        let Some(zoff) = find_next_zlib(f, next_off).map_err(|e| e.to_string())? else { break };
+        let (chunk, nxt) = decompress_zlib_at(f, zoff, 16 * 1024 * 1024).map_err(|e| e.to_string())?;
+        v.extend_from_slice(&chunk);
+        next_off = nxt;
+        v_chunks_read += 1;
+    }
+    let (v_cnt, p_cnt) = if bmap_off + 10 <= v.len() {
+        ((v[bmap_off + 8] as usize).clamp(1, 32), (v[bmap_off + 9] as usize).clamp(1, 64))
+    } else {
+        (v_chunks_read, 1)
+    };
+    for _ in v_chunks_read..v_cnt {
+        let Some(zoff) = find_next_zlib(f, next_off).map_err(|e| e.to_string())? else { break };
+        let (chunk, nxt) = decompress_zlib_at(f, zoff, 16 * 1024 * 1024).map_err(|e| e.to_string())?;
+        v.extend_from_slice(&chunk);
+        next_off = nxt;
+    }
+    Ok((v, next_off, p_cnt))
+}
+
+// finds dr ft dd modle string in virtual buffr
 pub fn extract_rage9_model_name(v: &[u8]) -> Option<(String, &'static str)> {
-    // Fast scan for ".#dr", ".#ft", ".#dd"
-    for i in 0..v.len().saturating_sub(4) {
-        if v[i] == b'.' && v[i + 1] == b'#' {
-            let ext = match (v[i + 2], v[i + 3]) {
+    let mut i = 1usize;
+    while i + 2 < v.len() {
+        if v[i] == b'#' && v[i - 1] == b'.' {
+            let ext = match (v[i + 1], v[i + 2]) {
                 (b'd', b'r') => ".#dr",
                 (b'f', b't') => ".#ft",
                 (b'd', b'd') => ".#dd",
-                _ => continue,
+                _ => {
+                    i += 1;
+                    continue;
+                }
             };
-            let mut start = i;
+            let dot = i - 1;
+            let mut start = dot;
             while start > 0 {
                 let c = v[start - 1];
                 if c.is_ascii_alphanumeric() || c == b'_' || c == b'-' {
@@ -348,22 +413,22 @@ pub fn extract_rage9_model_name(v: &[u8]) -> Option<(String, &'static str)> {
                     break;
                 }
             }
-            if i - start >= 2 && i - start <= 96 {
-                let stem = String::from_utf8_lossy(&v[start..i]);
+            if dot - start >= 2 && dot - start <= 96 {
+                let stem = String::from_utf8_lossy(&v[start..dot]);
                 return Some((format!("{stem}{ext}"), ext));
             }
         }
+        i += 1;
     }
     None
 }
 
-/// Detect whether a decompressed virtual chunk is a full GTA 6 vehicle `.#ft` (cars, bikes, boats, planes, helis, trailers).
+// checks if virtual resource is an actual vehicle and not a small tuning part
 pub fn is_vehicle_virtual(v: &[u8], name: &str) -> bool {
     let lo = name.to_ascii_lowercase();
     if !lo.ends_with(".#ft") || v.len() < 28_000 {
         return false;
     }
-    // Exclude vehicle tuning/mod sub-parts so Vehicles Only shows actual full vehicles
     for part in [
         "_dmg_", "_livery", "_roof_", "_roofext_", "_spoiler", "_exhaust",
         "_bumf_", "_bumr_", "_skirt_", "_bonnet", "_wing_", "_door_",
@@ -378,107 +443,64 @@ pub fn is_vehicle_virtual(v: &[u8], name: &str) -> bool {
             return false;
         }
     }
-    for needle in [b"wheel_lf".as_slice(), b"door_dside_f", b"chassis", b"bodyshell", b"cockpit", b"rudder", b"rotor_main"] {
-        if v.windows(needle.len()).any(|w| w == needle) {
-            return true;
-        }
-    }
-    false
+    [b"wheel_lf".as_slice(), b"door_dside_f", b"chassis", b"bodyshell", b"cockpit", b"rudder", b"rotor_main"]
+        .iter()
+        .any(|needle| v.windows(needle.len()).any(|w| w == *needle))
 }
 
-/// Zero-seek in-memory multi-chunk virtual header probe (50x faster than reopening file on HDD).
+// zero seek in memory probe falls back to disk if stream crosses chunk boundry
 pub fn probe_large_rage9_model_in_buf(buf: &[u8], rpf_path: &Path, abs_off: u64) -> Option<(String, bool, usize)> {
     let mut dec = Decompress::new(true);
     let mut v = Vec::with_capacity(131072);
-    let mut tmp = [0u8; 65536];
-    let mut pos = 0usize;
-
-    // Decompress chunk 0 from `buf`
-    loop {
-        let bi = dec.total_in();
-        let bo = dec.total_out();
-        let st = dec.decompress(&buf[pos..], &mut tmp, FlushDecompress::None).ok()?;
-        let cin = (dec.total_in() - bi) as usize;
-        let cout = (dec.total_out() - bo) as usize;
-        pos += cin;
-        if cout > 0 { v.extend_from_slice(&tmp[..cout]); }
-        if st == Status::StreamEnd { break; }
-        if cin == 0 && cout == 0 {
-            // Hit end of 4MB RAM buffer -> fall back to file read
-            return probe_large_rage9_model(rpf_path, abs_off);
-        }
-    }
+    let mut pos = match decompress_zlib_slice(buf, &mut dec, &mut v) {
+        Some(n) => n,
+        None => return probe_large_rage9_model(rpf_path, abs_off),
+    };
     if v.len() < 0x80 { return None; }
-    let bmap_ptr = ru64(&v, 8);
-    if !(0x5000_0000..0x5800_0000).contains(&bmap_ptr) { return None; }
-    let bmap_off = (bmap_ptr - 0x5000_0000) as usize;
+    let bmap_off = vptr(ru64(&v, 8))?;
     if bmap_off > 4 * 1024 * 1024 { return None; }
 
     for _ in 0..14 {
         if v.len() > bmap_off + 16 { break; }
-        // Advance to next zlib stream inside `buf`
-        while pos + 3 < buf.len() && !(buf[pos] == 0x78 && matches!(buf[pos + 1], 0x01 | 0x5e | 0x9c | 0xda) && (buf[pos + 2] & 0x06) != 0x06) {
+        while pos + 3 < buf.len() && !is_zlib_head(&buf[pos..]) {
             pos += 1;
         }
         if pos + 3 >= buf.len() {
             return probe_large_rage9_model(rpf_path, abs_off);
         }
-        dec.reset(true);
-        loop {
-            let bi = dec.total_in();
-            let bo = dec.total_out();
-            let st = dec.decompress(&buf[pos..], &mut tmp, FlushDecompress::None).ok()?;
-            let cin = (dec.total_in() - bi) as usize;
-            let cout = (dec.total_out() - bo) as usize;
-            pos += cin;
-            if cout > 0 { v.extend_from_slice(&tmp[..cout]); }
-            if st == Status::StreamEnd { break; }
-            if cin == 0 && cout == 0 {
-                return probe_large_rage9_model(rpf_path, abs_off);
-            }
+        match decompress_zlib_slice(&buf[pos..], &mut dec, &mut v) {
+            Some(n) => pos += n,
+            None => return probe_large_rage9_model(rpf_path, abs_off),
         }
     }
-    let (name, _ext) = extract_rage9_model_name(&v)?;
-    let is_veh = is_vehicle_virtual(&v, &name);
-    Some((name, is_veh, v.len()))
+    let (name, _) = extract_rage9_model_name(&v)?;
+    Some((name.clone(), is_vehicle_virtual(&v, &name), v.len()))
 }
 
-/// Probe a large multi-chunk RAGE9 resource (e.g. full vehicle `.#ft` with >32KB virtual buffer)
-/// to extract its real `.#dr`/`.#ft`/`.#dd` name and vehicle flag without reading physical buffers.
 pub fn probe_large_rage9_model(rpf_path: &Path, file_off: u64) -> Option<(String, bool, usize)> {
     let mut f = File::open(rpf_path).ok()?;
-    let (mut v, mut next_off) = decompress_zlib_at(&mut f, file_off, 2 * 1024 * 1024).ok()?;
-    if v.len() < 0x80 { return None; }
-    let bmap_ptr = ru64(&v, 8);
-    if !(0x5000_0000..0x5800_0000).contains(&bmap_ptr) { return None; }
-    let bmap_off = (bmap_ptr - 0x5000_0000) as usize;
-    if bmap_off > 4 * 1024 * 1024 { return None; }
-    // Read remaining virtual chunks until bmap_off is covered (cap at 12 chunks)
-    for _ in 0..12 {
-        if v.len() > bmap_off + 16 { break; }
-        let zoff = find_next_zlib(&mut f, next_off).ok()??;
-        let (chunk, nxt) = decompress_zlib_at(&mut f, zoff, 2 * 1024 * 1024).ok()?;
-        v.extend_from_slice(&chunk);
-        next_off = nxt;
-    }
-    let (name, _ext) = extract_rage9_model_name(&v)?;
-    let is_veh = is_vehicle_virtual(&v, &name);
-    Some((name, is_veh, v.len()))
+    let (v, _, _) = read_virtual_from_file(&mut f, file_off).ok()?;
+    let (name, _) = extract_rage9_model_name(&v)?;
+    Some((name.clone(), is_vehicle_virtual(&v, &name), v.len()))
 }
 
-/// Follow `gtaDrawable.Lod0 -> grmModel -> grmGeometry` for clean LOD0-only extraction.
+// shared meshlet link resolver so lod0 and fallback scanner stay dry
+#[inline]
+fn resolve_meshlet_buffer(v: &[u8], link_ptr: u64) -> Option<(usize, usize)> {
+    let lo = vptr(link_ptr)?;
+    if lo + 8 > v.len() { return None; }
+    let mo = vptr(ru64(v, lo))?;
+    if mo + 0x20 > v.len() { return None; }
+    let mb_poff = pptr(ru64(v, mo + 0x18))?;
+    let mb_words = ru32(v, mo + 0x08) as usize;
+    Some((mb_poff, mb_words * 4))
+}
+
 fn collect_lod0_geoms(v: &[u8]) -> Vec<(usize, usize, usize, usize)> {
-    let mut bases = Vec::new();
-    // Candidate 1: direct gtaDrawable at 0 (for .#dr)
-    bases.push(0usize);
-    // Candidate 2: fragType -> fragDrawable at *(v + 0x18) (for .#ft)
+    let mut bases = vec![0usize];
     if v.len() >= 0x20 {
-        let fp = ru64(v, 0x18);
-        if (0x5000_0000..0x5800_0000).contains(&fp) {
-            let fo = (fp - 0x5000_0000) as usize;
-            if fo + 0x80 <= v.len() {
-                bases.push(fo);
-            }
+        if let Some(fo) = vptr(ru64(v, 0x18)) {
+            if fo + 0x80 <= v.len() { bases.push(fo); }
         }
     }
 
@@ -486,91 +508,46 @@ fn collect_lod0_geoms(v: &[u8]) -> Vec<(usize, usize, usize, usize)> {
     let mut seen = HashSet::new();
     for base in bases {
         if base + 0x80 > v.len() { continue; }
-        let lod0_ptr = ru64(v, base + 0x50);
-        if !(0x5000_0000..0x5800_0000).contains(&lod0_ptr) { continue; }
-        let lod0_off = (lod0_ptr - 0x5000_0000) as usize;
+        let Some(lod0_off) = vptr(ru64(v, base + 0x50)) else { continue };
         if lod0_off + 0x10 > v.len() { continue; }
-        let models_ptr = ru64(v, lod0_off);
+        let Some(models_off) = vptr(ru64(v, lod0_off)) else { continue };
         let model_cnt = ru16(v, lod0_off + 8) as usize;
-        if !(0x5000_0000..0x5800_0000).contains(&models_ptr) || model_cnt == 0 || model_cnt > 128 {
-            continue;
-        }
-        let models_off = (models_ptr - 0x5000_0000) as usize;
-        if models_off + model_cnt * 8 > v.len() { continue; }
+        if model_cnt == 0 || model_cnt > 128 || models_off + model_cnt * 8 > v.len() { continue; }
 
         for mi in 0..model_cnt {
-            let mp_raw = ru64(v, models_off + mi * 8);
-            if !(0x5000_0000..0x5800_0000).contains(&mp_raw) { continue; }
-            let mp = (mp_raw - 0x5000_0000) as usize;
+            let Some(mp) = vptr(ru64(v, models_off + mi * 8)) else { continue };
             if mp + 0x18 > v.len() { continue; }
-            let garr_raw = ru64(v, mp + 0x08);
+            let Some(garr) = vptr(ru64(v, mp + 0x08)) else { continue };
             let gcnt = ru16(v, mp + 0x10) as usize;
-            if !(0x5000_0000..0x5800_0000).contains(&garr_raw) || gcnt == 0 || gcnt > 256 {
-                continue;
-            }
-            let garr = (garr_raw - 0x5000_0000) as usize;
-            if garr + gcnt * 8 > v.len() { continue; }
+            if gcnt == 0 || gcnt > 256 || garr + gcnt * 8 > v.len() { continue; }
 
             for gi in 0..gcnt {
-                let gp_raw = ru64(v, garr + gi * 8);
-                if !(0x5000_0000..0x5800_0000).contains(&gp_raw) { continue; }
-                let gp = (gp_raw - 0x5000_0000) as usize;
-                if gp + 0x70 > v.len() { continue; }
-                if ru64(v, gp + 0x60) != 0x1601 { continue; }
-                let vb_pptr = ru64(v, gp + 0x68);
-                let vb_words = ru32(v, gp + 0x58) as usize;
-                let link_ptr = ru64(v, gp + 0x40);
-                if !(0x6000_0000..0x7000_0000).contains(&vb_pptr) { continue; }
-                if !(0x5000_0000..0x5800_0000).contains(&link_ptr) { continue; }
-                let lo = (link_ptr - 0x5000_0000) as usize;
-                if lo + 8 > v.len() { continue; }
-                let mb_struct_ptr = ru64(v, lo);
-                if !(0x5000_0000..0x5800_0000).contains(&mb_struct_ptr) { continue; }
-                let mo = (mb_struct_ptr - 0x5000_0000) as usize;
-                if mo + 0x20 > v.len() { continue; }
-                let mb_pptr = ru64(v, mo + 0x18);
-                let mb_words = ru32(v, mo + 0x08) as usize;
-                if !(0x6000_0000..0x7000_0000).contains(&mb_pptr) { continue; }
-                let key = ((vb_pptr - 0x6000_0000) as usize, (mb_pptr - 0x6000_0000) as usize);
-                if seen.insert(key) {
-                    out.push((key.0, vb_words * 4, key.1, mb_words * 4));
+                let Some(gp) = vptr(ru64(v, garr + gi * 8)) else { continue };
+                if gp + 0x70 > v.len() || ru64(v, gp + 0x60) != 0x1601 { continue; }
+                let Some(vb_poff) = pptr(ru64(v, gp + 0x68)) else { continue };
+                let Some((mb_poff, mb_bytes)) = resolve_meshlet_buffer(v, ru64(v, gp + 0x40)) else { continue };
+                let vb_bytes = (ru32(v, gp + 0x58) as usize) * 4;
+                if seen.insert((vb_poff, mb_poff)) {
+                    out.push((vb_poff, vb_bytes, mb_poff, mb_bytes));
                 }
             }
         }
-        if !out.is_empty() {
-            break;
-        }
+        if !out.is_empty() { break; }
     }
     out
 }
 
-/// Fallback scanner: finds ALL `0x1601` VB + meshlet pairs across the entire virtual segment (for `.#dd` dicts etc).
 fn collect_all_geoms(v: &[u8]) -> Vec<(usize, usize, usize, usize)> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     let mut off = 0x28usize;
     while off + 0x10 <= v.len() {
-        let q_ptr = ru64(v, off);
-        if (0x6000_0000..0x7000_0000).contains(&q_ptr) && ru64(v, off - 8) == 0x1601 {
-            let vb_poff = (q_ptr - 0x6000_0000) as usize;
-            let vb_words = ru32(v, off - 16) as usize;
-            let link_ptr = ru64(v, off - 0x28);
-            if (0x5000_0000..0x5800_0000).contains(&link_ptr) {
-                let lo = (link_ptr - 0x5000_0000) as usize;
-                if lo + 8 <= v.len() {
-                    let mb_struct_ptr = ru64(v, lo);
-                    if (0x5000_0000..0x5800_0000).contains(&mb_struct_ptr) {
-                        let mo = (mb_struct_ptr - 0x5000_0000) as usize;
-                        if mo + 0x20 <= v.len() {
-                            let mb_pptr = ru64(v, mo + 0x18);
-                            let mb_words = ru32(v, mo + 0x08) as usize;
-                            if (0x6000_0000..0x7000_0000).contains(&mb_pptr) {
-                                let mb_poff = (mb_pptr - 0x6000_0000) as usize;
-                                if seen.insert((vb_poff, mb_poff)) {
-                                    out.push((vb_poff, vb_words * 4, mb_poff, mb_words * 4));
-                                }
-                            }
-                        }
+        if ru64(v, off - 8) == 0x1601 {
+            if let Some(vb_poff) = pptr(ru64(v, off)) {
+                if let Some((mb_poff, mb_bytes)) = resolve_meshlet_buffer(v, ru64(v, off - 0x28)) {
+                    let vb_bytes = (ru32(v, off - 16) as usize) * 4;
+                    if seen.insert((vb_poff, mb_poff)) {
+                        out.push((vb_poff, vb_bytes, mb_poff, mb_bytes));
                     }
                 }
             }
@@ -581,31 +558,25 @@ fn collect_all_geoms(v: &[u8]) -> Vec<(usize, usize, usize, usize)> {
 }
 
 fn decode_bc1_block(blk: &[u8], out: &mut [Color32], stride: usize, bx: usize, by: usize, w: usize, h: usize) {
-    let c0 = u16::from_le_bytes([blk[0], blk[1]]);
-    let c1 = u16::from_le_bytes([blk[2], blk[3]]);
-    let bits = u32::from_le_bytes([blk[4], blk[5], blk[6], blk[7]]);
+    let c0 = ru16(blk, 0);
+    let c1 = ru16(blk, 2);
+    let bits = ru32(blk, 4);
     let rgb565 = |c: u16| -> [u8; 3] {
-        let r = (((c >> 11) & 31) * 255 / 31) as u8;
-        let g = (((c >> 5) & 63) * 255 / 63) as u8;
-        let b = ((c & 31) * 255 / 31) as u8;
-        [r, g, b]
+        [(((c >> 11) & 31) * 255 / 31) as u8, (((c >> 5) & 63) * 255 / 63) as u8, ((c & 31) * 255 / 31) as u8]
     };
     let a = rgb565(c0);
     let b = rgb565(c1);
-    let pal: [[u8; 3]; 4] = if c0 > c1 {
+    let lerp = |w0: u16, w1: u16, div: u16| -> [u8; 3] {
         [
-            a,
-            b,
-            [((2 * a[0] as u16 + b[0] as u16) / 3) as u8, ((2 * a[1] as u16 + b[1] as u16) / 3) as u8, ((2 * a[2] as u16 + b[2] as u16) / 3) as u8],
-            [((a[0] as u16 + 2 * b[0] as u16) / 3) as u8, ((a[1] as u16 + 2 * b[1] as u16) / 3) as u8, ((a[2] as u16 + 2 * b[2] as u16) / 3) as u8],
+            ((w0 * a[0] as u16 + w1 * b[0] as u16) / div) as u8,
+            ((w0 * a[1] as u16 + w1 * b[1] as u16) / div) as u8,
+            ((w0 * a[2] as u16 + w1 * b[2] as u16) / div) as u8,
         ]
+    };
+    let pal = if c0 > c1 {
+        [a, b, lerp(2, 1, 3), lerp(1, 2, 3)]
     } else {
-        [
-            a,
-            b,
-            [((a[0] as u16 + b[0] as u16) / 2) as u8, ((a[1] as u16 + b[1] as u16) / 2) as u8, ((a[2] as u16 + b[2] as u16) / 2) as u8],
-            [0, 0, 0],
-        ]
+        [a, b, lerp(1, 1, 2), [0, 0, 0]]
     };
     for py in 0..4 {
         let y = by + py;
@@ -613,48 +584,33 @@ fn decode_bc1_block(blk: &[u8], out: &mut [Color32], stride: usize, bx: usize, b
         for px in 0..4 {
             let x = bx + px;
             if x >= w { continue; }
-            let code = ((bits >> (2 * (py * 4 + px))) & 3) as usize;
-            let c = pal[code];
+            let c = pal[((bits >> (2 * (py * 4 + px))) & 3) as usize];
             out[y * stride + x] = Color32::from_rgb(c[0], c[1], c[2]);
         }
     }
 }
 
-/// Try decoding the first embedded diffuse texture in `ShaderGroup.TextureDictionary` (if present in `p`).
 fn try_extract_embedded_texture(v: &[u8], p: &[u8]) -> (Option<Texture2D>, String) {
     let mut bases = vec![0usize];
     if v.len() >= 0x20 {
-        let fp = ru64(v, 0x18);
-        if (0x5000_0000..0x5800_0000).contains(&fp) {
-            bases.push((fp - 0x5000_0000) as usize);
+        if let Some(fo) = vptr(ru64(v, 0x18)) {
+            bases.push(fo);
         }
     }
     for base in bases {
         if base + 0x18 > v.len() { continue; }
-        let sg_ptr = ru64(v, base + 0x10);
-        if !(0x5000_0000..0x5800_0000).contains(&sg_ptr) { continue; }
-        let sg = (sg_ptr - 0x5000_0000) as usize;
+        let Some(sg) = vptr(ru64(v, base + 0x10)) else { continue };
         if sg + 0x10 > v.len() { continue; }
-        let txd_ptr = ru64(v, sg + 0x08);
-        if !(0x5000_0000..0x5800_0000).contains(&txd_ptr) { continue; }
-        let txd = (txd_ptr - 0x5000_0000) as usize;
+        let Some(txd) = vptr(ru64(v, sg + 0x08)) else { continue };
         if txd + 0x3a > v.len() { continue; }
-        let tarr_ptr = ru64(v, txd + 0x30);
+        let Some(tarr) = vptr(ru64(v, txd + 0x30)) else { continue };
         let tcnt = ru16(v, txd + 0x38) as usize;
-        if !(0x5000_0000..0x5800_0000).contains(&tarr_ptr) || tcnt == 0 || tcnt > 256 {
-            continue;
-        }
-        let tarr = (tarr_ptr - 0x5000_0000) as usize;
-        if tarr + tcnt * 8 > v.len() { continue; }
+        if tcnt == 0 || tcnt > 256 || tarr + tcnt * 8 > v.len() { continue; }
 
         for ti in 0..tcnt {
-            let tp_raw = ru64(v, tarr + ti * 8);
-            if !(0x5000_0000..0x5800_0000).contains(&tp_raw) { continue; }
-            let tp = (tp_raw - 0x5000_0000) as usize;
+            let Some(tp) = vptr(ru64(v, tarr + ti * 8)) else { continue };
             if tp + 0x48 > v.len() { continue; }
-            let pptr = ru64(v, tp + 0x18);
-            if !(0x6000_0000..0x7000_0000).contains(&pptr) { continue; }
-            let poff = (pptr - 0x6000_0000) as usize;
+            let Some(poff) = pptr(ru64(v, tp + 0x18)) else { continue };
             let w = ru16(v, tp + 0x38) as usize;
             let h = ru16(v, tp + 0x3a) as usize;
             let dxgi = v[tp + 0x3f];
@@ -662,8 +618,8 @@ fn try_extract_embedded_texture(v: &[u8], p: &[u8]) -> (Option<Texture2D>, Strin
             let bx_cnt = (w + 3) / 4;
             let by_cnt = (h + 3) / 4;
             let (blk_sz, rgb_off) = match dxgi {
-                70 | 71 | 72 => (8usize, 0usize), // BC1
-                73..=78 => (16usize, 8usize),     // BC2/BC3 (color block at +8)
+                70..=72 => (8usize, 0usize),
+                73..=78 => (16usize, 8usize),
                 _ => continue,
             };
             if poff + bx_cnt * by_cnt * blk_sz > p.len() { continue; }
@@ -680,40 +636,9 @@ fn try_extract_embedded_texture(v: &[u8], p: &[u8]) -> (Option<Texture2D>, Strin
     (None, "External .#td (Material Shading)".into())
 }
 
-/// Decode a GTA 6 `.#dr` / `.#ft` / `.#dd` directly from its RPF file at `file_off`.
 pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name: &str) -> Result<Mesh3D, String> {
     let mut f = File::open(rpf_path).map_err(|e| format!("Open error: {e}"))?;
-    let (mut v, mut next_off) = decompress_zlib_at(&mut f, file_off, 16 * 1024 * 1024)
-        .map_err(|e| format!("Virtual chunk 0 error: {e}"))?;
-    if v.len() < 0x80 {
-        return Err("Virtual chunk too small".into());
-    }
-    let bmap_ptr = ru64(&v, 8);
-    if !(0x5000_0000..0x5800_0000).contains(&bmap_ptr) {
-        return Err("Not a valid RAGE9 resource (missing BlockMap)".into());
-    }
-    let bmap_off = (bmap_ptr - 0x5000_0000) as usize;
-    // Keep reading virtual chunks until bmap_off is covered (handles huge vehicles with >1 virtual chunk!)
-    let mut v_chunks_read = 1usize;
-    while v.len() <= bmap_off + 10 && v_chunks_read < 32 {
-        let Some(zoff) = find_next_zlib(&mut f, next_off).map_err(|e| e.to_string())? else { break };
-        let (chunk, nxt) = decompress_zlib_at(&mut f, zoff, 16 * 1024 * 1024).map_err(|e| e.to_string())?;
-        v.extend_from_slice(&chunk);
-        next_off = nxt;
-        v_chunks_read += 1;
-    }
-    let (v_cnt, p_cnt) = if bmap_off + 10 <= v.len() {
-        ((v[bmap_off + 8] as usize).clamp(1, 32), (v[bmap_off + 9] as usize).clamp(1, 64))
-    } else {
-        (v_chunks_read, 1)
-    };
-
-    for _ in v_chunks_read..v_cnt {
-        let Some(zoff) = find_next_zlib(&mut f, next_off).map_err(|e| e.to_string())? else { break };
-        let (chunk, nxt) = decompress_zlib_at(&mut f, zoff, 16 * 1024 * 1024).map_err(|e| e.to_string())?;
-        v.extend_from_slice(&chunk);
-        next_off = nxt;
-    }
+    let (v, mut next_off, p_cnt) = read_virtual_from_file(&mut f, file_off)?;
 
     let mut p = Vec::new();
     for _ in 0..p_cnt {
@@ -800,7 +725,8 @@ pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name
 
         let base_v = all_verts.len() as u32;
         let mut max_v_used = 0usize;
-        let mut geom_tris: Vec<[u32; 3]> = Vec::with_capacity(tot_tris);
+        let start_tri = all_tris.len();
+        all_tris.reserve(tot_tris);
 
         for mi in 0..num_meshlets {
             let m_off = mb_off + 0x0c + mi * 16;
@@ -821,44 +747,36 @@ pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name
                     let i1 = ru16(&p, remap_base + r1 * 2) as usize;
                     let i2 = ru16(&p, remap_base + r2 * 2) as usize;
                     if i0 < max_vb_verts && i1 < max_vb_verts && i2 < max_vb_verts && i0 != i1 && i1 != i2 && i0 != i2 {
-                        geom_tris.push([base_v + i0 as u32, base_v + i1 as u32, base_v + i2 as u32]);
+                        all_tris.push([base_v + i0 as u32, base_v + i1 as u32, base_v + i2 as u32]);
                         max_v_used = max_v_used.max(i0).max(i1).max(i2);
                     }
                 }
             }
         }
 
-        if !geom_tris.is_empty() {
+        let added_tris = all_tris.len() - start_tri;
+        if added_tris > 0 {
             let v_cnt = (max_v_used + 1).min(max_vb_verts);
             let vbase = vb_off + stream0_off;
             all_verts.reserve(v_cnt);
             all_uvs.reserve(v_cnt);
             for i in 0..v_cnt {
                 let o = vbase + i * 8;
+                // xbox rage9 packs xy as 24 bit and z as 16 bit across 8 bytes
                 let ix = (p[o + 1] as u32) | ((p[o + 2] as u32) << 8) | ((p[o + 3] as u32) << 16);
                 let iy = (p[o] as u32) | ((p[o + 4] as u32) << 8) | ((p[o + 5] as u32) << 16);
                 let iz = (p[o + 6] as u32) | ((p[o + 7] as u32) << 8);
-                all_verts.push([
-                    ox + (ix as f32) * sx,
-                    oy + (iy as f32) * sy,
-                    oz + (iz as f32) * sz,
-                ]);
+                all_verts.push([ox + (ix as f32) * sx, oy + (iy as f32) * sy, oz + (iz as f32) * sz]);
                 if let Some(uvo) = uv_stream_off {
                     let u_pos = vb_off + uvo + i * 4;
                     if u_pos + 4 <= p.len() {
-                        // RAGE9 type 0x28 UV0: 16-bit normalized fixed-point (/8192.0 gives exact 0..1 tiles)
-                        let u = (ru16(&p, u_pos) as f32) / 8192.0;
-                        let v_coord = (ru16(&p, u_pos + 2) as f32) / 8192.0;
-                        all_uvs.push([u, v_coord]);
-                    } else {
-                        all_uvs.push([0.0, 0.0]);
+                        all_uvs.push([ru16(&p, u_pos) as f32 / 8192.0, ru16(&p, u_pos + 2) as f32 / 8192.0]);
+                        continue;
                     }
-                } else {
-                    all_uvs.push([0.0, 0.0]);
                 }
+                all_uvs.push([0.0, 0.0]);
             }
-            all_tri_geom.resize(all_tri_geom.len() + geom_tris.len(), gi_idx as u16);
-            all_tris.extend_from_slice(&geom_tris);
+            all_tri_geom.resize(all_tri_geom.len() + added_tris, gi_idx as u16);
             total_meshlets += num_meshlets;
         }
     }
@@ -888,17 +806,13 @@ fn draw_line_z(
     z_buf: &mut [f32],
     w: usize,
     h: usize,
-    x0: f32,
-    y0: f32,
-    z0: f32,
-    x1: f32,
-    y1: f32,
-    z1: f32,
+    p0: [f32; 3],
+    p1: [f32; 3],
     col: Color32,
     z_bias: f32,
 ) {
-    let dx = x1 - x0;
-    let dy = y1 - y0;
+    let dx = p1[0] - p0[0];
+    let dy = p1[1] - p0[1];
     let steps = dx.abs().max(dy.abs());
     if steps < 0.5 || steps > 4000.0 {
         return;
@@ -907,10 +821,10 @@ fn draw_line_z(
     let inv = 1.0 / (n as f32);
     let sx = dx * inv;
     let sy = dy * inv;
-    let sz = (z1 - z0) * inv;
-    let mut x = x0;
-    let mut y = y0;
-    let mut z = z0 + z_bias;
+    let sz = (p1[2] - p0[2]) * inv;
+    let mut x = p0[0];
+    let mut y = p0[1];
+    let mut z = p0[2] + z_bias;
     for _ in 0..=n {
         let xi = x as i32;
         let yi = y as i32;
@@ -927,7 +841,6 @@ fn draw_line_z(
     }
 }
 
-/// Super-optimized scanline Z-buffered software rasterizer (0 heap allocs per frame).
 fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
     let npix = w * h;
     if mesh.fb_w != w || mesh.fb_h != h {
@@ -937,7 +850,6 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
         mesh.z_buf.resize(npix, f32::NEG_INFINITY);
     }
 
-    // Subtle dark gradient backdrop
     for y in 0..h {
         let t = (y as f32) / (h.max(1) as f32);
         let c = Color32::from_rgb(
@@ -945,12 +857,10 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
             (12.0 + t * 10.0) as u8,
             (17.0 + t * 14.0) as u8,
         );
-        let row = &mut mesh.color_buf[y * w..(y + 1) * w];
-        row.fill(c);
+        mesh.color_buf[y * w..(y + 1) * w].fill(c);
     }
     mesh.z_buf.fill(f32::NEG_INFINITY);
 
-    // Z-up turntable rotation: yaw around Z, pitch around X
     let (sy, cy) = mesh.yaw.sin_cos();
     let (sp, cp) = mesh.pitch.sin_cos();
     let min_dim = (w.min(h) as f32) * 0.44;
@@ -958,24 +868,19 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
     let cx = (w as f32) * 0.5 + mesh.pan_x * (w as f32);
     let cy_s = (h as f32) * 0.5 + mesh.pan_y * (h as f32);
     let ctr = mesh.center;
+    let persp_k = 1.0 / (mesh.radius * 4.5);
 
-    // 1. Transform all vertices ONCE
     mesh.proj_buf.resize(mesh.verts.len(), [0.0; 3]);
-    for (i, v) in mesh.verts.iter().enumerate() {
+    for (dst, v) in mesh.proj_buf.iter_mut().zip(&mesh.verts) {
         let x = v[0] - ctr[0];
         let y = v[1] - ctr[1];
         let z = v[2] - ctr[2];
-        // Rotate yaw around Z
         let x1 = x * cy - y * sy;
         let y1 = x * sy + y * cy;
-        // Camera at -Y looking +Y, raised by pitch. y2 = toward-camera depth (larger = closer), z2 = screen up.
         let y2 = -y1 * cp + z * sp;
         let z2 = z * cp + y1 * sp;
-        // Mild perspective
-        let persp = 1.0 / (1.0 - (y2 / (mesh.radius * 4.5)).clamp(-0.65, 0.65));
-        let sx = cx + x1 * scale * persp;
-        let sy_p = cy_s - z2 * scale * persp;
-        mesh.proj_buf[i] = [sx, sy_p, y2];
+        let persp = 1.0 / (1.0 - (y2 * persp_k).clamp(-0.65, 0.65));
+        *dst = [cx + x1 * scale * persp, cy_s - z2 * scale * persp, y2];
     }
 
     let wf = w as f32;
@@ -987,25 +892,13 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
         let do_wire = matches!(mesh.shade_mode, ShadeMode::Wireframe | ShadeMode::SolidWire);
         let has_uvs = mesh.uvs.len() == mesh.verts.len() && !mesh.uvs.is_empty();
 
-        // Automotive / architectural material palette when external .#td texture is not embedded
         const MAT_PALETTE: [[f32; 3]; 12] = [
-            [0.82, 0.84, 0.88], // metallic silver body
-            [0.24, 0.26, 0.30], // dark carbon / trim
-            [0.18, 0.24, 0.32], // tinted glass / windshield
-            [0.72, 0.75, 0.80], // brushed alloy / chrome
-            [0.34, 0.36, 0.40], // chassis steel
-            [0.86, 0.24, 0.24], // tail-light / brake caliper accent
-            [0.48, 0.50, 0.56], // gunmetal
-            [0.28, 0.24, 0.22], // interior leather
-            [0.78, 0.72, 0.62], // warm trim
-            [0.38, 0.44, 0.52], // cool slate
-            [0.64, 0.66, 0.70], // satin aluminum
-            [0.20, 0.21, 0.24], // rubber / matte black
+            [0.82, 0.84, 0.88], [0.24, 0.26, 0.30], [0.18, 0.24, 0.32], [0.72, 0.75, 0.80],
+            [0.34, 0.36, 0.40], [0.86, 0.24, 0.24], [0.48, 0.50, 0.56], [0.28, 0.24, 0.22],
+            [0.78, 0.72, 0.62], [0.38, 0.44, 0.52], [0.64, 0.66, 0.70], [0.20, 0.21, 0.24],
         ];
-
-        // Two studio lights in camera space
-        let l1 = [0.42f32, 0.65f32, 0.63f32]; // key light
-        let l2 = [-0.60f32, 0.25f32, -0.45f32]; // cool fill/rim
+        let l1 = [0.42f32, 0.65f32, 0.63f32];
+        let l2 = [-0.60f32, 0.25f32, -0.45f32];
 
         if do_solid {
             for (ti, t) in mesh.tris.iter().enumerate() {
@@ -1030,7 +923,6 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                     continue;
                 }
 
-                // Transform precomputed normal to view space for studio MATCAP lighting
                 let n = mesh.normals[ti];
                 let nx1 = n[0] * cy - n[1] * sy;
                 let ny1 = n[0] * sy + n[1] * cy;
@@ -1063,7 +955,7 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                 let iy0 = (min_y.floor() as i32).max(0) as usize;
                 let iy1 = (max_y.ceil() as i32).min(h as i32 - 1) as usize;
 
-                // FIXED SIGN: edge normal points INWARD so w0,w1,w2 >= 0 inside triangle!
+                // flip sign so edge funcs stay positive inside triangls
                 let sign = if area > 0.0 { -1.0 } else { 1.0 };
                 let inv_abs = 1.0 / abs_area;
 
@@ -1080,6 +972,7 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                 let mut w0_row = (px_start - p1[0]) * e12_dx + (py_start - p1[1]) * e12_dy;
                 let mut w1_row = (px_start - p2[0]) * e20_dx + (py_start - p2[1]) * e20_dy;
                 let mut w2_row = (px_start - p0[0]) * e01_dx + (py_start - p0[1]) * e01_dy;
+                let span_len = ix1 - ix0 + 1;
 
                 if do_textured && has_uvs {
                     if let Some(tex) = &mesh.texture {
@@ -1087,24 +980,21 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                         let uv1 = mesh.uvs[i1];
                         let uv2 = mesh.uvs[i2];
                         for y in iy0..=iy1 {
-                            let mut w0 = w0_row;
-                            let mut w1 = w1_row;
-                            let mut w2 = w2_row;
-                            let row_off = y * w;
-                            for x in ix0..=ix1 {
+                            let row_start = y * w + ix0;
+                            let z_row = &mut mesh.z_buf[row_start..row_start + span_len];
+                            let c_row = &mut mesh.color_buf[row_start..row_start + span_len];
+                            let (mut w0, mut w1, mut w2) = (w0_row, w1_row, w2_row);
+                            for x in 0..span_len {
                                 if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
-                                    let b0 = w0 * inv_abs;
-                                    let b1 = w1 * inv_abs;
-                                    let b2 = w2 * inv_abs;
+                                    let (b0, b1, b2) = (w0 * inv_abs, w1 * inv_abs, w2 * inv_abs);
                                     let z = b0 * p0[2] + b1 * p1[2] + b2 * p2[2];
-                                    let idx = row_off + x;
-                                    if z > mesh.z_buf[idx] {
-                                        mesh.z_buf[idx] = z;
+                                    if z > z_row[x] {
+                                        z_row[x] = z;
                                         let tc = tex.sample(
                                             b0 * uv0[0] + b1 * uv1[0] + b2 * uv2[0],
                                             b0 * uv0[1] + b1 * uv1[1] + b2 * uv2[1],
                                         );
-                                        mesh.color_buf[idx] = Color32::from_rgb(
+                                        c_row[x] = Color32::from_rgb(
                                             ((tc.r() as f32 * shade_r).min(255.0)) as u8,
                                             ((tc.g() as f32 * shade_g).min(255.0)) as u8,
                                             ((tc.b() as f32 * shade_b).min(255.0)) as u8,
@@ -1124,17 +1014,16 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                 }
 
                 for y in iy0..=iy1 {
-                    let mut w0 = w0_row;
-                    let mut w1 = w1_row;
-                    let mut w2 = w2_row;
-                    let row_off = y * w;
-                    for x in ix0..=ix1 {
+                    let row_start = y * w + ix0;
+                    let z_row = &mut mesh.z_buf[row_start..row_start + span_len];
+                    let c_row = &mut mesh.color_buf[row_start..row_start + span_len];
+                    let (mut w0, mut w1, mut w2) = (w0_row, w1_row, w2_row);
+                    for x in 0..span_len {
                         if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
                             let z = (w0 * p0[2] + w1 * p1[2] + w2 * p2[2]) * inv_abs;
-                            let idx = row_off + x;
-                            if z > mesh.z_buf[idx] {
-                                mesh.z_buf[idx] = z;
-                                mesh.color_buf[idx] = flat_col;
+                            if z > z_row[x] {
+                                z_row[x] = z;
+                                c_row[x] = flat_col;
                             }
                         }
                         w0 += e12_dx;
@@ -1149,29 +1038,22 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
         }
 
         if do_wire {
-            let wire_col = if do_solid {
-                Color32::from_rgb(252, 175, 23)
-            } else {
-                Color32::from_rgb(72, 210, 255)
-            };
+            let wire_col = if do_solid { Color32::from_rgb(252, 175, 23) } else { Color32::from_rgb(72, 210, 255) };
             let z_bias = if do_solid { mesh.radius * 0.004 } else { 0.0 };
-            // Cap wire draw stride on massive meshes so SolidWire stays silky
             let step = (mesh.tris.len() / 25_000).max(1);
             for t in mesh.tris.iter().step_by(step) {
                 let p0 = mesh.proj_buf[t[0] as usize];
                 let p1 = mesh.proj_buf[t[1] as usize];
                 let p2 = mesh.proj_buf[t[2] as usize];
-                draw_line_z(&mut mesh.color_buf, &mut mesh.z_buf, w, h, p0[0], p0[1], p0[2], p1[0], p1[1], p1[2], wire_col, z_bias);
-                draw_line_z(&mut mesh.color_buf, &mut mesh.z_buf, w, h, p1[0], p1[1], p1[2], p2[0], p2[1], p2[2], wire_col, z_bias);
-                draw_line_z(&mut mesh.color_buf, &mut mesh.z_buf, w, h, p2[0], p2[1], p2[2], p0[0], p0[1], p0[2], wire_col, z_bias);
+                draw_line_z(&mut mesh.color_buf, &mut mesh.z_buf, w, h, p0, p1, wire_col, z_bias);
+                draw_line_z(&mut mesh.color_buf, &mut mesh.z_buf, w, h, p1, p2, wire_col, z_bias);
+                draw_line_z(&mut mesh.color_buf, &mut mesh.z_buf, w, h, p2, p0, wire_col, z_bias);
             }
         }
     } else if !mesh.edges.is_empty() {
         let col = Color32::from_rgb(72, 210, 255);
         for &(a, b) in mesh.edges.iter().take(60_000) {
-            let p0 = mesh.proj_buf[a as usize];
-            let p1 = mesh.proj_buf[b as usize];
-            draw_line_z(&mut mesh.color_buf, &mut mesh.z_buf, w, h, p0[0], p0[1], p0[2], p1[0], p1[1], p1[2], col, 0.0);
+            draw_line_z(&mut mesh.color_buf, &mut mesh.z_buf, w, h, mesh.proj_buf[a as usize], mesh.proj_buf[b as usize], col, 0.0);
         }
     } else {
         let col = Color32::from_rgb(252, 175, 23);
@@ -1194,32 +1076,22 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
         ui.label(
             RichText::new(format!(
                 "{}  ·  {} verts  ·  {} tris  ·  {} geoms / {} meshlets ({})",
-                mesh.name,
-                mesh.verts.len(),
-                mesh.tris.len(),
-                mesh.geom_count,
-                mesh.meshlet_count,
-                mesh.lod_label
+                mesh.name, mesh.verts.len(), mesh.tris.len(), mesh.geom_count, mesh.meshlet_count, mesh.lod_label
             ))
             .strong()
             .color(Color32::from_rgb(252, 175, 23)),
         );
         ui.add_space(6.0);
-        if ui.selectable_label(mesh.shade_mode == ShadeMode::Textured, "Textured/Mat").clicked() {
-            mesh.shade_mode = ShadeMode::Textured;
-            mesh.dirty = true;
-        }
-        if ui.selectable_label(mesh.shade_mode == ShadeMode::Solid, "Clay Solid").clicked() {
-            mesh.shade_mode = ShadeMode::Solid;
-            mesh.dirty = true;
-        }
-        if ui.selectable_label(mesh.shade_mode == ShadeMode::SolidWire, "Solid+Wire").clicked() {
-            mesh.shade_mode = ShadeMode::SolidWire;
-            mesh.dirty = true;
-        }
-        if ui.selectable_label(mesh.shade_mode == ShadeMode::Wireframe, "Wire").clicked() {
-            mesh.shade_mode = ShadeMode::Wireframe;
-            mesh.dirty = true;
+        for (mode, label) in [
+            (ShadeMode::Textured, "Textured/Mat"),
+            (ShadeMode::Solid, "Clay Solid"),
+            (ShadeMode::SolidWire, "Solid+Wire"),
+            (ShadeMode::Wireframe, "Wire"),
+        ] {
+            if ui.selectable_label(mesh.shade_mode == mode, label).clicked() {
+                mesh.shade_mode = mode;
+                mesh.dirty = true;
+            }
         }
         if ui.selectable_label(mesh.auto_spin, "Spin").clicked() {
             mesh.auto_spin = !mesh.auto_spin;
@@ -1229,8 +1101,7 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
             if let Some(tp) = rfd::FileDialog::new().add_filter("Textures", &["png", "bmp"]).pick_file() {
                 if let Ok(img) = image::open(&tp) {
                     let rgba = img.to_rgba8();
-                    let w = rgba.width() as usize;
-                    let h = rgba.height() as usize;
+                    let (w, h) = (rgba.width() as usize, rgba.height() as usize);
                     let pixels: Vec<Color32> = rgba
                         .chunks_exact(4)
                         .map(|c| Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]))
@@ -1252,10 +1123,7 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
         }
         if ui.button("Export .OBJ").clicked() {
             let safe_name = mesh.name.replace('#', "");
-            if let Some(p) = rfd::FileDialog::new()
-                .set_file_name(format!("{safe_name}.obj"))
-                .save_file()
-            {
+            if let Some(p) = rfd::FileDialog::new().set_file_name(format!("{safe_name}.obj")).save_file() {
                 let _ = mesh.export_obj(&p);
             }
         }
@@ -1301,23 +1169,19 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
         ui.ctx().request_repaint();
     }
     if mesh.last_dragging && !dragging {
-        mesh.dirty = true; // snap back to full crisp resolution on mouse release
+        mesh.dirty = true;
     }
     mesh.last_dragging = dragging;
 
-    // Adaptive resolution: ultra-fast 0.68x during heavy drag (>25k tris), crisp 1.0x at rest
     let heavy = mesh.tris.len() > 25_000;
     let ppp = ui.ctx().pixels_per_point();
-    let res_scale = ppp * if dragging && heavy { 0.6 } else { 1.0 };
+    let res_scale = ppp * if dragging && heavy { 0.55 } else { 1.0 };
     let target_w = ((rect.width() * res_scale) as usize).clamp(160, 1920);
     let target_h = ((rect.height() * res_scale) as usize).clamp(120, 1200);
 
     if mesh.dirty || mesh.fb_w != target_w || mesh.fb_h != target_h || mesh.tex.is_none() {
         rasterize_mesh(mesh, target_w, target_h);
-        let ci = ColorImage {
-            size: [target_w, target_h],
-            pixels: mesh.color_buf.clone(),
-        };
+        let ci = ColorImage { size: [target_w, target_h], pixels: mesh.color_buf.clone() };
         if let Some(tex) = &mut mesh.tex {
             tex.set(ci, TextureOptions::LINEAR);
         } else {
@@ -1329,12 +1193,7 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
     let p = ui.painter_at(rect);
     p.rect_filled(rect, CornerRadius::same(6), Color32::from_rgb(11, 12, 17));
     if let Some(tex) = &mesh.tex {
-        p.image(
-            tex.id(),
-            rect,
-            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-            Color32::WHITE,
-        );
+        p.image(tex.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
     }
     p.text(
         egui::pos2(rect.min.x + 10.0, rect.max.y - 16.0),
@@ -1351,7 +1210,6 @@ mod tests {
 
     #[test]
     fn upright_and_not_mirrored() {
-        // bottom, top, +X, far(+Y), near(-Y)
         let verts = vec![[0.0, 0.0, -1.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, -1.0, 0.0]];
         let mut m = Mesh3D::from_parts("t".into(), verts, vec![], vec![], vec![], vec![], None, String::new(), 1, 0, String::new());
         m.yaw = 0.0;
@@ -1362,5 +1220,17 @@ mod tests {
         assert!(p[2][0] > 100.0, "+X must be screen-right (no mirror)");
         assert!(p[3][1] < p[4][1], "positive pitch views from above");
         assert!(p[4][2] > p[3][2], "-Y side is closer to camera");
+    }
+
+    #[test]
+    fn model_name_and_vehicle_filter() {
+        let mut buf = vec![0u8; 30_000];
+        buf[100..112].copy_from_slice(b"italirsx.#ft");
+        buf[500..508].copy_from_slice(b"wheel_lf");
+        let (nm, ext) = extract_rage9_model_name(&buf).unwrap();
+        assert_eq!(nm, "italirsx.#ft");
+        assert_eq!(ext, ".#ft");
+        assert!(is_vehicle_virtual(&buf, &nm));
+        assert!(!is_vehicle_virtual(&buf, "italirsx_spoiler_01.#ft"));
     }
 }
