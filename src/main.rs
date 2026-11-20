@@ -1,3 +1,4 @@
+mod awc;
 mod model3d;
 use model3d::{
     Mesh3D, decode_rage9_model_from_rpf, extract_0drpz_mesh, extract_rage9_model_name,
@@ -779,37 +780,13 @@ fn collect_rpfs(dir: &Path, out: &mut Vec<PathBuf>) {
 fn decode_awc_for_player(e: &RpfEntry, media: &Arc<Mutex<MediaState>>) {
     let tmp = std::env::temp_dir().join("rpf9_preview_awc");
     let _ = fs::remove_dir_all(&tmp);
-    let _ = fs::create_dir_all(&tmp);
-    if let Ok(bytes) = read_entry_bytes(e) {
-        let _ = fs::write(tmp.join("sound.awc"), &bytes);
-    }
-    let awc_py = std::env::current_exe()
-        .ok()
-        .and_then(|p| {
-            let d = p.parent()?;
-            [d.join("awc_extract.py"), d.join("scripts").join("awc_extract.py")]
-                .into_iter()
-                .find(|c| c.exists())
-        })
-        .unwrap_or_else(|| PathBuf::from("scripts/awc_extract.py"));
-    let _ = Command::new("python")
-        .args([awc_py.to_str().unwrap(), tmp.to_str().unwrap(), tmp.to_str().unwrap()])
-        .status();
-
-    let mut wavs: Vec<(u32, PathBuf)> = fs::read_dir(&tmp)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|d| d.path())
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("wav"))
-        .enumerate()
-        .map(|(i, p)| (i as u32 + 1, p))
-        .collect();
-    wavs.sort_by(|a, b| a.1.cmp(&b.1));
-
+    let wavs = match read_entry_bytes(e) {
+        Ok(bytes) => awc::decode_awc_bytes_to_wavs(&bytes, &tmp, "stream"),
+        Err(_) => Vec::new(),
+    };
     let mut m = media.lock().unwrap();
     m.loading = false;
-    m.status = format!("Decoded {} playable .wav stream(s)", wavs.len());
+    m.status = format!("Decoded {} playable .wav stream(s) natively", wavs.len());
     m.awc_streams = wavs;
 }
 
