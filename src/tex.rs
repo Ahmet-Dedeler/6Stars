@@ -924,6 +924,162 @@ pub fn decode_ttpf_texture(path: &Path, tex_idx: usize) -> Result<DecodedTexture
     })
 }
 
+/// Global 64-bit ETPF texture hash -> (ttpf archive path, descriptor index, w, h, dxgi) resolver.
+/// Each RDS5/ETPF archive stores `tex_count` 64-bit texture hashes immediately after the
+/// `tex_count * 16`-byte descriptor table, 1:1 indexed with the descriptors.
+#[derive(Clone, Debug)]
+pub struct TtpfHashHit {
+    pub path: std::path::PathBuf,
+    pub tex_idx: usize,
+    pub w: usize,
+    pub h: usize,
+    pub dxgi: u8,
+}
+
+impl TtpfHashHit {
+    #[inline]
+    pub fn is_srgb(&self) -> bool {
+        matches!(self.dxgi, 29 | 72 | 75 | 78 | 91 | 99)
+    }
+
+    #[inline]
+    pub fn is_normal_format(&self) -> bool {
+        matches!(self.dxgi, 80 | 81 | 83 | 84)
+    }
+}
+
+/// Texture hash -> location, built once per game dump root (keyed by that root).
+type TtpfHashIndex = std::sync::Arc<HashMap<u64, TtpfHashHit>>;
+static TTPF_HASH_INDEX: std::sync::OnceLock<std::sync::Mutex<HashMap<std::path::PathBuf, TtpfHashIndex>>> =
+    std::sync::OnceLock::new();
+
+/// Decoded external textures by hash (`None` = known undecodable); cleared past 512 entries.
+type TtpfTexCache = HashMap<u64, Option<std::sync::Arc<Texture2D>>>;
+static TTPF_TEX_CACHE: std::sync::OnceLock<std::sync::Mutex<TtpfTexCache>> = std::sync::OnceLock::new();
+
+fn collect_ttpf_files(dir: &Path, depth: usize, out: &mut Vec<std::path::PathBuf>) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if !name.starts_with('.') {
+                collect_ttpf_files(&p, depth + 1, out);
+            }
+        } else if p
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|e| e.eq_ignore_ascii_case("ttpf"))
+            .unwrap_or(false)
+        {
+            out.push(p);
+        }
+    }
+}
+
+fn find_dump_root_for_ttpf(rpf_path: &Path) -> Option<std::path::PathBuf> {
+    let mut cur = rpf_path.parent()?;
+    for _ in 0..4 {
+        if cur.join("data").join("ttdb").is_dir() || cur.join("textures_loose.ttpf").is_file() {
+            return Some(cur.to_path_buf());
+        }
+        if let Ok(rd) = std::fs::read_dir(cur) {
+            if rd.flatten().any(|e| {
+                e.path()
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(|x| x.eq_ignore_ascii_case("ttpf"))
+                    .unwrap_or(false)
+            }) {
+                return Some(cur.to_path_buf());
+            }
+        }
+        cur = match cur.parent() {
+            Some(p) => p,
+            None => break,
+        };
+    }
+    None
+}
+
+pub fn ttpf_hash_index_for_rpf(rpf_path: &Path) -> Option<std::sync::Arc<HashMap<u64, TtpfHashHit>>> {
+    let root = find_dump_root_for_ttpf(rpf_path)?;
+    let map = TTPF_HASH_INDEX.get_or_init(Default::default);
+    if let Some(existing) = map.lock().unwrap().get(&root) {
+        return Some(existing.clone());
+    }
+
+    let mut ttpf_files = Vec::new();
+    collect_ttpf_files(&root, 0, &mut ttpf_files);
+    if ttpf_files.is_empty() {
+        return None;
+    }
+
+    let mut index: HashMap<u64, TtpfHashHit> = HashMap::with_capacity(360_000);
+    for tp in ttpf_files {
+        let Ok(mut f) = File::open(&tp) else { continue };
+        let mut hdr = [0u8; 24];
+        if f.read_exact(&mut hdr).is_err() || &hdr[..4] != b"RDS5" {
+            continue;
+        }
+        let etpf_off = ru32(&hdr, 16) as u64 * 0x100;
+        if f.seek(SeekFrom::Start(etpf_off)).is_err() {
+            continue;
+        }
+        let mut ehdr = [0u8; 16];
+        if f.read_exact(&mut ehdr).is_err() || &ehdr[..4] != b"ETPF" {
+            continue;
+        }
+        let tex_count = ru32(&ehdr, 8) as usize;
+        if tex_count == 0 || tex_count > 500_000 {
+            continue;
+        }
+        let mut recs = vec![0u8; tex_count * 16];
+        let mut hashes = vec![0u8; tex_count * 8];
+        if f.read_exact(&mut recs).is_err() || f.read_exact(&mut hashes).is_err() {
+            continue;
+        }
+        for i in 0..tex_count {
+            let h64 = ru64(&hashes, i * 8);
+            let u0 = ru32(&recs, i * 16);
+            let u1 = ru32(&recs, i * 16 + 4);
+            let w = ((u0 & 0x3FFF) + 1) as usize;
+            let h = (((u0 >> 14) & 0x3FFF) + 1) as usize;
+            let dxgi = ((u1 >> 3) & 0x7F) as u8;
+            index.entry(h64).or_insert_with(|| TtpfHashHit {
+                path: tp.clone(),
+                tex_idx: i,
+                w,
+                h,
+                dxgi,
+            });
+        }
+    }
+
+    let arc = std::sync::Arc::new(index);
+    map.lock().unwrap().insert(root, arc.clone());
+    Some(arc)
+}
+
+pub fn decode_ttpf_texture_cached(hit: &TtpfHashHit, hash64: u64) -> Option<std::sync::Arc<Texture2D>> {
+    let cache = TTPF_TEX_CACHE.get_or_init(Default::default);
+    if let Some(entry) = cache.lock().unwrap().get(&hash64) {
+        return entry.clone();
+    }
+    let decoded = decode_ttpf_texture(&hit.path, hit.tex_idx)
+        .ok()
+        .map(|t| std::sync::Arc::new(to_model_tex(&t)));
+    let mut g = cache.lock().unwrap();
+    if g.len() > 512 {
+        g.clear();
+    }
+    g.insert(hash64, decoded.clone());
+    decoded
+}
+
 // =============================================================================
 // RBF0 (GTA 6 fwui UIObject) -> Readable XML Decoder
 // =============================================================================
