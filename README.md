@@ -16,6 +16,18 @@
   <img src="https://img.shields.io/badge/License-Source--Available%20(No%20Modifications)-red?style=flat-square" alt="License" />
 </p>
 
+<p align="center">
+  <img src="assets/demo.gif" alt="PercyStar Neon Sunset UI, Search & 3D Meshlet Viewer Demo" width="900" />
+</p>
+
+---
+
+## Screenshots
+
+<p align="center">
+  <img src="assets/preview.png" alt="PercyStar 3D Meshlet Viewer — Neon Sunset Theme" width="860" />
+</p>
+
 ---
 
 ## Features
@@ -46,7 +58,9 @@
 PercyStar/
 ├── assets/
 │   ├── logo.png            # App & window icon
-│   └── logo.ico            # Windows executable icon
+│   ├── logo.ico            # Windows executable icon
+│   ├── demo.gif            # Animated UI & 3D meshlet viewer demo
+│   └── preview.png         # Neon Sunset 3D viewer screenshot
 ├── scripts/
 │   ├── setup_deps.ps1      # Optional RAD Video Tools (binkplay.exe) setup
 │   ├── awc_extract.py      # Standalone CLI ADAT (.awc) Opus -> .wav helper
