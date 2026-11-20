@@ -706,6 +706,17 @@ fn collect_all_geoms(v: &[u8]) -> Vec<GeomRef> {
     out
 }
 
+pub fn model_detail_score(file: &mut File, offset: u64) -> Option<usize> {
+    let (v, _, _) = read_virtual_from_file(file, offset).ok()?;
+    let mut geoms = drawable_lod0_geoms(&v, 0);
+    if geoms.is_empty() {
+        geoms = collect_all_geoms(&v);
+    }
+    // Meshlet buffer sizes distinguish variants without reading GPU buffers or textures.
+    let bytes = geoms.iter().map(|g| g.3).sum();
+    (bytes > 0).then_some(bytes)
+}
+
 fn try_extract_embedded_texture(v: &[u8], p: &[u8]) -> (Option<Texture2D>, String) {
     let mut bases = vec![0usize];
     if v.len() >= 0x20 {

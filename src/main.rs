@@ -9,7 +9,7 @@ mod tex;
 mod audit_tests;
 use model3d::{
     Mesh3D, decode_rage9_model_from_rpf, extract_0drpz_mesh, extract_rage9_model_name,
-    has_rage9_meshlets, is_vehicle_virtual, is_zlib_head, parse_obj,
+    has_rage9_meshlets, is_vehicle_virtual, is_zlib_head, model_detail_score, parse_obj,
     probe_large_rage9_model_in_buf, render_mesh3d_viewport,
 };
 use rdna2::{
@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -459,6 +459,32 @@ struct RpfEntry {
     chunks: Vec<(u64, u64)>,
 }
 
+type ModelVariants = HashMap<PathBuf, Vec<Vec<(usize, u64)>>>;
+type DetailIndex = (u64, HashMap<usize, usize>);
+
+fn lower_detail_variants(archives: ModelVariants) -> HashMap<usize, usize> {
+    let mut replacements = HashMap::new();
+    for (path, mut groups) in archives {
+        let Ok(mut file) = File::open(path) else { continue };
+        for group in &mut groups {
+            group.sort_unstable_by_key(|&(_, offset)| offset);
+        }
+        groups.sort_unstable_by_key(|group| group[0].1);
+        for group in groups {
+            let scored: Vec<_> = group.into_iter().filter_map(|(idx, offset)| {
+                model_detail_score(&mut file, offset).map(|score| (idx, offset, score))
+            }).collect();
+            let Some(&(best, _, _)) = scored.iter().max_by_key(|&&(_, offset, score)| {
+                (score, std::cmp::Reverse(offset))
+            }) else { continue };
+            replacements.extend(scored.into_iter().filter_map(|(idx, _, _)| {
+                (idx != best).then_some((idx, best))
+            }));
+        }
+    }
+    replacements
+}
+
 #[derive(Default)]
 struct ScanState {
     scanning: bool,
@@ -662,11 +688,14 @@ struct Rpf9App {
     mv_cat: ModelCat,
     mv_filter: String,
     mv_hide_lods: bool,
+    mv_high_detail: bool,
+    mv_detail_index: Option<DetailIndex>,
+    mv_detail_job: Option<mpsc::Receiver<DetailIndex>>,
     mv_entries: Vec<(usize, ModelCat, String)>,
     mv_counts: [usize; 10],
     mv_ver: u64,
     mv_view: Vec<usize>,
-    mv_view_key: Option<(u64, ModelCat, String, bool)>,
+    mv_view_key: Option<(u64, ModelCat, String, bool, bool)>,
     mv_rng: u64,
     // list ordering shared by Explorer + Model Viewer; *_sort = order the cached view was built with
     sort_mode: SortMode,
@@ -735,6 +764,9 @@ impl Rpf9App {
             mv_cat: ModelCat::All,
             mv_filter: String::new(),
             mv_hide_lods: true,
+            mv_high_detail: false,
+            mv_detail_index: None,
+            mv_detail_job: None,
             mv_entries: Vec::new(),
             mv_counts: [0; 10],
             mv_ver: u64::MAX,
@@ -1434,7 +1466,7 @@ impl Rpf9App {
             self.mv_ver = ver;
             self.mv_view_key = None;
         }
-        let key = (ver, self.mv_cat, self.mv_filter.clone(), self.mv_hide_lods);
+        let key = (ver, self.mv_cat, self.mv_filter.clone(), self.mv_hide_lods, self.mv_high_detail);
         if self.mv_sort != self.sort_mode {
             self.mv_view_key = None;
         }
@@ -1444,11 +1476,12 @@ impl Rpf9App {
         let q = key.2.to_ascii_lowercase();
         let (inc, exc): (Vec<&str>, Vec<&str>) = q.split_whitespace().partition(|t| !t.starts_with('-'));
         let exc: Vec<&str> = exc.iter().map(|t| &t[1..]).filter(|t| !t.is_empty()).collect();
+        let lower_detail = self.active_detail_index();
         let mut view: Vec<usize> = self
             .mv_entries
             .iter()
             .enumerate()
-            .filter(|(_, (_, cat, hay))| {
+            .filter(|(_, (idx, cat, hay))| {
                 let cat_ok = match self.mv_cat {
                     ModelCat::All => *cat != ModelCat::NavMesh,
                     other => *cat == other,
@@ -1466,6 +1499,7 @@ impl Rpf9App {
                         && !hay.contains("_bounds."));
                 cat_ok
                     && lod_ok
+                    && !lower_detail.is_some_and(|index| index.contains_key(idx))
                     && inc.iter().all(|t| hay.contains(t))
                     && !exc.iter().any(|t| hay.contains(t))
             })
@@ -1488,6 +1522,58 @@ impl Rpf9App {
         self.mv_view = view;
         self.mv_sort = self.sort_mode;
         self.mv_view_key = Some(key);
+    }
+
+    fn active_detail_index(&self) -> Option<&HashMap<usize, usize>> {
+        self.mv_detail_index.as_ref().and_then(|(ver, index)| {
+            (self.mv_high_detail && *ver == self.mv_ver).then_some(index)
+        })
+    }
+
+    fn update_detail_index(&mut self, ctx: &egui::Context) {
+        if let Some(job) = &self.mv_detail_job {
+            match job.try_recv() {
+                Ok(index) => {
+                    self.mv_detail_index = Some(index);
+                    self.mv_detail_job = None;
+                    self.mv_view_key = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => self.mv_detail_job = None,
+            }
+        }
+        if !self.mv_high_detail || self.active_detail_index().is_some() {
+            return;
+        }
+        let mut archives = ModelVariants::new();
+        {
+            let st = self.state.lock().unwrap();
+            if st.ver != self.mv_ver || st.scanning {
+                return;
+            }
+            let mut groups: HashMap<(&Path, &str), Vec<(usize, u64)>> = HashMap::new();
+            for &(idx, cat, _) in &self.mv_entries {
+                let e = &st.entries[idx];
+                if matches!(cat, ModelCat::Characters | ModelCat::Clothing)
+                    && e.kind == "MODEL" && e.name.ends_with(".#dr")
+                {
+                    groups.entry((&e.source_rpf, &e.name)).or_default().push((idx, e.offset));
+                }
+            }
+            for ((path, _), group) in groups {
+                if group.len() > 1 {
+                    archives.entry(path.to_path_buf()).or_default().push(group);
+                }
+            }
+        }
+        let (send, recv) = mpsc::channel();
+        let ver = self.mv_ver;
+        let ctx = ctx.clone();
+        self.mv_detail_job = Some(recv);
+        std::thread::spawn(move || {
+            let _ = send.send((ver, lower_detail_variants(archives)));
+            ctx.request_repaint();
+        });
     }
 
     fn next_rand(&mut self) -> usize {
@@ -1592,6 +1678,15 @@ impl Rpf9App {
                     self.mv_filter.clear();
                 }
 
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.mv_high_detail, "Highest detail only")
+                        .on_hover_text("For same-name character and clothing draws in one archive, keep the variant with the most meshlet data.");
+                    self.update_detail_index(ctx);
+                    if self.mv_high_detail && self.active_detail_index().is_none() {
+                        ui.weak("Comparing meshes...");
+                    }
+                });
+
                 ui.add_space(5.0);
                 self.refresh_mv_view();
                 let cur_pos = self.selected.and_then(|sel| {
@@ -1680,7 +1775,9 @@ impl Rpf9App {
                     });
             });
 
-        if let Some(i) = to_select {
+        if let Some(i) = to_select.or_else(|| {
+            self.active_detail_index()?.get(&self.selected?).copied()
+        }) {
             self.select_entry(i);
             self.show_3d = true;
         }
@@ -3338,6 +3435,18 @@ mod tests {
         assert_eq!(classify_model_cat("MODEL", "a_bfyb01_sea_tr_02_bridge_01.#dr"), ModelCat::World);
         assert_eq!(classify_model_cat("MODEL", "int_grg_14_painted_wall_skirting.#dr"), ModelCat::World);
         assert_eq!(classify_model_cat("NAVM", "nav_160_179.ynv"), ModelCat::NavMesh);
+    }
+
+    #[test]
+    fn picks_detailed_character_mesh_over_larger_metadata() {
+        let Some(path) = std::env::var_os("PERCYSTAR_PACKS_RPF") else { return };
+        // Matthews and Nine1Nine: 4,940, 13,320, and 514 triangles in archive order.
+        let groups = vec![
+            vec![(0, 1_645_899_792), (1, 1_646_092_304), (2, 1_646_534_672)],
+            vec![(3, 2_025_304_080), (4, 2_025_480_208), (5, 2_025_869_328)],
+        ];
+        let replacements = lower_detail_variants(HashMap::from([(PathBuf::from(path), groups)]));
+        assert_eq!(replacements, HashMap::from([(0, 1), (2, 1), (3, 4), (5, 4)]));
     }
 
     #[test]
