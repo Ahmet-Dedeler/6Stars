@@ -106,6 +106,16 @@ struct ScanState {
 }
 
 #[derive(Default)]
+struct Mesh3D {
+    name: String,
+    verts: Vec<[f32; 3]>,
+    edges: Vec<(usize, usize)>,
+    yaw: f32,
+    pitch: f32,
+    zoom: f32,
+}
+
+#[derive(Default)]
 struct MediaState {
     loading: bool,
     status: String,
@@ -139,6 +149,8 @@ struct Rpf9App {
     parent_hwnd: isize,
     last_dock_rect: [i32; 4],
     clip_seq: u64,
+    mesh3d: Option<Mesh3D>,
+    show_3d: bool,
 }
 
 impl Rpf9App {
@@ -174,6 +186,8 @@ impl Rpf9App {
             parent_hwnd: 0,
             last_dock_rect: [0; 4],
             clip_seq: 0,
+            mesh3d: None,
+            show_3d: false,
         };
         if let Some(last) = load_last_folder() {
             if last.is_dir() {
@@ -384,6 +398,8 @@ impl Rpf9App {
         self.playing = false;
         self.frame_idx = 0;
         self.last_dock_rect = [0; 4];
+        self.mesh3d = None;
+        self.show_3d = false;
         stop_wav();
         self.stop_bink_player();
 
@@ -460,6 +476,11 @@ impl Rpf9App {
                     } else if is_text {
                         self.preview = String::from_utf8_lossy(&data[..data.len().min(250_000)]).into_owned();
                     } else {
+                        if data.len() >= 24 && &data[16..21] == b"0DRPz" {
+                            if let Some(m) = extract_0drpz_mesh(&e.name, &data) {
+                                self.mesh3d = Some(m);
+                            }
+                        }
                         self.preview = format_hex(&data[..data.len().min(2048)]);
                     }
                 }
@@ -801,6 +822,150 @@ fn parse_psin(data: &[u8]) -> String {
     out
 }
 
+fn parse_obj(path: &PathBuf) -> Option<Mesh3D> {
+    let txt = fs::read_to_string(path).ok()?;
+    let mut verts = Vec::new();
+    let mut edges = Vec::new();
+    for line in txt.lines() {
+        let mut it = line.split_whitespace();
+        match it.next() {
+            Some("v") => {
+                if let (Some(x), Some(y), Some(z)) = (it.next()?.parse::<f32>().ok(), it.next()?.parse::<f32>().ok(), it.next()?.parse::<f32>().ok()) {
+                    verts.push([x, y, z]);
+                }
+            }
+            Some("f") => {
+                let idxs: Vec<usize> = it
+                    .filter_map(|tok| tok.split('/').next()?.parse::<usize>().ok().and_then(|i| i.checked_sub(1)))
+                    .filter(|&i| i < verts.len())
+                    .collect();
+                for w in idxs.windows(2) {
+                    edges.push((w[0], w[1]));
+                }
+                if idxs.len() >= 3 {
+                    edges.push((*idxs.last().unwrap(), idxs[0]));
+                }
+            }
+            _ => {}
+        }
+    }
+    if verts.is_empty() { return None; }
+    Some(Mesh3D {
+        name: path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+        verts,
+        edges,
+        yaw: 0.6,
+        pitch: 0.35,
+        zoom: 1.0,
+    })
+}
+
+fn extract_0drpz_mesh(name: &str, data: &[u8]) -> Option<Mesh3D> {
+    // Scan 16-byte aligned candidate float32 (x,y,z) triplets inside 0DRPz resource
+    let mut verts = Vec::new();
+    let mut off = 0x40usize;
+    while off + 12 <= data.len() && verts.len() < 12000 {
+        let x = f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+        let y = f32::from_le_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]]);
+        let z = f32::from_le_bytes([data[off + 8], data[off + 9], data[off + 10], data[off + 11]]);
+        if x.is_finite() && y.is_finite() && z.is_finite()
+            && x.abs() < 250.0 && y.abs() < 250.0 && z.abs() < 250.0
+            && (x.abs() > 1e-4 || y.abs() > 1e-4 || z.abs() > 1e-4)
+        {
+            verts.push([x, y, z]);
+            off += 12;
+        } else {
+            off += 4;
+        }
+    }
+    if verts.len() < 12 { return None; }
+    Some(Mesh3D {
+        name: name.to_string(),
+        verts,
+        edges: Vec::new(),
+        yaw: 0.6,
+        pitch: 0.35,
+        zoom: 1.0,
+    })
+}
+
+fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!("{}  ·  {} verts  ·  {} edges", mesh.name, mesh.verts.len(), mesh.edges.len())).strong().color(Color32::from_rgb(252, 175, 23)));
+        if ui.button("Reset View").clicked() {
+            mesh.yaw = 0.6;
+            mesh.pitch = 0.35;
+            mesh.zoom = 1.0;
+        }
+        if ui.button("Export .OBJ").clicked() {
+            if let Some(p) = rfd::FileDialog::new().set_file_name(format!("{}.obj", mesh.name)).save_file() {
+                let mut out = String::new();
+                for v in &mesh.verts {
+                    out.push_str(&format!("v {} {} {}\n", v[0], v[1], v[2]));
+                }
+                let _ = fs::write(p, out);
+            }
+        }
+    });
+    ui.add_space(4.0);
+    let avail = ui.available_size();
+    let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::drag());
+    if resp.dragged() {
+        let d = resp.drag_delta();
+        mesh.yaw += d.x * 0.01;
+        mesh.pitch = (mesh.pitch + d.y * 0.01).clamp(-1.5, 1.5);
+    }
+    if resp.hovered() {
+        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+        if scroll != 0.0 {
+            mesh.zoom = (mesh.zoom * (1.0 + scroll * 0.002)).clamp(0.1, 20.0);
+        }
+    }
+
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, CornerRadius::same(6), Color32::from_rgb(10, 11, 14));
+
+    // Compute bounding center & scale
+    let (mut min_v, mut max_v) = ([f32::MAX; 3], [f32::MIN; 3]);
+    for v in &mesh.verts {
+        for k in 0..3 {
+            min_v[k] = min_v[k].min(v[k]);
+            max_v[k] = max_v[k].max(v[k]);
+        }
+    }
+    let ctr = [(min_v[0] + max_v[0]) * 0.5, (min_v[1] + max_v[1]) * 0.5, (min_v[2] + max_v[2]) * 0.5];
+    let span = (max_v[0] - min_v[0]).max(max_v[1] - min_v[1]).max(max_v[2] - min_v[2]).max(1e-3);
+    let scale = (rect.width().min(rect.height()) * 0.42 / span) * mesh.zoom;
+    let (sy, cy) = mesh.yaw.sin_cos();
+    let (sp, cp) = mesh.pitch.sin_cos();
+    let rc = rect.center();
+
+    let proj = |v: [f32; 3]| -> (egui::Pos2, f32) {
+        let x = v[0] - ctr[0];
+        let y = v[1] - ctr[1];
+        let z = v[2] - ctr[2];
+        let rx = x * cy - z * sy;
+        let rz = x * sy + z * cy;
+        let ry = y * cp - rz * sp;
+        let depth = y * sp + rz * cp;
+        (egui::pos2(rc.x + rx * scale, rc.y - ry * scale), depth)
+    };
+
+    if !mesh.edges.is_empty() {
+        let stroke = Stroke::new(1.0_f32, Color32::from_rgb(72, 210, 255));
+        for &(a, b) in mesh.edges.iter().take(40_000) {
+            let (pa, _) = proj(mesh.verts[a]);
+            let (pb, _) = proj(mesh.verts[b]);
+            p.line_segment([pa, pb], stroke);
+        }
+    } else {
+        for v in mesh.verts.iter().take(12_000) {
+            let (pt, _) = proj(*v);
+            p.circle_filled(pt, 1.5, Color32::from_rgb(252, 175, 23));
+        }
+    }
+}
+
 fn format_size(bytes: u64) -> String {
     let b = bytes as f64;
     if b >= 1_073_741_824.0 {
@@ -1096,6 +1261,15 @@ impl eframe::App for Rpf9App {
                         self.start_single_scan(p);
                     }
                 }
+                if ui.button("Open .OBJ").clicked() {
+                    if let Some(p) = rfd::FileDialog::new().add_filter("OBJ 3D Model", &["obj"]).pick_file() {
+                        if let Some(m) = parse_obj(&p) {
+                            self.stop_bink_player();
+                            self.mesh3d = Some(m);
+                            self.show_3d = true;
+                        }
+                    }
+                }
                 if self.is_folder {
                     if ui.button("Rescan").clicked() {
                         if let Some(folder) = self.target_path.clone() {
@@ -1312,6 +1486,21 @@ impl eframe::App for Rpf9App {
                 });
             } else if !media_status.is_empty() {
                 ui.label(RichText::new(&media_status).color(Color32::from_rgb(255, 140, 120)));
+            } else if let Some(mesh) = self.mesh3d.as_mut() {
+                let mut toggle_3d = self.show_3d;
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(!toggle_3d, "Hex / Info").clicked() { toggle_3d = false; }
+                    if ui.selectable_label(toggle_3d, "3D Model View").clicked() { toggle_3d = true; }
+                });
+                self.show_3d = toggle_3d;
+                ui.separator();
+                if self.show_3d {
+                    render_mesh3d_viewport(ui, mesh);
+                } else {
+                    egui::ScrollArea::both().show(ui, |ui| {
+                        ui.add(egui::TextEdit::multiline(&mut self.preview).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY));
+                    });
+                }
             } else {
                 egui::ScrollArea::both().show(ui, |ui| {
                     ui.add(egui::TextEdit::multiline(&mut self.preview).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY));
