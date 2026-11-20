@@ -1,0 +1,43 @@
+# Keeps off-GitHub copies current: pushes every branch and tag to each
+# configured mirror and asks the Wayback Machine to snapshot the repo.
+# A mirror is skipped when its secret is not set.
+name: mirror
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["**"]
+  release:
+    types: [published]
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Push to mirrors
+        env:
+          CODEBERG_URL: ${{ secrets.CODEBERG_MIRROR_URL }}
+          GITLAB_URL: ${{ secrets.GITLAB_MIRROR_URL }}
+        run: |
+          git fetch --tags --force origin '+refs/heads/*:refs/remotes/origin/*'
+          for url in "$CODEBERG_URL" "$GITLAB_URL"; do
+            [ -z "$url" ] && continue
+            git push --force "$url" 'refs/remotes/origin/*:refs/heads/*' 'refs/tags/*:refs/tags/*' \
+              || echo "::warning::mirror push failed for one remote"
+          done
+
+      - name: Snapshot on Wayback Machine
+        continue-on-error: true
+        run: |
+          base="https://github.com/${{ github.repository }}"
+          for u in "$base" "$base/releases" "$base/archive/refs/heads/main.zip"; do
+            curl -s -o /dev/null -w "%{http_code} $u\n" -m 120 "https://web.archive.org/save/$u" || true
+            sleep 10
+          done
