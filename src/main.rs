@@ -11,8 +11,14 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const REPO_RELEASES_URL: &str = "https://github.com/rpatty-dev/PercyStar/releases";
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 // threshold in levels rpf where vehicle fragtypes begin
 const VEH_ZONE_OFF: u64 = 0x10b2_0000_00;
@@ -136,6 +142,135 @@ struct MediaState {
     loaded_mesh: Option<Mesh3D>,
 }
 
+#[derive(Default)]
+struct UpdateState {
+    available: Option<(String, String)>,
+    checking: bool,
+    installing: bool,
+    show_modal: bool,
+    status: String,
+}
+
+fn parse_semver(s: &str) -> Option<(u32, u32, u32)> {
+    let trimmed = s.trim().trim_start_matches(['v', 'V']);
+    let core = trimmed.split(['-', '+']).next()?;
+    let mut parts = core.split('.');
+    let maj = parts.next()?.parse::<u32>().ok()?;
+    let min = parts.next()?.parse::<u32>().ok()?;
+    let pat = parts.next().unwrap_or("0").parse::<u32>().ok()?;
+    Some((maj, min, pat))
+}
+
+fn silent_cmd(prog: &str) -> Command {
+    let mut c = Command::new(prog);
+    #[cfg(windows)]
+    c.creation_flags(CREATE_NO_WINDOW);
+    c
+}
+
+// checks github latest release redirect without api rate limits
+fn spawn_update_check(upd: Arc<Mutex<UpdateState>>, ctx: egui::Context) {
+    {
+        let mut g = upd.lock().unwrap();
+        if g.checking || g.installing { return; }
+        g.checking = true;
+    }
+    std::thread::spawn(move || {
+        let out = silent_cmd("curl.exe")
+            .args(["-fsSL", "-o", "NUL", "-w", "%{url_effective}", &format!("{REPO_RELEASES_URL}/latest")])
+            .output();
+        let mut found = None;
+        if let Ok(res) = out {
+            if res.status.success() {
+                let eff = String::from_utf8_lossy(&res.stdout).trim().to_string();
+                if let Some((_, tag)) = eff.rsplit_once("/tag/") {
+                    if let (Some(rem), Some(cur)) = (parse_semver(tag), parse_semver(APP_VERSION)) {
+                        if rem > cur {
+                            let ver = tag.trim_start_matches(['v', 'V']).to_string();
+                            found = Some((ver, eff));
+                        }
+                    }
+                }
+            }
+        }
+        {
+            let mut g = upd.lock().unwrap();
+            g.checking = false;
+            g.available = found;
+        }
+        ctx.request_repaint();
+    });
+}
+
+// downloads new release zip and swaps running windows binary cleanly
+fn spawn_install_update(ver: String, upd: Arc<Mutex<UpdateState>>, ctx: egui::Context) {
+    {
+        let mut g = upd.lock().unwrap();
+        if g.installing { return; }
+        g.installing = true;
+        g.status = format!("Downloading v{ver}...");
+    }
+    ctx.request_repaint();
+    std::thread::spawn(move || {
+        let res: Result<(), String> = (|| {
+            let tmp = std::env::temp_dir().join("percystar_self_update");
+            let _ = fs::remove_dir_all(&tmp);
+            fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
+            let zip_p = tmp.join("update.zip");
+            let dl_url = format!("{REPO_RELEASES_URL}/download/v{ver}/PercyStar_v{ver}_Win64.zip");
+            let dl = silent_cmd("curl.exe")
+                .args(["-fsSL", "-o", zip_p.to_str().ok_or("bad zip path")?, &dl_url])
+                .output()
+                .map_err(|e| format!("curl error: {e}"))?;
+            if !dl.status.success() {
+                return Err(format!("Download failed ({})", dl.status));
+            }
+
+            {
+                let mut g = upd.lock().unwrap();
+                g.status = format!("Extracting v{ver}...");
+            }
+            ctx.request_repaint();
+            let ps_arg = format!(
+                "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
+                zip_p.display(),
+                tmp.display()
+            );
+            let ex = silent_cmd("powershell")
+                .args(["-NoProfile", "-Command", &ps_arg])
+                .output()
+                .map_err(|e| format!("Expand error: {e}"))?;
+            if !ex.status.success() {
+                return Err("Archive extraction failed".into());
+            }
+
+            let new_exe = tmp.join("PercyStar.exe");
+            let head = fs::read(&new_exe).map_err(|_| "PercyStar.exe missing in release zip".to_string())?;
+            if head.len() < 100_000 || !head.starts_with(b"MZ") {
+                return Err("Downloaded binary looks invalid".into());
+            }
+
+            let cur_exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            let old_exe = cur_exe.with_extension("exe.old");
+            let _ = fs::remove_file(&old_exe);
+            fs::rename(&cur_exe, &old_exe).map_err(|e| format!("Rename failed: {e}"))?;
+            if let Err(e) = fs::copy(&new_exe, &cur_exe) {
+                let _ = fs::rename(&old_exe, &cur_exe);
+                return Err(format!("Replace failed: {e}"));
+            }
+            let _ = fs::remove_dir_all(&tmp);
+            Command::new(&cur_exe).spawn().map_err(|e| format!("Relaunch failed: {e}"))?;
+            std::process::exit(0);
+        })();
+        if let Err(err) = res {
+            let mut g = upd.lock().unwrap();
+            g.installing = false;
+            g.status = err;
+            ctx.request_repaint();
+        }
+    });
+}
+
 struct Rpf9App {
     target_path: Option<PathBuf>,
     is_folder: bool,
@@ -163,6 +298,7 @@ struct Rpf9App {
     counts: [usize; 8],
     cached_rpf_names: Vec<String>,
     last_rebuild: Instant,
+    update: Arc<Mutex<UpdateState>>,
 }
 
 impl Rpf9App {
@@ -202,8 +338,10 @@ impl Rpf9App {
             counts: [0; 8],
             cached_rpf_names: Vec::new(),
             last_rebuild: Instant::now(),
+            update: Arc::new(Mutex::new(UpdateState::default())),
         };
         load_ui_state(&mut app);
+        spawn_update_check(Arc::clone(&app.update), cc.egui_ctx.clone());
         if let Some(last) = load_last_folder() {
             if last.is_dir() {
                 app.start_folder_scan(last);
@@ -1258,6 +1396,17 @@ impl eframe::App for Rpf9App {
                 ui.add_space(6.0);
                 ui.label(RichText::new("PERCYSTAR").size(17.0).strong().color(Color32::from_rgb(255, 168, 28)));
                 ui.label(RichText::new("RPF9").size(13.0).strong().color(Color32::from_rgb(255, 72, 165)));
+                ui.label(RichText::new(format!("v{APP_VERSION}")).size(11.5).color(Color32::from_rgb(165, 145, 195)));
+                let upd_avail = self.update.lock().unwrap().available.clone();
+                if let Some((ref new_ver, _)) = upd_avail {
+                    let pill = egui::Button::new(
+                        RichText::new(format!("★ Update Available: v{new_ver}")).size(12.0).strong().color(Color32::BLACK),
+                    )
+                    .fill(Color32::from_rgb(255, 168, 28));
+                    if ui.add(pill).clicked() {
+                        self.update.lock().unwrap().show_modal = true;
+                    }
+                }
                 ui.add_space(10.0);
                 if ui.button("Open Folder...").clicked() {
                     if let Some(folder) = rfd::FileDialog::new().pick_folder() {
@@ -1481,6 +1630,63 @@ impl eframe::App for Rpf9App {
                 });
             }
         });
+
+        let (show_upd, upd_avail, upd_inst, upd_status) = {
+            let g = self.update.lock().unwrap();
+            (g.show_modal, g.available.clone(), g.installing, g.status.clone())
+        };
+        if show_upd {
+            if let Some((ref new_ver, ref rel_url)) = upd_avail {
+                let mut open = true;
+                egui::Window::new("Update Available")
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                    .show(ctx, |ui| {
+                        ui.label(RichText::new(format!("PercyStar v{new_ver} is ready!")).size(15.0).strong().color(Color32::from_rgb(255, 168, 28)));
+                        ui.label(RichText::new(format!("Installed: v{APP_VERSION}  ->  Latest: v{new_ver}")).color(Color32::from_rgb(200, 190, 220)));
+                        ui.add_space(8.0);
+                        if !upd_status.is_empty() {
+                            ui.label(RichText::new(&upd_status).color(Color32::from_rgb(255, 72, 165)));
+                            ui.add_space(4.0);
+                        }
+                        ui.horizontal(|ui| {
+                            let btn = egui::Button::new(
+                                RichText::new(if upd_inst { "Updating..." } else { "Download & Install" }).strong().color(Color32::BLACK),
+                            )
+                            .fill(Color32::from_rgb(255, 168, 28));
+                            if ui.add_enabled(!upd_inst, btn).clicked() {
+                                spawn_install_update(new_ver.clone(), Arc::clone(&self.update), ctx.clone());
+                            }
+                            if ui.button("View Release").clicked() {
+                                let _ = silent_cmd("cmd").args(["/C", "start", "", rel_url]).spawn();
+                            }
+                            if ui.add_enabled(!upd_inst, egui::Button::new("Later")).clicked() {
+                                self.update.lock().unwrap().show_modal = false;
+                            }
+                        });
+                    });
+                if !open {
+                    self.update.lock().unwrap().show_modal = false;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn semver_comparison_works() {
+        assert_eq!(parse_semver("1.0.3"), Some((1, 0, 3)));
+        assert_eq!(parse_semver("v1.0.4"), Some((1, 0, 4)));
+        assert!(parse_semver("v1.0.4") > parse_semver("1.0.3"));
+        assert!(parse_semver("1.1.0") > parse_semver("1.0.99"));
+        assert!(parse_semver("v1.0.3") == parse_semver("1.0.3"));
+        assert!(parse_semver("bad").is_none());
     }
 }
 
@@ -1536,6 +1742,10 @@ fn export_models_cli(rpf_path: &PathBuf, out_dir: &PathBuf, filter: &str, vehicl
 }
 
 fn main() -> eframe::Result<()> {
+    // remove leftover old exe from previous self update
+    if let Ok(cur) = std::env::current_exe() {
+        let _ = fs::remove_file(cur.with_extension("exe.old"));
+    }
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 4 && args[1] == "--extract-vehicles" {
         export_models_cli(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), "", true);
@@ -1559,5 +1769,6 @@ fn main() -> eframe::Result<()> {
         vb = vb.with_icon(egui::IconData { rgba: raw.clone(), width: w, height: h });
     }
     let opts = eframe::NativeOptions { viewport: vb, ..Default::default() };
-    eframe::run_native("PercyStar RPF9 Explorer", opts, Box::new(move |cc| Ok(Box::new(Rpf9App::new(cc, logo_rgba)))))
+    let title = format!("PercyStar v{APP_VERSION}");
+    eframe::run_native(&title, opts, Box::new(move |cc| Ok(Box::new(Rpf9App::new(cc, logo_rgba)))))
 }
