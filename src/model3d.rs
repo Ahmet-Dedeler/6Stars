@@ -39,6 +39,9 @@ impl Texture2D {
     }
 }
 
+const DEFAULT_YAW: f32 = 2.45;
+const DEFAULT_PITCH: f32 = 0.38;
+
 pub struct Mesh3D {
     pub name: String,
     pub verts: Vec<[f32; 3]>,
@@ -146,8 +149,8 @@ impl Mesh3D {
             geom_count,
             meshlet_count,
             lod_label,
-            yaw: 0.72,
-            pitch: 0.34,
+            yaw: DEFAULT_YAW,
+            pitch: DEFAULT_PITCH,
             zoom: 1.0,
             pan_x: 0.0,
             pan_y: 0.0,
@@ -225,6 +228,11 @@ pub fn parse_obj(path: &PathBuf) -> Option<Mesh3D> {
         }
     }
     if verts.is_empty() { return None; }
+    if !txt.starts_with("# PercyStar") {
+        for v in &mut verts {
+            *v = [v[0], -v[2], v[1]];
+        }
+    }
     let tri_geom = vec![0u16; tris.len()];
     let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
     Some(Mesh3D::from_parts(name, verts, Vec::new(), tris, tri_geom, edges, None, "OBJ".into(), 1, 0, "OBJ".into()))
@@ -960,9 +968,9 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
         // Rotate yaw around Z
         let x1 = x * cy - y * sy;
         let y1 = x * sy + y * cy;
-        // Rotate pitch around X (Y is depth into screen, Z is screen up)
-        let y2 = y1 * cp - z * sp; // depth (larger = closer? let's make +y2 closer or -y2 closer: -y2 closer!)
-        let z2 = y1 * sp + z * cp;
+        // Camera at -Y looking +Y, raised by pitch. y2 = toward-camera depth (larger = closer), z2 = screen up.
+        let y2 = -y1 * cp + z * sp;
+        let z2 = z * cp + y1 * sp;
         // Mild perspective
         let persp = 1.0 / (1.0 - (y2 / (mesh.radius * 4.5)).clamp(-0.65, 0.65));
         let sx = cx + x1 * scale * persp;
@@ -1026,8 +1034,8 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                 let n = mesh.normals[ti];
                 let nx1 = n[0] * cy - n[1] * sy;
                 let ny1 = n[0] * sy + n[1] * cy;
-                let ny2 = ny1 * cp - n[2] * sp;
-                let nz2 = ny1 * sp + n[2] * cp;
+                let ny2 = -ny1 * cp + n[2] * sp;
+                let nz2 = n[2] * cp + ny1 * sp;
 
                 let ndl1 = (nx1 * l1[0] + ny2 * l1[1] + nz2 * l1[2]).abs();
                 let ndl2 = (nx1 * l2[0] + ny2 * l2[1] + nz2 * l2[2]).max(0.0);
@@ -1235,8 +1243,8 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
             }
         }
         if ui.button("Reset").clicked() {
-            mesh.yaw = 0.72;
-            mesh.pitch = 0.34;
+            mesh.yaw = DEFAULT_YAW;
+            mesh.pitch = DEFAULT_PITCH;
             mesh.zoom = 1.0;
             mesh.pan_x = 0.0;
             mesh.pan_y = 0.0;
@@ -1262,7 +1270,7 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
     if resp.dragged_by(egui::PointerButton::Primary) {
         let d = resp.drag_delta();
         mesh.yaw += d.x * 0.01;
-        mesh.pitch = (mesh.pitch + d.y * 0.01).clamp(-1.55, 1.55);
+        mesh.pitch = (mesh.pitch + d.y * 0.01).clamp(-1.5, 1.5);
         mesh.dirty = true;
         dragging = true;
     } else if resp.dragged_by(egui::PointerButton::Secondary) || resp.dragged_by(egui::PointerButton::Middle) {
@@ -1271,6 +1279,14 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
         mesh.pan_y += d.y / rect.height().max(1.0);
         mesh.dirty = true;
         dragging = true;
+    }
+    if resp.double_clicked() {
+        mesh.yaw = DEFAULT_YAW;
+        mesh.pitch = DEFAULT_PITCH;
+        mesh.zoom = 1.0;
+        mesh.pan_x = 0.0;
+        mesh.pan_y = 0.0;
+        mesh.dirty = true;
     }
     if resp.hovered() {
         let scroll = ui.input(|i| i.smooth_scroll_delta.y);
@@ -1291,9 +1307,10 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
 
     // Adaptive resolution: ultra-fast 0.68x during heavy drag (>25k tris), crisp 1.0x at rest
     let heavy = mesh.tris.len() > 25_000;
-    let res_scale = if dragging && heavy { 0.65 } else { 1.0 };
-    let target_w = ((rect.width() * res_scale) as usize).clamp(160, 960);
-    let target_h = ((rect.height() * res_scale) as usize).clamp(120, 720);
+    let ppp = ui.ctx().pixels_per_point();
+    let res_scale = ppp * if dragging && heavy { 0.6 } else { 1.0 };
+    let target_w = ((rect.width() * res_scale) as usize).clamp(160, 1920);
+    let target_h = ((rect.height() * res_scale) as usize).clamp(120, 1200);
 
     if mesh.dirty || mesh.fb_w != target_w || mesh.fb_h != target_h || mesh.tex.is_none() {
         rasterize_mesh(mesh, target_w, target_h);
@@ -1322,8 +1339,28 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
     p.text(
         egui::pos2(rect.min.x + 10.0, rect.max.y - 16.0),
         egui::Align2::LEFT_BOTTOM,
-        "Left-drag: Orbit  ·  Right-drag: Pan  ·  Scroll: Zoom",
+        "Left-drag: Orbit  ·  Right-drag: Pan  ·  Scroll: Zoom  ·  Double-click: Reset",
         egui::FontId::proportional(11.0),
         Color32::from_rgba_unmultiplied(180, 188, 204, 150),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upright_and_not_mirrored() {
+        // bottom, top, +X, far(+Y), near(-Y)
+        let verts = vec![[0.0, 0.0, -1.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, -1.0, 0.0]];
+        let mut m = Mesh3D::from_parts("t".into(), verts, vec![], vec![], vec![], vec![], None, String::new(), 1, 0, String::new());
+        m.yaw = 0.0;
+        m.pitch = 0.4;
+        rasterize_mesh(&mut m, 200, 200);
+        let p = &m.proj_buf;
+        assert!(p[1][1] < p[0][1], "+Z must be screen-up");
+        assert!(p[2][0] > 100.0, "+X must be screen-right (no mirror)");
+        assert!(p[3][1] < p[4][1], "positive pitch views from above");
+        assert!(p[4][2] > p[3][2], "-Y side is closer to camera");
+    }
 }

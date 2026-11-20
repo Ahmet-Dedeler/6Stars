@@ -95,8 +95,11 @@ def extract_opus_packets(data: bytes, off: int, sz: int) -> list[bytes]:
 
 
 def main():
-    in_dir = sys.argv[1] if len(sys.argv) > 1 else r"F:\Ext6\shared_minigame000_awc"
-    out_dir = sys.argv[2] if len(sys.argv) > 2 else r"F:\Ext6\shared_minigame000_wav"
+    if len(sys.argv) < 3:
+        print("Usage: python awc_extract.py <input_awc_dir> <output_wav_dir>")
+        sys.exit(1)
+    in_dir = sys.argv[1]
+    out_dir = sys.argv[2]
     os.makedirs(out_dir, exist_ok=True)
     exported = 0
     for awc_path in sorted(glob.glob(os.path.join(in_dir, "*.awc"))):

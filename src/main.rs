@@ -107,6 +107,8 @@ struct ScanState {
     entries: Vec<RpfEntry>,
     rpf_names: Vec<String>,
     file_sig: HashMap<PathBuf, (u64, Option<SystemTime>)>,
+    /// Bumped on every entries change so the UI only re-filters when needed.
+    ver: u64,
 }
 
 #[derive(Default)]
@@ -126,7 +128,6 @@ struct MediaState {
 struct Rpf9App {
     target_path: Option<PathBuf>,
     is_folder: bool,
-    auto_update: bool,
     selected_rpf: String,
     state: Arc<Mutex<ScanState>>,
     media: Arc<Mutex<MediaState>>,
@@ -147,6 +148,13 @@ struct Rpf9App {
     mesh3d: Option<Mesh3D>,
     show_3d: bool,
     vehicles_only: bool,
+    // Cached filtered view: rebuilt only when entries/filter/category change, never per frame.
+    view: Vec<usize>,
+    view_key: Option<(u64, String, Category, String, bool)>,
+    hay: Vec<String>,
+    hay_ver: u64,
+    counts: [usize; 8],
+    last_rebuild: Instant,
 }
 
 impl Rpf9App {
@@ -160,7 +168,6 @@ impl Rpf9App {
         let mut app = Self {
             target_path: None,
             is_folder: false,
-            auto_update: true,
             selected_rpf: "All RPFs".into(),
             state: Arc::new(Mutex::new(ScanState {
                 header_info: "No archive or folder loaded".into(),
@@ -185,7 +192,14 @@ impl Rpf9App {
             mesh3d: None,
             show_3d: false,
             vehicles_only: false,
+            view: Vec::new(),
+            view_key: None,
+            hay: Vec::new(),
+            hay_ver: u64::MAX,
+            counts: [0; 8],
+            last_rebuild: Instant::now(),
         };
+        load_ui_state(&mut app);
         if let Some(last) = load_last_folder() {
             if last.is_dir() {
                 app.start_folder_scan(last);
@@ -223,6 +237,7 @@ impl Rpf9App {
             let mut st = self.state.lock().unwrap();
             st.scanning = true;
             st.entries.clear();
+            st.ver += 1;
             st.rpf_names.clear();
             st.file_sig.clear();
             st.status = "Scanning RPF9 archive...".into();
@@ -239,6 +254,7 @@ impl Rpf9App {
                     st.rpf_names = vec![path.file_name().unwrap_or_default().to_string_lossy().into_owned()];
                     let n = entries.len();
                     st.entries.append(&mut entries);
+                    st.ver += 1;
                     st.scanning = false;
                     st.status = format!("{n} entries ready");
                 }
@@ -253,10 +269,13 @@ impl Rpf9App {
     }
 
     fn start_folder_scan(&mut self, folder: PathBuf) {
+        // Keep the restored archive filter when reopening the same folder
+        if load_last_folder().as_ref() != Some(&folder) {
+            self.selected_rpf = "All RPFs".into();
+        }
         save_last_folder(&folder);
         self.target_path = Some(folder.clone());
         self.is_folder = true;
-        self.selected_rpf = "All RPFs".into();
         self.selected = None;
         self.preview.clear();
         self.textures.clear();
@@ -270,6 +289,7 @@ impl Rpf9App {
         {
             let mut st = self.state.lock().unwrap();
             st.entries.clear();
+            st.ver += 1;
             st.rpf_names.clear();
             st.file_sig.clear();
             st.scanning = true;
@@ -300,6 +320,7 @@ impl Rpf9App {
                                 if let Some(cached_vehs) = disk_cache.get(&vkey) {
                                     let mut st = state.lock().unwrap();
                                     st.entries.extend(cached_vehs.iter().cloned());
+                                    st.ver += 1;
                                     if !st.rpf_names.contains(&"levels.rpf".to_string()) {
                                         st.rpf_names.push("levels.rpf".into());
                                         st.rpf_names.sort();
@@ -342,6 +363,7 @@ impl Rpf9App {
                                     let is_levels = p.file_name().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("levels.rpf")).unwrap_or(false);
                                     st.entries.retain(|e| &e.source_rpf != p || (is_levels && e.offset >= 0x10b2_0000_00));
                                     st.entries.extend(cached_entries.iter().cloned());
+                                    st.ver += 1;
                                     st.file_sig.insert(p.clone(), sig);
                                     let rname = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
                                     if !st.rpf_names.contains(&rname) {
@@ -395,6 +417,7 @@ impl Rpf9App {
                                         let is_levels = rname.eq_ignore_ascii_case("levels.rpf");
                                         st.entries.retain(|e| &e.source_rpf != p || (is_levels && e.offset >= 0x10b2_0000_00));
                                         st.entries.extend(new_entries.iter().cloned());
+                                        st.ver += 1;
                                         st.file_sig.insert(p.clone(), *sig);
                                         if !st.rpf_names.contains(&rname) {
                                             st.rpf_names.push(rname);
@@ -559,8 +582,73 @@ impl Rpf9App {
         }
     }
 
+    /// Re-filter only when something changed; while scanning, entry churn is throttled to 4x/sec.
+    fn refresh_view(&mut self) {
+        let ver = self.state.lock().unwrap().ver;
+        let key = (ver, self.filter.clone(), self.category.clone(), self.selected_rpf.clone(), self.vehicles_only);
+        let Some(old) = &self.view_key else { return self.rebuild_view(key) };
+        if *old == key { return; }
+        let only_ver = old.1 == key.1 && old.2 == key.2 && old.3 == key.3 && old.4 == key.4;
+        if only_ver && self.last_rebuild.elapsed() < Duration::from_millis(250) {
+            return;
+        }
+        if !only_ver {
+            save_ui_state(self);
+        }
+        self.rebuild_view(key);
+    }
+
+    fn rebuild_view(&mut self, key: (u64, String, Category, String, bool)) {
+        let st = self.state.lock().unwrap();
+        if self.hay_ver != st.ver {
+            self.hay = st.entries.iter().map(|e| format!("{}|{}|{}", e.name, e.rpf_name, e.kind).to_lowercase()).collect();
+            self.hay_ver = st.ver;
+            let mut c = [0usize; 8];
+            for e in &st.entries {
+                c[0] += 1;
+                c[match e.kind { "VEH" => 1, "MODEL" => 2, "BK2" => 3, "AWC" => 4, "XML" => 5, "PSIN" => 6, _ => 7 }] += 1;
+            }
+            self.counts = c;
+        }
+        let q = key.1.to_lowercase();
+        let (inc, exc): (Vec<&str>, Vec<&str>) = q.split_whitespace().partition(|t| !t.starts_with('-'));
+        let exc: Vec<&str> = exc.iter().map(|t| &t[1..]).filter(|t| !t.is_empty()).collect();
+        let all_rpf = self.selected_rpf == "All RPFs";
+        let mut view: Vec<usize> = st
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(i, e)| {
+                let cat_ok = match self.category {
+                    Category::All => true,
+                    Category::Vehicles => e.kind == "VEH",
+                    Category::Models => e.kind == "VEH" || (!self.vehicles_only && e.kind == "MODEL"),
+                    Category::Videos => e.kind == "BK2",
+                    Category::Audio => e.kind == "AWC",
+                    Category::Xml => e.kind == "XML",
+                    Category::Resources => e.kind == "PSIN",
+                    Category::Binary => e.kind == "ZLIB",
+                };
+                let h = &self.hay[*i];
+                cat_ok
+                    && (all_rpf || e.rpf_name == self.selected_rpf)
+                    && inc.iter().all(|t| h.contains(t))
+                    && !exc.iter().any(|t| h.contains(t))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        drop(st);
+        // Smart ranking: names starting with the first term first, then shorter (closer) names.
+        if let Some(first) = inc.first() {
+            view.sort_by_key(|&i| (!self.hay[i].starts_with(first), self.hay[i].len()));
+        }
+        self.view = view;
+        self.view_key = Some(key);
+        self.last_rebuild = Instant::now();
+    }
+
     fn export_entries(&self, indices: &[usize]) {
-        let Some(out_dir) = rfd::FileDialog::new().set_directory(r"F:\Ext6").pick_folder() else { return };
+        let Some(out_dir) = rfd::FileDialog::new().pick_folder() else { return };
         let entries: Vec<RpfEntry> = {
             let st = self.state.lock().unwrap();
             indices.iter().filter_map(|&i| st.entries.get(i).cloned()).collect()
@@ -602,6 +690,39 @@ fn save_last_folder(folder: &PathBuf) {
         let dir = PathBuf::from(d).join("PercyStar");
         let _ = fs::create_dir_all(&dir);
         let _ = fs::write(dir.join("last_folder.txt"), folder.display().to_string());
+    }
+}
+
+fn ui_state_path() -> Option<PathBuf> {
+    std::env::var("LOCALAPPDATA").ok().map(|d| PathBuf::from(d).join("PercyStar").join("ui_state.txt"))
+}
+
+const CATS: [Category; 8] = [
+    Category::All, Category::Vehicles, Category::Models, Category::Videos,
+    Category::Audio, Category::Xml, Category::Resources, Category::Binary,
+];
+
+fn save_ui_state(app: &Rpf9App) {
+    let Some(p) = ui_state_path() else { return };
+    if let Some(d) = p.parent() {
+        let _ = fs::create_dir_all(d);
+    }
+    let cat = CATS.iter().position(|c| *c == app.category).unwrap_or(0);
+    let _ = fs::write(p, format!("{cat}\n{}\n{}\n{}", app.vehicles_only as u8, app.selected_rpf, app.filter));
+}
+
+fn load_ui_state(app: &mut Rpf9App) {
+    let Some(s) = ui_state_path().and_then(|p| fs::read_to_string(p).ok()) else { return };
+    let mut l = s.splitn(4, '\n');
+    if let Some(c) = l.next().and_then(|x| x.parse::<usize>().ok()).and_then(|i| CATS.get(i)) {
+        app.category = c.clone();
+    }
+    app.vehicles_only = l.next() == Some("1");
+    if let Some(r) = l.next().filter(|r| !r.is_empty()) {
+        app.selected_rpf = r.into();
+    }
+    if let Some(f) = l.next() {
+        app.filter = f.into();
     }
 }
 
@@ -650,7 +771,9 @@ fn save_disk_cache(map: &HashMap<String, Vec<RpfEntry>>) {
     if let Some(parent) = p.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let Ok(f) = File::create(p) else { return };
+    // Write to .tmp then rename: closing the app mid-save must never wipe the cache
+    let tmp = p.with_extension("tmp");
+    let Ok(f) = File::create(&tmp) else { return };
     let mut w = BufWriter::new(f);
     for (key, entries) in map {
         for e in entries {
@@ -662,6 +785,10 @@ fn save_disk_cache(map: &HashMap<String, Vec<RpfEntry>>) {
                 e.offset, e.comp_size, e.raw_size, e.fps, e.tracks, chunks_s
             );
         }
+    }
+    if w.flush().is_ok() {
+        drop(w);
+        let _ = fs::rename(&tmp, &p);
     }
 }
 
@@ -678,89 +805,6 @@ fn collect_rpfs(dir: &PathBuf, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn decode_bk2_for_player(e: &RpfEntry, media: &Arc<Mutex<MediaState>>) {
-    let tmp = std::env::temp_dir().join("rpf9_preview_bk2");
-    let _ = fs::remove_dir_all(&tmp);
-    let _ = fs::create_dir_all(&tmp);
-
-    let bk2_p = tmp.join("clip.bk2");
-    match read_entry_bytes(e) {
-        Ok(bytes) => {
-            if let Err(err) = fs::write(&bk2_p, &bytes) {
-                let mut m = media.lock().unwrap();
-                m.loading = false;
-                m.status = format!("Write error: {err}");
-                return;
-            }
-        }
-        Err(err) => {
-            let mut m = media.lock().unwrap();
-            m.loading = false;
-            m.status = format!("Read error: {err}");
-            return;
-        }
-    }
-
-    let rad = r"C:\Program Files (x86)\RADVideo\radvideo64.exe";
-    let frame_out = tmp.join("frame.bmp");
-    let _ = Command::new(rad)
-        .args(["BinkConv", bk2_p.to_str().unwrap(), frame_out.to_str().unwrap(), "/O", "/#"])
-        .status();
-
-    let wav_p = tmp.join("audio.wav");
-    if e.tracks > 0 {
-        let _ = Command::new(rad)
-            .args(["BinkConv", bk2_p.to_str().unwrap(), wav_p.to_str().unwrap(), "/NoVideo", "/O", "/#"])
-            .status();
-    }
-
-    let mut bmps: Vec<PathBuf> = fs::read_dir(&tmp)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|d| d.path())
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("bmp"))
-        .collect();
-    bmps.sort();
-
-    let slice = &bmps[..bmps.len().min(450)];
-    let mut frames_opt: Vec<Option<ColorImage>> = vec![None; slice.len()];
-    let chunks = (slice.len() + 3) / 4;
-    if chunks > 0 {
-        std::thread::scope(|s| {
-            for (t_idx, out_chunk) in frames_opt.chunks_mut(chunks).enumerate() {
-                let start = t_idx * chunks;
-                let paths = &slice[start..start + out_chunk.len()];
-                s.spawn(move || {
-                    for (j, p) in paths.iter().enumerate() {
-                        if let Ok(img) = image::open(p) {
-                            let rgba = img.to_rgba8();
-                            let size = [rgba.width() as usize, rgba.height() as usize];
-                            out_chunk[j] = Some(ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()));
-                        }
-                    }
-                });
-            }
-        });
-    }
-    let frames: Vec<ColorImage> = frames_opt.into_iter().flatten().collect();
-
-    let mut m = media.lock().unwrap();
-    m.loading = false;
-    let total_bmps = bmps.len();
-    m.frames = frames;
-    if wav_p.exists() && fs::metadata(&wav_p).map(|x| x.len() > 44).unwrap_or(false) {
-        m.wav_path = Some(wav_p);
-    }
-    m.status = if m.frames.is_empty() {
-        "Failed to decode .bk2 (check RAD Video Tools at C:\\Program Files (x86)\\RADVideo)".into()
-    } else if total_bmps > m.frames.len() {
-        format!("Loaded {}/{} frames @ {:.1} fps", m.frames.len(), total_bmps, m.fps)
-    } else {
-        format!("Loaded {} frames @ {:.1} fps", m.frames.len(), m.fps)
-    };
-}
-
 fn decode_awc_for_player(e: &RpfEntry, media: &Arc<Mutex<MediaState>>) {
     let tmp = std::env::temp_dir().join("rpf9_preview_awc");
     let _ = fs::remove_dir_all(&tmp);
@@ -771,9 +815,15 @@ fn decode_awc_for_player(e: &RpfEntry, media: &Arc<Mutex<MediaState>>) {
     }
     let awc_py = std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.join("awc_extract.py")))
-        .filter(|p| p.exists())
-        .unwrap_or_else(|| PathBuf::from(r"F:\Ext6\awc_extract.py"));
+        .and_then(|p| {
+            let d = p.parent()?;
+            let c1 = d.join("awc_extract.py");
+            if c1.exists() { return Some(c1); }
+            let c2 = d.join("scripts").join("awc_extract.py");
+            if c2.exists() { return Some(c2); }
+            None
+        })
+        .unwrap_or_else(|| PathBuf::from("scripts/awc_extract.py"));
     let _ = Command::new("python")
         .args([awc_py.to_str().unwrap(), tmp.to_str().unwrap(), tmp.to_str().unwrap()])
         .status();
@@ -1038,6 +1088,7 @@ fn scan_levels_vehicle_zone(levels_rpf: &PathBuf, live_state: Option<&Arc<Mutex<
                                 if let Some(st) = live_state {
                                     let mut g = st.lock().unwrap();
                                     g.entries.extend(local_batch.iter().cloned());
+                                    g.ver += 1;
                                 }
                                 all_entries.extend(local_batch.drain(..));
                             }
@@ -1060,7 +1111,9 @@ fn scan_levels_vehicle_zone(levels_rpf: &PathBuf, live_state: Option<&Arc<Mutex<
     }
     if !local_batch.is_empty() {
         if let Some(st) = live_state {
-            st.lock().unwrap().entries.extend(local_batch.iter().cloned());
+            let mut g = st.lock().unwrap();
+            g.entries.extend(local_batch.iter().cloned());
+            g.ver += 1;
         }
         all_entries.extend(local_batch);
     }
@@ -1329,16 +1382,12 @@ impl eframe::App for Rpf9App {
                 ui.label(RichText::new("RPF9").size(13.0).strong().color(Color32::from_rgb(255, 95, 185)));
                 ui.add_space(10.0);
                 if ui.button("Open Folder...").clicked() {
-                    if let Some(folder) = rfd::FileDialog::new()
-                        .set_directory(r"D:\Downloads\GTA6.Xbox.v1.0.2.1-CYBERLEEK")
-                        .pick_folder()
-                    {
+                    if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                         self.start_folder_scan(folder);
                     }
                 }
                 if ui.button("Open .RPF").clicked() {
                     if let Some(p) = rfd::FileDialog::new()
-                        .set_directory(r"D:\Downloads\GTA6.Xbox.v1.0.2.1-CYBERLEEK")
                         .add_filter("RPF Archives", &["rpf"])
                         .pick_file()
                     {
@@ -1372,7 +1421,13 @@ impl eframe::App for Rpf9App {
                             self.export_entries(&[i]);
                         }
                     }
-                    ui.add(egui::TextEdit::singleline(&mut self.filter).desired_width(190.0).hint_text("Search files..."));
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.filter).desired_width(250.0).hint_text("Search (Ctrl+F) · words AND · -exclude"));
+                    if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
+                        r.request_focus();
+                    }
+                    if r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        self.filter.clear();
+                    }
                 });
             });
         });
@@ -1392,22 +1447,20 @@ impl eframe::App for Rpf9App {
         });
 
         egui::SidePanel::left("tree").default_width(195.0).frame(egui::Frame::new().fill(Color32::from_rgb(16, 17, 21)).inner_margin(8.0)).show(ctx, |ui| {
-            let (entries_all, rpf_names) = {
-                let st = self.state.lock().unwrap();
-                (st.entries.clone(), st.rpf_names.clone())
-            };
-            let cnt = |k: &str| entries_all.iter().filter(|e| e.kind == k).count();
+            self.refresh_view();
+            let rpf_names = self.state.lock().unwrap().rpf_names.clone();
+            let c = self.counts;
             ui.label(RichText::new("ARCHIVE TREE").size(11.0).color(Color32::from_rgb(110, 118, 134)));
             ui.add_space(4.0);
             for (cat, label, count) in [
-                (Category::All, "All Files", entries_all.len()),
-                (Category::Vehicles, "Vehicles (.#ft)", cnt("VEH")),
-                (Category::Models, "3D Models (.#dr/.#ft)", cnt("MODEL") + cnt("VEH")),
-                (Category::Videos, "Videos (.bk2)", cnt("BK2")),
-                (Category::Audio, "Audio (.awc)", cnt("AWC")),
-                (Category::Xml, "Configs (.xml)", cnt("XML")),
-                (Category::Resources, "Resources (.psin)", cnt("PSIN")),
-                (Category::Binary, "Binary (.bin)", cnt("ZLIB")),
+                (Category::All, "All Files", c[0]),
+                (Category::Vehicles, "Vehicles (.#ft)", c[1]),
+                (Category::Models, "3D Models (.#dr/.#ft)", c[2] + c[1]),
+                (Category::Videos, "Videos (.bk2)", c[3]),
+                (Category::Audio, "Audio (.awc)", c[4]),
+                (Category::Xml, "Configs (.xml)", c[5]),
+                (Category::Resources, "Resources (.psin)", c[6]),
+                (Category::Binary, "Binary (.bin)", c[7]),
             ] {
                 if ui.selectable_label(self.category == cat, format!("{label} ({count})")).clicked() {
                     self.category = cat;
@@ -1445,35 +1498,17 @@ impl eframe::App for Rpf9App {
                 });
                 ui.add_space(4.0);
             }
-            let entries = self.state.lock().unwrap().entries.clone();
-            let q = self.filter.to_lowercase();
-            let filtered: Vec<(usize, RpfEntry)> = entries
-                .into_iter()
-                .enumerate()
-                .filter(|(_, e)| {
-                    let cat_ok = match self.category {
-                        Category::All => true,
-                        Category::Vehicles => e.kind == "VEH",
-                        Category::Models => {
-                            if self.vehicles_only {
-                                e.kind == "VEH"
-                            } else {
-                                e.kind == "MODEL" || e.kind == "VEH"
-                            }
-                        }
-                        Category::Videos => e.kind == "BK2",
-                        Category::Audio => e.kind == "AWC",
-                        Category::Xml => e.kind == "XML",
-                        Category::Resources => e.kind == "PSIN",
-                        Category::Binary => e.kind == "ZLIB",
-                    };
-                    let rpf_ok = self.selected_rpf == "All RPFs" || e.rpf_name == self.selected_rpf;
-                    cat_ok && rpf_ok && (q.is_empty() || e.name.to_lowercase().contains(&q) || e.rpf_name.to_lowercase().contains(&q))
-                })
-                .collect();
-
-            egui::ScrollArea::vertical().show_rows(ui, 24.0, filtered.len(), |ui, range| {
-                for &(idx, ref e) in &filtered[range] {
+            self.refresh_view();
+            ui.label(RichText::new(format!("{} results", self.view.len())).size(11.0).color(Color32::from_rgb(110, 118, 134)));
+            let mut clicked = None;
+            egui::ScrollArea::vertical().show_rows(ui, 24.0, self.view.len(), |ui, range| {
+                // Only the visible rows are cloned out of the shared state
+                let rows: Vec<(usize, RpfEntry)> = {
+                    let st = self.state.lock().unwrap();
+                    self.view[range].iter().filter_map(|&i| st.entries.get(i).map(|e| (i, e.clone()))).collect()
+                };
+                for (idx, e) in &rows {
+                    let idx = *idx;
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(format!("{:<4}", e.kind)).strong().size(11.5).color(kind_color(e.kind)));
                         let sz_s = format_size(e.raw_size);
@@ -1483,11 +1518,14 @@ impl eframe::App for Rpf9App {
                             format!("{}  ({})", e.name, sz_s)
                         };
                         if ui.selectable_label(self.selected == Some(idx), RichText::new(label).size(12.5)).clicked() {
-                            self.select_entry(idx);
+                            clicked = Some(idx);
                         }
                     });
                 }
             });
+            if let Some(i) = clicked {
+                self.select_entry(i);
+            }
         });
 
         egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::from_rgb(13, 14, 17)).inner_margin(12.0)).show(ctx, |ui| {
@@ -1656,10 +1694,50 @@ fn batch_extract_vehicles(levels_rpf: &PathBuf, out_dir: &PathBuf) {
     eprintln!("DONE: Exported {ok_cnt}/{} vehicles to {}", list.len(), out_dir.display());
 }
 
+fn batch_extract_models(rpf_path: &PathBuf, out_dir: &PathBuf, filter: &str) {
+    let _ = fs::create_dir_all(out_dir);
+    let q = filter.to_ascii_lowercase();
+    eprintln!("Scanning {} for models (filter={:?})...", rpf_path.display(), filter);
+    let Ok((_, entries)) = scan_single_rpf(rpf_path, None) else {
+        eprintln!("Failed to scan {}", rpf_path.display());
+        return;
+    };
+    let mut best: HashMap<String, (u64, String)> = HashMap::new();
+    for e in entries {
+        if e.kind != "MODEL" && e.kind != "VEH" { continue; }
+        let lo = e.name.to_ascii_lowercase();
+        if !q.is_empty() && !q.split(',').any(|tok| !tok.is_empty() && lo.contains(tok)) {
+            continue;
+        }
+        best.entry(lo).or_insert((e.offset, e.name));
+    }
+    let mut list: Vec<(String, u64, String)> = best.into_iter().map(|(k, (o, n))| (k, o, n)).collect();
+    list.sort_by(|a, b| a.0.cmp(&b.0));
+    eprintln!("Found {} matching models! Exporting .OBJs...", list.len());
+    let mut ok = 0usize;
+    for (idx, (_, off, name)) in list.iter().enumerate() {
+        if let Ok(mesh) = decode_rage9_model_from_rpf(rpf_path, *off, name) {
+            let safe = name.replace('#', "").replace('.', "_");
+            if mesh.export_obj(&out_dir.join(format!("{safe}.obj"))).is_ok() {
+                ok += 1;
+                if ok <= 25 || ok % 50 == 0 {
+                    eprintln!("  [{}/{}] {} ({} v, {} f)", idx + 1, list.len(), name, mesh.verts.len(), mesh.tris.len());
+                }
+            }
+        }
+    }
+    eprintln!("DONE: Exported {ok}/{} models to {}", list.len(), out_dir.display());
+}
+
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 4 && args[1] == "--extract-vehicles" {
         batch_extract_vehicles(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]));
+        return Ok(());
+    }
+    if args.len() >= 4 && args[1] == "--extract-models" {
+        let filt = args.get(4).map(|s| s.as_str()).unwrap_or("");
+        batch_extract_models(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), filt);
         return Ok(());
     }
     let mut vb = egui::ViewportBuilder::default().with_inner_size([1320.0, 800.0]);

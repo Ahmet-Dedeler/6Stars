@@ -2,5 +2,8 @@
 **/*.rs.bk
 *.exe
 *.pdb
+*.obj
+*.zip
+*.tsv
 __pycache__/
 *.pyc
