@@ -642,6 +642,10 @@ struct Rpf9App {
     mv_view: Vec<usize>,
     mv_view_key: Option<(u64, ModelCat, String, bool)>,
     mv_rng: u64,
+    // list ordering shared by Explorer + Model Viewer; *_sort = order the cached view was built with
+    sort_mode: SortMode,
+    view_sort: SortMode,
+    mv_sort: SortMode,
     // dedicated RDNA2 (GFX10.3) PS\x00\x09 Shader Disassembler & HLSL/SPIR-V Lifter tab
     sh_cache: Option<Ps09Cache>,
     sh_status: String,
@@ -703,6 +707,9 @@ impl Rpf9App {
             mv_ver: u64::MAX,
             mv_view: Vec::new(),
             mv_view_key: None,
+            sort_mode: SortMode::Relevance,
+            view_sort: SortMode::Relevance,
+            mv_sort: SortMode::Relevance,
             mv_rng: 0x9E37_79B9_7F4A_7C15,
             sh_cache: None,
             sh_status: String::new(),
@@ -1243,6 +1250,9 @@ impl Rpf9App {
     fn refresh_view(&mut self) {
         let ver = self.state.lock().unwrap().ver;
         let key = (ver, self.filter.clone(), self.category.clone(), self.selected_rpf.clone(), self.vehicles_only);
+        if self.view_sort != self.sort_mode {
+            self.view_key = None;
+        }
         if let Some(old) = &self.view_key {
             if *old == key { return; }
             let only_ver = old.1 == key.1 && old.2 == key.2 && old.3 == key.3 && old.4 == key.4;
@@ -1310,11 +1320,19 @@ impl Rpf9App {
             })
             .map(|(i, _)| i)
             .collect();
-        drop(st);
-        if let Some(first) = inc.first() {
-            view.sort_by_key(|&i| (!self.hay[i].starts_with(first), self.hay[i].len()));
+        match self.sort_mode {
+            SortMode::Relevance => {
+                if let Some(first) = inc.first() {
+                    view.sort_by_key(|&i| (!self.hay[i].starts_with(first), self.hay[i].len()));
+                }
+            }
+            SortMode::SizeDesc => view.sort_by_key(|&i| std::cmp::Reverse(st.entries[i].raw_size)),
+            SortMode::SizeAsc => view.sort_by_key(|&i| st.entries[i].raw_size),
+            SortMode::Name => view.sort_by(|&a, &b| self.hay[a].cmp(&self.hay[b])),
         }
+        drop(st);
         self.view = view;
+        self.view_sort = self.sort_mode;
         self.view_key = Some(key);
         self.last_rebuild = Instant::now();
     }
@@ -1368,6 +1386,9 @@ impl Rpf9App {
             self.mv_view_key = None;
         }
         let key = (ver, self.mv_cat, self.mv_filter.clone(), self.mv_hide_lods);
+        if self.mv_sort != self.sort_mode {
+            self.mv_view_key = None;
+        }
         if self.mv_view_key.as_ref() == Some(&key) {
             return;
         }
@@ -1401,10 +1422,22 @@ impl Rpf9App {
             })
             .map(|(i, _)| i)
             .collect();
-        if let Some(first) = inc.first() {
-            view.sort_by_key(|&i| (!self.mv_entries[i].2.starts_with(first), self.mv_entries[i].2.len()));
+        {
+            let st = self.state.lock().unwrap();
+            let size = |mi: usize| st.entries.get(self.mv_entries[mi].0).map_or(0, |e| e.raw_size);
+            match self.sort_mode {
+                SortMode::Relevance => {
+                    if let Some(first) = inc.first() {
+                        view.sort_by_key(|&i| (!self.mv_entries[i].2.starts_with(first), self.mv_entries[i].2.len()));
+                    }
+                }
+                SortMode::SizeDesc => view.sort_by_key(|&i| std::cmp::Reverse(size(i))),
+                SortMode::SizeAsc => view.sort_by_key(|&i| size(i)),
+                SortMode::Name => view.sort_by(|&a, &b| self.mv_entries[a].2.cmp(&self.mv_entries[b].2)),
+            }
         }
         self.mv_view = view;
+        self.mv_sort = self.sort_mode;
         self.mv_view_key = Some(key);
     }
 
@@ -1525,6 +1558,7 @@ impl Rpf9App {
                     if ui.add(lod_btn).clicked() {
                         self.mv_hide_lods = !self.mv_hide_lods;
                     }
+                    sort_combo(ui, "mv_sort_combo", &mut self.sort_mode);
                     let has_any = !self.mv_view.is_empty();
                     if ui.add_enabled(has_any, egui::Button::new("◀ Prev")).clicked() {
                         let next_i = match cur_pos {
@@ -1572,23 +1606,23 @@ impl Rpf9App {
                     .id_salt("mv_list_scroll")
                     .auto_shrink([false, false])
                     .show_rows(ui, ROW_H, self.mv_view.len(), |ui, range| {
-                        let rows: Vec<(usize, ModelCat, String, String)> = {
+                        let rows: Vec<(usize, ModelCat, String, String, u64)> = {
                             let st = self.state.lock().unwrap();
                             self.mv_view[range]
                                 .iter()
                                 .filter_map(|&mi| {
                                     let (eidx, cat, _) = &self.mv_entries[mi];
-                                    st.entries.get(*eidx).map(|e| (*eidx, *cat, e.name.clone(), e.rpf_name.clone()))
+                                    st.entries.get(*eidx).map(|e| (*eidx, *cat, e.name.clone(), e.rpf_name.clone(), e.raw_size))
                                 })
                                 .collect()
                         };
-                        for (eidx, cat, name, rpf_name) in rows {
+                        for (eidx, cat, name, rpf_name, raw_size) in rows {
                             let w = ui.available_width();
                             let (tag, col) = model_cat_tag(cat);
                             ui.allocate_ui_with_layout(egui::vec2(w, ROW_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                 ui.set_height(ROW_H);
                                 ui.label(RichText::new(tag).strong().size(10.5).color(col));
-                                let label = format!("{name}  ·  {rpf_name}");
+                                let label = format!("{name}  ·  {rpf_name}  ·  {}", format_size(raw_size));
                                 if ui.selectable_label(self.selected == Some(eidx), RichText::new(label).size(12.0)).clicked() {
                                     to_select = Some(eidx);
                                 }
@@ -2298,6 +2332,40 @@ fn parse_psin(data: &[u8]) -> String {
     out
 }
 
+/// Result-list ordering. `Relevance` = scan order, or best name match first while searching.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SortMode {
+    Relevance,
+    SizeDesc,
+    SizeAsc,
+    Name,
+}
+
+impl SortMode {
+    const ALL: [SortMode; 4] = [SortMode::Relevance, SortMode::SizeDesc, SortMode::SizeAsc, SortMode::Name];
+
+    fn label(self) -> &'static str {
+        match self {
+            SortMode::Relevance => "Relevance",
+            SortMode::SizeDesc => "Size: largest first",
+            SortMode::SizeAsc => "Size: smallest first",
+            SortMode::Name => "Name (A-Z)",
+        }
+    }
+}
+
+/// Compact "Sort:" dropdown; lists pick up the change on their next refresh.
+fn sort_combo(ui: &mut egui::Ui, id: &str, mode: &mut SortMode) {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(RichText::new(format!("Sort: {}", mode.label())).size(11.0))
+        .width(170.0)
+        .show_ui(ui, |ui| {
+            for m in SortMode::ALL {
+                ui.selectable_value(mode, m, m.label());
+            }
+        });
+}
+
 fn format_size(bytes: u64) -> String {
     let b = bytes as f64;
     if b >= 1_073_741_824.0 {
@@ -2937,7 +3005,12 @@ impl eframe::App for Rpf9App {
                 ui.add_space(4.0);
             }
             self.refresh_view();
-            ui.label(RichText::new(format!("{} results", self.view.len())).size(11.0).color(Color32::from_rgb(110, 118, 134)));
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("{} results", self.view.len())).size(11.0).color(Color32::from_rgb(110, 118, 134)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    sort_combo(ui, "explorer_sort_combo", &mut self.sort_mode);
+                });
+            });
             let mut clicked = None;
             // Rows MUST be exactly ROW_H tall or show_rows miscomputes the total height (blank space / jumpy scroll)
             const ROW_H: f32 = 20.0;
