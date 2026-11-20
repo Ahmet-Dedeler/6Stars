@@ -1,7 +1,12 @@
+mod audio_player;
 mod awc;
+#[cfg(target_os = "macos")]
+mod bink_embed;
 mod model3d;
 mod rdna2;
 mod tex;
+#[cfg(test)]
+mod audit_tests;
 use model3d::{
     Mesh3D, decode_rage9_model_from_rpf, extract_0drpz_mesh, extract_rage9_model_name,
     has_rage9_meshlets, is_vehicle_virtual, is_zlib_head, parse_obj,
@@ -12,7 +17,7 @@ use rdna2::{
     lift_to_spirv,
 };
 use tex::{
-    DecodedTexture, build_dds_dx10, decode_0drpz_text, decode_navmesh_from_rpf, decode_rbf0,
+    DecodedTexture, build_dds_dx10, decode_0drpz_text, decode_0drpz_text_min, decode_navmesh_from_rpf, decode_rbf0,
     decode_ttpf_texture, decode_txd_from_rpf, export_texture_png, inspect_gfx, probe_txd_header,
     scan_ttpf_descriptors,
 };
@@ -103,6 +108,9 @@ pub fn find_binkplay() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(r"C:\Program Files (x86)\RADVideo\binkplay.exe"))
 }
 
+/// Extra player args after the clip path: borderless D3D11 window that gets docked into the preview panel.
+pub fn binkplay_args() -> &'static [&'static str] { &["/NoBorder", "/DrawD3D11", "/L", "/W640", "/H360"] }
+
 pub fn play_wav_async(path: &Path) {
     let mut wide: Vec<u16> = path.to_string_lossy().encode_utf16().collect();
     wide.push(0);
@@ -136,13 +144,22 @@ pub fn dock_child_hwnd(_c: isize, _p: isize, _x: i32, _y: i32, _w: i32, _h: i32)
 pub fn active_window() -> isize { 0 }
 pub fn move_window(_hwnd: isize, _x: i32, _y: i32, _w: i32, _h: i32) {}
 
+// order: binkplay beside our exe, then Bink Player.app (github.com/Ahmet-Dedeler/bink-player-mac),
+// then whatever "binkplay" resolves to on PATH. The .app launcher execs into the real player
+// under the same pid, so Stop (kill on that pid) still works.
 pub fn find_binkplay() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("binkplay")))
-        .filter(|p| p.exists())
+    let beside = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("binkplay")));
+    let home_apps = std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Applications/Bink Player.app/Contents/MacOS/BinkPlayerLauncher"));
+    beside
+        .into_iter()
+        .chain(std::iter::once(PathBuf::from("/Applications/Bink Player.app/Contents/MacOS/BinkPlayerLauncher")))
+        .chain(home_apps)
+        .find(|p| p.exists())
         .unwrap_or_else(|| PathBuf::from("binkplay"))
 }
+
+/// Extra player args after the clip path (Windows binkplay takes D3D11/window flags; Mac player takes none).
+pub fn binkplay_args() -> &'static [&'static str] { &[] }
 
 pub fn play_wav_async(path: &Path) {
     stop_wav();
@@ -159,7 +176,7 @@ pub fn stop_wav() {
     }
 }
 }
-use plat::{active_window, dock_child_hwnd, find_binkplay, find_hwnd_for_pid, move_window, play_wav_async, stop_wav};
+use plat::{active_window, binkplay_args, dock_child_hwnd, find_binkplay, find_hwnd_for_pid, move_window, play_wav_async, stop_wav};
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum AppTab {
@@ -612,6 +629,15 @@ struct Rpf9App {
     logo_tex: Option<TextureHandle>,
     watch_gen: Arc<Mutex<u64>>,
     bink_proc: Option<Child>,
+    // in-panel player for the selected AWC's decoded streams
+    audio: Option<audio_player::AudioPlayer>,
+    // macOS: BK2 decoded by Bink Player.app in embed mode and drawn in the preview panel
+    #[cfg(target_os = "macos")]
+    bink_embed: Option<bink_embed::BinkEmbed>,
+    #[cfg(target_os = "macos")]
+    bink_volume: f32,
+    #[cfg(target_os = "macos")]
+    bink_loop: bool,
     parent_hwnd: isize,
     last_dock_rect: [i32; 4],
     clip_seq: u64,
@@ -680,6 +706,13 @@ impl Rpf9App {
             logo_tex,
             watch_gen: Arc::new(Mutex::new(0)),
             bink_proc: None,
+            audio: None,
+            #[cfg(target_os = "macos")]
+            bink_embed: None,
+            #[cfg(target_os = "macos")]
+            bink_volume: 0.8,
+            #[cfg(target_os = "macos")]
+            bink_loop: true,
             parent_hwnd: 0,
             last_dock_rect: [0; 4],
             clip_seq: 0,
@@ -730,6 +763,10 @@ impl Rpf9App {
     }
 
     fn stop_bink_player(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            self.bink_embed = None; // Drop quits the player and removes its frame file
+        }
         if let Some(mut c) = self.bink_proc.take() {
             let _ = c.kill();
             let _ = c.wait();
@@ -751,6 +788,7 @@ impl Rpf9App {
         self.tex_handle = None;
         self.tex_zoom = 1.0;
         stop_wav();
+        self.audio = None;
         self.stop_bink_player();
         let mut m = self.media.lock().unwrap();
         m.awc_streams.clear();
@@ -1189,8 +1227,19 @@ impl Rpf9App {
                     return;
                 }
             }
+            #[cfg(target_os = "macos")]
+            if bink_embed::available() {
+                match bink_embed::BinkEmbed::spawn(&bk2_p, &e.name, self.bink_volume, self.bink_loop) {
+                    Ok(be) => {
+                        self.bink_embed = Some(be);
+                        return;
+                    }
+                    Err(err) => self.media.lock().unwrap().status = format!("In-panel playback failed ({err}), opening Bink Player"),
+                }
+            }
             match Command::new(find_binkplay())
-                .args([bk2_p.to_str().unwrap(), "/NoBorder", "/DrawD3D11", "/L", "/W640", "/H360"])
+                .arg(&bk2_p)
+                .args(binkplay_args())
                 .spawn()
             {
                 Ok(child) => {
@@ -1199,10 +1248,10 @@ impl Rpf9App {
                     let mut m = self.media.lock().unwrap();
                     m.bink_child_pid = Some(pid);
                     m.bink_clip = Some(bk2_p);
-                    m.status = format!("Playing {} (D3D11 BinkPlay)", e.name);
+                    m.status = format!("Playing {} (Bink player)", e.name);
                 }
                 Err(err) => {
-                    self.media.lock().unwrap().status = format!("binkplay.exe error: {err}");
+                    self.media.lock().unwrap().status = format!("Bink player not found ({err}). Windows: binkplay.exe beside PercyStar. Mac: install Bink Player.app");
                 }
             }
         } else if e.kind == "AWC" {
@@ -1227,7 +1276,7 @@ impl Rpf9App {
                     } else if e.kind == "GFX" {
                         self.preview = inspect_gfx(&data);
                     } else if e.kind == "GXT" {
-                        self.preview = decode_0drpz_text(&data).unwrap_or_else(|| format_hex(&data[..data.len().min(2048)]));
+                        self.preview = decode_0drpz_text_min(&data, 1).unwrap_or_else(|| format_hex(&data[..data.len().min(2048)]));
                     } else if is_text {
                         self.preview = String::from_utf8_lossy(&data[..data.len().min(250_000)]).into_owned();
                     } else {
@@ -2115,8 +2164,11 @@ fn load_ui_state(app: &mut Rpf9App) {
 }
 
 fn load_disk_cache() -> HashMap<String, Vec<RpfEntry>> {
+    cache_file_path().map(|p| load_disk_cache_from(&p)).unwrap_or_default()
+}
+
+fn load_disk_cache_from(p: &Path) -> HashMap<String, Vec<RpfEntry>> {
     let mut map: HashMap<String, Vec<RpfEntry>> = HashMap::new();
-    let Some(p) = cache_file_path() else { return map };
     let Ok(f) = File::open(p) else { return map };
     for line in BufReader::new(f).lines().flatten() {
         let cols: Vec<&str> = line.split('\t').collect();
@@ -2768,7 +2820,13 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
                             z_idx += 1;
                             let trimmed = stitch_head.iter().position(|&b| !matches!(b, 0xef | 0xbb | 0xbf | b' ' | b'\t' | b'\r' | b'\n')).unwrap_or(0);
                             let head = &stitch_head[trimmed..stitch_head.len().min(trimmed + 32)];
-                            let (kind, name) = if head.starts_with(b"<?xml") || head.starts_with(b"<") {
+                            // real markup: '<' then a tag/decl char, and no control bytes (binary blobs
+                            // starting with 0x3C used to be listed as XML)
+                            let looks_xml = head.len() >= 2
+                                && head[0] == b'<'
+                                && (head[1].is_ascii_alphabetic() || matches!(head[1], b'?' | b'!' | b'_'))
+                                && head.iter().all(|&b| b >= 0x20 || matches!(b, b'\t' | b'\r' | b'\n'));
+                            let (kind, name) = if looks_xml {
                                 let tag = extract_xml_tag(&stitch_head[trimmed..]).unwrap_or_else(|| "config".into());
                                 ("XML", format!("{z_idx:04}_{tag}.xml"))
                             } else if stitch_head.starts_with(b"RBF0") {
@@ -3052,7 +3110,19 @@ impl eframe::App for Rpf9App {
                 (m.bink_child_pid, m.bink_hwnd, m.bink_clip.clone())
             };
 
-            if let Some(pid) = bink_pid {
+            #[allow(unused_mut)]
+            let mut embedded = false;
+            #[cfg(target_os = "macos")]
+            if let Some(be) = self.bink_embed.as_mut() {
+                embedded = true;
+                if be.ui(ui, &mut self.bink_volume, &mut self.bink_loop) {
+                    let clip = be.clip.clone();
+                    self.bink_embed = None;
+                    let _ = Command::new(find_binkplay()).arg(&clip).spawn();
+                }
+            }
+            if embedded {
+            } else if let Some(pid) = bink_pid {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(&media_status).strong().color(Color32::from_rgb(252, 175, 23)));
                     if ui.button("Stop").clicked() {
@@ -3090,18 +3160,12 @@ impl eframe::App for Rpf9App {
                     ui.label(RichText::new(&media_status).color(Color32::from_rgb(252, 175, 23)));
                 });
             } else if !awc_streams.is_empty() {
-                ui.label(RichText::new(&media_status).strong().color(Color32::WHITE));
-                ui.add_space(8.0);
-                if ui.button("Stop Audio").clicked() { stop_wav(); }
-                ui.separator();
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for (idx, wp) in &awc_streams {
-                        ui.horizontal(|ui| {
-                            if ui.button("Play").clicked() { play_wav_async(wp); }
-                            ui.label(format!("Stream #{idx}: {}", wp.file_name().unwrap_or_default().to_string_lossy()));
-                        });
-                    }
-                });
+                if !self.audio.as_ref().is_some_and(|a| a.matches(&awc_streams)) {
+                    self.audio = Some(audio_player::AudioPlayer::new(&awc_streams));
+                }
+                if let Some(a) = self.audio.as_mut() {
+                    a.ui(ui, &media_status);
+                }
             } else if !media_status.is_empty() {
                 ui.label(RichText::new(&media_status).color(Color32::from_rgb(255, 140, 120)));
             } else if !self.textures.is_empty() {

@@ -1279,6 +1279,13 @@ pub fn probe_gxt_snippet(head: &[u8]) -> Option<String> {
 /// Extract clean readable UTF-8 strings from a GTA VI RAGE9 `0DRPz` localization/text table
 /// (or standalone null-terminated string pool chunk in `data.rpf`).
 pub fn decode_0drpz_text(data: &[u8]) -> Option<String> {
+    decode_0drpz_text_min(data, 3)
+}
+
+/// Like [`decode_0drpz_text`] but accepts tables with as few as `min_lines` strings. Use 1 for
+/// entries already known to be text tables (GXT); keep 3 when probing arbitrary binaries so
+/// stray byte runs don't pass as text.
+pub fn decode_0drpz_text_min(data: &[u8], min_lines: usize) -> Option<String> {
     let start = if data.len() >= 0x60 && &data[0x10..0x15] == b"0DRPz" { 0x60 } else { 0 };
     let end = if start == 0x60 {
         let bmap = ru64(data, 8);
@@ -1307,7 +1314,7 @@ pub fn decode_0drpz_text(data: &[u8]) -> Option<String> {
             if lines.len() >= 6000 { break; }
         }
     }
-    if lines.len() < 3 {
+    if lines.len() < min_lines.max(1) {
         return None;
     }
     let header = format!("=== GTA VI RAGE9 Text Table ({} strings) ===\n\n", lines.len());
