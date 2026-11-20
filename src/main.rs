@@ -1,5 +1,5 @@
 mod model3d;
-use model3d::{Mesh3D, decode_rage9_model_from_rpf, extract_0drpz_mesh, extract_rage9_model_name, is_vehicle_virtual, parse_obj, probe_large_rage9_model, render_mesh3d_viewport};
+use model3d::{Mesh3D, decode_rage9_model_from_rpf, extract_0drpz_mesh, extract_rage9_model_name, is_vehicle_virtual, parse_obj, probe_large_rage9_model_in_buf, render_mesh3d_viewport};
 use eframe::egui::{self, Color32, ColorImage, CornerRadius, FontData, FontDefinitions, FontFamily, RichText, Stroke, TextureHandle, TextureOptions};
 use flate2::{Decompress, FlushDecompress, Status};
 use std::collections::HashMap;
@@ -229,6 +229,9 @@ impl Rpf9App {
         }
         let state = Arc::clone(&self.state);
         std::thread::spawn(move || {
+            if path.file_name().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("levels.rpf")).unwrap_or(false) {
+                let _ = scan_levels_vehicle_zone(&path, Some(&state));
+            }
             match scan_single_rpf(&path, Some(&state)) {
                 Ok((hdr, mut entries)) => {
                     let mut st = state.lock().unwrap();
@@ -284,6 +287,44 @@ impl Rpf9App {
                 }
                 let mut rpfs = Vec::new();
                 collect_rpfs(&folder, &mut rpfs);
+                // Fast-path: scan levels.rpf vehicle zone (71.71GB..EOF) FIRST so searching "itali" / vehicles works within seconds!
+                if let Some(levels_p) = rpfs.iter().find(|p| {
+                    p.file_name().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("levels.rpf")).unwrap_or(false)
+                }).cloned() {
+                    if let Ok(meta) = fs::metadata(&levels_p) {
+                        if meta.len() > 0x10b2_0000_00 {
+                            let mtime_s = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+                            let vkey = format!("VEHZONE|{}|{}|{}", levels_p.display(), meta.len(), mtime_s);
+                            let already_loaded = state.lock().unwrap().entries.iter().any(|e| e.kind == "VEH" && e.source_rpf == levels_p);
+                            if !already_loaded {
+                                if let Some(cached_vehs) = disk_cache.get(&vkey) {
+                                    let mut st = state.lock().unwrap();
+                                    st.entries.extend(cached_vehs.iter().cloned());
+                                    if !st.rpf_names.contains(&"levels.rpf".to_string()) {
+                                        st.rpf_names.push("levels.rpf".into());
+                                        st.rpf_names.sort();
+                                    }
+                                    st.status = format!("Loaded {} cached GTA 6 vehicles!", cached_vehs.len());
+                                } else {
+                                    state.lock().unwrap().status = "Fast-indexing GTA 6 Vehicles (levels.rpf)...".into();
+                                    let veh_entries = scan_levels_vehicle_zone(&levels_p, Some(&state));
+                                    if !veh_entries.is_empty() {
+                                        {
+                                            let mut st = state.lock().unwrap();
+                                            if !st.rpf_names.contains(&"levels.rpf".to_string()) {
+                                                st.rpf_names.push("levels.rpf".into());
+                                                st.rpf_names.sort();
+                                            }
+                                            st.status = format!("Indexed {} vehicle/mod models from levels.rpf!", veh_entries.len());
+                                        }
+                                        disk_cache.insert(vkey, veh_entries);
+                                        save_disk_cache(&disk_cache);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 // Smallest RPFs first so XMLs/scripts/minigame audio appear in <2s
                 rpfs.sort_by_key(|p| fs::metadata(p).map(|m| m.len()).unwrap_or(u64::MAX));
 
@@ -298,7 +339,8 @@ impl Rpf9App {
                             if st.file_sig.get(p) != Some(&sig) {
                                 let key = format!("{}|{}|{}", p.display(), meta.len(), mtime_s);
                                 if let Some(cached_entries) = disk_cache.get(&key) {
-                                    st.entries.retain(|e| &e.source_rpf != p);
+                                    let is_levels = p.file_name().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("levels.rpf")).unwrap_or(false);
+                                    st.entries.retain(|e| &e.source_rpf != p || (is_levels && e.offset >= 0x10b2_0000_00));
                                     st.entries.extend(cached_entries.iter().cloned());
                                     st.file_sig.insert(p.clone(), sig);
                                     let rname = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
@@ -349,7 +391,9 @@ impl Rpf9App {
                                 if let Ok((_, new_entries)) = scan_single_rpf(p, None) {
                                     {
                                         let mut st = state.lock().unwrap();
-                                        st.entries.retain(|e| &e.source_rpf != p);
+                                        // Keep vehicle-zone entries from levels.rpf intact when refreshing base levels.rpf
+                                        let is_levels = rname.eq_ignore_ascii_case("levels.rpf");
+                                        st.entries.retain(|e| &e.source_rpf != p || (is_levels && e.offset >= 0x10b2_0000_00));
                                         st.entries.extend(new_entries.iter().cloned());
                                         st.file_sig.insert(p.clone(), *sig);
                                         if !st.rpf_names.contains(&rname) {
@@ -543,7 +587,7 @@ impl Rpf9App {
 }
 
 fn cache_file_path() -> Option<PathBuf> {
-    std::env::var("LOCALAPPDATA").ok().map(|d| PathBuf::from(d).join("PercyStar").join("scan_cache_v2.tsv"))
+    std::env::var("LOCALAPPDATA").ok().map(|d| PathBuf::from(d).join("PercyStar").join("scan_cache_v3.tsv"))
 }
 
 fn load_last_folder() -> Option<PathBuf> {
@@ -931,6 +975,99 @@ fn extract_xml_tag(bytes: &[u8]) -> Option<String> {
     None
 }
 
+fn scan_levels_vehicle_zone(levels_rpf: &PathBuf, live_state: Option<&Arc<Mutex<ScanState>>>) -> Vec<RpfEntry> {
+    let sz = fs::metadata(levels_rpf).map(|m| m.len()).unwrap_or(0);
+    let start_off: u64 = 0x10b2_0000_00u64.min(sz);
+    let total_len = sz.saturating_sub(start_off);
+    if total_len == 0 { return Vec::new(); }
+    let rname = levels_rpf.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let n_threads = 4u64;
+    let slice_len = ((total_len / n_threads) + 0xfff) & !0xfff;
+    let all_entries: Arc<Mutex<Vec<RpfEntry>>> = Arc::new(Mutex::new(Vec::new()));
+
+    std::thread::scope(|s| {
+        for t in 0..n_threads {
+            let s0 = start_off + t * slice_len;
+            let s1 = (s0 + slice_len).min(sz);
+            let all_entries = Arc::clone(&all_entries);
+            let rname = rname.clone();
+            s.spawn(move || {
+                let Ok(mut f) = File::open(levels_rpf) else { return };
+                let mut buf = vec![0u8; 4 * 1024 * 1024];
+                let mut probe_dec = Decompress::new(true);
+                let mut probe_out = vec![0u8; 32768];
+                let mut local_batch: Vec<RpfEntry> = Vec::with_capacity(32);
+                let mut off = s0;
+                while off < s1 {
+                    if f.seek(SeekFrom::Start(off)).is_err() { break; }
+                    let to_read = (buf.len() as u64).min(s1 - off) as usize;
+                    let Ok(n) = f.read(&mut buf[..to_read]) else { break };
+                    if n == 0 { break; }
+                    let mut pos = 0usize;
+                    while pos + 44 <= n {
+                        let h0 = u64::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3], buf[pos+4], buf[pos+5], buf[pos+6], buf[pos+7]]);
+                        let h1 = u64::from_le_bytes([buf[pos+8], buf[pos+9], buf[pos+10], buf[pos+11], buf[pos+12], buf[pos+13], buf[pos+14], buf[pos+15]]);
+                        if h0 == 0 && h1 == 0 && buf[pos + 0x10] == 0x78 && matches!(buf[pos + 0x11], 0x9c | 0xda) && (buf[pos + 0x12] & 0x06) != 0x06 {
+                            let p = pos + 0x10;
+                            let end = (p + 32768).min(n);
+                            probe_dec.reset(true);
+                            let _ = probe_dec.decompress(&buf[p..end], &mut probe_out, FlushDecompress::None);
+                            let olen = probe_dec.total_out() as usize;
+                            if olen >= 0x80 {
+                                let vft = u64::from_le_bytes([probe_out[0], probe_out[1], probe_out[2], probe_out[3], probe_out[4], probe_out[5], probe_out[6], probe_out[7]]);
+                                let bmap = u64::from_le_bytes([probe_out[8], probe_out[9], probe_out[10], probe_out[11], probe_out[12], probe_out[13], probe_out[14], probe_out[15]]);
+                                if vft == 0 && (0x5000_0000..0x5800_0000).contains(&bmap) && &probe_out[0x10..0x15] != b"0DRPz" {
+                                    let model_hit = if let Some((mname, _)) = extract_rage9_model_name(&probe_out[..olen]) {
+                                        let is_veh = is_vehicle_virtual(&probe_out[..olen], &mname);
+                                        Some((mname, is_veh, olen))
+                                    } else if olen >= 32768 && (bmap - 0x5000_0000) >= 32768 {
+                                        probe_large_rage9_model_in_buf(&buf[p..n], levels_rpf, off + p as u64)
+                                    } else {
+                                        None
+                                    };
+                                    if let Some((mname, is_veh, vlen)) = model_hit {
+                                        let kind = if is_veh { "VEH" } else { "MODEL" };
+                                        local_batch.push(RpfEntry {
+                                            source_rpf: levels_rpf.clone(),
+                                            rpf_name: rname.clone(),
+                                            name: mname,
+                                            kind,
+                                            offset: off + p as u64,
+                                            comp_size: probe_dec.total_in(),
+                                            raw_size: vlen as u64,
+                                            fps: 0.0,
+                                            tracks: 0,
+                                            chunks: Vec::new(),
+                                        });
+                                        if local_batch.len() >= 25 {
+                                            if let Some(st) = live_state {
+                                                let mut g = st.lock().unwrap();
+                                                g.entries.extend(local_batch.iter().cloned());
+                                                let vcnt = g.entries.iter().filter(|e| e.kind == "VEH").count();
+                                                g.status = format!("Fast-indexing GTA 6 Vehicles... ({vcnt} vehicles found)");
+                                            }
+                                            all_entries.lock().unwrap().extend(local_batch.drain(..));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        pos += 0x1000;
+                    }
+                    off += n as u64;
+                }
+                if !local_batch.is_empty() {
+                    if let Some(st) = live_state {
+                        st.lock().unwrap().entries.extend(local_batch.iter().cloned());
+                    }
+                    all_entries.lock().unwrap().extend(local_batch);
+                }
+            });
+        }
+    });
+    Arc::try_unwrap(all_entries).unwrap().into_inner().unwrap()
+}
+
 fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>>) -> std::io::Result<(String, Vec<RpfEntry>)> {
     let mut f = File::open(path)?;
     let sz = f.metadata()?.len();
@@ -953,7 +1090,12 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
     let mut awc_idx = 0usize;
     let mut last_ui_mb = 0u64;
     let mut need_seek = true;
-    while off < sz {
+    let scan_limit = if rname.eq_ignore_ascii_case("levels.rpf") && sz > 0x10b2_0000_00 {
+        0x10b2_0000_00
+    } else {
+        sz
+    };
+    while off < scan_limit {
         if let Some(st) = progress_state {
             let cur_mb = off / (64 * 1024 * 1024);
             if cur_mb != last_ui_mb {
@@ -988,8 +1130,8 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
                                 let is_veh = is_vehicle_virtual(&probe_out[..olen], &mname);
                                 Some((mname, is_veh, olen))
                             } else if olen >= 32768 && (bmap - 0x5000_0000) >= 32768 {
-                                // Large multi-chunk virtual resource (e.g. full vehicle .#ft): read full virtual segment
-                                probe_large_rage9_model(path, off + p as u64)
+                                // Large multi-chunk virtual resource (e.g. full vehicle .#ft): zero-seek in-memory probe
+                                probe_large_rage9_model_in_buf(&buf[p..read_n], path, off + p as u64)
                             } else {
                                 None
                             };
@@ -1520,28 +1662,9 @@ fn batch_extract_vehicles(levels_rpf: &PathBuf, out_dir: &PathBuf) {
                                 let bmap = u64::from_le_bytes([probe_out[8], probe_out[9], probe_out[10], probe_out[11], probe_out[12], probe_out[13], probe_out[14], probe_out[15]]);
                                 // Full vehicles have large virtual headers (> 48KB)
                                 if vft == 0 && (0x5000_c000..0x5800_0000).contains(&bmap) && &probe_out[0x10..0x15] != b"0DRPz" {
-                                    if let Some((mname, is_veh, vlen)) = probe_large_rage9_model(levels_rpf, off + p as u64) {
+                                    if let Some((mname, is_veh, vlen)) = probe_large_rage9_model_in_buf(&buf[p..n], levels_rpf, off + p as u64) {
                                         let lo = mname.to_ascii_lowercase();
-                                        // Keep full vehicles (_hi.#ft preferred, skip _mid/_dmg_/tiny mods)
-                                        let is_full = is_veh
-                                            && vlen >= 50_000
-                                            && lo.ends_with(".#ft")
-                                            && !lo.contains("_mid.")
-                                            && !lo.contains("_dmg_")
-                                            && !lo.contains("_livery")
-                                            && !lo.contains("_roof_")
-                                            && !lo.contains("_spoiler")
-                                            && !lo.contains("_exhaust")
-                                            && !lo.contains("_bumf_")
-                                            && !lo.contains("_bumr_")
-                                            && !lo.contains("_skirt_")
-                                            && !lo.contains("_bonnet")
-                                            && !lo.contains("_wing_")
-                                            && !lo.contains("_door_")
-                                            && !lo.contains("_mirror")
-                                            && !lo.contains("_lights_")
-                                            && !lo.contains("_intakes_");
-                                        if is_full {
+                                        if is_veh && vlen >= 50_000 && !lo.contains("_mid.") {
                                             found_all.lock().unwrap().push((off + p as u64, mname));
                                         }
                                     }

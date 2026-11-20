@@ -304,18 +304,90 @@ pub fn extract_rage9_model_name(v: &[u8]) -> Option<(String, &'static str)> {
     None
 }
 
-/// Detect whether a decompressed virtual chunk looks like a GTA 6 vehicle `.#ft`/`.#dr`.
+/// Detect whether a decompressed virtual chunk is a full GTA 6 vehicle `.#ft` (cars, bikes, boats, planes, helis, trailers).
 pub fn is_vehicle_virtual(v: &[u8], name: &str) -> bool {
     let lo = name.to_ascii_lowercase();
-    if lo.starts_with("rim_") || lo.starts_with("tyre_") || lo.starts_with("veh_") || lo.contains("_livery") {
-        return true;
+    if !lo.ends_with(".#ft") || v.len() < 28_000 {
+        return false;
     }
-    for needle in [b"wheel_lf".as_slice(), b"door_dside_f", b"bumper_f", b"windscreen", b"bodyshell"] {
+    // Exclude vehicle tuning/mod sub-parts so Vehicles Only shows actual full vehicles
+    for part in [
+        "_dmg_", "_livery", "_roof_", "_roofext_", "_spoiler", "_exhaust",
+        "_bumf_", "_bumr_", "_skirt_", "_bonnet", "_wing_", "_door_",
+        "_mirror", "_lights_", "_intakes_", "_platemount", "_towbar",
+        "_speakermount", "_deliverybag", "_antennaset", "_radar_", "_horn",
+        "_outboard", "_inboard", "_mast", "_mount", "_turret", "_weap_",
+        "_wheeliebar", "_induction_", "_whiplight", "_rack_", "_sign_mesh",
+        "_armour_plate", "_fairing_", "_rescuehoist", "_footboards", "_callsign",
+        "_shorad", "_badge", "_trim", "_overlay",
+    ] {
+        if lo.contains(part) {
+            return false;
+        }
+    }
+    for needle in [b"wheel_lf".as_slice(), b"door_dside_f", b"chassis", b"bodyshell", b"cockpit", b"rudder", b"rotor_main"] {
         if v.windows(needle.len()).any(|w| w == needle) {
             return true;
         }
     }
     false
+}
+
+/// Zero-seek in-memory multi-chunk virtual header probe (50x faster than reopening file on HDD).
+pub fn probe_large_rage9_model_in_buf(buf: &[u8], rpf_path: &Path, abs_off: u64) -> Option<(String, bool, usize)> {
+    let mut dec = Decompress::new(true);
+    let mut v = Vec::with_capacity(131072);
+    let mut tmp = [0u8; 65536];
+    let mut pos = 0usize;
+
+    // Decompress chunk 0 from `buf`
+    loop {
+        let bi = dec.total_in();
+        let bo = dec.total_out();
+        let st = dec.decompress(&buf[pos..], &mut tmp, FlushDecompress::None).ok()?;
+        let cin = (dec.total_in() - bi) as usize;
+        let cout = (dec.total_out() - bo) as usize;
+        pos += cin;
+        if cout > 0 { v.extend_from_slice(&tmp[..cout]); }
+        if st == Status::StreamEnd { break; }
+        if cin == 0 && cout == 0 {
+            // Hit end of 4MB RAM buffer -> fall back to file read
+            return probe_large_rage9_model(rpf_path, abs_off);
+        }
+    }
+    if v.len() < 0x80 { return None; }
+    let bmap_ptr = ru64(&v, 8);
+    if !(0x5000_0000..0x5800_0000).contains(&bmap_ptr) { return None; }
+    let bmap_off = (bmap_ptr - 0x5000_0000) as usize;
+    if bmap_off > 4 * 1024 * 1024 { return None; }
+
+    for _ in 0..14 {
+        if v.len() > bmap_off + 16 { break; }
+        // Advance to next zlib stream inside `buf`
+        while pos + 3 < buf.len() && !(buf[pos] == 0x78 && matches!(buf[pos + 1], 0x01 | 0x5e | 0x9c | 0xda) && (buf[pos + 2] & 0x06) != 0x06) {
+            pos += 1;
+        }
+        if pos + 3 >= buf.len() {
+            return probe_large_rage9_model(rpf_path, abs_off);
+        }
+        dec.reset(true);
+        loop {
+            let bi = dec.total_in();
+            let bo = dec.total_out();
+            let st = dec.decompress(&buf[pos..], &mut tmp, FlushDecompress::None).ok()?;
+            let cin = (dec.total_in() - bi) as usize;
+            let cout = (dec.total_out() - bo) as usize;
+            pos += cin;
+            if cout > 0 { v.extend_from_slice(&tmp[..cout]); }
+            if st == Status::StreamEnd { break; }
+            if cin == 0 && cout == 0 {
+                return probe_large_rage9_model(rpf_path, abs_off);
+            }
+        }
+    }
+    let (name, _ext) = extract_rage9_model_name(&v)?;
+    let is_veh = is_vehicle_virtual(&v, &name);
+    Some((name, is_veh, v.len()))
 }
 
 /// Probe a large multi-chunk RAGE9 resource (e.g. full vehicle `.#ft` with >32KB virtual buffer)
