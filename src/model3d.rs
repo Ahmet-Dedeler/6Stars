@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ShadeMode {
+    Textured,
     Solid,
     SolidWire,
     Wireframe,
@@ -14,16 +15,40 @@ pub enum ShadeMode {
 
 impl Default for ShadeMode {
     fn default() -> Self {
-        Self::Solid
+        Self::Textured
+    }
+}
+
+pub struct Texture2D {
+    pub w: usize,
+    pub h: usize,
+    pub pixels: Vec<Color32>,
+}
+
+impl Texture2D {
+    #[inline]
+    pub fn sample(&self, u: f32, v: f32) -> Color32 {
+        if self.w == 0 || self.h == 0 {
+            return Color32::WHITE;
+        }
+        let uu = u.rem_euclid(1.0);
+        let vv = v.rem_euclid(1.0);
+        let x = ((uu * (self.w as f32)) as usize).min(self.w - 1);
+        let y = ((vv * (self.h as f32)) as usize).min(self.h - 1);
+        self.pixels[y * self.w + x]
     }
 }
 
 pub struct Mesh3D {
     pub name: String,
     pub verts: Vec<[f32; 3]>,
+    pub uvs: Vec<[f32; 2]>,
     pub tris: Vec<[u32; 3]>,
+    pub tri_geom: Vec<u16>,
     pub normals: Vec<[f32; 3]>,
     pub edges: Vec<(u32, u32)>,
+    pub texture: Option<Texture2D>,
+    pub tex_status: String,
     pub center: [f32; 3],
     pub radius: f32,
     pub geom_count: usize,
@@ -51,8 +76,12 @@ impl Mesh3D {
     pub fn from_parts(
         name: String,
         verts: Vec<[f32; 3]>,
+        uvs: Vec<[f32; 2]>,
         tris: Vec<[u32; 3]>,
+        tri_geom: Vec<u16>,
         edges: Vec<(u32, u32)>,
+        texture: Option<Texture2D>,
+        tex_status: String,
         geom_count: usize,
         meshlet_count: usize,
         lod_label: String,
@@ -105,9 +134,13 @@ impl Mesh3D {
         Self {
             name,
             verts,
+            uvs,
             tris,
+            tri_geom,
             normals,
             edges,
+            texture,
+            tex_status,
             center,
             radius,
             geom_count,
@@ -118,7 +151,7 @@ impl Mesh3D {
             zoom: 1.0,
             pan_x: 0.0,
             pan_y: 0.0,
-            shade_mode: ShadeMode::Solid,
+            shade_mode: ShadeMode::Textured,
             auto_spin: false,
             fb_w: 0,
             fb_h: 0,
@@ -139,8 +172,19 @@ impl Mesh3D {
         for v in &self.verts {
             writeln!(w, "v {:.6} {:.6} {:.6}", v[0], v[1], v[2])?;
         }
-        for t in &self.tris {
-            writeln!(w, "f {} {} {}", t[0] + 1, t[1] + 1, t[2] + 1)?;
+        let has_uv = self.uvs.len() == self.verts.len() && !self.uvs.is_empty();
+        if has_uv {
+            for uv in &self.uvs {
+                writeln!(w, "vt {:.6} {:.6}", uv[0], uv[1])?;
+            }
+            for t in &self.tris {
+                let (a, b, c) = (t[0] + 1, t[1] + 1, t[2] + 1);
+                writeln!(w, "f {a}/{a} {b}/{b} {c}/{c}")?;
+            }
+        } else {
+            for t in &self.tris {
+                writeln!(w, "f {} {} {}", t[0] + 1, t[1] + 1, t[2] + 1)?;
+            }
         }
         Ok(())
     }
@@ -181,8 +225,9 @@ pub fn parse_obj(path: &PathBuf) -> Option<Mesh3D> {
         }
     }
     if verts.is_empty() { return None; }
+    let tri_geom = vec![0u16; tris.len()];
     let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-    Some(Mesh3D::from_parts(name, verts, tris, edges, 1, 0, "OBJ".into()))
+    Some(Mesh3D::from_parts(name, verts, Vec::new(), tris, tri_geom, edges, None, "OBJ".into(), 1, 0, "OBJ".into()))
 }
 
 pub fn extract_0drpz_mesh(name: &str, data: &[u8]) -> Option<Mesh3D> {
@@ -203,7 +248,7 @@ pub fn extract_0drpz_mesh(name: &str, data: &[u8]) -> Option<Mesh3D> {
         }
     }
     if verts.len() < 12 { return None; }
-    Some(Mesh3D::from_parts(name.to_string(), verts, Vec::new(), Vec::new(), 1, 0, "Points".into()))
+    Some(Mesh3D::from_parts(name.to_string(), verts, Vec::new(), Vec::new(), Vec::new(), Vec::new(), None, "Points".into(), 1, 0, "Points".into()))
 }
 
 #[inline]
@@ -527,6 +572,106 @@ fn collect_all_geoms(v: &[u8]) -> Vec<(usize, usize, usize, usize)> {
     out
 }
 
+fn decode_bc1_block(blk: &[u8], out: &mut [Color32], stride: usize, bx: usize, by: usize, w: usize, h: usize) {
+    let c0 = u16::from_le_bytes([blk[0], blk[1]]);
+    let c1 = u16::from_le_bytes([blk[2], blk[3]]);
+    let bits = u32::from_le_bytes([blk[4], blk[5], blk[6], blk[7]]);
+    let rgb565 = |c: u16| -> [u8; 3] {
+        let r = (((c >> 11) & 31) * 255 / 31) as u8;
+        let g = (((c >> 5) & 63) * 255 / 63) as u8;
+        let b = ((c & 31) * 255 / 31) as u8;
+        [r, g, b]
+    };
+    let a = rgb565(c0);
+    let b = rgb565(c1);
+    let pal: [[u8; 3]; 4] = if c0 > c1 {
+        [
+            a,
+            b,
+            [((2 * a[0] as u16 + b[0] as u16) / 3) as u8, ((2 * a[1] as u16 + b[1] as u16) / 3) as u8, ((2 * a[2] as u16 + b[2] as u16) / 3) as u8],
+            [((a[0] as u16 + 2 * b[0] as u16) / 3) as u8, ((a[1] as u16 + 2 * b[1] as u16) / 3) as u8, ((a[2] as u16 + 2 * b[2] as u16) / 3) as u8],
+        ]
+    } else {
+        [
+            a,
+            b,
+            [((a[0] as u16 + b[0] as u16) / 2) as u8, ((a[1] as u16 + b[1] as u16) / 2) as u8, ((a[2] as u16 + b[2] as u16) / 2) as u8],
+            [0, 0, 0],
+        ]
+    };
+    for py in 0..4 {
+        let y = by + py;
+        if y >= h { continue; }
+        for px in 0..4 {
+            let x = bx + px;
+            if x >= w { continue; }
+            let code = ((bits >> (2 * (py * 4 + px))) & 3) as usize;
+            let c = pal[code];
+            out[y * stride + x] = Color32::from_rgb(c[0], c[1], c[2]);
+        }
+    }
+}
+
+/// Try decoding the first embedded diffuse texture in `ShaderGroup.TextureDictionary` (if present in `p`).
+fn try_extract_embedded_texture(v: &[u8], p: &[u8]) -> (Option<Texture2D>, String) {
+    let mut bases = vec![0usize];
+    if v.len() >= 0x20 {
+        let fp = ru64(v, 0x18);
+        if (0x5000_0000..0x5800_0000).contains(&fp) {
+            bases.push((fp - 0x5000_0000) as usize);
+        }
+    }
+    for base in bases {
+        if base + 0x18 > v.len() { continue; }
+        let sg_ptr = ru64(v, base + 0x10);
+        if !(0x5000_0000..0x5800_0000).contains(&sg_ptr) { continue; }
+        let sg = (sg_ptr - 0x5000_0000) as usize;
+        if sg + 0x10 > v.len() { continue; }
+        let txd_ptr = ru64(v, sg + 0x08);
+        if !(0x5000_0000..0x5800_0000).contains(&txd_ptr) { continue; }
+        let txd = (txd_ptr - 0x5000_0000) as usize;
+        if txd + 0x3a > v.len() { continue; }
+        let tarr_ptr = ru64(v, txd + 0x30);
+        let tcnt = ru16(v, txd + 0x38) as usize;
+        if !(0x5000_0000..0x5800_0000).contains(&tarr_ptr) || tcnt == 0 || tcnt > 256 {
+            continue;
+        }
+        let tarr = (tarr_ptr - 0x5000_0000) as usize;
+        if tarr + tcnt * 8 > v.len() { continue; }
+
+        for ti in 0..tcnt {
+            let tp_raw = ru64(v, tarr + ti * 8);
+            if !(0x5000_0000..0x5800_0000).contains(&tp_raw) { continue; }
+            let tp = (tp_raw - 0x5000_0000) as usize;
+            if tp + 0x48 > v.len() { continue; }
+            let pptr = ru64(v, tp + 0x18);
+            if !(0x6000_0000..0x7000_0000).contains(&pptr) { continue; }
+            let poff = (pptr - 0x6000_0000) as usize;
+            let w = ru16(v, tp + 0x38) as usize;
+            let h = ru16(v, tp + 0x3a) as usize;
+            let dxgi = v[tp + 0x3f];
+            if !(16..=2048).contains(&w) || !(16..=2048).contains(&h) { continue; }
+            let bx_cnt = (w + 3) / 4;
+            let by_cnt = (h + 3) / 4;
+            let (blk_sz, rgb_off) = match dxgi {
+                70 | 71 | 72 => (8usize, 0usize), // BC1
+                73..=78 => (16usize, 8usize),     // BC2/BC3 (color block at +8)
+                _ => continue,
+            };
+            if poff + bx_cnt * by_cnt * blk_sz > p.len() { continue; }
+            let mut pixels = vec![Color32::from_rgb(160, 165, 175); w * h];
+            for by in 0..by_cnt {
+                for bx in 0..bx_cnt {
+                    let bo = poff + (by * bx_cnt + bx) * blk_sz + rgb_off;
+                    decode_bc1_block(&p[bo..bo + 8], &mut pixels, w, bx * 4, by * 4, w, h);
+                }
+            }
+            return (Some(Texture2D { w, h, pixels }), format!("Embedded {w}x{h} (fmt {dxgi})"));
+        }
+    }
+    (None, "External .#td (Material Shading)".into())
+}
+
 /// Decode a GTA 6 `.#dr` / `.#ft` / `.#dd` directly from its RPF file at `file_off`.
 pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name: &str) -> Result<Mesh3D, String> {
     let mut f = File::open(rpf_path).map_err(|e| format!("Open error: {e}"))?;
@@ -588,10 +733,12 @@ pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name
         .unwrap_or_else(|| fallback_name.to_string());
 
     let mut all_verts: Vec<[f32; 3]> = Vec::new();
+    let mut all_uvs: Vec<[f32; 2]> = Vec::new();
     let mut all_tris: Vec<[u32; 3]> = Vec::new();
+    let mut all_tri_geom: Vec<u16> = Vec::new();
     let mut total_meshlets = 0usize;
 
-    for &(vb_off, vb_size, mb_off, _mb_size) in &geoms {
+    for (gi_idx, &(vb_off, vb_size, mb_off, _mb_size)) in geoms.iter().enumerate() {
         if mb_off + 0x10 > p.len() || vb_off + 0x80 > p.len() {
             continue;
         }
@@ -607,16 +754,24 @@ pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name
             continue;
         }
 
-        let hdr0 = ru32(&p, vb_off);
-        let hdr1 = ru32(&p, vb_off + 4);
-        let hdr2 = ru32(&p, vb_off + 8);
-        let hdr3 = ru32(&p, vb_off + 12);
-        let stream0_off = ((hdr0 >> 8) << 1) as usize;
+        let mut hdrs = [0u32; 8];
+        for k in 0..8 {
+            if vb_off + k * 4 + 4 <= p.len() {
+                hdrs[k] = ru32(&p, vb_off + k * 4);
+            }
+        }
+        let stream0_off = ((hdrs[0] >> 8) << 1) as usize;
         let mut stream0_end = vb_size;
-        for h in [hdr1, hdr2, hdr3] {
+        let mut uv_stream_off: Option<usize> = None;
+        for &h in &hdrs[1..] {
+            if h == 0 { continue; }
             let so = ((h >> 8) << 1) as usize;
+            let st = h & 0xff;
             if so > stream0_off && so < stream0_end {
                 stream0_end = so;
+            }
+            if st == 0x28 && uv_stream_off.is_none() {
+                uv_stream_off = Some(so);
             }
         }
         if vb_off + stream0_off >= p.len() {
@@ -669,6 +824,7 @@ pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name
             let v_cnt = (max_v_used + 1).min(max_vb_verts);
             let vbase = vb_off + stream0_off;
             all_verts.reserve(v_cnt);
+            all_uvs.reserve(v_cnt);
             for i in 0..v_cnt {
                 let o = vbase + i * 8;
                 let ix = (p[o + 1] as u32) | ((p[o + 2] as u32) << 8) | ((p[o + 3] as u32) << 16);
@@ -679,7 +835,21 @@ pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name
                     oy + (iy as f32) * sy,
                     oz + (iz as f32) * sz,
                 ]);
+                if let Some(uvo) = uv_stream_off {
+                    let u_pos = vb_off + uvo + i * 4;
+                    if u_pos + 4 <= p.len() {
+                        // RAGE9 type 0x28 UV0: 16-bit normalized fixed-point (/8192.0 gives exact 0..1 tiles)
+                        let u = (ru16(&p, u_pos) as f32) / 8192.0;
+                        let v_coord = (ru16(&p, u_pos + 2) as f32) / 8192.0;
+                        all_uvs.push([u, v_coord]);
+                    } else {
+                        all_uvs.push([0.0, 0.0]);
+                    }
+                } else {
+                    all_uvs.push([0.0, 0.0]);
+                }
             }
+            all_tri_geom.resize(all_tri_geom.len() + geom_tris.len(), gi_idx as u16);
             all_tris.extend_from_slice(&geom_tris);
             total_meshlets += num_meshlets;
         }
@@ -688,11 +858,16 @@ pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name
     if all_verts.is_empty() {
         return Err("Decoded 0 vertices from meshlets".into());
     }
+    let (texture, tex_status) = try_extract_embedded_texture(&v, &p);
     Ok(Mesh3D::from_parts(
         model_name,
         all_verts,
+        all_uvs,
         all_tris,
+        all_tri_geom,
         Vec::new(),
+        texture,
+        tex_status,
         geoms.len(),
         total_meshlets,
         lod_label,
@@ -799,8 +974,26 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
     let hf = h as f32;
 
     if !mesh.tris.is_empty() {
-        let do_solid = matches!(mesh.shade_mode, ShadeMode::Solid | ShadeMode::SolidWire);
+        let do_textured = mesh.shade_mode == ShadeMode::Textured;
+        let do_solid = matches!(mesh.shade_mode, ShadeMode::Textured | ShadeMode::Solid | ShadeMode::SolidWire);
         let do_wire = matches!(mesh.shade_mode, ShadeMode::Wireframe | ShadeMode::SolidWire);
+        let has_uvs = mesh.uvs.len() == mesh.verts.len() && !mesh.uvs.is_empty();
+
+        // Automotive / architectural material palette when external .#td texture is not embedded
+        const MAT_PALETTE: [[f32; 3]; 12] = [
+            [0.82, 0.84, 0.88], // metallic silver body
+            [0.24, 0.26, 0.30], // dark carbon / trim
+            [0.18, 0.24, 0.32], // tinted glass / windshield
+            [0.72, 0.75, 0.80], // brushed alloy / chrome
+            [0.34, 0.36, 0.40], // chassis steel
+            [0.86, 0.24, 0.24], // tail-light / brake caliper accent
+            [0.48, 0.50, 0.56], // gunmetal
+            [0.28, 0.24, 0.22], // interior leather
+            [0.78, 0.72, 0.62], // warm trim
+            [0.38, 0.44, 0.52], // cool slate
+            [0.64, 0.66, 0.70], // satin aluminum
+            [0.20, 0.21, 0.24], // rubber / matte black
+        ];
 
         // Two studio lights in camera space
         let l1 = [0.42f32, 0.65f32, 0.63f32]; // key light
@@ -808,9 +1001,12 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
 
         if do_solid {
             for (ti, t) in mesh.tris.iter().enumerate() {
-                let p0 = mesh.proj_buf[t[0] as usize];
-                let p1 = mesh.proj_buf[t[1] as usize];
-                let p2 = mesh.proj_buf[t[2] as usize];
+                let i0 = t[0] as usize;
+                let i1 = t[1] as usize;
+                let i2 = t[2] as usize;
+                let p0 = mesh.proj_buf[i0];
+                let p1 = mesh.proj_buf[i1];
+                let p2 = mesh.proj_buf[i2];
 
                 let min_x = p0[0].min(p1[0]).min(p2[0]);
                 let max_x = p0[0].max(p1[0]).max(p2[0]);
@@ -821,7 +1017,8 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                 }
 
                 let area = (p1[0] - p0[0]) * (p2[1] - p0[1]) - (p1[1] - p0[1]) * (p2[0] - p0[0]);
-                if area.abs() < 0.15 {
+                let abs_area = area.abs();
+                if abs_area < 0.15 {
                     continue;
                 }
 
@@ -834,21 +1031,33 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
 
                 let ndl1 = (nx1 * l1[0] + ny2 * l1[1] + nz2 * l1[2]).abs();
                 let ndl2 = (nx1 * l2[0] + ny2 * l2[1] + nz2 * l2[2]).max(0.0);
+                let spec = ndl1.powi(10) * 0.35;
                 let rim = (1.0 - ny2.abs()).powi(2) * 0.22;
 
-                // Clean metallic clay-slate MATCAP with warm key + cyan fill
-                let r = ((0.16 + ndl1 * 0.72 + rim * 0.65).min(1.0) * 238.0) as u8;
-                let g = ((0.17 + ndl1 * 0.70 + ndl2 * 0.22 + rim * 0.45).min(1.0) * 240.0) as u8;
-                let b = ((0.21 + ndl1 * 0.66 + ndl2 * 0.36 + rim * 0.75).min(1.0) * 248.0) as u8;
-                let col = Color32::from_rgb(r, g, b);
+                let shade_r = (0.18 + ndl1 * 0.72 + spec + rim * 0.45).min(1.15);
+                let shade_g = (0.18 + ndl1 * 0.72 + ndl2 * 0.18 + spec + rim * 0.40).min(1.15);
+                let shade_b = (0.20 + ndl1 * 0.70 + ndl2 * 0.28 + spec + rim * 0.55).min(1.15);
+
+                let base_albedo = if do_textured && mesh.texture.is_none() {
+                    let g = mesh.tri_geom.get(ti).copied().unwrap_or(0) as usize;
+                    MAT_PALETTE[g % MAT_PALETTE.len()]
+                } else {
+                    [0.86, 0.88, 0.92]
+                };
+                let flat_col = Color32::from_rgb(
+                    ((base_albedo[0] * shade_r).min(1.0) * 255.0) as u8,
+                    ((base_albedo[1] * shade_g).min(1.0) * 255.0) as u8,
+                    ((base_albedo[2] * shade_b).min(1.0) * 255.0) as u8,
+                );
 
                 let ix0 = (min_x.floor() as i32).max(0) as usize;
                 let ix1 = (max_x.ceil() as i32).min(w as i32 - 1) as usize;
                 let iy0 = (min_y.floor() as i32).max(0) as usize;
                 let iy1 = (max_y.ceil() as i32).min(h as i32 - 1) as usize;
 
-                let inv_area = 1.0 / area;
-                let sign = if area > 0.0 { 1.0 } else { -1.0 };
+                // FIXED SIGN: edge normal points INWARD so w0,w1,w2 >= 0 inside triangle!
+                let sign = if area > 0.0 { -1.0 } else { 1.0 };
+                let inv_abs = 1.0 / abs_area;
 
                 let e01_dx = (p1[1] - p0[1]) * sign;
                 let e01_dy = (p0[0] - p1[0]) * sign;
@@ -864,7 +1073,48 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                 let mut w1_row = (px_start - p2[0]) * e20_dx + (py_start - p2[1]) * e20_dy;
                 let mut w2_row = (px_start - p0[0]) * e01_dx + (py_start - p0[1]) * e01_dy;
 
-                let s_inv = sign * inv_area;
+                if do_textured && has_uvs {
+                    if let Some(tex) = &mesh.texture {
+                        let uv0 = mesh.uvs[i0];
+                        let uv1 = mesh.uvs[i1];
+                        let uv2 = mesh.uvs[i2];
+                        for y in iy0..=iy1 {
+                            let mut w0 = w0_row;
+                            let mut w1 = w1_row;
+                            let mut w2 = w2_row;
+                            let row_off = y * w;
+                            for x in ix0..=ix1 {
+                                if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
+                                    let b0 = w0 * inv_abs;
+                                    let b1 = w1 * inv_abs;
+                                    let b2 = w2 * inv_abs;
+                                    let z = b0 * p0[2] + b1 * p1[2] + b2 * p2[2];
+                                    let idx = row_off + x;
+                                    if z > mesh.z_buf[idx] {
+                                        mesh.z_buf[idx] = z;
+                                        let tc = tex.sample(
+                                            b0 * uv0[0] + b1 * uv1[0] + b2 * uv2[0],
+                                            b0 * uv0[1] + b1 * uv1[1] + b2 * uv2[1],
+                                        );
+                                        mesh.color_buf[idx] = Color32::from_rgb(
+                                            ((tc.r() as f32 * shade_r).min(255.0)) as u8,
+                                            ((tc.g() as f32 * shade_g).min(255.0)) as u8,
+                                            ((tc.b() as f32 * shade_b).min(255.0)) as u8,
+                                        );
+                                    }
+                                }
+                                w0 += e12_dx;
+                                w1 += e20_dx;
+                                w2 += e01_dx;
+                            }
+                            w0_row += e12_dy;
+                            w1_row += e20_dy;
+                            w2_row += e01_dy;
+                        }
+                        continue;
+                    }
+                }
+
                 for y in iy0..=iy1 {
                     let mut w0 = w0_row;
                     let mut w1 = w1_row;
@@ -872,11 +1122,11 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                     let row_off = y * w;
                     for x in ix0..=ix1 {
                         if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
-                            let z = (w0 * p0[2] + w1 * p1[2] + w2 * p2[2]) * s_inv;
+                            let z = (w0 * p0[2] + w1 * p1[2] + w2 * p2[2]) * inv_abs;
                             let idx = row_off + x;
                             if z > mesh.z_buf[idx] {
                                 mesh.z_buf[idx] = z;
-                                mesh.color_buf[idx] = col;
+                                mesh.color_buf[idx] = flat_col;
                             }
                         }
                         w0 += e12_dx;
@@ -947,7 +1197,11 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
             .color(Color32::from_rgb(252, 175, 23)),
         );
         ui.add_space(6.0);
-        if ui.selectable_label(mesh.shade_mode == ShadeMode::Solid, "Solid").clicked() {
+        if ui.selectable_label(mesh.shade_mode == ShadeMode::Textured, "Textured/Mat").clicked() {
+            mesh.shade_mode = ShadeMode::Textured;
+            mesh.dirty = true;
+        }
+        if ui.selectable_label(mesh.shade_mode == ShadeMode::Solid, "Clay Solid").clicked() {
             mesh.shade_mode = ShadeMode::Solid;
             mesh.dirty = true;
         }
@@ -962,6 +1216,23 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
         if ui.selectable_label(mesh.auto_spin, "Spin").clicked() {
             mesh.auto_spin = !mesh.auto_spin;
             mesh.dirty = true;
+        }
+        if ui.button("Load Texture...").clicked() {
+            if let Some(tp) = rfd::FileDialog::new().add_filter("Textures", &["png", "bmp"]).pick_file() {
+                if let Ok(img) = image::open(&tp) {
+                    let rgba = img.to_rgba8();
+                    let w = rgba.width() as usize;
+                    let h = rgba.height() as usize;
+                    let pixels: Vec<Color32> = rgba
+                        .chunks_exact(4)
+                        .map(|c| Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]))
+                        .collect();
+                    mesh.texture = Some(Texture2D { w, h, pixels });
+                    mesh.tex_status = format!("Loaded {} ({w}x{h})", tp.file_name().unwrap_or_default().to_string_lossy());
+                    mesh.shade_mode = ShadeMode::Textured;
+                    mesh.dirty = true;
+                }
+            }
         }
         if ui.button("Reset").clicked() {
             mesh.yaw = 0.72;
@@ -980,6 +1251,7 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
                 let _ = mesh.export_obj(&p);
             }
         }
+        ui.label(RichText::new(&mesh.tex_status).size(11.0).color(Color32::from_rgb(130, 145, 168)));
     });
     ui.add_space(4.0);
 

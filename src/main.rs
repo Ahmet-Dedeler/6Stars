@@ -587,7 +587,7 @@ impl Rpf9App {
 }
 
 fn cache_file_path() -> Option<PathBuf> {
-    std::env::var("LOCALAPPDATA").ok().map(|d| PathBuf::from(d).join("PercyStar").join("scan_cache_v3.tsv"))
+    std::env::var("LOCALAPPDATA").ok().map(|d| PathBuf::from(d).join("PercyStar").join("scan_cache_v4.tsv"))
 }
 
 fn load_last_folder() -> Option<PathBuf> {
@@ -975,97 +975,96 @@ fn extract_xml_tag(bytes: &[u8]) -> Option<String> {
     None
 }
 
+/// Sequential 16MB streaming scanner for levels.rpf's 4.45 GB vehicle zone (zero HDD seek thrashing!).
 fn scan_levels_vehicle_zone(levels_rpf: &PathBuf, live_state: Option<&Arc<Mutex<ScanState>>>) -> Vec<RpfEntry> {
     let sz = fs::metadata(levels_rpf).map(|m| m.len()).unwrap_or(0);
     let start_off: u64 = 0x10b2_0000_00u64.min(sz);
     let total_len = sz.saturating_sub(start_off);
     if total_len == 0 { return Vec::new(); }
     let rname = levels_rpf.file_name().unwrap_or_default().to_string_lossy().into_owned();
-    let n_threads = 4u64;
-    let slice_len = ((total_len / n_threads) + 0xfff) & !0xfff;
-    let all_entries: Arc<Mutex<Vec<RpfEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    let Ok(mut f) = File::open(levels_rpf) else { return Vec::new() };
+    if f.seek(SeekFrom::Start(start_off)).is_err() { return Vec::new(); }
 
-    std::thread::scope(|s| {
-        for t in 0..n_threads {
-            let s0 = start_off + t * slice_len;
-            let s1 = (s0 + slice_len).min(sz);
-            let all_entries = Arc::clone(&all_entries);
-            let rname = rname.clone();
-            s.spawn(move || {
-                let Ok(mut f) = File::open(levels_rpf) else { return };
-                let mut buf = vec![0u8; 4 * 1024 * 1024];
-                let mut probe_dec = Decompress::new(true);
-                let mut probe_out = vec![0u8; 32768];
-                let mut local_batch: Vec<RpfEntry> = Vec::with_capacity(32);
-                let mut off = s0;
-                while off < s1 {
-                    if f.seek(SeekFrom::Start(off)).is_err() { break; }
-                    let to_read = (buf.len() as u64).min(s1 - off) as usize;
-                    let Ok(n) = f.read(&mut buf[..to_read]) else { break };
-                    if n == 0 { break; }
-                    let mut pos = 0usize;
-                    while pos + 44 <= n {
-                        let h0 = u64::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3], buf[pos+4], buf[pos+5], buf[pos+6], buf[pos+7]]);
-                        let h1 = u64::from_le_bytes([buf[pos+8], buf[pos+9], buf[pos+10], buf[pos+11], buf[pos+12], buf[pos+13], buf[pos+14], buf[pos+15]]);
-                        if h0 == 0 && h1 == 0 && buf[pos + 0x10] == 0x78 && matches!(buf[pos + 0x11], 0x9c | 0xda) && (buf[pos + 0x12] & 0x06) != 0x06 {
-                            let p = pos + 0x10;
-                            let end = (p + 32768).min(n);
-                            probe_dec.reset(true);
-                            let _ = probe_dec.decompress(&buf[p..end], &mut probe_out, FlushDecompress::None);
-                            let olen = probe_dec.total_out() as usize;
-                            if olen >= 0x80 {
-                                let vft = u64::from_le_bytes([probe_out[0], probe_out[1], probe_out[2], probe_out[3], probe_out[4], probe_out[5], probe_out[6], probe_out[7]]);
-                                let bmap = u64::from_le_bytes([probe_out[8], probe_out[9], probe_out[10], probe_out[11], probe_out[12], probe_out[13], probe_out[14], probe_out[15]]);
-                                if vft == 0 && (0x5000_0000..0x5800_0000).contains(&bmap) && &probe_out[0x10..0x15] != b"0DRPz" {
-                                    let model_hit = if let Some((mname, _)) = extract_rage9_model_name(&probe_out[..olen]) {
-                                        let is_veh = is_vehicle_virtual(&probe_out[..olen], &mname);
-                                        Some((mname, is_veh, olen))
-                                    } else if olen >= 32768 && (bmap - 0x5000_0000) >= 32768 {
-                                        probe_large_rage9_model_in_buf(&buf[p..n], levels_rpf, off + p as u64)
-                                    } else {
-                                        None
-                                    };
-                                    if let Some((mname, is_veh, vlen)) = model_hit {
-                                        let kind = if is_veh { "VEH" } else { "MODEL" };
-                                        local_batch.push(RpfEntry {
-                                            source_rpf: levels_rpf.clone(),
-                                            rpf_name: rname.clone(),
-                                            name: mname,
-                                            kind,
-                                            offset: off + p as u64,
-                                            comp_size: probe_dec.total_in(),
-                                            raw_size: vlen as u64,
-                                            fps: 0.0,
-                                            tracks: 0,
-                                            chunks: Vec::new(),
-                                        });
-                                        if local_batch.len() >= 25 {
-                                            if let Some(st) = live_state {
-                                                let mut g = st.lock().unwrap();
-                                                g.entries.extend(local_batch.iter().cloned());
-                                                let vcnt = g.entries.iter().filter(|e| e.kind == "VEH").count();
-                                                g.status = format!("Fast-indexing GTA 6 Vehicles... ({vcnt} vehicles found)");
-                                            }
-                                            all_entries.lock().unwrap().extend(local_batch.drain(..));
-                                        }
-                                    }
+    let mut all_entries: Vec<RpfEntry> = Vec::new();
+    let mut local_batch: Vec<RpfEntry> = Vec::with_capacity(32);
+    let mut buf = vec![0u8; 16 * 1024 * 1024];
+    let mut probe_dec = Decompress::new(true);
+    let mut probe_out = vec![0u8; 32768];
+    let mut off = start_off;
+    let mut last_pct = 999u64;
+
+    while off < sz {
+        let Ok(n) = f.read(&mut buf) else { break };
+        if n == 0 { break; }
+        let mut pos = 0usize;
+        while pos + 44 <= n {
+            let h0 = u64::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3], buf[pos+4], buf[pos+5], buf[pos+6], buf[pos+7]]);
+            let h1 = u64::from_le_bytes([buf[pos+8], buf[pos+9], buf[pos+10], buf[pos+11], buf[pos+12], buf[pos+13], buf[pos+14], buf[pos+15]]);
+            if h0 == 0 && h1 == 0 && buf[pos + 0x10] == 0x78 && matches!(buf[pos + 0x11], 0x9c | 0xda) && (buf[pos + 0x12] & 0x06) != 0x06 {
+                let p = pos + 0x10;
+                let end = (p + 32768).min(n);
+                probe_dec.reset(true);
+                let _ = probe_dec.decompress(&buf[p..end], &mut probe_out, FlushDecompress::None);
+                let olen = probe_dec.total_out() as usize;
+                if olen >= 0x80 {
+                    let vft = u64::from_le_bytes([probe_out[0], probe_out[1], probe_out[2], probe_out[3], probe_out[4], probe_out[5], probe_out[6], probe_out[7]]);
+                    let bmap = u64::from_le_bytes([probe_out[8], probe_out[9], probe_out[10], probe_out[11], probe_out[12], probe_out[13], probe_out[14], probe_out[15]]);
+                    if vft == 0 && (0x5000_0000..0x5800_0000).contains(&bmap) && &probe_out[0x10..0x15] != b"0DRPz" {
+                        let bmap_off = bmap - 0x5000_0000;
+                        // ALWAYS read full multi-chunk virtual header if bmap_off >= 32KB so vehicle bones & names aren't missed!
+                        let model_hit = if bmap_off >= 32768 {
+                            probe_large_rage9_model_in_buf(&buf[p..n], levels_rpf, off + p as u64)
+                        } else if let Some((mname, _)) = extract_rage9_model_name(&probe_out[..olen]) {
+                            let is_veh = is_vehicle_virtual(&probe_out[..olen], &mname);
+                            Some((mname, is_veh, olen))
+                        } else {
+                            None
+                        };
+                        if let Some((mname, is_veh, vlen)) = model_hit {
+                            let kind = if is_veh { "VEH" } else { "MODEL" };
+                            local_batch.push(RpfEntry {
+                                source_rpf: levels_rpf.clone(),
+                                rpf_name: rname.clone(),
+                                name: mname,
+                                kind,
+                                offset: off + p as u64,
+                                comp_size: probe_dec.total_in(),
+                                raw_size: vlen as u64,
+                                fps: 0.0,
+                                tracks: 0,
+                                chunks: Vec::new(),
+                            });
+                            if local_batch.len() >= 15 {
+                                if let Some(st) = live_state {
+                                    let mut g = st.lock().unwrap();
+                                    g.entries.extend(local_batch.iter().cloned());
                                 }
+                                all_entries.extend(local_batch.drain(..));
                             }
                         }
-                        pos += 0x1000;
                     }
-                    off += n as u64;
                 }
-                if !local_batch.is_empty() {
-                    if let Some(st) = live_state {
-                        st.lock().unwrap().entries.extend(local_batch.iter().cloned());
-                    }
-                    all_entries.lock().unwrap().extend(local_batch);
-                }
-            });
+            }
+            pos += 0x1000;
         }
-    });
-    Arc::try_unwrap(all_entries).unwrap().into_inner().unwrap()
+        off += n as u64;
+        if let Some(st) = live_state {
+            let pct = ((off - start_off) * 100 / total_len).min(100);
+            if pct != last_pct {
+                last_pct = pct;
+                let mut g = st.lock().unwrap();
+                let vcnt = g.entries.iter().filter(|e| e.kind == "VEH").count();
+                g.status = format!("Fast-indexing GTA 6 Vehicles: {pct}% ({vcnt} vehicles found)...");
+            }
+        }
+    }
+    if !local_batch.is_empty() {
+        if let Some(st) = live_state {
+            st.lock().unwrap().entries.extend(local_batch.iter().cloned());
+        }
+        all_entries.extend(local_batch);
+    }
+    all_entries
 }
 
 fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>>) -> std::io::Result<(String, Vec<RpfEntry>)> {
@@ -1126,12 +1125,11 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
                         let vft = u64::from_le_bytes([probe_out[0], probe_out[1], probe_out[2], probe_out[3], probe_out[4], probe_out[5], probe_out[6], probe_out[7]]);
                         let bmap = u64::from_le_bytes([probe_out[8], probe_out[9], probe_out[10], probe_out[11], probe_out[12], probe_out[13], probe_out[14], probe_out[15]]);
                         if vft == 0 && (0x5000_0000..0x5800_0000).contains(&bmap) && &probe_out[0x10..0x15] != b"0DRPz" {
-                            let model_hit = if let Some((mname, _ext)) = extract_rage9_model_name(&probe_out[..olen]) {
+                            let model_hit = if (bmap - 0x5000_0000) >= 32768 {
+                                probe_large_rage9_model_in_buf(&buf[p..read_n], path, off + p as u64)
+                            } else if let Some((mname, _ext)) = extract_rage9_model_name(&probe_out[..olen]) {
                                 let is_veh = is_vehicle_virtual(&probe_out[..olen], &mname);
                                 Some((mname, is_veh, olen))
-                            } else if olen >= 32768 && (bmap - 0x5000_0000) >= 32768 {
-                                // Large multi-chunk virtual resource (e.g. full vehicle .#ft): zero-seek in-memory probe
-                                probe_large_rage9_model_in_buf(&buf[p..read_n], path, off + p as u64)
                             } else {
                                 None
                             };
@@ -1622,111 +1620,40 @@ impl eframe::App for Rpf9App {
 
 fn batch_extract_vehicles(levels_rpf: &PathBuf, out_dir: &PathBuf) {
     let _ = fs::create_dir_all(out_dir);
-    let sz = fs::metadata(levels_rpf).map(|m| m.len()).unwrap_or(0);
-    // Vehicle section in levels.rpf runs from 0x10b2000000 (~71.71 GB) to EOF (~76.16 GB)
-    let start_off: u64 = 0x10b2_0000_00u64.min(sz);
-    let total_len = sz.saturating_sub(start_off);
-    let n_threads = 4u64;
-    let slice_len = ((total_len / n_threads) + 0xfff) & !0xfff;
-    let found_all: Arc<Mutex<Vec<(u64, String)>>> = Arc::new(Mutex::new(Vec::new()));
-
-    eprintln!("Scanning {:.2} GB vehicle zone in {} with {} threads...", total_len as f64 / 1e9, levels_rpf.display(), n_threads);
-    std::thread::scope(|s| {
-        for t in 0..n_threads {
-            let s0 = start_off + t * slice_len;
-            let s1 = (s0 + slice_len).min(sz);
-            let found_all = Arc::clone(&found_all);
-            s.spawn(move || {
-                let Ok(mut f) = File::open(levels_rpf) else { return };
-                let mut buf = vec![0u8; 4 * 1024 * 1024];
-                let mut probe_dec = Decompress::new(true);
-                let mut probe_out = vec![0u8; 32768];
-                let mut off = s0;
-                while off < s1 {
-                    if f.seek(SeekFrom::Start(off)).is_err() { break; }
-                    let to_read = (buf.len() as u64).min(s1 - off) as usize;
-                    let Ok(n) = f.read(&mut buf[..to_read]) else { break };
-                    if n == 0 { break; }
-                    let mut pos = 0usize;
-                    while pos + 44 <= n {
-                        let h0 = u64::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3], buf[pos+4], buf[pos+5], buf[pos+6], buf[pos+7]]);
-                        let h1 = u64::from_le_bytes([buf[pos+8], buf[pos+9], buf[pos+10], buf[pos+11], buf[pos+12], buf[pos+13], buf[pos+14], buf[pos+15]]);
-                        if h0 == 0 && h1 == 0 && buf[pos + 0x10] == 0x78 && matches!(buf[pos + 0x11], 0x9c | 0xda) && (buf[pos + 0x12] & 0x06) != 0x06 {
-                            let p = pos + 0x10;
-                            let end = (p + 32768).min(n);
-                            probe_dec.reset(true);
-                            let _ = probe_dec.decompress(&buf[p..end], &mut probe_out, FlushDecompress::None);
-                            let olen = probe_dec.total_out() as usize;
-                            if olen >= 0x80 {
-                                let vft = u64::from_le_bytes([probe_out[0], probe_out[1], probe_out[2], probe_out[3], probe_out[4], probe_out[5], probe_out[6], probe_out[7]]);
-                                let bmap = u64::from_le_bytes([probe_out[8], probe_out[9], probe_out[10], probe_out[11], probe_out[12], probe_out[13], probe_out[14], probe_out[15]]);
-                                // Full vehicles have large virtual headers (> 48KB)
-                                if vft == 0 && (0x5000_c000..0x5800_0000).contains(&bmap) && &probe_out[0x10..0x15] != b"0DRPz" {
-                                    if let Some((mname, is_veh, vlen)) = probe_large_rage9_model_in_buf(&buf[p..n], levels_rpf, off + p as u64) {
-                                        let lo = mname.to_ascii_lowercase();
-                                        if is_veh && vlen >= 50_000 && !lo.contains("_mid.") {
-                                            found_all.lock().unwrap().push((off + p as u64, mname));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        pos += 0x1000;
-                    }
-                    off += n as u64;
-                }
-            });
-        }
-    });
-
-    // Deduplicate: prefer `_hi.#ft` over base `.#ft` for each vehicle stem
+    eprintln!("Sequential fast-scan of vehicle zone in {}...", levels_rpf.display());
+    let entries = scan_levels_vehicle_zone(levels_rpf, None);
     let mut best: HashMap<String, (u64, String, bool)> = HashMap::new();
-    for (off, name) in found_all.lock().unwrap().iter() {
-        let stem_raw = name.trim_end_matches(".#ft");
+    for e in entries {
+        if e.kind != "VEH" { continue; }
+        let lo = e.name.to_ascii_lowercase();
+        if lo.contains("_mid.") { continue; }
+        let stem_raw = e.name.trim_end_matches(".#ft");
         let is_hi = stem_raw.ends_with("_hi");
         let base = stem_raw.trim_end_matches("_hi").to_ascii_lowercase();
         match best.get(&base) {
             Some((_, _, prev_hi)) if *prev_hi && !is_hi => {}
             _ => {
-                best.insert(base, (*off, name.clone(), is_hi));
+                best.insert(base, (e.offset, e.name.clone(), is_hi));
             }
         }
     }
     let mut list: Vec<(String, u64, String)> = best.into_iter().map(|(b, (o, n, _))| (b, o, n)).collect();
     list.sort_by(|a, b| a.0.cmp(&b.0));
-    eprintln!("Found {} unique full GTA 6 vehicles! Extracting .OBJs...", list.len());
+    eprintln!("Found {} unique full GTA 6 vehicles! Extracting .OBJs (with UVs)...", list.len());
 
-    let ok_cnt = Arc::new(Mutex::new(0usize));
-    let next_i = Arc::new(Mutex::new(0usize));
-    std::thread::scope(|s| {
-        for _ in 0..4 {
-            let list = &list;
-            let ok_cnt = Arc::clone(&ok_cnt);
-            let next_i = Arc::clone(&next_i);
-            s.spawn(move || loop {
-                let idx = {
-                    let mut g = next_i.lock().unwrap();
-                    let i = *g;
-                    *g += 1;
-                    i
-                };
-                if idx >= list.len() { return; }
-                let (base, off, name) = &list[idx];
-                if let Ok(mesh) = decode_rage9_model_from_rpf(levels_rpf, *off, name) {
-                    let out_p = out_dir.join(format!("{base}.obj"));
-                    if mesh.export_obj(&out_p).is_ok() {
-                        let mut c = ok_cnt.lock().unwrap();
-                        *c += 1;
-                        if *c <= 30 || *c % 25 == 0 {
-                            eprintln!("  [{}/{}] {} ({} v, {} f)", *c, list.len(), base, mesh.verts.len(), mesh.tris.len());
-                        }
-                    }
+    let mut ok_cnt = 0usize;
+    for (idx, (base, off, name)) in list.iter().enumerate() {
+        if let Ok(mesh) = decode_rage9_model_from_rpf(levels_rpf, *off, name) {
+            let out_p = out_dir.join(format!("{base}.obj"));
+            if mesh.export_obj(&out_p).is_ok() {
+                ok_cnt += 1;
+                if ok_cnt <= 30 || ok_cnt % 25 == 0 {
+                    eprintln!("  [{}/{}] {} ({} v, {} f)", idx + 1, list.len(), base, mesh.verts.len(), mesh.tris.len());
                 }
-            });
+            }
         }
-    });
-    let final_ok = *ok_cnt.lock().unwrap();
-    eprintln!("DONE: Exported {final_ok}/{} vehicles to {}", list.len(), out_dir.display());
+    }
+    eprintln!("DONE: Exported {ok_cnt}/{} vehicles to {}", list.len(), out_dir.display());
 }
 
 fn main() -> eframe::Result<()> {
