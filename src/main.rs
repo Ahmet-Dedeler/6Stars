@@ -146,6 +146,7 @@ struct Rpf9App {
     clip_seq: u64,
     mesh3d: Option<Mesh3D>,
     show_3d: bool,
+    vehicles_only: bool,
 }
 
 impl Rpf9App {
@@ -183,6 +184,7 @@ impl Rpf9App {
             clip_seq: 0,
             mesh3d: None,
             show_3d: false,
+            vehicles_only: false,
         };
         if let Some(last) = load_last_folder() {
             if last.is_dir() {
@@ -1289,6 +1291,20 @@ impl eframe::App for Rpf9App {
         });
 
         egui::SidePanel::left("filelist").default_width(390.0).frame(egui::Frame::new().fill(Color32::from_rgb(19, 21, 26)).inner_margin(8.0)).show(ctx, |ui| {
+            if self.category == Category::Models {
+                ui.horizontal(|ui| {
+                    let btn = egui::Button::new(
+                        RichText::new(if self.vehicles_only { "★ Vehicles Only: ON" } else { "Vehicles Only" })
+                            .strong()
+                            .color(if self.vehicles_only { Color32::BLACK } else { Color32::from_rgb(255, 85, 175) }),
+                    )
+                    .fill(if self.vehicles_only { Color32::from_rgb(252, 175, 23) } else { Color32::from_rgb(32, 34, 44) });
+                    if ui.add(btn).clicked() {
+                        self.vehicles_only = !self.vehicles_only;
+                    }
+                });
+                ui.add_space(4.0);
+            }
             let entries = self.state.lock().unwrap().entries.clone();
             let q = self.filter.to_lowercase();
             let filtered: Vec<(usize, RpfEntry)> = entries
@@ -1298,7 +1314,13 @@ impl eframe::App for Rpf9App {
                     let cat_ok = match self.category {
                         Category::All => true,
                         Category::Vehicles => e.kind == "VEH",
-                        Category::Models => e.kind == "MODEL" || e.kind == "VEH",
+                        Category::Models => {
+                            if self.vehicles_only {
+                                e.kind == "VEH"
+                            } else {
+                                e.kind == "MODEL" || e.kind == "VEH"
+                            }
+                        }
                         Category::Videos => e.kind == "BK2",
                         Category::Audio => e.kind == "AWC",
                         Category::Xml => e.kind == "XML",
