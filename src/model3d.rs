@@ -762,7 +762,7 @@ pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name
             all_uvs.reserve(v_cnt);
             for i in 0..v_cnt {
                 let o = vbase + i * 8;
-                // xbox rage9 packs xy as 24 bit and z as 16 bit across 8 bytes
+                // packed rage9 24 bit xy and 16 bit z across 8 bytes
                 let ix = (p[o + 1] as u32) | ((p[o + 2] as u32) << 8) | ((p[o + 3] as u32) << 16);
                 let iy = (p[o] as u32) | ((p[o + 4] as u32) << 8) | ((p[o + 5] as u32) << 16);
                 let iz = (p[o + 6] as u32) | ((p[o + 7] as u32) << 8);
@@ -1225,12 +1225,12 @@ mod tests {
     #[test]
     fn model_name_and_vehicle_filter() {
         let mut buf = vec![0u8; 30_000];
-        buf[100..112].copy_from_slice(b"italirsx.#ft");
+        buf[100..116].copy_from_slice(b"test_vehicle.#ft");
         buf[500..508].copy_from_slice(b"wheel_lf");
         let (nm, ext) = extract_rage9_model_name(&buf).unwrap();
-        assert_eq!(nm, "italirsx.#ft");
+        assert_eq!(nm, "test_vehicle.#ft");
         assert_eq!(ext, ".#ft");
         assert!(is_vehicle_virtual(&buf, &nm));
-        assert!(!is_vehicle_virtual(&buf, "italirsx_spoiler_01.#ft"));
+        assert!(!is_vehicle_virtual(&buf, "test_vehicle_spoiler_01.#ft"));
     }
 }

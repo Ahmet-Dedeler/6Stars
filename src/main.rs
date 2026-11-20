@@ -804,19 +804,22 @@ fn setup_style(ctx: &egui::Context) {
     }
     ctx.set_fonts(fonts);
 
+    // neon sunset theme matching dusk purple magenta and golden amber
     let mut vis = egui::Visuals::dark();
-    vis.panel_fill = Color32::from_rgb(16, 17, 22);
-    vis.window_fill = Color32::from_rgb(22, 23, 30);
-    vis.extreme_bg_color = Color32::from_rgb(11, 12, 16);
-    vis.widgets.inactive.bg_fill = Color32::from_rgb(28, 30, 38);
+    vis.panel_fill = Color32::from_rgb(18, 12, 28);
+    vis.window_fill = Color32::from_rgb(24, 16, 36);
+    vis.extreme_bg_color = Color32::from_rgb(12, 8, 20);
+    vis.widgets.inactive.bg_fill = Color32::from_rgb(34, 22, 50);
+    vis.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(68, 42, 98));
     vis.widgets.inactive.corner_radius = CornerRadius::same(6);
-    vis.widgets.hovered.bg_fill = Color32::from_rgb(44, 46, 58);
+    vis.widgets.hovered.bg_fill = Color32::from_rgb(56, 34, 82);
+    vis.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(255, 72, 165));
     vis.widgets.hovered.corner_radius = CornerRadius::same(6);
-    vis.widgets.active.bg_fill = Color32::from_rgb(252, 175, 23);
+    vis.widgets.active.bg_fill = Color32::from_rgb(255, 168, 28);
     vis.widgets.active.fg_stroke = Stroke::new(1.5_f32, Color32::BLACK);
     vis.widgets.active.corner_radius = CornerRadius::same(6);
-    vis.selection.bg_fill = Color32::from_rgba_unmultiplied(252, 175, 23, 55);
-    vis.selection.stroke = Stroke::new(1.0_f32, Color32::from_rgb(252, 175, 23));
+    vis.selection.bg_fill = Color32::from_rgba_unmultiplied(255, 72, 165, 58);
+    vis.selection.stroke = Stroke::new(1.0_f32, Color32::from_rgb(255, 168, 28));
     ctx.set_visuals(vis);
 }
 
@@ -1247,14 +1250,14 @@ impl eframe::App for Rpf9App {
             (m.loading, m.status.clone(), m.awc_streams.clone())
         };
 
-        egui::TopBottomPanel::top("top").frame(egui::Frame::new().fill(Color32::from_rgb(20, 21, 27)).inner_margin(10.0)).show(ctx, |ui| {
+        egui::TopBottomPanel::top("top").frame(egui::Frame::new().fill(Color32::from_rgb(24, 14, 36)).inner_margin(10.0)).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if let Some(tex) = &self.logo_tex {
                     ui.image((tex.id(), egui::vec2(28.0, 28.0)));
                 }
                 ui.add_space(6.0);
-                ui.label(RichText::new("PERCYSTAR").size(17.0).strong().color(Color32::from_rgb(252, 175, 23)));
-                ui.label(RichText::new("RPF9").size(13.0).strong().color(Color32::from_rgb(255, 95, 185)));
+                ui.label(RichText::new("PERCYSTAR").size(17.0).strong().color(Color32::from_rgb(255, 168, 28)));
+                ui.label(RichText::new("RPF9").size(13.0).strong().color(Color32::from_rgb(255, 72, 165)));
                 ui.add_space(10.0);
                 if ui.button("Open Folder...").clicked() {
                     if let Some(folder) = rfd::FileDialog::new().pick_folder() {
@@ -1302,7 +1305,7 @@ impl eframe::App for Rpf9App {
             });
         });
 
-        egui::TopBottomPanel::bottom("bottom").frame(egui::Frame::new().fill(Color32::from_rgb(12, 13, 17)).inner_margin(egui::Margin::symmetric(12, 5))).show(ctx, |ui| {
+        egui::TopBottomPanel::bottom("bottom").frame(egui::Frame::new().fill(Color32::from_rgb(14, 9, 22)).inner_margin(egui::Margin::symmetric(12, 5))).show(ctx, |ui| {
             let (hdr, status, scanning) = {
                 let st = self.state.lock().unwrap();
                 (st.header_info.clone(), st.status.clone(), st.scanning)
@@ -1316,7 +1319,7 @@ impl eframe::App for Rpf9App {
             });
         });
 
-        egui::SidePanel::left("tree").default_width(195.0).frame(egui::Frame::new().fill(Color32::from_rgb(16, 17, 21)).inner_margin(8.0)).show(ctx, |ui| {
+        egui::SidePanel::left("tree").default_width(195.0).frame(egui::Frame::new().fill(Color32::from_rgb(18, 12, 28)).inner_margin(8.0)).show(ctx, |ui| {
             self.refresh_view();
             let c = self.counts;
             ui.label(RichText::new("ARCHIVE TREE").size(11.0).color(Color32::from_rgb(110, 118, 134)));
@@ -1352,15 +1355,15 @@ impl eframe::App for Rpf9App {
             }
         });
 
-        egui::SidePanel::left("filelist").default_width(390.0).frame(egui::Frame::new().fill(Color32::from_rgb(19, 21, 26)).inner_margin(8.0)).show(ctx, |ui| {
+        egui::SidePanel::left("filelist").default_width(390.0).frame(egui::Frame::new().fill(Color32::from_rgb(22, 15, 34)).inner_margin(8.0)).show(ctx, |ui| {
             if self.category == Category::Models {
                 ui.horizontal(|ui| {
                     let btn = egui::Button::new(
                         RichText::new(if self.vehicles_only { "★ Vehicles Only: ON" } else { "Vehicles Only" })
                             .strong()
-                            .color(if self.vehicles_only { Color32::BLACK } else { Color32::from_rgb(255, 85, 175) }),
+                            .color(if self.vehicles_only { Color32::BLACK } else { Color32::from_rgb(255, 72, 165) }),
                     )
-                    .fill(if self.vehicles_only { Color32::from_rgb(252, 175, 23) } else { Color32::from_rgb(32, 34, 44) });
+                    .fill(if self.vehicles_only { Color32::from_rgb(255, 168, 28) } else { Color32::from_rgb(38, 24, 56) });
                     if ui.add(btn).clicked() {
                         self.vehicles_only = !self.vehicles_only;
                     }
@@ -1395,7 +1398,7 @@ impl eframe::App for Rpf9App {
             }
         });
 
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::from_rgb(13, 14, 17)).inner_margin(12.0)).show(ctx, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::from_rgb(14, 10, 22)).inner_margin(12.0)).show(ctx, |ui| {
             if self.parent_hwnd == 0 {
                 let h = unsafe { GetActiveWindow() };
                 if h != 0 { self.parent_hwnd = h; }

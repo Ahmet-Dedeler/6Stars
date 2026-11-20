@@ -1,4 +1,4 @@
-"""decode gta 6 adat v1 awc audio into playable wav streams"""
+"""decode adat v1 awc audio into playable wav streams"""
 import glob
 import os
 import struct

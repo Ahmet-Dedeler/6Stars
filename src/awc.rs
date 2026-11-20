@@ -125,7 +125,7 @@ mod tests {
         let mut pkt = [0u8; 512];
         let plen = enc.encode(&pcm, 960, &mut pkt).unwrap();
 
-        // build fake adat blob matching gta 6 layout
+        // build fake adat blob matching adat v1 layout
         let mut blk = vec![0u8; 2048];
         blk[0..2].copy_from_slice(&(plen as u16).to_le_bytes());
         blk[2..2 + plen].copy_from_slice(&pkt[..plen]);

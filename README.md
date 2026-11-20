@@ -25,7 +25,7 @@
   - All Rust crate dependencies are pinned in [`Cargo.lock`](Cargo.lock).
 - **Native RAGE 9 3D Model Viewer (`.#dr`, `.#ft`, `.#dd`, `.obj`)**
   - Direct click-to-view decoding of unencrypted RAGE 9 virtual (`0x50xxxxxx`) + physical (`0x60xxxxxx`) meshlet resources straight out of `.rpf` archives.
-  - Clean **LOD0-only** extraction (`gtaDrawable.Lod0 -> grmModel -> grmGeometry`), 24/24/16-bit quantized vertices, 7-bit packed meshlet triangles + `u16` remap table, and **UV0** (`type 0x28`).
+  - Clean **LOD0-only** extraction (`Lod0 -> grmModel -> grmGeometry`), 24/24/16-bit quantized vertices, 7-bit packed meshlet triangles + `u16` remap table, and **UV0** (`type 0x28`).
   - Zero-alloc **Z-buffered software rasterizer** (`Textured/Mat`, `Clay Solid`, `Solid+Wire`, `Wire`, `Spin`), embedded `BC1`/`BC3` TXD decoding, custom `.png`/`.bmp` texture loading, and full `.OBJ` export (`v` + `vt` + `f v/vt`).
   - Dedicated **`Vehicles Only`** toggle in the 3D Models tab + sequential fast-indexing of vehicle archives.
 - **Whole-Folder & Single-RPF Scanning**
@@ -75,9 +75,13 @@ Compiled standalone binary: `target/release/PercyStar.exe`.
 
 ---
 
-## Scope & License
+## Scope, Clean-Room Research & Legal Notice
 
-PercyStar inspects **unencrypted** streams (`KB2*` video, `ADAT` audio, plain `zlib` XML/PSIN/RAGE 9 meshlet resources). It does not include encryption keys, DRM bypasses, or third-party proprietary binaries.
+PercyStar is an **independent, clean-room binary inspection and parser tool** built from scratch in Rust. It only parses **unencrypted, user-supplied files** (`KB2*` streams, `ADAT` audio, plain `zlib` XML/PSIN containers, and standard uncompressed meshlet vertex/index blocks) for research and interoperability (cf. 17 U.S.C. § 1201(f)):
+
+- **Zero Circumvention / Zero Keys:** Contains **no** decryption routines, encryption keys, hashes, DRM bypasses, or access-control workarounds. Encrypted data is skipped untouched.
+- **Zero Proprietary Content:** Ships **no** third-party binaries, copyrighted models, textures, audio, shaders, or game assets. Users are solely responsible for supplying archives they legally own or are authorized to inspect.
+- **Independent Trademark Disclaimer:** PercyStar is an independent open-source project and is not affiliated with, endorsed by, or sponsored by any game studio or publisher.
 
 **Copyright (c) 2026 rpatty-dev — All Rights Reserved.**  
 See [LICENSE](LICENSE). You may download, run, and fork this repository on GitHub for personal use/reference, **but you may not modify, alter, or redistribute modified versions of the code or binaries without explicit written permission.**
