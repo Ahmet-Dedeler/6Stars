@@ -434,6 +434,7 @@ pub struct AudioPlayerState {
     pub auto_advance: bool,
     pub loop_track: bool,
     pub filter: String,
+    pub bank_info: Option<String>,
     pub status_msg: String,
     pub error: Option<String>,
     pub decoding_idx: Option<usize>,
@@ -458,6 +459,7 @@ impl Default for AudioPlayerState {
             auto_advance: true,
             loop_track: false,
             filter: String::new(),
+            bank_info: None,
             status_msg: String::new(),
             error: None,
             decoding_idx: None,
@@ -484,6 +486,7 @@ impl AudioPlayerState {
         self.active_idx = None;
         self.active_samples = Arc::new(Vec::new());
         self.filter.clear();
+        self.bank_info = None;
         self.status_msg.clear();
         self.error = None;
         self.decoding_idx = None;
@@ -730,6 +733,14 @@ pub fn render_awc_audio_view(
         });
     });
     ui.add_space(4.0);
+    if let Some(ref info) = player.bank_info {
+        ui.label(
+            RichText::new(info)
+                .size(11.5)
+                .color(Color32::from_rgb(155, 225, 195)),
+        );
+        ui.add_space(2.0);
+    }
     ui.separator();
 
     let needle = player.filter.trim().to_ascii_lowercase();

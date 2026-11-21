@@ -31,9 +31,20 @@ pub fn probe_dat(head: &[u8]) -> Option<u32> {
 
 #[derive(Clone, Debug)]
 pub struct AudioBankMeta {
+    pub bank_hash: u32,
+    pub exact_size: u64,
     pub aligned_size: u64,
     pub pack_name: String,
-    pub sound_label: Option<String>,
+    pub used_by: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResolvedAwcMeta {
+    pub name: String,
+    pub exact_size: u64,
+    pub bank_hash: u32,
+    pub pack_name: String,
+    pub used_by: Vec<String>,
 }
 
 pub struct AudioRpfCatalog {
@@ -179,8 +190,8 @@ pub fn parse_audio_rpf_catalog(audio_rpf: &Path, first_awc_off: u64) -> Option<A
 
     // 2. Build metadata_chunks list for the UI file browser and locate BankSizes in DAT26
     let mut metadata_chunks = Vec::new();
-    let mut raw_banks: Vec<(u32, u64, u32)> = Vec::new();
-    let mut bank_labels: HashMap<u32, String> = HashMap::new();
+    let mut raw_banks: Vec<(u32, u64, u64, u32)> = Vec::new();
+    let mut bank_labels: HashMap<u32, Vec<String>> = HashMap::new();
 
     for (z_idx, (off, chunks, payload)) in files.iter().enumerate() {
         let num = z_idx + 1;
@@ -244,14 +255,14 @@ pub fn parse_audio_rpf_catalog(audio_rpf: &Path, first_awc_off: u64) -> Option<A
                                     let sz1 = rd32(payload, bo + 4) as u64;
                                     let pack_h = rd32(payload, bo + 16);
                                     let aligned = (sz1 + 4095) & !4095;
-                                    raw_banks.push((bh, aligned, pack_h));
+                                    raw_banks.push((bh, sz1, aligned, pack_h));
                                 }
                             }
                         }
                     }
                     // Second pass over objects in DAT26 to extract WaveSlot -> bank_hash labels
                     if !raw_banks.is_empty() {
-                        let bank_set: HashMap<u32, usize> = raw_banks.iter().enumerate().map(|(idx, &(bh, _, _))| (bh, idx)).collect();
+                        let bank_set: HashMap<u32, usize> = raw_banks.iter().enumerate().map(|(idx, &(bh, _, _, _))| (bh, idx)).collect();
                         for (oi, &(oo, h)) in objs.iter().enumerate() {
                             if h == h_banksizes {
                                 continue;
@@ -267,7 +278,10 @@ pub fn parse_audio_rpf_catalog(audio_rpf: &Path, first_awc_off: u64) -> Option<A
                                 while p + 4 <= nxt {
                                     let v = rd32(payload, p);
                                     if bank_set.contains_key(&v) {
-                                        bank_labels.entry(v).or_insert_with(|| clean.to_string());
+                                        let list = bank_labels.entry(v).or_default();
+                                        if list.len() < 16 && !list.iter().any(|s| s == clean) {
+                                            list.push(clean.to_string());
+                                        }
                                     }
                                     p += 4;
                                 }
@@ -287,7 +301,7 @@ pub fn parse_audio_rpf_catalog(audio_rpf: &Path, first_awc_off: u64) -> Option<A
     }
 
     // 3. Scan length-prefixed sound strings in DAT166 / DAT581 and link nearby bank_hash references
-    let bank_set: HashMap<u32, usize> = raw_banks.iter().enumerate().map(|(idx, &(bh, _, _))| (bh, idx)).collect();
+    let bank_set: HashMap<u32, usize> = raw_banks.iter().enumerate().map(|(idx, &(bh, _, _, _))| (bh, idx)).collect();
     for (_, _, payload) in &files {
         if payload.len() < 1024 {
             continue;
@@ -308,7 +322,10 @@ pub fn parse_audio_rpf_catalog(audio_rpf: &Path, first_awc_off: u64) -> Option<A
                         while wp + 4 <= win_end {
                             let v = rd32(payload, wp);
                             if bank_set.contains_key(&v) {
-                                bank_labels.entry(v).or_insert_with(|| sname.to_string());
+                                let list = bank_labels.entry(v).or_default();
+                                if list.len() < 16 && !list.iter().any(|s| s == sname) {
+                                    list.push(sname.to_string());
+                                }
                             }
                             wp += 1;
                         }
@@ -323,16 +340,18 @@ pub fn parse_audio_rpf_catalog(audio_rpf: &Path, first_awc_off: u64) -> Option<A
 
     let banks = raw_banks
         .into_iter()
-        .map(|(bh, aligned_size, ph)| {
+        .map(|(bh, exact_size, aligned_size, ph)| {
             let pack_name = known_pack_fallback(ph)
                 .map(|s| s.to_string())
                 .or_else(|| hash_dict.get(&ph).cloned())
                 .unwrap_or_else(|| format!("pack_{ph:08x}"));
-            let sound_label = bank_labels.get(&bh).cloned();
+            let used_by = bank_labels.remove(&bh).unwrap_or_default();
             AudioBankMeta {
+                bank_hash: bh,
+                exact_size,
                 aligned_size,
                 pack_name,
-                sound_label,
+                used_by,
             }
         })
         .collect();
@@ -349,7 +368,7 @@ pub fn resolve_awc_names_from_catalog(
     awc_offsets_and_tracks: &[(u64, u32)],
     rpf_total_size: u64,
     catalog: &AudioRpfCatalog,
-) -> Vec<Option<String>> {
+) -> Vec<Option<ResolvedAwcMeta>> {
     let n_awc = awc_offsets_and_tracks.len();
     let mut out = vec![None; n_awc];
     if catalog.banks.is_empty() || n_awc == 0 {
@@ -434,26 +453,32 @@ pub fn resolve_awc_names_from_catalog(
         }
     }
 
-    // Format descriptive names for matched AWCs, and interpolate contiguous same-pack blocks
+    // Format descriptive names and metadata for matched AWCs
     for k in 0..n_awc {
         let sc = awc_offsets_and_tracks[k].1;
         let idx_num = k + 1;
         if let Some(bi) = matched_awc[k] {
             let b = &bs[bi];
             let pack_slug = b.pack_name.replace('.', "_");
-            let label = if let Some(ref sl) = b.sound_label {
+            let name = if let Some(sl) = b.used_by.first() {
                 let sl_clean = sl.replace('.', "_");
                 format!("sound_{idx_num:04}_{pack_slug}__{sl_clean}_{sc}st.awc")
             } else {
                 format!("sound_{idx_num:04}_{pack_slug}_{sc}st.awc")
             };
-            out[k] = Some(label);
+            out[k] = Some(ResolvedAwcMeta {
+                name,
+                exact_size: b.exact_size,
+                bank_hash: b.bank_hash,
+                pack_name: b.pack_name.clone(),
+                used_by: b.used_by.clone(),
+            });
         }
     }
     out
 }
 
-// decode rage 9 audMetadata rel header hash index table and embedded paths
+// decode rage 9 audMetadata rel header hash index table, resolved names, and embedded identifiers
 pub fn parse_dat(data: &[u8]) -> String {
     if data.len() < 16 {
         return String::from("Truncated DAT audio metadata");
@@ -463,7 +488,33 @@ pub fn parse_dat(data: &[u8]) -> String {
     let ts = rd32(data, 8);
     let flags = rd32(data, 12);
 
-    let mut out = String::with_capacity(2048);
+    // Collect clean identifier strings across the full DAT file for JOAAT resolution + summary
+    let mut hash_dict: HashMap<u32, String> = HashMap::new();
+    let mut clean_strs: Vec<String> = Vec::new();
+    let mut seen_strs = std::collections::HashSet::new();
+    let mut cur = Vec::new();
+    for &b in data {
+        if b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'/' | b':' | b'-') {
+            cur.push(b);
+        } else {
+            if cur.len() >= 4 {
+                if let Ok(s) = std::str::from_utf8(&cur) {
+                    if s.as_bytes()[0].is_ascii_alphabetic() {
+                        hash_dict.entry(joaat(s)).or_insert_with(|| s.to_string());
+                        if (s.contains('_') || s.contains('.') || s.contains('/'))
+                            && clean_strs.len() < 500
+                            && seen_strs.insert(s.to_string())
+                        {
+                            clean_strs.push(s.to_string());
+                        }
+                    }
+                }
+            }
+            cur.clear();
+        }
+    }
+
+    let mut out = String::with_capacity(8192);
     let _ = writeln!(
         out,
         "=== RAGE 9 Audio Metadata (DAT{ver}) ===\nTotal: {} B | Payload: {} B (0x{:x}) | BuildTag: 0x{:08x} | Flags: 0x{:08x}\n",
@@ -483,36 +534,27 @@ pub fn parse_dat(data: &[u8]) -> String {
             "--- Object Index Table @0x{idx_off:x} (tables={num_tables}, entries={entry_cnt}) ---"
         );
         let list_off = idx_off + 12;
-        for i in 0..entry_cnt.min(64) {
+        for i in 0..entry_cnt.min(250) {
             let e = list_off + i * 8;
             if e + 8 > data.len() {
                 break;
             }
             let hash = rd32(data, e);
             let obj_off = rd32(data, e + 4);
-            let _ = writeln!(out, "  [{i:03}] hash=0x{hash:08x} -> obj@0x{obj_off:06x}");
+            if let Some(name) = hash_dict.get(&hash) {
+                let _ = writeln!(out, "  [{i:03}] {name} (0x{hash:08x}) -> obj@0x{obj_off:06x}");
+            } else {
+                let _ = writeln!(out, "  [{i:03}] hash=0x{hash:08x} -> obj@0x{obj_off:06x}");
+            }
+        }
+        if entry_cnt > 250 {
+            let _ = writeln!(out, "  ... ({} more entries)", entry_cnt - 250);
         }
     }
 
-    // extract readable audio paths and bank references
-    let mut cur = Vec::new();
-    let mut strs = Vec::new();
-    for &b in data.iter().take(256 * 1024) {
-        if (32..127).contains(&b) {
-            cur.push(b);
-        } else {
-            if cur.len() >= 5 {
-                strs.push(String::from_utf8_lossy(&cur).into_owned());
-                if strs.len() >= 64 {
-                    break;
-                }
-            }
-            cur.clear();
-        }
-    }
-    if !strs.is_empty() {
-        let _ = writeln!(out, "\n--- Embedded Audio Strings / Paths ({}) ---", strs.len());
-        for s in strs {
+    if !clean_strs.is_empty() {
+        let _ = writeln!(out, "\n--- Embedded Audio Identifiers / Paths ({}) ---", clean_strs.len());
+        for s in clean_strs {
             let _ = writeln!(out, "  {s}");
         }
     }
