@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 pub const ENTITY_STRUCT_HASH: u32 = 0xce50_1483;
 pub const MAPDATA_STRUCT_HASH: u32 = 0xd359_3fa6;
+pub const ARCHETYPE_DEF_HASH: u32 = 0x82d6_fc83;
 
 #[derive(Clone, Copy, Debug)]
 pub struct EntityPlacement {
@@ -108,6 +109,65 @@ pub fn parse_0drpz_map_entities(sys: &[u8]) -> Option<Vec<EntityPlacement>> {
     }
 }
 
+pub fn parse_0drpz_archetype_aliases(sys: &[u8]) -> Vec<(u32, u32)> {
+    if sys.len() < 0x50 || sys.get(0x10..0x15) != Some(b"0DRPz") {
+        return Vec::new();
+    }
+    let nbl = ru16(sys, 0x4C) as usize;
+    let Some(it) = vptr(ru64(sys, 0x38)) else { return Vec::new() };
+    if it + nbl * 16 > sys.len() {
+        return Vec::new();
+    }
+    let mut aliases = Vec::new();
+    for i in 0..nbl {
+        let o = it + i * 16;
+        let hash = ru32(sys, o);
+        let sz = ru32(sys, o + 4) as usize;
+        if hash != ARCHETYPE_DEF_HASH || sz < 0x90 {
+            continue;
+        }
+        let Some(base) = vptr(ru64(sys, o + 8)) else { continue };
+        let end = base.saturating_add(sz).min(sys.len());
+        let mut cur = base;
+        while cur + 0x90 <= end {
+            let arch = ru32(sys, cur + 0x74);
+            let draw = ru32(sys, cur + 0x7C);
+            let asset = ru32(sys, cur + 0x88);
+            if arch != 0 && draw != 0 && draw != arch {
+                aliases.push((arch, draw));
+            }
+            if arch != 0 && asset != 0 && asset != arch {
+                aliases.push((arch, asset));
+            }
+            cur += 0x90;
+        }
+    }
+    aliases
+}
+
+fn merge_scan_cache_models(ix: &mut WorldIndex) {
+    let Some(base) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) else { return };
+    let tsv = base.join("PercyStar").join("scan_cache_v9.tsv");
+    let Ok(f) = File::open(tsv) else { return };
+    use std::io::BufRead;
+    let r = BufReader::new(f);
+    for line in r.lines().map_while(Result::ok) {
+        if !line.contains("\tlevels.rpf\t") {
+            continue;
+        }
+        let mut cols = line.split('\t');
+        let (_k, _p, _rpf, Some(name), Some(kind), Some(off_s)) = (
+            cols.next(), cols.next(), cols.next(), cols.next(), cols.next(), cols.next()
+        ) else { continue };
+        if kind != "MODEL" && kind != "VEH" {
+            continue;
+        }
+        let Ok(off) = off_s.parse::<u64>() else { continue };
+        let stem = name.split(".#").next().unwrap_or(name);
+        ix.models.entry(joaat(stem)).or_insert(off);
+    }
+}
+
 fn cache_path() -> Option<PathBuf> {
     let base = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
@@ -175,7 +235,8 @@ pub fn build_or_load_world_index(levels_rpf: &Path) -> WorldIndex {
     let Ok(f) = File::open(levels_rpf) else { return WorldIndex::default() };
     let sz = f.metadata().map(|m| m.len()).unwrap_or(0);
     if let Some(cp) = cache_path() {
-        if let Some(ix) = load_world_index(&cp, sz) {
+        if let Some(mut ix) = load_world_index(&cp, sz) {
+            merge_scan_cache_models(&mut ix);
             return ix;
         }
     }
@@ -192,8 +253,9 @@ pub fn build_or_load_world_index(levels_rpf: &Path) -> WorldIndex {
             let done_bytes = &done_bytes;
             handles.push(s.spawn(move || {
                 let mut local = WorldIndex::default();
-                let Ok(mut f_scan) = File::open(levels_rpf) else { return local };
-                let Ok(mut f_res) = File::open(levels_rpf) else { return local };
+                let mut local_aliases: Vec<(u32, u32)> = Vec::new();
+                let Ok(mut f_scan) = File::open(levels_rpf) else { return (local, local_aliases) };
+                let Ok(mut f_res) = File::open(levels_rpf) else { return (local, local_aliases) };
                 let mut buf = vec![0u8; chunk_sz as usize];
                 let mut dec = Decompress::new(true);
                 let mut head = [0u8; 64];
@@ -232,6 +294,9 @@ pub fn build_or_load_world_index(levels_rpf: &Path) -> WorldIndex {
                                                 local.map_count += 1;
                                                 local.entities.extend(ents);
                                             }
+                                            for (arch, draw) in parse_0drpz_archetype_aliases(&sys) {
+                                                local_aliases.push((arch, draw));
+                                            }
                                         }
                                     } else {
                                         dec.reset(true);
@@ -254,26 +319,33 @@ pub fn build_or_load_world_index(levels_rpf: &Path) -> WorldIndex {
                         eprintln!("[world-index] {:.1} / {:.1} GB...", done as f64 / 1e9, sz as f64 / 1e9);
                     }
                 }
-                local
+                (local, local_aliases)
             }));
         }
         let mut merged = WorldIndex::default();
+        let mut all_aliases = Vec::new();
         for h in handles {
-            if let Ok(local) = h.join() {
+            if let Ok((local, aliases)) = h.join() {
                 merged.map_count += local.map_count;
                 merged.entities.extend(local.entities);
                 for (k, v) in local.models {
                     merged.models.entry(k).or_insert(v);
                 }
+                all_aliases.extend(aliases);
+            }
+        }
+        for (arch, draw) in all_aliases {
+            if let Some(&off) = merged.models.get(&draw) {
+                merged.models.entry(arch).or_insert(off);
             }
         }
         merged
     });
 
+    merge_scan_cache_models(&mut ix);
     if let Some(cp) = cache_path() {
         save_world_index(&cp, sz, &ix);
     }
-    let _ = &mut ix;
     ix
 }
 
