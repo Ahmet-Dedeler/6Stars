@@ -1,6 +1,8 @@
-﻿mod awc;
+﻿mod anim;
+mod awc;
 mod dxbc;
 mod psin;
+mod rsc9;
 mod sgd5;
 mod model3d;
 mod rdna2;
@@ -1296,6 +1298,10 @@ impl Rpf9App {
                             && sample.iter().all(|&b| (32..127).contains(&b) || matches!(b, 9 | 10 | 13 | 0x80..)));
                     if e.kind == "PSIN" {
                         self.preview = psin::parse_psin(&data);
+                    } else if e.kind == "ANIM" {
+                        self.preview = anim::parse_anim_dict(&data);
+                    } else if e.kind == "RSC9" {
+                        self.preview = rsc9::parse_qqqq_table(&data);
                     } else if e.kind == "RBF0" {
                         self.preview = decode_rbf0(&data).unwrap_or_else(|| format_hex(&data[..data.len().min(2048)]));
                     } else if e.kind == "GFX" {
@@ -1358,7 +1364,7 @@ impl Rpf9App {
                     "BK2" => 6,
                     "AWC" => 7,
                     "XML" => 8,
-                    "PSIN" => 9,
+                    "PSIN" | "ANIM" | "RSC9" => 9,
                     _ => 10,
                 }] += 1;
             }
@@ -1383,7 +1389,7 @@ impl Rpf9App {
                     Category::Videos => e.kind == "BK2",
                     Category::Audio => e.kind == "AWC",
                     Category::Xml => e.kind == "XML",
-                    Category::Resources => e.kind == "PSIN",
+                    Category::Resources => matches!(e.kind, "PSIN" | "ANIM" | "RSC9"),
                     Category::Binary => e.kind == "ZLIB",
                 };
                 let h = &self.hay[*i];
@@ -2666,6 +2672,8 @@ fn load_disk_cache() -> HashMap<String, Vec<RpfEntry>> {
             "AWC" => "AWC",
             "XML" => "XML",
             "PSIN" => "PSIN",
+            "ANIM" => "ANIM",
+            "RSC9" => "RSC9",
             _ => "ZLIB",
         };
         // tolerate old 11 col cache rows and newer 10 col ones
@@ -2849,6 +2857,8 @@ fn kind_color(kind: &str) -> Color32 {
         "AWC" => Color32::from_rgb(90, 235, 165),
         "BK2" => Color32::from_rgb(252, 175, 23),
         "PSIN" => Color32::from_rgb(210, 120, 255),
+        "ANIM" => Color32::from_rgb(100, 225, 195),
+        "RSC9" => Color32::from_rgb(120, 185, 255),
         _ => Color32::from_rgb(145, 152, 168),
     }
 }
@@ -2970,7 +2980,7 @@ fn read_entry_bytes(e: &RpfEntry) -> std::io::Result<Vec<u8>> {
         f.seek(SeekFrom::Start(e.offset))?;
         let mut raw = vec![0u8; e.comp_size as usize];
         f.read_exact(&mut raw)?;
-        if matches!(e.kind, "XML" | "PSIN" | "RBF0" | "GFX" | "GXT" | "ZLIB") {
+        if matches!(e.kind, "XML" | "PSIN" | "ANIM" | "RSC9" | "RBF0" | "GFX" | "GXT" | "ZLIB") {
             let mut out = Vec::new();
             ZlibDecoder::new(&raw[..]).read_to_end(&mut out)?;
             Ok(out)
@@ -3057,6 +3067,20 @@ fn probe_rage9_page(
             comp_size: probe_dec.total_in(),
             raw_size: olen as u64,
             tracks: tex_cnt as u32,
+            chunks: Vec::new(),
+        });
+    }
+    // 2b. crClipDictionary (.ycd animation dictionary)
+    if let Some((aname, clip_cnt)) = anim::probe_anim_dict(&probe_out[..olen]) {
+        return Some(RpfEntry {
+            source_rpf: path.to_path_buf(),
+            rpf_name: rname.to_string(),
+            name: aname,
+            kind: "ANIM",
+            offset: off + p as u64,
+            comp_size: probe_dec.total_in(),
+            raw_size: olen as u64,
+            tracks: clip_cnt,
             chunks: Vec::new(),
         });
     }
@@ -3339,13 +3363,22 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
                                 let tag = extract_xml_tag(&stitch_head[trimmed..]).unwrap_or_else(|| "config".into());
                                 ("XML", format!("{z_idx:04}_{tag}.xml"))
                             } else if stitch_head.starts_with(b"RBF0") {
-                                ("RBF0", format!("{z_idx:04}_ui.rbf"))
+                                let slug: String = stitch_head[12..].iter()
+                                    .skip_while(|&&b| !b.is_ascii_alphabetic())
+                                    .take_while(|&&b| b.is_ascii_alphanumeric() || b == b'_')
+                                    .map(|&b| b as char)
+                                    .take(36)
+                                    .collect();
+                                let nm = if slug.len() >= 4 { format!("{z_idx:04}_{slug}.rbf") } else { format!("{z_idx:04}_ui.rbf") };
+                                ("RBF0", nm)
                             } else if stitch_head.starts_with(b"GFX") {
                                 ("GFX", format!("{z_idx:04}_scaleform.gfx"))
                             } else if let Some(slug) = tex::probe_gxt_snippet(&stitch_head) {
                                 ("GXT", format!("{z_idx:04}_{slug}.gxt"))
                             } else if stitch_head.starts_with(b"PSIN") {
                                 ("PSIN", format!("{z_idx:04}_resource.psin"))
+                            } else if rsc9::is_qqqq_table(&stitch_head) {
+                                ("RSC9", format!("{z_idx:04}_rsc9_table.bin"))
                             } else {
                                 ("ZLIB", format!("{z_idx:04}_data.bin"))
                             };

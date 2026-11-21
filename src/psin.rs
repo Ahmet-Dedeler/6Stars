@@ -16,6 +16,12 @@ const KNOWN_NAMES: &[&str] = &[
     "CMapData", "CMapTypes", "CEntityDef", "CBaseArchetypeDef", "CMloArchetypeDef",
     "CDataFileMgr__ContentDef", "CDataFileMgr__ContentChangeSetDef",
     "CWeaponInfo", "CVehicleModelInfo", "CPedModelInfo", "CScenarioPoint",
+    "CVehiclePointsMeta", "CTuningFile", "CDamageDataManager", "GridAtlasInfo",
+    "CMovieSubtitleContainer", "CMovieSubtitleEventArg", "CAnimalAttackBehaviours",
+    "CBaitingInfo", "TextBlockName", "Tunables", "VehiclePointFiles", "Behaviours",
+    "Contexts", "Condition", "contentSets", "includedSets", "includedChangesets",
+    "registrationGroup", "associatedMap", "loadPath", "changesetIncludeFlags",
+    "clientSystemName", "tileTextureNamePrefix", "MaxDistance", "DamageCleanlinessDatas",
 ];
 
 #[derive(Clone, Debug)]
