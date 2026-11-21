@@ -957,6 +957,11 @@ struct TtpfMipLayout {
 impl TtpfMipLayout {
     /// `ew`/`eh`: mip-0 size in elements. Mip n is `max(1, e >> n)` elements per axis.
     fn new(ew: usize, eh: usize, mip_count: usize, bpe: usize, use_64k: bool) -> Self {
+        Self::new_ext(ew, eh, mip_count, bpe, use_64k, true)
+    }
+
+    /// `extend`: lay out levels below the declared chain down to a tail block (see below).
+    fn new_ext(ew: usize, eh: usize, mip_count: usize, bpe: usize, use_64k: bool, extend: bool) -> Self {
         let (block_w, block_h) = swizzle_block_dims(bpe, use_64k);
         let block_bytes = (block_w * block_h * bpe) as u64;
         // Gfx10 caps how many trailing mips may share the tail block at log2(block bytes) - 4.
@@ -972,7 +977,7 @@ impl TtpfMipLayout {
         // (wide textures like 1024x256 with 5 mips), the allocation still holds the lower
         // levels down to a tail block, so lay those out too and hide them afterwards.
         let mut n = declared;
-        while find_tail(n) == n && n < 16 && dim(n - 1) != (1, 1) {
+        while extend && find_tail(n) == n && n < 16 && dim(n - 1) != (1, 1) {
             n += 1;
         }
         let first_tail = find_tail(n);
@@ -1128,19 +1133,9 @@ pub fn decode_ttpf_texture(path: &Path, tex_idx: usize) -> Result<DecodedTexture
 
     let (fmt_name, is_bc, bpe) = dxgi_info(d.dxgi)
         .ok_or_else(|| format!("Unsupported DXGI format {} (fmt_byte=0x{:02x})", d.dxgi, d.fmt_byte))?;
-    // Small BCn textures can have mip 0 inside the shared tail rather than at
-    // the origin of the tile. Reading the origin can look like an empty mask.
-    let tail = if is_bc && d.mip_count > 1 {
-        ttpf_bc_layout(d, bpe).filter(|l| l.mips[0].tail_origin.is_some() && l.block_bytes <= d.alloc_sz)
-    } else {
-        None
-    };
-    let (mip0_off, mip0_padded, use_64k) = tail.as_ref()
-        .map(|l| (d.byte_off, l.block_bytes as usize, l.use_64k))
-        .unwrap_or_else(|| ttpf_mip0_range(d, is_bc, bpe));
 
-    let raw_tex = match ttpf_read_virtual(path, &ix, mip0_off, mip0_padded) {
-        Ok(raw) => raw,
+    let (lin, pixels) = match ttpf_decode_mip0(path, &ix, d, is_bc, bpe) {
+        Ok(v) => v,
         Err(err) if err.contains("BCPack") => {
             let Some(low) = ttpf_decode_lower_mip(path, &ix, d) else {
                 return Err(format!("{err}; no smaller mip is stored outside BCPack"));
@@ -1159,15 +1154,6 @@ pub fn decode_ttpf_texture(path: &Path, tex_idx: usize) -> Result<DecodedTexture
         }
         Err(err) => return Err(err),
     };
-    let lin = if let Some(l) = tail {
-        l.untile(&raw_tex, 0)
-    } else if use_64k {
-        deswizzle_64kb_ttpf(&raw_tex, d.w, d.h, is_bc, bpe)
-    } else {
-        deswizzle_4kb_d(&raw_tex, d.w, d.h, is_bc, bpe)
-    };
-    let pixels = decode_linear_to_rgba(&lin, d.w, d.h, d.dxgi)
-        .ok_or_else(|| format!("Pixel decode failed for {fmt_name} ({}x{})", d.w, d.h))?;
     Ok(DecodedTexture {
         name: format!("tex_{:05}_{}x{}_{fmt_name}", d.idx, d.w, d.h),
         w: d.w,
@@ -1179,6 +1165,177 @@ pub fn decode_ttpf_texture(path: &Path, tex_idx: usize) -> Result<DecodedTexture
         raw_dds_payload: lin,
         full_size: None,
     })
+}
+
+/// One guess at where mip 0 lives, plus where its mip 1 would then be.
+struct Mip0Guess {
+    label: &'static str,
+    off: u64,
+    len: usize,
+    /// Untile with this layout's mip 0; None means the original deswizzlers.
+    layout: Option<TtpfMipLayout>,
+    use_64k: bool,
+    /// Mip 1 location and the layout that untiles it (its mip index 1).
+    mip1: Option<(u64, u64, TtpfMipLayout)>,
+}
+
+/// Decodes a texture's full-size mip, returning (linear blocks, pixels).
+///
+/// The descriptor doesn't say exactly where mip 0 starts, and no single rule fits the
+/// whole dump: the original guess (end of the allocation, else its start) shows the
+/// small-mip strip for many multi-mip textures, and the computed mip-chain layout is off
+/// for many UI and short-chain textures. So for mipmapped BCn textures we try each
+/// plausible placement and keep the one whose mip 1 is a 2x downscale of its mip 0;
+/// a wrong placement pairs two unrelated images. Measured on the Xbox dump, see
+/// `ttpf_mip0_choice_audit`. When every guess agrees (most textures) only one is decoded.
+fn ttpf_decode_mip0(path: &Path, ix: &TtpfIndex, d: &TtpfTexMeta, is_bc: bool, bpe: usize) -> Result<(Vec<u8>, Vec<Color32>), String> {
+    ttpf_decode_mip0_labeled(path, ix, d, is_bc, bpe).map(|(_, v)| v)
+}
+
+fn ttpf_decode_mip0_labeled(path: &Path, ix: &TtpfIndex, d: &TtpfTexMeta, is_bc: bool, bpe: usize) -> Result<(&'static str, (Vec<u8>, Vec<Color32>)), String> {
+    let guesses = ttpf_mip0_guesses(d, is_bc, bpe);
+    let decode = |g: &Mip0Guess| ttpf_decode_guess(path, ix, d, is_bc, bpe, g);
+    if guesses.len() == 1 {
+        return decode(&guesses[0]).map(|v| (guesses[0].label, v));
+    }
+    // (decoded mip 0, how well its mip 1 matches) for each guess; guesses[0] is the baseline
+    let mut results: Vec<(Result<(Vec<u8>, Vec<Color32>), String>, Option<f64>)> = guesses
+        .iter()
+        .map(|g| {
+            let r = decode(g);
+            let score = match (&r, &g.mip1) {
+                (Ok((_, px0)), Some((o1, l1, lay))) => ttpf_read_virtual(path, ix, *o1, *l1 as usize).ok().and_then(|raw1| {
+                    let s1 = &lay.mips[1];
+                    let px1 = decode_linear_to_rgba(&lay.untile(&raw1, 1), s1.ew * 4, s1.eh * 4, d.dxgi)?;
+                    mip_pair_error(px0, d.w, d.h, &px1, s1.ew * 4)
+                }),
+                _ => None,
+            };
+            (r, score)
+        })
+        .collect();
+    // Move away from the baseline only on clear evidence: an alternative whose mip pair is
+    // close (mean error under MIP_MATCH_MAX per channel) and at most half the baseline's
+    // error, or, when the baseline can't be scored or read, a very close pair
+    // (MIP_MATCH_STRICT). Flat images such as UI icons pair up fairly well even when
+    // misplaced, and the baseline is right for those; real fixes on the dump score under 5.
+    const MIP_MATCH_MAX: f64 = 12.0;
+    const MIP_MATCH_STRICT: f64 = 5.0;
+    let base_score = if results[0].0.is_ok() { results[0].1 } else { None };
+    let best_alt = (1..results.len())
+        .filter(|&i| results[i].0.is_ok())
+        .filter_map(|i| results[i].1.map(|e| (i, e)))
+        .min_by(|a, b| a.1.total_cmp(&b.1));
+    let pick = match (best_alt, base_score) {
+        (Some((i, e)), Some(o)) if e < MIP_MATCH_MAX && e * 2.0 < o => i,
+        (Some((i, e)), None) if e < MIP_MATCH_STRICT => i,
+        _ => 0,
+    };
+    let label = guesses[pick].label;
+    // An unreadable baseline (BCPack) keeps its error so the lower-mip fallback runs.
+    results.swap_remove(pick).0.map(|v| (label, v))
+}
+
+/// Read and untile one mip-0 guess, returning (linear blocks, pixels).
+fn ttpf_decode_guess(path: &Path, ix: &TtpfIndex, d: &TtpfTexMeta, is_bc: bool, bpe: usize, g: &Mip0Guess) -> Result<(Vec<u8>, Vec<Color32>), String> {
+    let raw = ttpf_read_virtual(path, ix, g.off, g.len)?;
+    let lin = match &g.layout {
+        Some(l) => l.untile(&raw, 0),
+        None if g.use_64k => deswizzle_64kb_ttpf(&raw, d.w, d.h, is_bc, bpe),
+        None => deswizzle_4kb_d(&raw, d.w, d.h, is_bc, bpe),
+    };
+    let px = decode_linear_to_rgba(&lin, d.w, d.h, d.dxgi).ok_or_else(|| format!("Pixel decode failed for DXGI {} ({}x{})", d.dxgi, d.w, d.h))?;
+    Ok((lin, px))
+}
+
+/// Mean absolute RGB difference between `px1` and a 2x2 box filter of `px0`, on a sample
+/// of pixels. None when the texture is too small to compare.
+fn mip_pair_error(px0: &[Color32], w0: usize, h0: usize, px1: &[Color32], stride1: usize) -> Option<f64> {
+    let (w1, h1) = (w0 / 2, h0 / 2);
+    if w1 < 2 || h1 < 2 {
+        return None;
+    }
+    let step = ((w1 * h1) as f64 / 16384.0).sqrt().ceil().max(1.0) as usize;
+    // A guess that lands on padding decodes to one flat color for both mips and would
+    // score a perfect match, so a (nearly) single-color mip 1 proves nothing.
+    let (mut sum, mut sum2, mut cnt) = (0f64, 0f64, 0f64);
+    for y in (0..h1).step_by(step) {
+        for x in (0..w1).step_by(step) {
+            let c = px1[y * stride1 + x];
+            let v = c.r() as f64 + c.g() as f64 + c.b() as f64 + c.a() as f64;
+            sum += v;
+            sum2 += v * v;
+            cnt += 1.0;
+        }
+    }
+    let var = sum2 / cnt - (sum / cnt).powi(2);
+    if var < 16.0 {
+        return None;
+    }
+    let (mut err, mut n) = (0u64, 0u64);
+    for y in (0..h1).step_by(step) {
+        for x in (0..w1).step_by(step) {
+            let q = [(0, 0), (1, 0), (0, 1), (1, 1)].map(|(dx, dy)| px0[(2 * y + dy) * w0 + 2 * x + dx]);
+            let c = px1[y * stride1 + x];
+            for (k, v) in [c.r(), c.g(), c.b(), c.a()].into_iter().enumerate() {
+                let avg = q.iter().map(|p| [p.r(), p.g(), p.b(), p.a()][k] as u32).sum::<u32>() / 4;
+                err += (avg as i32 - v as i32).unsigned_abs() as u64;
+            }
+            n += 4;
+        }
+    }
+    Some(err as f64 / n.max(1) as f64)
+}
+
+/// Candidate placements for mip 0, first = preferred when they can't be told apart.
+fn ttpf_mip0_guesses(d: &TtpfTexMeta, is_bc: bool, bpe: usize) -> Vec<Mip0Guess> {
+    let (oo, ol, o64) = ttpf_mip0_range(d, is_bc, bpe);
+    let old = |mip1| Mip0Guess { label: "old", off: oo, len: ol, layout: None, use_64k: o64, mip1 };
+    let Some(ext) = (if is_bc && d.mip_count > 1 { ttpf_bc_layout(d, bpe) } else { None }) else {
+        return vec![old(None)];
+    };
+    let (ew, eh) = (d.w.div_ceil(4).max(1), d.h.div_ceil(4).max(1));
+    let noext = TtpfMipLayout::new_ext(ew, eh, d.mip_count as usize, bpe, ext.use_64k, false);
+    let mut out: Vec<Mip0Guess> = Vec::new();
+    let push = |out: &mut Vec<Mip0Guess>, g: Mip0Guess| {
+        if !out.iter().any(|o| o.off == g.off && o.use_64k == g.use_64k) {
+            out.push(g);
+        }
+    };
+    let span_len = |l: &TtpfMipLayout, m: usize| {
+        let (a, b) = l.span(m);
+        b - a
+    };
+    // mip 1 sits right before mip 0 when neither is in the tail block
+    let before = |off0: u64, l: &TtpfMipLayout| -> Option<(u64, u64, TtpfMipLayout)> {
+        let n1 = span_len(l, 1);
+        (l.mips[0].tail_origin.is_none() && l.mips[1].tail_origin.is_none() && off0 >= d.byte_off + n1).then(|| (off0 - n1, n1, l.clone()))
+    };
+    let from_layout = |label: &'static str, l: TtpfMipLayout| {
+        let (a, b) = l.span(0);
+        let (a1, b1) = l.span(1);
+        Mip0Guess { label, off: d.byte_off + a, len: (b - a) as usize, use_64k: l.use_64k, mip1: Some((d.byte_off + a1, b1 - a1, l.clone())), layout: Some(l) }
+    };
+    // Baseline first: what 6Stars decoded before guesses were compared. Tiny textures whose
+    // mip 0 sits inside the shared tail block are read from the tail (reading the block's
+    // origin shows an empty mask); everything else uses the original allocation guess.
+    if ext.mips[0].tail_origin.is_some() && ext.block_bytes <= d.alloc_sz {
+        push(&mut out, from_layout("tail", ext.clone()));
+    }
+    // the old guess's mip 1, untiled the way the old guess untiles mip 0
+    let old_tiling = if o64 == ext.use_64k { ext.clone() } else { TtpfMipLayout::new(ew, eh, d.mip_count as usize, bpe, o64) };
+    let old_mip1 = before(oo, &old_tiling);
+    push(&mut out, old(old_mip1));
+    push(&mut out, from_layout("layout", ext.clone()));
+    push(&mut out, from_layout("layout-short", noext));
+    let n0 = span_len(&ext, 0);
+    if ext.mips[0].tail_origin.is_none() && d.alloc_sz >= n0 {
+        let off = d.byte_off + d.alloc_sz - n0;
+        let mut one = ext.clone();
+        one.mips.truncate(2);
+        push(&mut out, Mip0Guess { label: "end", off, len: n0 as usize, layout: Some(one.clone()), use_64k: one.use_64k, mip1: before(off, &one) });
+    }
+    out
 }
 
 /// Global 64-bit ETPF texture hash -> (ttpf archive path, descriptor index, w, h, dxgi) resolver.
@@ -1723,6 +1880,90 @@ mod tests {
     /// Dump root for the data-gated tests (folder holding `data/ttdb`).
     fn dump_root() -> Option<std::path::PathBuf> {
         std::env::var("PERCYSTAR_DUMP").ok().map(std::path::PathBuf::from).filter(|p| p.join("data/ttdb").is_dir())
+    }
+
+    #[test]
+    #[ignore]
+    fn ttpf_mip0_debug() {
+        let (Some(root), Ok(picks)) = (dump_root(), std::env::var("PERCYSTAR_PICKS")) else { return };
+        let mut files = Vec::new();
+        collect_ttpf_files(&root, 0, &mut files);
+        for pick in picks.split(';') {
+            let (f, i) = pick.split_once(':').unwrap();
+            let i: usize = i.parse().unwrap();
+            let Some(path) = files.iter().find(|p| p.to_string_lossy().ends_with(f)) else { continue };
+            let ix = ttpf_index(path).unwrap();
+            let d = &ix.descs[i];
+            let (_, is_bc, bpe) = dxgi_info(d.dxgi).unwrap();
+            println!("DBG {f}:{i} {}x{} dxgi {} tile {} mips {} off {:#x} alloc {:#x}", d.w, d.h, d.dxgi, d.tile_mode, d.mip_count, d.byte_off, d.alloc_sz);
+            for g in ttpf_mip0_guesses(d, is_bc, bpe) {
+                let score = (|| {
+                    let raw = ttpf_read_virtual(path, &ix, g.off, g.len).ok()?;
+                    let lin = match &g.layout { Some(l) => l.untile(&raw, 0), None if g.use_64k => deswizzle_64kb_ttpf(&raw, d.w, d.h, is_bc, bpe), None => deswizzle_4kb_d(&raw, d.w, d.h, is_bc, bpe) };
+                    let px0 = decode_linear_to_rgba(&lin, d.w, d.h, d.dxgi)?;
+                    let (o1, l1, lay) = g.mip1.as_ref()?;
+                    let raw1 = ttpf_read_virtual(path, &ix, *o1, *l1 as usize).ok()?;
+                    let s1 = &lay.mips[1];
+                    let px1 = decode_linear_to_rgba(&lay.untile(&raw1, 1), s1.ew * 4, s1.eh * 4, d.dxgi)?;
+                    mip_pair_error(&px0, d.w, d.h, &px1, s1.ew * 4)
+                })();
+                println!("   {:13} off+{:#x} len {:#x} 64k {} mip1 {} score {:?}", g.label, g.off - d.byte_off, g.len, g.use_64k, g.mip1.as_ref().map(|m| format!("+{:#x}", m.0 - d.byte_off)).unwrap_or("-".into()), score);
+            }
+        }
+    }
+
+    /// Which mip-0 placement wins across the dump, and how often the result differs from the
+    /// original guess. `PERCY_OUT=<dir>` writes old | chosen pairs for a sample of changes.
+    ///
+    ///   PERCYSTAR_DUMP=<dump root> cargo test --release ttpf_mip0_choice_audit -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn ttpf_mip0_choice_audit() {
+        let Some(root) = dump_root() else { return };
+        let filt = std::env::var("PERCYSTAR_TTPF_FILTER").unwrap_or_default();
+        let out = std::env::var("PERCY_OUT").ok();
+        let every: usize = std::env::var("PERCY_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(997);
+        let mut files = Vec::new();
+        collect_ttpf_files(&root, 0, &mut files);
+        let mut wins = std::collections::BTreeMap::<&str, usize>::new();
+        let (mut total, mut multi, mut changed, mut written) = (0usize, 0usize, 0usize, 0usize);
+        for path in files.iter().filter(|p| p.to_string_lossy().contains(&filt)) {
+            let Ok(ix) = ttpf_index(path) else { continue };
+            for d in ix.descs.iter() {
+                let Some((_, is_bc, bpe)) = dxgi_info(d.dxgi) else { continue };
+                let guesses = ttpf_mip0_guesses(d, is_bc, bpe);
+                let Ok((label, (lin, px))) = ttpf_decode_mip0_labeled(path, &ix, d, is_bc, bpe) else { continue };
+                total += 1;
+                if guesses.len() < 2 {
+                    continue;
+                }
+                multi += 1;
+                *wins.entry(label).or_default() += 1;
+                // baseline = what v1.4.1 decoded (tail block for tiny textures, else the old guess)
+                let Ok((olin, po)) = ttpf_decode_guess(path, &ix, d, is_bc, bpe, &guesses[0]) else { continue };
+                if olin == lin {
+                    continue;
+                }
+                changed += 1;
+                if let Some(dir) = &out {
+                    if written < 24 && changed % every == 1 && d.w >= 128 && d.h >= 128 {
+                        let mut img = image::RgbaImage::new((d.w * 2 + 8) as u32, d.h as u32);
+                        for y in 0..d.h {
+                            for x in 0..d.w {
+                                for (k, p) in [&po, &px].into_iter().enumerate() {
+                                    let c = p[y * d.w + x];
+                                    img.put_pixel((k * (d.w + 8) + x) as u32, y as u32, image::Rgba([c.r(), c.g(), c.b(), 255]));
+                                }
+                            }
+                        }
+                        let name = format!("{label}__{}_{}.png", path.file_name().unwrap().to_string_lossy(), d.idx);
+                        img.save(std::path::Path::new(dir).join(name)).unwrap();
+                        written += 1;
+                    }
+                }
+            }
+        }
+        println!("AUDIT decoded {total}, ambiguous {multi}, changed vs v1.4.1 baseline {changed}, winners {wins:?}");
     }
 
     /// Counts BCPack-blocked textures and how many the lower-mip fallback recovers.
