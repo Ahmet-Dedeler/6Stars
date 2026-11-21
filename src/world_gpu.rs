@@ -3,7 +3,7 @@ use crate::worldmap::WorldMapData;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Quat, Vec3};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::time::Instant;
@@ -128,11 +128,12 @@ struct Uniforms {
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var shadow_tex: texture_depth_2d;
-@group(0) @binding(2) var shadow_samp: sampler_comparison;
 
 @group(1) @binding(0) var albedo_tex: texture_2d<f32>;
 @group(1) @binding(1) var albedo_samp: sampler;
+
+@group(2) @binding(0) var shadow_tex: texture_depth_2d;
+@group(2) @binding(1) var shadow_samp: sampler_comparison;
 
 struct VsIn {
     @location(0) pos: vec3<f32>,
@@ -322,6 +323,7 @@ struct GpuState {
     shadow_view: wgpu::TextureView,
     uniform_buf: wgpu::Buffer,
     uniform_bg: wgpu::BindGroup,
+    shadow_bg: wgpu::BindGroup,
     tex_bgl: wgpu::BindGroupLayout,
     tex_samp: wgpu::Sampler,
     white_bg: wgpu::BindGroup,
@@ -482,34 +484,42 @@ impl GpuState {
 
         let u_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("u_bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            }],
+        });
+        let uniform_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("u_bg"),
+            layout: &u_bgl,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() }],
+        });
+
+        let shadow_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shadow_bgl"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 2,
+                    binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                     count: None,
                 },
             ],
         });
-        let uniform_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("u_bg"),
-            layout: &u_bgl,
+        let shadow_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shadow_bg"),
+            layout: &shadow_bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&shadow_view) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&shadow_samp) },
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&shadow_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&shadow_samp) },
             ],
         });
 
@@ -556,15 +566,21 @@ impl GpuState {
             },
         ];
 
+        let shadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("shadow_pl"),
+            bind_group_layouts: &[&u_bgl, &tex_bgl],
+            push_constant_ranges: &[],
+        });
+
         let main_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("main_pl"),
-            bind_group_layouts: &[&u_bgl, &tex_bgl],
+            bind_group_layouts: &[&u_bgl, &tex_bgl, &shadow_bgl],
             push_constant_ranges: &[],
         });
 
         let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("shadow_pipe"),
-            layout: Some(&main_layout),
+            layout: Some(&shadow_layout),
             vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_shadow"), buffers: &v_layouts, compilation_options: Default::default() },
             fragment: None,
             primitive: wgpu::PrimitiveState { cull_mode: Some(wgpu::Face::Back), ..Default::default() },
@@ -657,6 +673,7 @@ impl GpuState {
             shadow_view,
             uniform_buf,
             uniform_bg,
+            shadow_bg,
             tex_bgl,
             tex_samp,
             white_bg,
@@ -1036,6 +1053,7 @@ impl ApplicationHandler for GpuWorldApp {
                     rp.set_pipeline(&g.sky_pipeline);
                     rp.set_bind_group(0, &g.uniform_bg, &[]);
                     rp.set_bind_group(1, &g.minimap_bg, &[]);
+                    rp.set_bind_group(2, &g.shadow_bg, &[]);
                     rp.draw(0..3, 0..1);
 
                     rp.set_pipeline(&g.main_pipeline);
