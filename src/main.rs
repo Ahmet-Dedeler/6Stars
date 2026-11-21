@@ -2693,7 +2693,7 @@ fn cache_file_path() -> Option<PathBuf> {
     app_data_dir().map(|d| d.join("scan_cache_v9.tsv"))
 }
 
-fn load_last_folder() -> Option<PathBuf> {
+pub(crate) fn load_last_folder() -> Option<PathBuf> {
     let s = fs::read_to_string(app_data_dir()?.join("last_folder.txt")).ok()?;
     let t = s.trim();
     (!t.is_empty()).then(|| PathBuf::from(t))

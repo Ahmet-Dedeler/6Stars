@@ -92,13 +92,21 @@ pub fn launch_world_gpu_process(common_rpf: Option<&Path>, levels_rpf: Option<&P
 }
 
 pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
-    let terrain = common_rpf
+    let fallback_dir = crate::load_last_folder();
+    let resolved_common = common_rpf.map(Path::to_path_buf).or_else(|| {
+        fallback_dir.as_ref().map(|d| d.join("common.rpf")).filter(|p| p.exists())
+    });
+    let resolved_levels = levels_rpf.map(Path::to_path_buf).or_else(|| {
+        fallback_dir.as_ref().map(|d| d.join("levels.rpf")).filter(|p| p.exists())
+    });
+    let terrain = resolved_common
+        .as_deref()
         .and_then(|p| crate::worldmap::load_mhiu_from_rpf(p).ok())
         .map(Arc::new);
     let cfg = WorldLaunchConfig {
         terrain,
         batches: Vec::new(),
-        levels_rpf: levels_rpf.map(Path::to_path_buf),
+        levels_rpf: resolved_levels,
         map_count: 0,
         start_pos: [-2351.0, -5533.0, 140.0],
     };
@@ -116,30 +124,9 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
                     instances: vec![(Vec3::ZERO, Quat::IDENTITY, Vec3::ONE, [1.0; 4])],
                 }));
             }
-            // 2. build/load cached 0DRPz map placements + model index and stream nearest models
+            // 2. build/load cached 0DRPz map placements + model index and stream all levels nearest-first
             let ix = crate::mapdata::build_or_load_world_index(&lp);
             let _ = tx.send(WorldStreamMsg::MapCount(ix.map_count));
-            let mut by_arch: HashMap<u32, Vec<(Vec3, Quat, Vec3, [f32; 4], f32)>> = HashMap::new();
-            for e in &ix.entities {
-                let Some(&moff) = ix.models.get(&e.archetype_hash) else { continue };
-                let dx = e.pos[0] - start[0];
-                let dy = e.pos[1] - start[1];
-                let d2 = dx * dx + dy * dy;
-                if d2 > 3500.0 * 3500.0 {
-                    continue;
-                }
-                let q = Quat::from_xyzw(e.rot[0], e.rot[1], e.rot[2], e.rot[3]).normalize();
-                let sc = Vec3::new(e.scale_xy, e.scale_xy, e.scale_z);
-                by_arch.entry(moff as u32 ^ e.archetype_hash).or_default().push((
-                    Vec3::from_array(e.pos),
-                    q,
-                    sc,
-                    [1.0; 4],
-                    d2,
-                ));
-                let _ = moff;
-            }
-            // group by archetype_hash cleanly, sorted nearest-first to start_pos
             let mut arch_groups: Vec<(u32, u64, f32, Vec<(Vec3, Quat, Vec3, [f32; 4])>)> = Vec::new();
             let mut grouped: HashMap<u32, (f32, Vec<(Vec3, Quat, Vec3, [f32; 4])>)> = HashMap::new();
             for e in &ix.entities {
@@ -149,9 +136,6 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
                 let dx = e.pos[0] - start[0];
                 let dy = e.pos[1] - start[1];
                 let d2 = dx * dx + dy * dy;
-                if d2 > 2500.0 * 2500.0 {
-                    continue;
-                }
                 let q = Quat::from_xyzw(e.rot[0], e.rot[1], e.rot[2], e.rot[3]).normalize();
                 let sc = Vec3::new(e.scale_xy, e.scale_xy, e.scale_z);
                 let entry = grouped.entry(e.archetype_hash).or_insert_with(|| (d2, Vec::new()));
@@ -166,7 +150,7 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
                 }
             }
             arch_groups.sort_by(|a, b| a.2.total_cmp(&b.2));
-            for (h, moff, _, insts) in arch_groups.into_iter().take(600) {
+            for (h, moff, _, insts) in arch_groups {
                 if let Ok(mesh) = crate::model3d::decode_rage9_model_from_rpf(&lp, moff, &format!("arch_{h:08x}")) {
                     let lo = mesh.name.to_ascii_lowercase();
                     if lo.ends_with("_shadow") || lo.ends_with("_pxy") || lo.ends_with("_lit_proxy") {
