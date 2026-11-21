@@ -1422,7 +1422,15 @@ impl Rpf9App {
             #[cfg(not(target_os = "macos"))]
             let decoder = bink_dock::player_path();
             let Some(decoder) = decoder else {
-                m.status = "No video decoder in this build. Open the packaged Percy6Stars build.".into();
+                #[cfg(target_os = "macos")]
+                let message = if cfg!(target_arch = "aarch64") {
+                    "No Bink decoder in this build. See Build from Source in the README for compatible players."
+                } else {
+                    "In-app Bink playback requires Apple Silicon."
+                };
+                #[cfg(not(target_os = "macos"))]
+                let message = "No video decoder in this build. Open the packaged Percy6Stars build.";
+                m.status = message.into();
                 return;
             };
             match video_clip::PendingClip::prepare(e.source_rpf, e.offset, e.comp_size) {

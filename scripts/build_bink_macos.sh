@@ -11,8 +11,12 @@ bridge_sha=b8846c23ba07d62b9ebe60b2c1828977e26ee7b396b23e0c53130266addabd80
 mkdir -p "$cache" "$app/Contents/Helpers" "$app/Contents/Resources"
 tmp="$(mktemp -d)"
 mounted=0
+detach_rad() {
+  hdiutil detach "$tmp/rad" -quiet || { sleep 1; hdiutil detach "$tmp/rad" -quiet; }
+}
+
 cleanup() {
-  if [[ "$mounted" == 1 ]]; then hdiutil detach "$tmp/rad" -quiet || return; fi
+  if [[ "$mounted" == 1 ]]; then detach_rad || return; fi
   rm -r "$tmp"
 }
 trap cleanup EXIT
@@ -38,10 +42,10 @@ if ! matches_sha "$rad" "$rad_sha"; then
     matches_sha "$candidate" "$rad_sha" || {
       echo "RAD player changed; the frame bridge needs updating." >&2
       echo "If you have the original unpatched player, set SIXSTARS_BINK_PLAYER to its path (SHA-256: $rad_sha)." >&2
-      exit 1
+      exit 78
     }
     cp -X "$candidate" "$tmp/player"
-    hdiutil detach "$tmp/rad" -quiet
+    detach_rad
     mounted=0
     cp "$tmp/player" "$rad"
   fi

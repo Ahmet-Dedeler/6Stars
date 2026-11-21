@@ -68,7 +68,7 @@ cd Percy6Stars
 2. Run `bash scripts/build_macos.sh`.
 3. Open `dist/Percy6Stars.app`.
 
-The script fetches and verifies the pinned decoder and frame bridge, so video playback works offline. The app also builds for Intel, but the bundled decoder is ARM-only.
+In-app `.bk2` playback is Apple Silicon only. The build checks that RAD's player matches the frame bridge. If RAD has changed the download, the app still builds, but without video playback. If you already have the original unpatched player, set `SIXSTARS_BINK_PLAYER` to its path. Set `SIXSTARS_REQUIRE_BINK=1` if you want the build to fail rather than ship without the player.
 
 </details>
 

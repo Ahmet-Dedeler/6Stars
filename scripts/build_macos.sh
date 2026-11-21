@@ -147,7 +147,16 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-bash scripts/build_bink_macos.sh "$bundle"
+if bash scripts/build_bink_macos.sh "$bundle"; then
+  :
+else
+  bink_status=$?
+  # The helper returns EX_CONFIG only when RAD's public download no longer fits the bridge.
+  if [[ "$bink_status" != 78 || "${SIXSTARS_REQUIRE_BINK:-0}" == 1 ]]; then
+    exit "$bink_status"
+  fi
+  echo "Building Percy6Stars without in-app Bink playback. Set SIXSTARS_REQUIRE_BINK=1 to fail instead." >&2
+fi
 codesign --force --timestamp=none --sign "$SIXSTARS_SIGN_IDENTITY" "$bundle"
 codesign --verify --deep --strict "$bundle"
 mv "$bundle" "$APP"
