@@ -60,7 +60,7 @@ pub fn first_audio_track(path: &Path) -> Option<u32> {
 pub fn copy_clip(path: &Path, offset: u64, size: u64, cancel: &AtomicBool) -> io::Result<TempDir> {
     let mut archive = File::open(path)?;
     archive.seek(SeekFrom::Start(offset))?;
-    let dir = tempfile::Builder::new().prefix("6stars-video-").tempdir()?;
+    let dir = tempfile::Builder::new().prefix("percy6stars-video-").tempdir()?;
     // a standalone .bk2: link it instead of copying (multi-GB cutscenes), falling back to a
     // copy when the temp folder is on another drive. The fixed name keeps odd paths safe.
     if offset == 0 && std::fs::metadata(path)?.len() == size && std::fs::hard_link(path, dir.path().join("clip.bk2")).is_ok() {

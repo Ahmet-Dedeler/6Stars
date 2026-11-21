@@ -1,10 +1,10 @@
 # Format Coverage
 
-What 6Stars can show for each kind of entry its scanner recognizes. Coverage was measured by running the opt-in decoder audit (below) on a large scan of user-supplied, unencrypted archives: the audit samples up to 65 entries per kind, so the notes describe the sample, not every file. This repository contains no game files, and none are needed to build or test it.
+What Percy6Stars can show for each kind of entry its scanner recognizes. Coverage was measured by running the opt-in decoder audit (below) on a large scan of user-supplied, unencrypted archives: the audit samples up to 65 entries per kind, so the notes describe the sample, not every file. This repository contains no game files, and none are needed to build or test it.
 
-| Entries | What 6Stars can show |
+| Entries | What Percy6Stars can show |
 | --- | --- |
-| TTPF textures | Preview and PNG/DDS export. Some textures keep their full-size mip in BCPack, which 6Stars can't decode; for about a third of those a smaller mip is stored as zlib or raw data, and the preview shows that one, labelled "Reduced resolution". See [BCPack and the lower-mip fallback](#bcpack-and-the-lower-mip-fallback). |
+| TTPF textures | Preview and PNG/DDS export. Some textures keep their full-size mip in BCPack, which Percy6Stars can't decode; for about a third of those a smaller mip is stored as zlib or raw data, and the preview shows that one, labelled "Reduced resolution". See [BCPack and the lower-mip fallback](#bcpack-and-the-lower-mip-fallback). |
 | Models and vehicles | Mesh previews. Every sampled model and vehicle produced geometry; this doesn't guarantee full materials, rigging or animation. |
 | AWC audio | Every sampled bank yielded at least one playable stream. |
 | NavMesh | Every sampled tile opened as triangles. |
@@ -21,7 +21,7 @@ The shader tab inspects supported RDNA2 PSO caches separately. The archive scan 
 
 ## BCPack and the lower-mip fallback
 
-A `.ttpf` texture stores its whole mip chain, smallest mip first. The store compresses each chunk with zlib, stores it raw, or uses BCPack, a hardware texture codec with no public decoder. When the full-size mip falls in a BCPack chunk, 6Stars decodes the largest smaller mip that sits outside BCPack. The texture preview shows it as "Reduced resolution (WxH of FULLWxFULLH)", and the Model Viewer uses it for materials, so those models show texture colors instead of gray.
+A `.ttpf` texture stores its whole mip chain, smallest mip first. The store compresses each chunk with zlib, stores it raw, or uses BCPack, a hardware texture codec with no public decoder. When the full-size mip falls in a BCPack chunk, Percy6Stars decodes the largest smaller mip that sits outside BCPack. The texture preview shows it as "Reduced resolution (WxH of FULLWxFULLH)", and the Model Viewer uses it for materials, so those models show texture colors instead of gray.
 
 In the measured scan, about a third of BCPack-blocked textures could be recovered this way, most at 1/2 to 1/8 of full width (mip 1 to mip 3). Blocked UI textures couldn't be recovered. Chunks flagged as BCPack that are exactly their uncompressed size are read as raw data.
 
@@ -36,14 +36,14 @@ All of these are opt-in and read only files you point them at.
 PERCYSTAR_DUMP=/path/to/your/archives PERCYSTAR_TTPF_ALL=1 \
   cargo test --release ttpf_lower_mip_fallback -- --ignored --nocapture
 
-# decoder sampling over your 6Stars scan cache
+# decoder sampling over your Percy6Stars scan cache
 PERCYSTAR_AUDIT=1 PERCYSTAR_AUDIT_N=65 cargo test --release format_audit -- --ignored --nocapture
 
 # silent BK2 play / pause / seek against a built Mac bundle
-PERCYSTAR_BINK_APP=dist/6Stars.app PERCYSTAR_BK2=/path/to/sample.bk2 \
+PERCYSTAR_BINK_APP=dist/Percy6Stars.app PERCYSTAR_BK2=/path/to/sample.bk2 \
   cargo test --release bink_embed -- --ignored --nocapture
 ```
 
 ## Full-size mip placement
 
-Where a texture's mip 0 starts isn't fully given by its descriptor. Since v1.6.1, when the original guess and the mip-chain layout disagree, 6Stars decodes each candidate and keeps the one whose mip 1 is a 2x downscale of its mip 0. In the measured scan this fixed thousands of textures (mostly props, maps and vehicles) that used to show the strip of smaller mips instead of the image; UI textures are unchanged. Re-run with `PERCYSTAR_DUMP=/path/to/your/archives cargo test --release ttpf_mip0_choice_audit -- --ignored --nocapture`.
+Where a texture's mip 0 starts isn't fully given by its descriptor. Since v1.6.1, when the original guess and the mip-chain layout disagree, Percy6Stars decodes each candidate and keeps the one whose mip 1 is a 2x downscale of its mip 0. In the measured scan this fixed thousands of textures (mostly props, maps and vehicles) that used to show the strip of smaller mips instead of the image; UI textures are unchanged. Re-run with `PERCYSTAR_DUMP=/path/to/your/archives cargo test --release ttpf_mip0_choice_audit -- --ignored --nocapture`.

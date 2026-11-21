@@ -1,7 +1,7 @@
 //! In-panel Bink 2 (.bk2) playback on macOS.
 //!
 //! The Mac bundle includes a decoder and frame bridge. Only the helper decodes video and
-//! plays audio; 6Stars reads the latest BGRA frame into an egui texture and sends commands
+//! plays audio; Percy6Stars reads the latest BGRA frame into an egui texture and sends commands
 //! through the same file. No external app or launcher is used.
 //!
 //! Shared file layout (see bink-player `src/embed.inc`):

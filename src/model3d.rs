@@ -250,7 +250,7 @@ impl Mesh3D {
     /// part is re-centred on its own origin (undoing the grid offset).
     pub fn export_obj(&self, path: &Path) -> std::io::Result<()> {
         let mut w = BufWriter::new(File::create(path)?);
-        writeln!(w, "# 6Stars RAGE9 Model Export: {}", self.name)?;
+        writeln!(w, "# Percy6Stars RAGE9 Model Export: {}", self.name)?;
         let groups: Vec<(&str, std::ops::Range<usize>)> = match self.active_part.and_then(|i| self.parts.get(i)) {
             Some(p) => vec![(p.name.as_str(), self.visible_tris())],
             None if !self.parts.is_empty() => self.parts.iter().map(|p| (p.name.as_str(), p.tris.clone())).collect(),
@@ -324,8 +324,8 @@ pub fn parse_obj(path: &Path) -> Option<Mesh3D> {
     }
     if verts.is_empty() { return None; }
     // flip external y up obj files into z up turntabl space
-    // our own exports are already z-up ("# PercyStar" = files from before the rename)
-    if !(txt.starts_with("# 6Stars") || txt.starts_with("# PercyStar")) {
+    // our own exports are already z-up ("# 6Stars" / "# PercyStar" = files from before the renames)
+    if !(txt.starts_with("# Percy6Stars") || txt.starts_with("# 6Stars") || txt.starts_with("# PercyStar")) {
         for v in &mut verts {
             *v = [v[0], -v[2], v[1]];
         }

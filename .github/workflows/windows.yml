@@ -22,4 +22,4 @@ jobs:
         shell: pwsh
         run: |
           ./scripts/build_windows.ps1
-          Get-Item ./dist/6Stars-Win64/6Stars.exe, ./dist/6Stars-Win64/binkplay.exe
+          Get-Item ./dist/Percy6Stars-Win64/Percy6Stars.exe, ./dist/Percy6Stars-Win64/binkplay.exe

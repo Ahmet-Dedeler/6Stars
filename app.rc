@@ -14,11 +14,11 @@ BEGIN
     BLOCK "040904b0"
     BEGIN
       VALUE "CompanyName", "rpatty-dev"
-      VALUE "FileDescription", "6Stars RPF9 Explorer (based on PercyStar by rpatty-dev)"
+      VALUE "FileDescription", "Percy6Stars RPF9 Explorer (based on PercyStar by rpatty-dev)"
       VALUE "FileVersion", "1.6.1.0"
-      VALUE "InternalName", "6Stars"
-      VALUE "OriginalFilename", "6Stars.exe"
-      VALUE "ProductName", "6Stars"
+      VALUE "InternalName", "Percy6Stars"
+      VALUE "OriginalFilename", "Percy6Stars.exe"
+      VALUE "ProductName", "Percy6Stars"
       VALUE "ProductVersion", "1.6.1"
     END
   END

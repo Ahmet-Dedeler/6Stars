@@ -7,7 +7,7 @@
 Everything here is original and procedural: the "Sunset GT" coupe, a lighthouse, a palm tree,
 a small city block, and a handful of textures (neon sign, poster, livery decals, road tile).
 No game files are read or included. The README recorder (`src/demo_capture.rs`) loads this
-folder and shows it through the real 6Stars UI.
+folder and shows it through the real Percy6Stars UI.
 
     uv run scripts/demo_data.py <out-dir>
 
@@ -109,7 +109,7 @@ class Mesh:
 
     def save(self, path: Path, name: str) -> None:
         with open(path, "w") as fh:
-            fh.write(f"# {name}: original procedural model for the 6Stars README demos (Z-up)\n")
+            fh.write(f"# {name}: original procedural model for the Percy6Stars README demos (Z-up)\n")
             for p in self.v:
                 fh.write(f"v {p[0]:.5f} {p[1]:.5f} {p[2]:.5f}\n")
             for uv in self.vt:
@@ -724,7 +724,7 @@ def road_tile(path: Path) -> None:
 
 
 SAMPLE_XML = """<?xml version="1.0" encoding="UTF-8"?>
-<!-- made-up handling data for the 6Stars demo coupe -->
+<!-- made-up handling data for the Percy6Stars demo coupe -->
 <VehicleHandling name="sunset_gt">
   <Mass value="1340.0" />
   <DragCoefficient value="0.29" />
@@ -752,7 +752,7 @@ SAMPLE_XML = """<?xml version="1.0" encoding="UTF-8"?>
 SAMPLE_STRINGS = """=== Text table (12 strings) ===
 
 DEMO_TITLE        Welcome to Sunset Coast
-DEMO_SUB          A made-up sample set for the 6Stars README
+DEMO_SUB          A made-up sample set for the Percy6Stars README
 MOTEL_SIGN        Six Stars Motel · Vacancy
 GARAGE_ENTER      Press E to enter the garage
 GARAGE_PAINT      Pick a paint: Sunset Pink, Ocean Blue, Lemon

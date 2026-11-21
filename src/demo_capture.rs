@@ -10,8 +10,8 @@
 //! Selecting a row hands the matching sample straight to the preview panel, because the
 //! samples aren't packed into real archives.
 //!
-//!   uv run scripts/demo_data.py /tmp/6stars-demo-data
-//!   SIXSTARS_DEMO_DATA=/tmp/6stars-demo-data SIXSTARS_DEMO_OUT=/tmp/6stars-demos \
+//!   uv run scripts/demo_data.py /tmp/percy6stars-demo-data
+//!   SIXSTARS_DEMO_DATA=/tmp/percy6stars-demo-data SIXSTARS_DEMO_OUT=/tmp/percy6stars-demos \
 //!     cargo test --release demo_capture -- --ignored --nocapture
 //!
 //! `SIXSTARS_DEMO_SCENES=overview,models,media,still,scout` picks scenes (default: the three clips).

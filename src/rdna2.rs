@@ -935,7 +935,7 @@ pub fn format_gfx103_disasm(entry: &Ps09ShaderEntry, code: &[u8]) -> String {
     let _ = writeln!(
         s,
         "; =============================================================================\n\
-         ; 6Stars AMD RDNA2 (GFX10.3 / Xbox Scarlett) Disassembly\n\
+         ; Percy6Stars AMD RDNA2 (GFX10.3 / Xbox Scarlett) Disassembly\n\
          ; Shader #{idx} | Stage: {st} | PSO Hash: 0x{h:016X} | Size: {sz} bytes ({ic} insns)",
         idx = entry.index,
         st = entry.stage.tag(),
@@ -982,7 +982,7 @@ pub fn lift_to_hlsl(entry: &Ps09ShaderEntry, code: &[u8]) -> String {
     let insns = decode_gfx103(code, 4000);
     let mut s = String::with_capacity(insns.len() * 44 + 1024);
     let _ = writeln!(s, "// ============================================================================");
-    let _ = writeln!(s, "// 6Stars Clean-Room GFX10.3 (RDNA2) -> HLSL SM 6.6 Lifted Shader");
+    let _ = writeln!(s, "// Percy6Stars Clean-Room GFX10.3 (RDNA2) -> HLSL SM 6.6 Lifted Shader");
     let _ = writeln!(s, "// Shader #{} | Stage: {} | PSO 0x{:016X}", entry.index, entry.stage.tag(), entry.pso_hash);
     if entry.has_rt {
         let _ = writeln!(s, "// Uses RDNA2 Hardware Raytracing (image_bvh64_intersect_ray -> RayQuery)");
