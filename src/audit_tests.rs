@@ -38,7 +38,7 @@ fn check(e: &RpfEntry, tmp: &Path) -> Result<String, String> {
                 "RBF0" => tex::decode_rbf0(&data).map(|s| format!("{} chars", s.len())).ok_or_else(|| "rbf0 decode failed (hex fallback)".into()),
                 "GXT" => tex::decode_0drpz_text_min(&data, 1).map(|s| format!("{} chars", s.len())).ok_or_else(|| "gxt decode failed (hex fallback)".into()),
                 "GFX" => Ok(format!("{} chars", tex::inspect_gfx(&data).len())),
-                "PSIN" => Ok(format!("{} chars", parse_psin(&data).len())),
+                "PSIN" => Ok(format!("{} chars", psin::parse_psin(&data).len())),
                 "XML" => std::str::from_utf8(&data[..data.len().min(4096)]).map(|_| "utf8".into()).map_err(|_| "not utf8".into()),
                 _ => Ok(format!("{} bytes (hex view)", data.len())),
             }

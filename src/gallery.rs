@@ -4,16 +4,18 @@
 //! .ttpf as a gallery. Thumbnails are decoded on background threads, only for tiles that
 //! are on screen, newest request first, so scrolling through 10k textures stays smooth.
 
-use crate::tex::{decode_ttpf_texture, decode_txd_from_rpf};
+use crate::tex::{decode_ttpf_thumbnail, decode_txd_thumbnail};
 use eframe::egui::{self, Color32, ColorImage, RichText, TextureHandle, TextureOptions};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::time::SystemTime;
 
 /// Identifies one texture entry independently of the current scan's entry order.
 #[derive(Clone, Hash, PartialEq, Eq)]
 pub struct ThumbKey {
     pub source: PathBuf,
+    pub revision: Option<(u64, Option<SystemTime>)>,
     pub offset: u64,
     /// TTPF descriptor index (`RpfEntry::tracks`); 0 for TXD.
     pub index: u32,
@@ -26,9 +28,16 @@ enum Thumb {
     Failed(String),
 }
 
+struct CachedThumb {
+    image: Thumb,
+    max: usize,
+    last_visible: u64,
+}
+
 struct Job {
     key: ThumbKey,
     max: usize,
+    ctx: egui::Context,
 }
 
 type Done = (ThumbKey, Result<(ColorImage, bool), String>);
@@ -44,15 +53,17 @@ struct Queue {
 pub const SIZES: std::ops::RangeInclusive<f32> = 64.0..=256.0;
 const MAX_QUEUED: usize = 192;
 const MAX_CACHED: usize = 3000;
+const MAX_CACHE_BYTES: usize = 64 << 20;
 
 pub struct Gallery {
-    thumbs: HashMap<ThumbKey, Thumb>,
+    thumbs: HashMap<ThumbKey, CachedThumb>,
     queue: Arc<(Mutex<Queue>, Condvar)>,
     done_rx: mpsc::Receiver<Done>,
     pub size: f32,
     checker: Option<TextureHandle>,
     /// Scroll offset and visible height from the last frame, to keep the selection in view.
     view: (f32, f32),
+    frame: u64,
 }
 
 impl Drop for Gallery {
@@ -94,14 +105,11 @@ fn decode(job: &Job) -> Result<(ColorImage, bool), String> {
     let k = &job.key;
     let (px, w, h, reduced) = match k.kind {
         "TTPF" => {
-            let t = decode_ttpf_texture(&k.source, k.index as usize)?;
+            let t = decode_ttpf_thumbnail(&k.source, k.index as usize)?;
             (t.pixels, t.w, t.h, t.full_size.is_some())
         }
         "TXD" => {
-            let t = decode_txd_from_rpf(&k.source, k.offset)?
-                .into_iter()
-                .max_by_key(|t| t.w * t.h)
-                .ok_or("empty dictionary")?;
+            let t = decode_txd_thumbnail(&k.source, k.offset)?;
             (t.pixels, t.w, t.h, false)
         }
         _ => return Err("not a texture".into()),
@@ -115,6 +123,8 @@ fn short_reason(err: &str) -> String {
         "BCPack".into()
     } else if err.contains("Unsupported DXGI") {
         "format".into()
+    } else if err.contains("too large") {
+        "too large".into()
     } else {
         "error".into()
     }
@@ -123,9 +133,9 @@ fn short_reason(err: &str) -> String {
 impl Gallery {
     pub fn new() -> Self {
         let queue: Arc<(Mutex<Queue>, Condvar)> = Arc::default();
-        let (done_tx, done_rx) = mpsc::channel::<Done>();
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get()).saturating_sub(2).clamp(2, 8);
-        for _ in 0..workers {
+        let (done_tx, done_rx) = mpsc::sync_channel::<Done>(8);
+        // Each decode can read and inflate several archive blocks before shrinking.
+        for _ in 0..2 {
             let queue = Arc::clone(&queue);
             let tx = done_tx.clone();
             std::thread::spawn(move || loop {
@@ -147,17 +157,18 @@ impl Gallery {
                 if tx.send((job.key, r)).is_err() {
                     return;
                 }
+                job.ctx.request_repaint();
             });
         }
-        Self { thumbs: HashMap::new(), queue, done_rx, size: 112.0, checker: None, view: (0.0, 0.0) }
+        Self { thumbs: HashMap::new(), queue, done_rx, size: 112.0, checker: None, view: (0.0, 0.0), frame: 0 }
     }
 
-    /// Upload finished thumbnails. Returns true if any arrived (caller repaints).
-    pub fn poll(&mut self, ctx: &egui::Context) -> bool {
-        let mut any = false;
-        while let Ok((key, r)) = self.done_rx.try_recv() {
-            any = true;
-            let thumb = match r {
+    fn poll(&mut self, ctx: &egui::Context) {
+        // Upload at most one channel's worth per frame, even if workers are still busy.
+        for _ in 0..8 {
+            let Ok((key, r)) = self.done_rx.try_recv() else { return };
+            let Some(slot) = self.thumbs.get_mut(&key) else { continue };
+            slot.image = match r {
                 Ok((img, reduced)) => {
                     let size = img.size;
                     let tex = ctx.load_texture(format!("thumb_{}_{}_{}", key.source.display(), key.offset, key.index), img, TextureOptions::LINEAR);
@@ -165,23 +176,22 @@ impl Gallery {
                 }
                 Err(e) => Thumb::Failed(short_reason(&e)),
             };
-            self.thumbs.insert(key, thumb);
         }
-        if self.thumbs.values().any(|t| matches!(t, Thumb::Pending)) {
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
-        }
-        any
+        ctx.request_repaint();
     }
 
-    fn request(&mut self, key: &ThumbKey, ppp: f32) {
-        if self.thumbs.contains_key(key) {
-            return;
+    fn request(&mut self, key: &ThumbKey, ctx: &egui::Context) {
+        let max = ((self.size * ctx.pixels_per_point().clamp(1.0, 2.0)).ceil() as usize).next_power_of_two();
+        if let Some(slot) = self.thumbs.get_mut(key) {
+            slot.last_visible = self.frame;
+            if !matches!(slot.image, Thumb::Ready { .. }) || slot.max >= max {
+                return;
+            }
         }
-        let max = (self.size * ppp.max(1.0)).round() as usize;
-        self.thumbs.insert(key.clone(), Thumb::Pending);
+        self.thumbs.insert(key.clone(), CachedThumb { image: Thumb::Pending, max, last_visible: self.frame });
         let (lock, cv) = &*self.queue;
         let mut q = lock.lock().unwrap();
-        q.jobs.push(Job { key: key.clone(), max });
+        q.jobs.push(Job { key: key.clone(), max, ctx: ctx.clone() });
         // Scrolled past: drop the oldest requests and let them be asked for again later.
         if q.jobs.len() > MAX_QUEUED {
             let excess = q.jobs.len() - MAX_QUEUED;
@@ -193,10 +203,30 @@ impl Gallery {
         cv.notify_one();
     }
 
-    /// Forget decoded thumbnails, e.g. after the thumbnail size changed a lot.
-    pub fn clear(&mut self) {
-        self.queue.0.lock().unwrap().jobs.clear();
-        self.thumbs.clear();
+    fn trim_cache(&mut self) {
+        let mut bytes = self.thumbs.values().map(|slot| match &slot.image {
+            Thumb::Ready { size: [w, h], .. } => w * h * 4,
+            _ => 0,
+        }).sum::<usize>();
+        if bytes <= MAX_CACHE_BYTES && self.thumbs.len() <= MAX_CACHED {
+            return;
+        }
+        let mut evictable: Vec<_> = self.thumbs.iter().filter_map(|(key, slot)| {
+            let size = match &slot.image {
+                Thumb::Pending => return None,
+                Thumb::Ready { size: [w, h], .. } => w * h * 4,
+                Thumb::Failed(_) => 0,
+            };
+            Some((slot.last_visible, size, key.clone()))
+        }).collect();
+        evictable.sort_unstable_by_key(|&(last_visible, _, _)| last_visible);
+        for (_, size, key) in evictable {
+            self.thumbs.remove(&key);
+            bytes -= size;
+            if bytes <= MAX_CACHE_BYTES && self.thumbs.len() <= MAX_CACHED {
+                break;
+            }
+        }
     }
 
     fn checker(&mut self, ctx: &egui::Context) -> egui::TextureId {
@@ -221,12 +251,9 @@ impl Gallery {
         position_of: impl Fn(usize) -> Option<usize>,
     ) -> Option<usize> {
         let ctx = ui.ctx().clone();
+        self.frame += 1;
         self.poll(&ctx);
-        if self.thumbs.len() > MAX_CACHED {
-            self.clear();
-        }
         let checker = self.checker(&ctx);
-        let ppp = ctx.pixels_per_point();
         let gap = 6.0;
         let cell = self.size;
         let label_h = 16.0;
@@ -283,8 +310,8 @@ impl Gallery {
                         let is_sel = selected == Some(*idx);
                         p.rect_filled(img_rect, 3.0, Color32::from_rgb(30, 22, 44));
                         match key.as_ref().map(|k| {
-                            self.request(k, ppp);
-                            self.thumbs.get(k)
+                            self.request(k, &ctx);
+                            self.thumbs.get(k).map(|slot| &slot.image)
                         }) {
                             Some(Some(Thumb::Ready { tex, size, reduced })) => {
                                 let fit = (cell / size[0] as f32).min(cell / size[1] as f32);
@@ -334,6 +361,7 @@ impl Gallery {
             }
         });
         self.view = (out.state.offset.y, out.inner_rect.height());
+        self.trim_cache();
         clicked
     }
 }
@@ -352,6 +380,24 @@ pub fn tile_label(kind: &str, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thumbnail_completion_wakes_an_idle_ui() {
+        let ctx = egui::Context::default();
+        // Let egui settle its initial repaint before installing the callback.
+        for _ in 0..3 {
+            let _ = ctx.run(egui::RawInput::default(), |_| {});
+        }
+        let (wake, woken) = mpsc::channel();
+        ctx.set_request_repaint_callback(move |_| { let _ = wake.send(()); });
+        let dir = tempfile::tempdir().unwrap();
+        let key = ThumbKey { source: dir.path().join("missing.ttpf"), revision: None, offset: 0, index: 0, kind: "TTPF" };
+        let mut gallery = Gallery::new();
+        gallery.request(&key, &ctx);
+        woken.recv_timeout(std::time::Duration::from_secs(5)).expect("worker did not wake the UI");
+        gallery.poll(&ctx);
+        assert!(matches!(gallery.thumbs[&key].image, Thumb::Failed(_)));
+    }
 
     #[test]
     fn labels_and_shrink() {

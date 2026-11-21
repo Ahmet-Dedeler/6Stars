@@ -55,5 +55,6 @@ When we added video previews, searching for "video" still found nothing. This ch
 - macOS BK2: `src/bink_embed.rs` hosts the bundled Bink decoder and frame bridge (`github.com/Ahmet-Dedeler/bink-player-mac`, `src/embed.inc`). Change both sides together.
 - Windows BK2: `src/bink_dock.rs` docks RAD's `binkplay.exe` inside the window. `scripts/setup_deps.ps1` pins the extracted player's hash, not the unversioned archive.
 - Clips go into a `percy6stars-video-*` temp folder as `clip.bk2` so unusual paths work. Treat that file as read-only: a standalone clip may be a hard link to the user's original.
-- AWC: `src/awc.rs` decodes, `src/audio_player.rs` plays (afplay on macOS, `PlaySoundW` on Windows).
+- AWC: `src/awc.rs` decodes (upstream's in-memory chunk decoder, or our stream-table decoder when it recovers more audio, e.g. multichannel banks). `src/audio_player.rs` (upstream's player) plays through `waveOut` on Windows and `afplay` on a temporary WAV on macOS; Linux has no output yet.
+- Upstream sync: `rpatty-dev/PercyStar` is merged into the fork with a real merge (not cherry-picks), keeping both histories. Keep our decoders where they measure better and note the measurement in the commit.
 - Use SixNG (GPLv3) to read up on formats, not as a source of code to copy into this repo.

@@ -8,3 +8,9 @@
 __pycache__/
 *.pyc
 /dist/
+/logo.ico
+/breakthroughs_site/
+GEMINI.md
+gemini.md
+**/GEMINI.md
+**/gemini.md

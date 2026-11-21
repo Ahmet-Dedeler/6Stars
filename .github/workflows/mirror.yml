@@ -1,16 +1,9 @@
-# Keeps off-GitHub copies current: pushes every branch and tag to each
-# configured mirror and asks the Wayback Machine to snapshot the repo.
-# A mirror is skipped when its secret is not set.
+# keeps off github copies current on release or manual dispatch
 name: mirror
 
 on:
-  push:
-    branches: ["**"]
-    tags: ["**"]
   release:
     types: [published]
-  schedule:
-    - cron: "17 4 * * 1"
   workflow_dispatch:
 
 jobs:

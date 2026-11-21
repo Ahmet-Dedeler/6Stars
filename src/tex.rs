@@ -8,6 +8,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::time::SystemTime;
+
+const THUMBNAIL_PIXELS: usize = 2048 * 2048;
 
 #[inline]
 fn ru16(b: &[u8], o: usize) -> u16 {
@@ -515,6 +518,10 @@ pub fn extract_txd_textures(v: &[u8], p: &[u8], dict_off: usize) -> Vec<DecodedT
 
 /// Keep each virtual texture pointer so drawable shaders can bind the correct entry.
 pub fn extract_txd_textures_by_ptr(v: &[u8], p: &[u8], dict_off: usize) -> Vec<(usize, DecodedTexture)> {
+    extract_txd_textures_impl(v, p, dict_off, false)
+}
+
+fn extract_txd_textures_impl(v: &[u8], p: &[u8], dict_off: usize, thumbnail: bool) -> Vec<(usize, DecodedTexture)> {
     if dict_off + 0x3a > v.len() { return Vec::new(); }
     let Some(tarr) = vptr(ru64(v, dict_off + 0x30)) else { return Vec::new() };
     let tcnt = ru16(v, dict_off + 0x38) as usize;
@@ -539,7 +546,7 @@ pub fn extract_txd_textures_by_ptr(v: &[u8], p: &[u8], dict_off: usize) -> Vec<(
             if no + 8 < v.len() && v[no..no + 8] == [0u8; 8] {
                 no += 8;
             }
-            if let Some(rel) = v[no..].iter().position(|&b| b == 0) {
+            if let Some(rel) = v.get(no..).and_then(|s| s.iter().take(128).position(|&b| b == 0)) {
                 if rel > 0 && rel < 128 {
                     let s = String::from_utf8_lossy(&v[no..no + rel]).into_owned();
                     if s.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
@@ -559,8 +566,12 @@ pub fn extract_txd_textures_by_ptr(v: &[u8], p: &[u8], dict_off: usize) -> Vec<(
         next_map.insert(w2[0], w2[1]);
     }
 
+    if thumbnail {
+        raw_list.sort_by_key(|t| std::cmp::Reverse(t.3 * t.4));
+    }
     let mut out = Vec::new();
     for (poff, tp, name, w, h, dxgi, swiz, mips) in raw_list {
+        if thumbnail && w * h > THUMBNAIL_PIXELS { continue; }
         let Some((fmt_name, is_bc, bpe)) = dxgi_info(dxgi) else { continue };
         let alloc_end = next_map.get(&poff).copied().unwrap_or(p.len());
         let alloc_sz = alloc_end.saturating_sub(poff);
@@ -595,6 +606,7 @@ pub fn extract_txd_textures_by_ptr(v: &[u8], p: &[u8], dict_off: usize) -> Vec<(
                 raw_dds_payload: lin,
                 full_size: None,
             }));
+            if thumbnail { break; }
         }
     }
     out
@@ -621,6 +633,14 @@ pub fn decode_txd_from_rpf(rpf_path: &Path, file_off: u64) -> Result<Vec<Decoded
         return Err("No decodable textures found in dictionary".into());
     }
     Ok(texs)
+}
+
+pub fn decode_txd_thumbnail(rpf_path: &Path, file_off: u64) -> Result<DecodedTexture, String> {
+    let mut f = File::open(rpf_path).map_err(|e| format!("Open error: {e}"))?;
+    let (v, p) = read_rage9_vp_with_budget(&mut f, file_off, 64 << 20)?;
+    extract_txd_textures_impl(&v, &p, 0, true).pop()
+        .map(|(_, tex)| tex)
+        .ok_or_else(|| "No decodable thumbnail-sized texture found in dictionary".into())
 }
 
 fn decompress_stream_at(f: &mut File, file_off: u64, max_out: usize) -> Result<(Vec<u8>, u64), String> {
@@ -670,13 +690,23 @@ fn find_next_zlib_near(f: &mut File, start_off: u64) -> Result<Option<u64>, Stri
 }
 
 pub fn read_rage9_vp(f: &mut File, file_off: u64) -> Result<(Vec<u8>, Vec<u8>), String> {
-    let (mut v, mut next_off) = decompress_stream_at(f, file_off, 16 * 1024 * 1024)?;
+    read_rage9_vp_with_budget(f, file_off, usize::MAX)
+}
+
+fn read_rage9_vp_with_budget(f: &mut File, file_off: u64, budget: usize) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let mut remaining = budget;
+    let mut decompress = |f: &mut File, off, limit: usize| {
+        let (data, next) = decompress_stream_at(f, off, limit.min(remaining))?;
+        remaining = remaining.checked_sub(data.len()).ok_or("Dictionary is too large for the gallery")?;
+        Ok::<_, String>((data, next))
+    };
+    let (mut v, mut next_off) = decompress(f, file_off, 16 * 1024 * 1024)?;
     if v.len() < 0x40 { return Err("Virtual chunk too small".into()); }
     let Some(bmap_off) = vptr(ru64(&v, 8)) else { return Err("Missing BlockMap".into()) };
     let mut v_read = 1usize;
     while v.len() <= bmap_off + 16 && v_read < 32 {
         let Some(zoff) = find_next_zlib_near(f, next_off)? else { break };
-        let (c, nxt) = decompress_stream_at(f, zoff, 16 * 1024 * 1024)?;
+        let (c, nxt) = decompress(f, zoff, 16 * 1024 * 1024)?;
         v.extend_from_slice(&c);
         next_off = nxt;
         v_read += 1;
@@ -688,14 +718,14 @@ pub fn read_rage9_vp(f: &mut File, file_off: u64) -> Result<(Vec<u8>, Vec<u8>), 
     };
     for _ in v_read..v_cnt {
         let Some(zoff) = find_next_zlib_near(f, next_off)? else { break };
-        let (c, nxt) = decompress_stream_at(f, zoff, 16 * 1024 * 1024)?;
+        let (c, nxt) = decompress(f, zoff, 16 * 1024 * 1024)?;
         v.extend_from_slice(&c);
         next_off = nxt;
     }
     let mut p = Vec::new();
     for _ in 0..p_cnt {
         let Some(zoff) = find_next_zlib_near(f, next_off)? else { break };
-        let (c, nxt) = decompress_stream_at(f, zoff, 64 * 1024 * 1024)?;
+        let (c, nxt) = decompress(f, zoff, 64 * 1024 * 1024)?;
         p.extend_from_slice(&c);
         next_off = nxt;
     }
@@ -761,13 +791,17 @@ pub struct TtpfTexMeta {
 pub fn scan_ttpf_descriptors(path: &Path) -> Result<(String, Vec<TtpfTexMeta>), String> {
     let mut f = File::open(path).map_err(|e| e.to_string())?;
     let sz = f.metadata().map_err(|e| e.to_string())?.len();
+    scan_ttpf_descriptors_in(&mut f, sz)
+}
+
+fn scan_ttpf_descriptors_in(f: &mut File, sz: u64) -> Result<(String, Vec<TtpfTexMeta>), String> {
     let mut hdr = [0u8; 24];
     f.read_exact(&mut hdr).map_err(|e| e.to_string())?;
     if &hdr[..4] != b"RDS5" {
         return Err("Not an RDS5 TTPF file".into());
     }
     let n_chunks = ru32(&hdr, 4);
-    let tot_uncomp = ru32(&hdr, 8) as u64;
+    let tot_uncomp = ru64(&hdr, 8) & 0xff_ffff_ffff;
     let hdr_pages = ru32(&hdr, 16) as u64;
     let etpf_off = hdr_pages * 0x100;
 
@@ -778,6 +812,9 @@ pub fn scan_ttpf_descriptors(path: &Path) -> Result<(String, Vec<TtpfTexMeta>), 
         return Err(format!("Missing ETPF header at 0x{etpf_off:x}"));
     }
     let tex_count = ru32(&ehdr, 8) as usize;
+    if tex_count > 500_000 || tex_count as u64 * 16 > sz.saturating_sub(etpf_off + 16) {
+        return Err("Invalid ETPF descriptor table size".into());
+    }
     let mut recs = vec![0u8; tex_count * 16];
     f.read_exact(&mut recs).map_err(|e| e.to_string())?;
 
@@ -795,7 +832,8 @@ pub fn scan_ttpf_descriptors(path: &Path) -> Result<(String, Vec<TtpfTexMeta>), 
         let has_mips = (u1 >> 24) > 0;
         let mip_count = ((u0 >> 28) + 1) as u8;
         let tile_mode = ((u1 >> 24) & 0xF) as u8;
-        let page4k = (u2 & 0x000F_FFFF) as u64;
+        // 21-bit page index: stores past 4 GiB (upstream v1.3.8)
+        let page4k = (u2 & 0x001F_FFFF) as u64;
         out.push(TtpfTexMeta { idx: i, w, h, fmt_byte, dxgi, has_mips, mip_count, tile_mode, byte_off: page4k * 0x1000, alloc_sz: 0 });
     }
     let mut offs: Vec<u64> = out.iter().map(|d| d.byte_off).collect();
@@ -823,21 +861,34 @@ pub struct TtpfIndex {
     pub descs: Vec<TtpfTexMeta>,
     /// (file_start, file_end, virt_start, virt_len, codec)
     chunks: Vec<(u64, u64, u64, u64, u8)>,
+    signature: ArchiveSignature,
+}
+
+type ArchiveSignature = (u64, Option<SystemTime>);
+
+fn archive_signature(file: &File) -> Result<ArchiveSignature, String> {
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    Ok((meta.len(), meta.modified().ok()))
 }
 
 static TTPF_INDEX: std::sync::OnceLock<std::sync::Mutex<HashMap<std::path::PathBuf, std::sync::Arc<TtpfIndex>>>> = std::sync::OnceLock::new();
 
 pub fn ttpf_index(path: &Path) -> Result<std::sync::Arc<TtpfIndex>, String> {
     let map = TTPF_INDEX.get_or_init(Default::default);
-    if let Some(ix) = map.lock().unwrap().get(path) {
+    let mut f = File::open(path).map_err(|e| e.to_string())?;
+    let signature = archive_signature(&f)?;
+    if let Some(ix) = map.lock().unwrap().get(path).filter(|ix| ix.signature == signature) {
         return Ok(ix.clone());
     }
-    let (_, descs) = scan_ttpf_descriptors(path)?;
-    let mut f = File::open(path).map_err(|e| e.to_string())?;
+    let (_, descs) = scan_ttpf_descriptors_in(&mut f, signature.0)?;
+    f.rewind().map_err(|e| e.to_string())?;
     let mut hdr = [0u8; 24];
     f.read_exact(&mut hdr).map_err(|e| e.to_string())?;
     let n_chunks = ru32(&hdr, 4) as usize;
     let etpf_off = ru32(&hdr, 16) as u64 * 0x100;
+    if n_chunks > 1_000_000 || n_chunks as u64 * 8 + 24 > signature.0 {
+        return Err("Invalid RDS5 chunk table size".into());
+    }
     let mut tbl = vec![0u8; n_chunks * 8];
     f.read_exact(&mut tbl).map_err(|e| e.to_string())?;
 
@@ -857,7 +908,10 @@ pub fn ttpf_index(path: &Path) -> Result<std::sync::Arc<TtpfIndex>, String> {
         prev_c = cend;
         cur_codec = next_codec;
     }
-    let ix = std::sync::Arc::new(TtpfIndex { descs, chunks });
+    if archive_signature(&f)? != signature {
+        return Err("TTPF archive changed while it was being indexed".into());
+    }
+    let ix = std::sync::Arc::new(TtpfIndex { descs, chunks, signature });
     map.lock().unwrap().insert(path.to_path_buf(), ix.clone());
     Ok(ix)
 }
@@ -866,24 +920,25 @@ pub fn ttpf_index(path: &Path) -> Result<std::sync::Arc<TtpfIndex>, String> {
 /// mip-0 guesses below) mostly sit in the same chunk, so a gallery of one archive would
 /// otherwise inflate each chunk once per texture. Idea from paryzius/ttpf-viewer.
 struct ChunkCache {
-    map: HashMap<(std::path::PathBuf, u64), std::sync::Arc<Vec<u8>>>,
-    order: std::collections::VecDeque<(std::path::PathBuf, u64)>,
+    map: HashMap<ChunkKey, std::sync::Arc<Vec<u8>>>,
+    order: std::collections::VecDeque<ChunkKey>,
     bytes: usize,
 }
 
+type ChunkKey = (std::path::PathBuf, ArchiveSignature, u64);
 const CHUNK_CACHE_BYTES: usize = 384 << 20;
+const MAX_TTPF_CHUNK_BYTES: u64 = 64 << 20;
 static TTPF_CHUNKS: std::sync::Mutex<Option<ChunkCache>> = std::sync::Mutex::new(None);
 
 /// One chunk's bytes: inflated if zlib, as stored if raw, Err(codec) if BCPack.
-fn ttpf_chunk(path: &Path, f: &mut Option<File>, (cs, ce, vl, codec): (u64, u64, u64, u8)) -> Result<std::sync::Arc<Vec<u8>>, String> {
-    let key = (path.to_path_buf(), cs);
+fn ttpf_chunk(path: &Path, file: &mut File, signature: ArchiveSignature, (cs, ce, vl, codec): (u64, u64, u64, u8)) -> Result<std::sync::Arc<Vec<u8>>, String> {
+    let key = (path.to_path_buf(), signature, cs);
     if let Some(c) = TTPF_CHUNKS.lock().unwrap().as_ref().and_then(|c| c.map.get(&key)) {
         return Ok(c.clone());
     }
-    if f.is_none() {
-        *f = Some(File::open(path).map_err(|e| e.to_string())?);
+    if ce > signature.0 || ce - cs > MAX_TTPF_CHUNK_BYTES || vl > MAX_TTPF_CHUNK_BYTES {
+        return Err("Invalid or oversized RDS5 chunk".into());
     }
-    let file = f.as_mut().unwrap();
     let mut ch = vec![0u8; (ce - cs) as usize];
     file.seek(SeekFrom::Start(cs)).map_err(|e| e.to_string())?;
     file.read_exact(&mut ch).map_err(|e| e.to_string())?;
@@ -899,17 +954,20 @@ fn ttpf_chunk(path: &Path, f: &mut Option<File>, (cs, ce, vl, codec): (u64, u64,
         };
         return Err(format!("Texture uses Xbox Series X hardware BCPack ({mode}) — ASIC-only compression (not decodable on PC)"));
     };
+    if archive_signature(file)? != signature {
+        return Err("TTPF archive changed while it was being read".into());
+    }
     let data = std::sync::Arc::new(data);
     let mut guard = TTPF_CHUNKS.lock().unwrap();
     let c = guard.get_or_insert_with(|| ChunkCache { map: HashMap::new(), order: Default::default(), bytes: 0 });
-    if c.map.insert(key.clone(), data.clone()).is_none() {
-        c.bytes += data.len();
-        c.order.push_back(key);
-    }
+    if let Some(existing) = c.map.get(&key) { return Ok(existing.clone()); }
+    c.map.insert(key.clone(), data.clone());
+    c.bytes += data.capacity();
+    c.order.push_back(key);
     while c.bytes > CHUNK_CACHE_BYTES {
         let Some(old) = c.order.pop_front() else { break };
         if let Some(b) = c.map.remove(&old) {
-            c.bytes -= b.len();
+            c.bytes -= b.capacity();
         }
     }
     Ok(data)
@@ -918,13 +976,16 @@ fn ttpf_chunk(path: &Path, f: &mut Option<File>, (cs, ce, vl, codec): (u64, u64,
 /// Read `len` bytes of the RDS5 virtual stream starting at `off`, inflating only overlapping chunks.
 pub fn ttpf_read_virtual(path: &Path, ix: &TtpfIndex, off: u64, len: usize) -> Result<Vec<u8>, String> {
     let end = off + len as u64;
-    let mut f = None;
+    let mut f = File::open(path).map_err(|e| e.to_string())?;
+    if archive_signature(&f)? != ix.signature {
+        return Err("TTPF archive changed since it was indexed".into());
+    }
     let mut out_buf = vec![0u8; len];
     let mut covered = 0usize;
     let first = ix.chunks.partition_point(|c| c.2 + c.3 <= off);
     for &(cs, ce, vs, vl, codec) in &ix.chunks[first..] {
         if vs >= end { break; }
-        let data = ttpf_chunk(path, &mut f, (cs, ce, vl, codec))?;
+        let data = ttpf_chunk(path, &mut f, ix.signature, (cs, ce, vl, codec))?;
         let s0 = vs.max(off);
         let s1 = (vs + data.len() as u64).min(end);
         if s1 > s0 {
@@ -1113,7 +1174,7 @@ struct TtpfLowerMip {
 }
 
 /// Decode the largest mip below mip 0 that is stored outside BCPack chunks.
-fn ttpf_decode_lower_mip(path: &Path, ix: &TtpfIndex, d: &TtpfTexMeta) -> Option<TtpfLowerMip> {
+fn ttpf_decode_lower_mip(path: &Path, ix: &TtpfIndex, d: &TtpfTexMeta, max_pixels: usize) -> Option<TtpfLowerMip> {
     let (_, is_bc, bpe) = dxgi_info(d.dxgi)?;
     // BCPack only wraps BCn data, and the mip-chain layout is only verified for BCn.
     if !is_bc || d.mip_count < 2 {
@@ -1121,15 +1182,16 @@ fn ttpf_decode_lower_mip(path: &Path, ix: &TtpfIndex, d: &TtpfTexMeta) -> Option
     }
     let layout = ttpf_bc_layout(d, bpe)?;
     for m in 1..layout.mips.len() {
+        let s = &layout.mips[m];
+        // Decode whole 4x4 blocks, then trim to the mip's pixel size.
+        let (bw, bh) = (s.ew * 4, s.eh * 4);
+        if bw * bh > max_pixels { continue; }
         let (a, b) = layout.span(m);
         if ix.range_hits_bcpack(d.byte_off + a, b - a) {
             continue;
         }
         let Ok(raw) = ttpf_read_virtual(path, ix, d.byte_off + a, (b - a) as usize) else { continue };
         let lin = layout.untile(&raw, m);
-        let s = &layout.mips[m];
-        // Decode whole 4x4 blocks, then trim to the mip's pixel size.
-        let (bw, bh) = (s.ew * 4, s.eh * 4);
         let Some(px) = decode_linear_to_rgba(&lin, bw, bh, d.dxgi) else { continue };
         let (w, h) = ((d.w >> m).max(1).min(bw), (d.h >> m).max(1).min(bh));
         let pixels = if (w, h) == (bw, bh) { px } else { (0..h).flat_map(|y| px[y * bw..y * bw + w].iter().copied()).collect() };
@@ -1165,17 +1227,30 @@ fn ttpf_mip0_range(d: &TtpfTexMeta, is_bc: bool, bpe: usize) -> (u64, usize, boo
 /// When mip 0 is BCPack-compressed this falls back to the largest smaller mip stored as raw
 /// or zlib data: `full_size` is then set and `w`/`h`/`pixels` describe the reduced mip.
 pub fn decode_ttpf_texture(path: &Path, tex_idx: usize) -> Result<DecodedTexture, String> {
+    decode_ttpf_with_budget(path, tex_idx, usize::MAX)
+}
+
+pub fn decode_ttpf_thumbnail(path: &Path, tex_idx: usize) -> Result<DecodedTexture, String> {
+    decode_ttpf_with_budget(path, tex_idx, THUMBNAIL_PIXELS)
+}
+
+fn decode_ttpf_with_budget(path: &Path, tex_idx: usize, max_pixels: usize) -> Result<DecodedTexture, String> {
     let ix = ttpf_index(path)?;
     let d = ix.descs.get(tex_idx).ok_or("Texture index out of range")?;
 
     let (fmt_name, is_bc, bpe) = dxgi_info(d.dxgi)
         .ok_or_else(|| format!("Unsupported DXGI format {} (fmt_byte=0x{:02x})", d.dxgi, d.fmt_byte))?;
 
-    let (lin, pixels) = match ttpf_decode_mip0(path, &ix, d, is_bc, bpe) {
+    let mip0 = if d.w * d.h <= max_pixels {
+        ttpf_decode_mip0(path, &ix, d, is_bc, bpe)
+    } else {
+        Err("Full texture is too large for the gallery".into())
+    };
+    let (lin, pixels) = match mip0 {
         Ok(v) => v,
-        Err(err) if err.contains("BCPack") => {
-            let Some(low) = ttpf_decode_lower_mip(path, &ix, d) else {
-                return Err(format!("{err}; no smaller mip is stored outside BCPack"));
+        Err(err) if d.w * d.h > max_pixels || err.contains("BCPack") => {
+            let Some(low) = ttpf_decode_lower_mip(path, &ix, d, max_pixels) else {
+                return Err(format!("{err}; no usable smaller mip"));
             };
             return Ok(DecodedTexture {
                 name: format!("tex_{:05}_{}x{}_{fmt_name}_mip{}", d.idx, d.w, d.h, low.mip),
@@ -1825,15 +1900,20 @@ pub fn probe_gxt_snippet(head: &[u8]) -> Option<String> {
         let Ok(s) = std::str::from_utf8(raw) else { continue };
         let s = s.trim();
         if s.len() < 4 || s == "0DRPz" { continue; }
-        let ok_chars = s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_' | '\'' | '.' | '!' | '?' | ',')).count();
-        let letters = s.chars().filter(|c| c.is_ascii_alphabetic()).count();
-        if ok_chars * 100 / s.chars().count().max(1) >= 92 && letters >= 3 {
+        let ok_chars = s.chars().filter(|c| c.is_alphanumeric() || !c.is_control()).count();
+        let letters = s.chars().filter(|c| c.is_alphabetic()).count();
+        if ok_chars * 100 / s.chars().count().max(1) >= 92 && letters >= 2 {
             good.push(s);
             if good.len() >= 2 { break; }
         }
     }
     if is_0drpz || good.len() >= 2 {
-        let slug: String = good.first().copied().unwrap_or("text")
+        let slug: String = good
+            .iter()
+            .find(|s| s.chars().any(|c| c.is_ascii_alphabetic()))
+            .or_else(|| good.first())
+            .copied()
+            .unwrap_or("text")
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .take(32)
@@ -1867,15 +1947,16 @@ pub fn decode_0drpz_text_min(data: &[u8], min_lines: usize) -> Option<String> {
     };
     let mut lines = Vec::new();
     for raw in data[start..end].split(|&b| b == 0) {
-        if raw.len() < 3 || raw.len() > 2000 { continue; }
+        if raw.len() < 2 || raw.len() > 2000 { continue; }
         let Ok(s) = std::str::from_utf8(raw) else { continue };
         let s = s.trim();
-        if s.len() < 3 || s == "0DRPz" { continue; }
+        if s.chars().count() < 2 || s == "0DRPz" { continue; }
         let printable = s.chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t')).count();
         let letters = s.chars().filter(|c| c.is_alphabetic()).count();
-        if printable * 100 / s.chars().count().max(1) >= 96 && letters >= 2 {
-            // Skip tiny binary hash-table noise
-            if s.len() <= 5 && s.chars().any(|c| !c.is_alphanumeric()) && !s.starts_with('~') {
+        if printable * 100 / s.chars().count().max(1) >= 96 && letters >= 1 {
+            // skip tiny binary hash table noise while keeping short cjk and tag strings
+            let has_non_ascii_letter = s.chars().any(|c| !c.is_ascii() && c.is_alphabetic());
+            if !has_non_ascii_letter && s.len() <= 5 && s.chars().any(|c| !c.is_alphanumeric()) && !s.starts_with('~') {
                 continue;
             }
             lines.push(s.to_string());
@@ -1995,13 +2076,115 @@ pub fn decode_navmesh_from_rpf(rpf_path: &Path, file_off: u64, fallback_name: &s
     ))
 }
 
+// decode rage 9 mhiu 2048x2048 row-compressed world heightmap into colorized elevation texture
+pub fn decode_mhiu_heightmap(data: &[u8]) -> Option<DecodedTexture> {
+    if data.len() < 44 || &data[..4] != b"MHIU" {
+        return None;
+    }
+    let w = u16::from_le_bytes([data[6], data[7]]) as usize;
+    let h = u16::from_le_bytes([data[8], data[9]]) as usize;
+    if w == 0 || h == 0 || w > 4096 || h > 4096 || data.len() < 44 + h * 8 {
+        return None;
+    }
+    let rows = &data[44..44 + h * 8];
+    let pix = &data[44 + h * 8..];
+    let mut vals = vec![23u8; w * h];
+    for y in 0..h {
+        let r = &rows[y * 8..y * 8 + 8];
+        let sx = u16::from_le_bytes([r[0], r[1]]) as usize;
+        let cnt = u16::from_le_bytes([r[2], r[3]]) as usize;
+        let off = i32::from_le_bytes([r[4], r[5], r[6], r[7]]) as isize;
+        if cnt > 0 && sx + cnt <= w {
+            let src = off + sx as isize;
+            if src >= 0 && (src as usize) + cnt <= pix.len() {
+                vals[y * w + sx..y * w + sx + cnt].copy_from_slice(&pix[src as usize..src as usize + cnt]);
+            }
+        }
+    }
+    let mut pixels = Vec::with_capacity(w * h);
+    for &v in &vals {
+        let c = if v <= 23 {
+            Color32::from_rgb(16, 44, 92)
+        } else if v <= 30 {
+            let t = (v - 23) as u8 * 14;
+            Color32::from_rgb(45 + t, 115 + t, 72)
+        } else if v <= 85 {
+            let t = ((v - 30) as u16 * 120 / 55) as u8;
+            Color32::from_rgb(80 + t, 145 + t / 2, 70)
+        } else {
+            let t = ((v - 85) as u16 * 100 / 170) as u8;
+            Color32::from_rgb(155 + t, 145 + t, 130 + t)
+        };
+        pixels.push(c);
+    }
+    Some(DecodedTexture {
+        name: format!("world_heightmap_{w}x{h}"),
+        w,
+        h,
+        mips: 1,
+        fmt_name: "MHIU RLE8".into(),
+        dxgi: 28,
+        pixels,
+        raw_dds_payload: Vec::new(),
+        full_size: None,
+    })
+}
+
 #[cfg(test)]
-mod tests {
+mod large_address_tests;
+
+#[cfg(test)]
+mod mhiu_tests {
     use super::*;
 
     #[test]
+    fn ttpf_caches_distinguish_revisions_at_the_same_path() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let path = temp.path();
+        let mut archive = vec![0u8; 0x1100];
+        archive[..4].copy_from_slice(b"RDS5");
+        archive[4..8].copy_from_slice(&1u32.to_le_bytes()); // one chunk
+        archive[8..12].copy_from_slice(&0x1000u32.to_le_bytes());
+        archive[16..20].copy_from_slice(&1u32.to_le_bytes()); // ETPF at 0x100
+        archive[24..28].copy_from_slice(&(0x4000_0000u32 | 0x11).to_le_bytes()); // raw 4 KiB
+        archive[0x100..0x104].copy_from_slice(b"ETPF");
+        archive[0x120] = 1;
+        std::fs::write(path, &archive).unwrap();
+
+        let old = ttpf_index(path).unwrap();
+        assert_eq!(ttpf_read_virtual(path, &old, 0x20, 1).unwrap(), [1]);
+        assert!(std::sync::Arc::ptr_eq(&old, &ttpf_index(path).unwrap()));
+
+        archive[0x120] = 2;
+        archive.push(0); // guarantee a new signature even on coarse-mtime filesystems
+        std::fs::write(path, &archive).unwrap();
+        assert!(ttpf_read_virtual(path, &old, 0x20, 1).is_err());
+        let new = ttpf_index(path).unwrap();
+        assert_eq!(ttpf_read_virtual(path, &new, 0x20, 1).unwrap(), [2]);
+    }
+
+    #[test]
+    fn decodes_synthetic_mhiu_heightmap() {
+        let mut buf = vec![0u8; 44 + 4 * 8 + 2];
+        buf[0..4].copy_from_slice(b"MHIU");
+        buf[6..8].copy_from_slice(&4u16.to_le_bytes());
+        buf[8..10].copy_from_slice(&4u16.to_le_bytes());
+        // row 1: sx=1, cnt=2, off=-1 -> pix[0..2]
+        let r1 = 44 + 8;
+        buf[r1..r1 + 2].copy_from_slice(&1u16.to_le_bytes());
+        buf[r1 + 2..r1 + 4].copy_from_slice(&2u16.to_le_bytes());
+        buf[r1 + 4..r1 + 8].copy_from_slice(&(-1i32).to_le_bytes());
+        buf[44 + 32] = 60;
+        buf[44 + 33] = 120;
+        let tex = decode_mhiu_heightmap(&buf).expect("should decode mhiu");
+        assert_eq!(tex.w, 4);
+        assert_eq!(tex.h, 4);
+        assert_eq!(tex.pixels[0], Color32::from_rgb(16, 44, 92));
+        assert_ne!(tex.pixels[5], Color32::from_rgb(16, 44, 92));
+    }
+
+    #[test]
     fn bc1_preserves_one_bit_transparency() {
-        // c0 <= c1 selects BC1's transparent color index; first pixel uses it.
         let px = decode_linear_to_rgba(&[0, 0, 255, 255, 3, 0, 0, 0], 4, 4, 72).unwrap();
         assert_eq!(px[0], Color32::TRANSPARENT);
         assert_eq!(px[1], Color32::BLACK);

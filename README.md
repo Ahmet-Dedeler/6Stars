@@ -130,6 +130,12 @@ The demos are recorded from the real app, offscreen, by [`src/demo_capture.rs`](
 
 ## Features & Format Support
 
+- **World Map tab** (from upstream PercyStar v1.3.5 to v1.3.9)
+  - Decodes the `MHIU` 2048x2048 world heightmap into a 2D map or a hillshaded 3D terrain, with a clickable NavMesh overlay and the 3D city blocks drawn with their textures.
+  - **Launch 3D GPU World** opens a separate wgpu window (Metal on macOS, DX12/Vulkan on Windows) that streams map placements, with WASD/Q/E fly and walk modes. Map placement schema credited upstream to `@holdmysocks` ([SixNG](https://github.com/holdmysocks/SixNG)).
+- **Animation, PSO and resource decoders** (upstream): `crClipDictionary` animations with clip length, bone/track counts and a stickman preview, the binary `PSIN` PSO schema/instance decoder, `RSC9` tables and `phBound` boxes, cutscene `.cutc` cast/track names, and `DAT` audio metadata. They're listed under **Anim / PSO / RSC9**.
+- **SGD5 / DXBC shaders** (upstream): the Shaders tab can switch between the PS09 cache and SGD5 groups, and lifts their FSSM code through the same GFX10.3 path.
+- **AWC player:** waveform and loudness bars, auto-advance, loop, search and keyboard controls (upstream), playing through `afplay` on macOS and `waveOut` on Windows. Banks whose stream table carries multichannel music still decode per channel.
 - **RDNA2 shader disassembler and HLSL / SPIR-V lifter (`Shaders (RDNA2)` tab)**
   - Parses `PS\x00\x09` PSO caches: graphics and compute PSOs, metadata blobs, and compiled AMD GFX10.3 shaders, including `0x41` `USER_DATA` root-signature bindings (`SRV`/`CBV`/`UAV`/`Sampler`), `COMPUTE_PGM_RSRC1/2` and `[numthreads(x,y,z)]`.
   - Tags each stage (**PS**, **VS**, **CS**, **NGG/Meshlet** `exp prim`, **hardware RT** `image_bvh64_intersect_ray`).
@@ -152,7 +158,7 @@ The demos are recorded from the real app, offscreen, by [`src/demo_capture.rs`](
 - **No runtime dependencies for audio, 3D, textures, UI, XML or PSO**
   - No Python, FFmpeg or external DLLs. `ADAT` (`.awc`) Opus streams decode with pure-Rust `rusty-opus` (RFC 6716). All crates are pinned in [`Cargo.lock`](Cargo.lock).
 - **Folder and single-archive scanning (`.rpf` and `.ttpf`)**
-  - Multi-threaded scanning, cached to `scan_cache_v9.tsv` in `%LOCALAPPDATA%\Percy6Stars` (Windows) or `~/Library/Application Support/Percy6Stars` (macOS). An existing PercyStar folder is moved over on first launch.
+  - Multi-threaded scanning, cached to `scan_cache_v10.tsv` in `%LOCALAPPDATA%\Percy6Stars` (Windows) or `~/Library/Application Support/Percy6Stars` (macOS). An existing PercyStar folder is moved over on first launch.
 - **In-app Bink 2 playback**
   - The Apple Silicon build includes the decoder and frame bridge. Windows docks RAD's native player for pause and seeking. The Windows loop toggle applies when you next open a video.
 - **CLI batch exporters (models, textures, RDNA2 shaders)**
@@ -161,6 +167,11 @@ The demos are recorded from the real app, offscreen, by [`src/demo_capture.rs`](
   Percy6Stars.exe --extract-models "<path-to-archive.rpf>" "<output-dir>" "filter1,filter2"
   Percy6Stars.exe --dump-textures "<path-to-archive.rpf|.ttpf>" "<output-dir>" [limit]
   Percy6Stars.exe --disasm-shaders "<path-to-shaders.rpf|zlib_dir|.ps09>" "<output-dir>" [limit]
+  Percy6Stars.exe --extract-sgd5 "<path-to-shaders.rpf>" "<output-dir>" [limit]
+  Percy6Stars.exe --disassemble-dxbc "<file.dxbc>" ["<output.txt>"]
+  Percy6Stars.exe --probe-maps "<path-to-levels.rpf>"
+  Percy6Stars.exe --gpu-world [--common "<common.rpf>"] [--levels "<levels.rpf>"]
+  Percy6Stars.exe --inspect-exe "<path-to-exe>"
   ```
 
 ---
@@ -226,4 +237,4 @@ Rights holders with a concern can [open an issue](https://github.com/Ahmet-Dedel
 
 ## License
 
-Licensed under the [PercyStar Non-Commercial Attribution & Copyleft License v1.2](LICENSE) from [PercyStar](https://github.com/rpatty-dev/PercyStar) by @rpatty-dev. Free to use, fork and modify, not for commercial use. Three modules are also [MIT](LICENSE-MIT): `audio_player.rs`, `mac_open.rs` and `video_clip.rs`. `ttpf_tile.rs` is ported from [paryzius/ttpf-viewer](https://github.com/paryzius/ttpf-viewer) and stays under its MIT license, with the copyright notice in the file.
+Licensed under the [PercyStar Non-Commercial Attribution & Copyleft License v1.2](LICENSE) from [PercyStar](https://github.com/rpatty-dev/PercyStar) by @rpatty-dev. Free to use, fork and modify, not for commercial use. Two modules are also [MIT](LICENSE-MIT): `mac_open.rs` and `video_clip.rs`. `ttpf_tile.rs` is ported from [paryzius/ttpf-viewer](https://github.com/paryzius/ttpf-viewer) and stays under its MIT license, with the copyright notice in the file.

@@ -6,6 +6,8 @@ use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Arc;
 
+mod vertex_stream;
+
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum ShadeMode {
     #[default]
@@ -15,6 +17,7 @@ pub enum ShadeMode {
     Wireframe,
 }
 
+#[derive(Clone)]
 pub struct Texture2D {
     pub w: usize,
     pub h: usize,
@@ -76,6 +79,7 @@ impl Texture2D {
 const DEFAULT_YAW: f32 = 2.45;
 const DEFAULT_PITCH: f32 = 0.38;
 
+#[derive(Clone)]
 pub struct Mesh3D {
     pub name: String,
     pub verts: Vec<[f32; 3]>,
@@ -93,6 +97,7 @@ pub struct Mesh3D {
     pub radius: f32,
     pub geom_count: usize,
     pub meshlet_count: usize,
+    pub bone_count: usize,
     pub lod_label: String,
     /// Separate drawables (dictionary entries); empty for single-drawable meshes.
     pub parts: Vec<MeshPart>,
@@ -105,6 +110,7 @@ pub struct Mesh3D {
     pub pan_y: f32,
     pub shade_mode: ShadeMode,
     pub auto_spin: bool,
+    pub sky_bg: bool,
     // reused softwre rasterizer buffrs zero allocs per fram
     fb_w: usize,
     fb_h: usize,
@@ -192,6 +198,7 @@ impl Mesh3D {
             radius,
             geom_count,
             meshlet_count,
+            bone_count: 0,
             lod_label,
             parts: Vec::new(),
             active_part: None,
@@ -202,6 +209,7 @@ impl Mesh3D {
             pan_y: 0.0,
             shade_mode: ShadeMode::Textured,
             auto_spin: false,
+            sky_bg: false,
             fb_w: 0,
             fb_h: 0,
             color_buf: Vec::new(),
@@ -463,7 +471,7 @@ fn find_next_zlib(f: &mut File, start_off: u64) -> std::io::Result<Option<u64>> 
 }
 
 // reads all virtual chnks from a rage9 resource stopping right after blockmap
-fn read_virtual_from_file(f: &mut File, file_off: u64) -> Result<(Vec<u8>, u64, usize), String> {
+pub fn read_virtual_from_file(f: &mut File, file_off: u64) -> Result<(Vec<u8>, u64, usize), String> {
     let (mut v, mut next_off) = decompress_zlib_at(f, file_off, 16 * 1024 * 1024)
         .map_err(|e| format!("Virtual chunk 0 error: {e}"))?;
     if v.len() < 0x80 {
@@ -996,8 +1004,11 @@ fn drawable_dictionary_entries(v: &[u8]) -> Vec<(String, usize)> {
 /// [`drawable_dictionary_entries`]). Such files have no shader group at the root.
 fn single_dictionary_drawable(v: &[u8]) -> Option<usize> {
     if v.len() < 0x40 || ru16(v, 0x28) != 1 || ru16(v, 0x38) != 1 { return None; }
-    vptr(ru64(v, 0x20))?;
-    let d = vptr(ru64(v, vptr(ru64(v, 0x30))?))?;
+    let hashes = vptr(ru64(v, 0x20))?;
+    let arr = vptr(ru64(v, 0x30))?;
+    v.get(hashes..hashes + 4)?;
+    v.get(arr..arr + 8)?;
+    let d = vptr(ru64(v, arr))?;
     (d != 0 && d + 0xb0 <= v.len() && vptr(ru64(v, d + 0x50)).is_some()).then_some(d)
 }
 
@@ -1025,6 +1036,27 @@ fn append_meshlet_geom(p: &[u8], (vb_off, vb_size, mb_off, _mb_size): GeomRef, g
     let remap_base = tri_base + tot_tris * 4;
     if remap_base + tot_vrefs * 2 > p.len() {
         return false;
+    }
+
+    // Float3 positions (format 99) go through upstream's stream decoder (v1.3.8);
+    // the packed 24/16-bit format below stays on the path the regressions cover.
+    if vb_off + 4 <= p.len() && ru32(p, vb_off) & 127 == 99 {
+        let Some(vs) = vb_off.checked_add(vb_size).and_then(|end| p.get(vb_off..end)).and_then(|bytes| vertex_stream::decode(bytes).ok()) else {
+            return false;
+        };
+        return append_meshlet_tris(p, mb_off, num_meshlets, tot_tris, tot_vrefs, vs.positions.len(), geom_id, b, |b, v_cnt| {
+            b.verts.extend_from_slice(&vs.positions[..v_cnt]);
+            match &vs.uvs {
+                Some(uvs) => {
+                    b.uvs.extend_from_slice(&uvs[..v_cnt]);
+                    true
+                }
+                None => {
+                    b.uvs.resize(b.uvs.len() + v_cnt, [0.0; 2]);
+                    false
+                }
+            }
+        });
     }
 
     let mut hdrs = [0u32; 8];
@@ -1077,6 +1109,62 @@ fn append_meshlet_geom(p: &[u8], (vb_off, vb_size, mb_off, _mb_size): GeomRef, g
         _ => [0, 1, 2],
     };
 
+    append_meshlet_tris(p, mb_off, num_meshlets, tot_tris, tot_vrefs, max_vb_verts, geom_id, b, |b, v_cnt| {
+        let uv_stream = uv_stream.filter(|&(off, stride)| {
+            let end = hdrs.iter().map(|h| ((h >> 8) << 1) as usize)
+                .filter(|&next| next > off)
+                .fold(vb_size.min(p.len() - vb_off), usize::min);
+            off + v_cnt * stride <= end
+        });
+        let mut has_uvs = uv_stream.is_some();
+        let vbase = vb_off + stream0_off;
+        b.verts.reserve(v_cnt);
+        b.uvs.reserve(v_cnt);
+        for i in 0..v_cnt {
+            let o = vbase + i * 8;
+            // packed rage9 24 bit xy and 16 bit z across 8 bytes
+            let ix = (p[o + 1] as u32) | ((p[o + 2] as u32) << 8) | ((p[o + 3] as u32) << 16);
+            let iy = (p[o] as u32) | ((p[o + 4] as u32) << 8) | ((p[o + 5] as u32) << 16);
+            let iz = (p[o + 6] as u32) | ((p[o + 7] as u32) << 8);
+            let slots = [ox + (ix as f32) * sx, oy + (iy as f32) * sy, oz + (iz as f32) * sz];
+            let mut pos = [0.0f32; 3];
+            for (slot, &axis) in slot_axis.iter().enumerate() {
+                pos[axis] = slots[slot];
+            }
+            b.verts.push(pos);
+            let uv = uv_stream
+                .map(|(off, stride)| {
+                    let uv = vb_off + off + i * stride;
+                    if stride == 4 {
+                        [ru16(p, uv) as i16 as f32 / 8192.0, ru16(p, uv + 2) as i16 as f32 / 8192.0]
+                    } else {
+                        [rf32(p, uv), rf32(p, uv + 4)]
+                    }
+                })
+                .filter(|uv| uv.iter().all(|x| x.is_finite()));
+            has_uvs &= uv.is_some();
+            b.uvs.push(uv.unwrap_or([0.0, 0.0]));
+        }
+        has_uvs
+    })
+}
+
+/// Appends one geometry's meshlet triangles (indices into `max_vb_verts` vertices), then lets
+/// `push_verts` append the `v_cnt` vertices they use. Returns whether those had usable UVs.
+#[allow(clippy::too_many_arguments)]
+fn append_meshlet_tris(
+    p: &[u8],
+    mb_off: usize,
+    num_meshlets: usize,
+    tot_tris: usize,
+    tot_vrefs: usize,
+    max_vb_verts: usize,
+    geom_id: u16,
+    b: &mut MeshBuild,
+    push_verts: impl FnOnce(&mut MeshBuild, usize) -> bool,
+) -> bool {
+    let tri_base = mb_off + 0x0c + num_meshlets * 16;
+    let remap_base = tri_base + tot_tris * 4;
     let base_v = b.verts.len() as u32;
     let mut max_v_used = 0usize;
     let start_tri = b.tris.len();
@@ -1109,41 +1197,7 @@ fn append_meshlet_geom(p: &[u8], (vb_off, vb_size, mb_off, _mb_size): GeomRef, g
         return false;
     }
     let v_cnt = (max_v_used + 1).min(max_vb_verts);
-    let uv_stream = uv_stream.filter(|&(off, stride)| {
-        let end = hdrs.iter().map(|h| ((h >> 8) << 1) as usize)
-            .filter(|&next| next > off)
-            .fold(vb_size.min(p.len() - vb_off), usize::min);
-        off + v_cnt * stride <= end
-    });
-    let mut has_uvs = uv_stream.is_some();
-    let vbase = vb_off + stream0_off;
-    b.verts.reserve(v_cnt);
-    b.uvs.reserve(v_cnt);
-    for i in 0..v_cnt {
-        let o = vbase + i * 8;
-        // packed rage9 24 bit xy and 16 bit z across 8 bytes
-        let ix = (p[o + 1] as u32) | ((p[o + 2] as u32) << 8) | ((p[o + 3] as u32) << 16);
-        let iy = (p[o] as u32) | ((p[o + 4] as u32) << 8) | ((p[o + 5] as u32) << 16);
-        let iz = (p[o + 6] as u32) | ((p[o + 7] as u32) << 8);
-        let slots = [ox + (ix as f32) * sx, oy + (iy as f32) * sy, oz + (iz as f32) * sz];
-        let mut pos = [0.0f32; 3];
-        for (slot, &axis) in slot_axis.iter().enumerate() {
-            pos[axis] = slots[slot];
-        }
-        b.verts.push(pos);
-        let uv = uv_stream
-            .map(|(off, stride)| {
-                let uv = vb_off + off + i * stride;
-                if stride == 4 {
-                    [ru16(p, uv) as i16 as f32 / 8192.0, ru16(p, uv + 2) as i16 as f32 / 8192.0]
-                } else {
-                    [rf32(p, uv), rf32(p, uv + 4)]
-                }
-            })
-            .filter(|uv| uv.iter().all(|x| x.is_finite()));
-        has_uvs &= uv.is_some();
-        b.uvs.push(uv.unwrap_or([0.0, 0.0]));
-    }
+    let has_uvs = push_verts(b, v_cnt);
     b.tri_geom.resize(b.tri_geom.len() + added_tris, geom_id);
     b.meshlets += num_meshlets;
     has_uvs
@@ -1183,6 +1237,27 @@ fn layout_parts_in_grid(verts: &mut [[f32; 3]], part_verts: &[std::ops::Range<us
             v[1] += ty;
         }
     }
+}
+
+// reads rage9 crSkeletonData bone count from drawable+0x18 -> skel+0x6c
+fn extract_rage9_bone_count(v: &[u8]) -> usize {
+    let mut bases = vec![0usize];
+    if v.len() >= 0x20 {
+        if let Some(fo) = vptr(ru64(v, 0x18)) {
+            if fo + 0x20 <= v.len() { bases.push(fo); }
+        }
+    }
+    for base in bases {
+        if base + 0x20 > v.len() { continue; }
+        let Some(so) = vptr(ru64(v, base + 0x18)) else { continue };
+        if so + 0x70 <= v.len() {
+            let cnt = ru16(v, so + 0x6c) as usize;
+            if (1..=1024).contains(&cnt) && vptr(ru64(v, so + 0x28)).is_some() {
+                return cnt;
+            }
+        }
+    }
+    0
 }
 
 pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name: &str) -> Result<Mesh3D, String> {
@@ -1299,6 +1374,7 @@ pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name
     );
     mesh.geom_materials = geom_materials;
     mesh.has_paint_geom = paint_geoms > 0;
+    mesh.bone_count = extract_rage9_bone_count(&v);
     if parts.len() > 1 {
         mesh.parts = parts;
     }
@@ -1364,11 +1440,29 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
 
     for y in 0..h {
         let t = (y as f32) / (h.max(1) as f32);
-        let c = Color32::from_rgb(
-            (11.0 + t * 9.0) as u8,
-            (12.0 + t * 10.0) as u8,
-            (17.0 + t * 14.0) as u8,
-        );
+        let c = if mesh.sky_bg {
+            if t < 0.56 {
+                let s = t / 0.56;
+                Color32::from_rgb(
+                    (78.0 + s * 108.0) as u8,
+                    (134.0 + s * 84.0) as u8,
+                    (202.0 + s * 40.0) as u8,
+                )
+            } else {
+                let s = (t - 0.56) / 0.44;
+                Color32::from_rgb(
+                    (52.0 - s * 22.0) as u8,
+                    (78.0 - s * 28.0) as u8,
+                    (102.0 - s * 30.0) as u8,
+                )
+            }
+        } else {
+            Color32::from_rgb(
+                (11.0 + t * 9.0) as u8,
+                (12.0 + t * 10.0) as u8,
+                (17.0 + t * 14.0) as u8,
+            )
+        };
         mesh.color_buf[y * w..(y + 1) * w].fill(c);
     }
     mesh.z_buf.fill(f32::NEG_INFINITY);
@@ -1693,10 +1787,11 @@ pub fn part_picker(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
 
 pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
     ui.horizontal_wrapped(|ui| {
+        let bone_s = if mesh.bone_count > 0 { format!("  ·  {} bones", mesh.bone_count) } else { String::new() };
         ui.label(
             RichText::new(format!(
-                "{}  ·  {} verts  ·  {} tris  ·  {} geoms / {} meshlets ({})",
-                mesh.name, mesh.verts.len(), mesh.tris.len(), mesh.geom_count, mesh.meshlet_count, mesh.lod_label
+                "{}  ·  {} verts  ·  {} tris  ·  {} geoms / {} meshlets ({}){}",
+                mesh.name, mesh.verts.len(), mesh.tris.len(), mesh.geom_count, mesh.meshlet_count, mesh.lod_label, bone_s
             ))
             .strong()
             .color(Color32::from_rgb(252, 175, 23)),
@@ -1814,6 +1909,20 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
         if scroll != 0.0 {
             mesh.zoom = (mesh.zoom * (1.0 + scroll * 0.0022)).clamp(0.15, 25.0);
             mesh.dirty = true;
+        }
+        // codewalker-style wasd + q/e camera navigation
+        let (fw, rt, up) = ui.input(|i| {
+            let f = (i.key_down(egui::Key::W) as i32 - i.key_down(egui::Key::S) as i32) as f32;
+            let r = (i.key_down(egui::Key::D) as i32 - i.key_down(egui::Key::A) as i32) as f32;
+            let u = (i.key_down(egui::Key::E) as i32 - i.key_down(egui::Key::Q) as i32) as f32;
+            (f, r, u)
+        });
+        if fw != 0.0 || rt != 0.0 || up != 0.0 {
+            mesh.zoom = (mesh.zoom * (1.0 + fw * 0.03)).clamp(0.15, 25.0);
+            mesh.pan_x -= rt * 0.015;
+            mesh.pan_y += up * 0.015;
+            mesh.dirty = true;
+            ui.ctx().request_repaint();
         }
     }
     if mesh.auto_spin && !dragging {
@@ -2049,6 +2158,12 @@ mod dictionary_decode_tests {
         put(&mut v, 0x110 + 0x50, 0x5000_0100);
         assert_eq!(single_dictionary_drawable(&v), Some(0x110));
         assert!(drawable_dictionary_entries(&v).is_empty(), "one entry is handled as a plain drawable");
+        put(&mut v, 0x30, 0x5000_01fc);
+        assert_eq!(single_dictionary_drawable(&v), None, "truncated pointer array");
+        put(&mut v, 0x30, 0x5000_0108);
+        put(&mut v, 0x20, 0x5000_0200);
+        assert_eq!(single_dictionary_drawable(&v), None, "out-of-range hash array");
+        put(&mut v, 0x20, 0x5000_0100);
         v[0x38] = 2;
         assert_eq!(single_dictionary_drawable(&v), None);
     }
