@@ -8,29 +8,6 @@
   A maintained fork of <a href="https://github.com/rpatty-dev/PercyStar">rpatty-dev/PercyStar</a>, the Rust RPF9 and TTPF archive explorer. I use it on macOS, so most of my changes are around in-app playback and model browsing.
 </p>
 
-## Build from Source
-
-Clone `main` for the latest version of this fork.
-
-```sh
-git clone --branch main https://github.com/Ahmet-Dedeler/PercyStar.git
-cd PercyStar
-```
-
-**macOS:** Install Rust via `rustup`, Python 3, and the Xcode Command Line Tools. Run `bash scripts/build_macos.sh` and open `dist/PercyStar.app`. The script fetches and verifies the pinned decoder and frame bridge. Video playback works offline on Apple Silicon with macOS 12 or later. The app also builds for Intel, but the included decoder is ARM-only.
-
-**Windows x64:** Install Rust and the Visual Studio C++ Build Tools. Run `cargo build --release --locked` and open `target\release\PercyStar.exe`. For `.bk2` previews, use [the RAD player setup script](scripts/setup_deps.ps1).
-
-To update, run `git pull --ff-only` and rebuild. On macOS, the script won't overwrite an existing app, so use a new output path, for example `PERCYSTAR_APP_PATH=dist/PercyStar-next.app bash scripts/build_macos.sh`. On Windows, skip the in-app updater. It points to upstream.
-
-## What This Fork Adds
-
-- **BK2 video on Apple Silicon:** Select a `.bk2` to play it right in the preview panel. You can pause, scrub, mute and loop. The Mac build includes the decoder, so there's no second app to install.
-- **AWC audio previews:** Play and seek through individual streams without exporting them first. The decoder also reads multichannel banks and files with extra stream-table headers that upstream can miss.
-- **Better 3D previews:** Drawables in a model dictionary appear separately instead of stacked on top of each other. Fixed rotated meshes and false model entries, added streamed `.ttpf` textures and vehicle paint previews, and added a **Highest detail only** toggle for character and clothing models.
-- **More accurate model colors:** The viewer finds shared textures across packs, binds them to the right materials, and reads both packed and floating-point UVs. If it can't find a usable color texture, it shows that part in gray.
-- **Easier browsing:** Sort the Explorer and Model Viewer by name or size. Small text tables show their strings instead of hex, and binary blobs no longer show up as XML just because they start with `<`.
-
 <p align="center">
   <img src="https://img.shields.io/badge/Rust-1.85%2B-orange?style=flat-square&logo=rust" alt="Rust" />
   <img src="https://img.shields.io/badge/Shaders-RDNA2%20GFX10.3%20%E2%86%92%20HLSL%20%2F%20SPIR--V-FF4FA3?style=flat-square" alt="Shaders" />
@@ -49,6 +26,54 @@ To update, run `git pull --ff-only` and rebuild. On macOS, the script won't over
 <p align="center">
   <img src="assets/demo_overview.webp" alt="PercyStar demo: Neon Sunset UI, search, and vehicle filters" width="920" />
 </p>
+
+## What This Fork Adds
+
+- **BK2 video on Apple Silicon:** Select a `.bk2` to play it right in the preview panel. You can pause, scrub, mute and loop. The Mac build includes the decoder, so there's no second app to install.
+- **AWC audio previews:** Play and seek through individual streams without exporting them first. The decoder also reads multichannel banks and files with extra stream-table headers that upstream can miss.
+- **Better 3D previews:** Drawables in a model dictionary appear separately instead of stacked on top of each other. Fixed rotated meshes and false model entries, added streamed `.ttpf` textures and vehicle paint previews, and added a **Highest detail only** toggle for character and clothing models.
+- **More accurate model colors:** The viewer finds shared textures across packs, binds them to the right materials, and reads both packed and floating-point UVs. If it can't find a usable color texture, it shows that part in gray.
+- **Easier browsing:** Sort the Explorer and Model Viewer by name or size. Small text tables show their strings instead of hex, and binary blobs no longer show up as XML just because they start with `<`.
+
+## Build from Source
+
+```sh
+git clone https://github.com/Ahmet-Dedeler/PercyStar.git
+cd PercyStar
+```
+
+<details>
+<summary><b>macOS</b> (Apple Silicon, macOS 12+)</summary>
+
+1. Install Rust via `rustup`, Python 3, and the Xcode Command Line Tools.
+2. Run `bash scripts/build_macos.sh`.
+3. Open `dist/PercyStar.app`.
+
+The script fetches and verifies the pinned decoder and frame bridge, so video playback works offline. The app also builds for Intel, but the bundled decoder is ARM-only.
+
+</details>
+
+<details>
+<summary><b>Windows x64</b></summary>
+
+1. Install Rust and the Visual Studio C++ Build Tools.
+2. Run `cargo build --release --locked`.
+3. Open `target\release\PercyStar.exe`.
+
+For `.bk2` previews, run [the RAD player setup script](scripts/setup_deps.ps1). Skip the in-app updater, it points to upstream.
+
+</details>
+
+<details>
+<summary><b>Updating</b></summary>
+
+Run `git pull --ff-only` and rebuild. On macOS the build script won't overwrite an existing app, so pick a new output path:
+
+```sh
+PERCYSTAR_APP_PATH=dist/PercyStar-next.app bash scripts/build_macos.sh
+```
+
+</details>
 
 ---
 
