@@ -94,6 +94,15 @@ impl WorldMapData {
         self.bmin[2] + (v / 255.0) * (self.bmax[2] - self.bmin[2])
     }
 
+    pub fn ground_elevation_m(&self, x: f32, y: f32) -> f32 {
+        let u = ((x - self.bmin[0]) / (self.bmax[0] - self.bmin[0]).max(1.0)).clamp(0.0, 1.0);
+        // Row zero is at maximum world Y, like the terrain mesh and the 2D map.
+        let v = ((self.bmax[1] - y) / (self.bmax[1] - self.bmin[1]).max(1.0)).clamp(0.0, 1.0);
+        let px = ((u * self.w as f32) as usize).min(self.w - 1);
+        let py = ((v * self.h as f32) as usize).min(self.h - 1);
+        self.elevation_m(px, py).max(0.0)
+    }
+
     pub fn build_color_image(&self) -> ColorImage {
         let mut pixels = Vec::with_capacity(self.w * self.h);
         for &v in &self.heights {
@@ -478,6 +487,8 @@ mod tests {
         assert_eq!(mesh.verts[0], [-10.0, 10.0, 20.0]);
         assert_eq!(world.verts[0], [-1000.0, 1000.0, 500.0]);
         assert_eq!(world.verts[3], [0.0, 0.0, 0.0]);
+        assert_eq!(d.ground_elevation_m(-1000.0, 900.0), 500.0);
+        assert_eq!(d.ground_elevation_m(-1000.0, -900.0), 0.0);
         assert_eq!(parse_nav_coords("nav_256_256_(0,0).ynv"), Some((0.0, 0.0)));
     }
 }

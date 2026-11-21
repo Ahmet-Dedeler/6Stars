@@ -890,13 +890,7 @@ impl GpuWorldApp {
     }
 
     fn sample_terrain_z(&self, x: f32, y: f32) -> f32 {
-        let Some(ref t) = self.terrain_ref else { return 0.0 };
-        let u = ((x - t.bmin[0]) / (t.bmax[0] - t.bmin[0]).max(1.0)).clamp(0.0, 1.0);
-        let v = ((y - t.bmin[1]) / (t.bmax[1] - t.bmin[1]).max(1.0)).clamp(0.0, 1.0);
-        let ix = ((u * (t.w.saturating_sub(1)) as f32) as usize).min(t.w - 1);
-        let iy = ((v * (t.h.saturating_sub(1)) as f32) as usize).min(t.h - 1);
-        let h = t.heights[iy * t.w + ix] as f32 / 255.0;
-        t.bmin[2] + h * (t.bmax[2] - t.bmin[2])
+        self.terrain_ref.as_ref().map_or(0.0, |t| t.ground_elevation_m(x, y))
     }
 }
 
