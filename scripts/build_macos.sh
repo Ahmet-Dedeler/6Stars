@@ -1,21 +1,22 @@
 #!/usr/bin/env bash
-# Builds dist/PercyStar.app: universal (arm64 + x86_64), fat LTO, CPU-tuned per arch, ad-hoc signed.
+# Builds dist/6Stars.app: universal (arm64 + x86_64), fat LTO, CPU-tuned per arch, ad-hoc signed.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-APP="${PERCYSTAR_APP_PATH:-dist/PercyStar.app}"
+# SIXSTARS_APP_PATH picks the output; PERCYSTAR_APP_PATH still works from before the rename
+APP="${SIXSTARS_APP_PATH:-${PERCYSTAR_APP_PATH:-dist/6Stars.app}}"
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 export MACOSX_DEPLOYMENT_TARGET=11.0
 
 if [[ -e "$APP" || -L "$APP" ]]; then
-  echo "$APP already exists. Set PERCYSTAR_APP_PATH to a new output path." >&2
+  echo "$APP already exists. Set SIXSTARS_APP_PATH to a new output path." >&2
   exit 1
 fi
 mkdir -p "$(dirname "$APP")"
-stage=$(mktemp -d "$(dirname "$APP")/.percystar-build.XXXXXX")
+stage=$(mktemp -d "$(dirname "$APP")/.6stars-build.XXXXXX")
 trap 'rm -r "$stage"' EXIT
-bundle="$stage/PercyStar.app"
+bundle="$stage/6Stars.app"
 
 rustup target add aarch64-apple-darwin x86_64-apple-darwin >/dev/null
 
@@ -24,47 +25,47 @@ RUSTFLAGS="-C target-cpu=apple-m1" cargo build --locked --release --target aarch
 RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --locked --release --target x86_64-apple-darwin
 
 mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
-lipo -create -output "$bundle/Contents/MacOS/PercyStar" \
-  "$TARGET_DIR/aarch64-apple-darwin/release/PercyStar" \
-  "$TARGET_DIR/x86_64-apple-darwin/release/PercyStar"
+lipo -create -output "$bundle/Contents/MacOS/6Stars" \
+  "$TARGET_DIR/aarch64-apple-darwin/release/6Stars" \
+  "$TARGET_DIR/x86_64-apple-darwin/release/6Stars"
 
-ICONSET="$stage/PercyStar.iconset"
+ICONSET="$stage/6Stars.iconset"
 mkdir -p "$ICONSET"
 for s in 16 32 128 256 512; do
-  sips -z $s $s assets/logo.png --out "$ICONSET/icon_${s}x${s}.png" >/dev/null
-  sips -z $((s * 2)) $((s * 2)) assets/logo.png --out "$ICONSET/icon_${s}x${s}@2x.png" >/dev/null
+  sips -z $s $s assets/icon.png --out "$ICONSET/icon_${s}x${s}.png" >/dev/null
+  sips -z $((s * 2)) $((s * 2)) assets/icon.png --out "$ICONSET/icon_${s}x${s}@2x.png" >/dev/null
 done
-iconutil -c icns "$ICONSET" -o "$bundle/Contents/Resources/PercyStar.icns"
+iconutil -c icns "$ICONSET" -o "$bundle/Contents/Resources/6Stars.icns"
 
 cat > "$bundle/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>PercyStar</string>
-  <key>CFBundleDisplayName</key><string>PercyStar</string>
-  <key>CFBundleIdentifier</key><string>dev.rpatty.percystar</string>
-  <key>CFBundleExecutable</key><string>PercyStar</string>
-  <key>CFBundleIconFile</key><string>PercyStar</string>
+  <key>CFBundleName</key><string>6Stars</string>
+  <key>CFBundleDisplayName</key><string>6Stars</string>
+  <key>CFBundleIdentifier</key><string>io.github.ahmet-dedeler.6stars</string>
+  <key>CFBundleExecutable</key><string>6Stars</string>
+  <key>CFBundleIconFile</key><string>6Stars</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>${VERSION}</string>
   <key>CFBundleVersion</key><string>${VERSION}</string>
   <key>LSMinimumSystemVersion</key><string>${MACOSX_DEPLOYMENT_TARGET}</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
-  <!-- Lets Finder open these with PercyStar (double-click, Open With, drop on the Dock icon).
-       Archives default to PercyStar; .bk2/.awc are Alternate so an installed Bink Player or
+  <!-- Lets Finder open these with 6Stars (double-click, Open With, drop on the Dock icon).
+       Archives default to 6Stars; .bk2/.awc are Alternate so an installed Bink Player or
        audio tool keeps the default. -->
   <key>UTImportedTypeDeclarations</key>
   <array>
     <dict>
-      <key>UTTypeIdentifier</key><string>dev.rpatty.percystar.rpf</string>
+      <key>UTTypeIdentifier</key><string>io.github.ahmet-dedeler.6stars.rpf</string>
       <key>UTTypeDescription</key><string>RAGE Package File</string>
       <key>UTTypeConformsTo</key><array><string>public.data</string></array>
       <key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array><string>rpf</string></array></dict>
     </dict>
     <dict>
-      <key>UTTypeIdentifier</key><string>dev.rpatty.percystar.ttpf</string>
+      <key>UTTypeIdentifier</key><string>io.github.ahmet-dedeler.6stars.ttpf</string>
       <key>UTTypeDescription</key><string>RAGE Texture Pack</string>
       <key>UTTypeConformsTo</key><array><string>public.data</string></array>
       <key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array><string>ttpf</string></array></dict>
@@ -76,7 +77,7 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
       <key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array><string>bk2</string></array></dict>
     </dict>
     <dict>
-      <key>UTTypeIdentifier</key><string>dev.rpatty.percystar.awc</string>
+      <key>UTTypeIdentifier</key><string>io.github.ahmet-dedeler.6stars.awc</string>
       <key>UTTypeDescription</key><string>RAGE Audio Wave Container</string>
       <key>UTTypeConformsTo</key><array><string>public.audio</string><string>public.data</string></array>
       <key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array><string>awc</string></array></dict>
@@ -89,7 +90,7 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
       <key>CFBundleTypeRole</key><string>Viewer</string>
       <key>LSHandlerRank</key><string>Default</string>
       <key>CFBundleTypeExtensions</key><array><string>rpf</string><string>ttpf</string></array>
-      <key>LSItemContentTypes</key><array><string>dev.rpatty.percystar.rpf</string><string>dev.rpatty.percystar.ttpf</string></array>
+      <key>LSItemContentTypes</key><array><string>io.github.ahmet-dedeler.6stars.rpf</string><string>io.github.ahmet-dedeler.6stars.ttpf</string></array>
     </dict>
     <dict>
       <key>CFBundleTypeName</key><string>Bink 2 Video</string>
@@ -103,7 +104,7 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
       <key>CFBundleTypeRole</key><string>Viewer</string>
       <key>LSHandlerRank</key><string>Alternate</string>
       <key>CFBundleTypeExtensions</key><array><string>awc</string></array>
-      <key>LSItemContentTypes</key><array><string>dev.rpatty.percystar.awc</string></array>
+      <key>LSItemContentTypes</key><array><string>io.github.ahmet-dedeler.6stars.awc</string></array>
     </dict>
   </array>
 </dict>
@@ -115,4 +116,4 @@ codesign --force --sign - "$bundle"
 codesign --verify --deep --strict "$bundle"
 mv "$bundle" "$APP"
 echo "Built $APP ($(du -sh "$APP" | cut -f1))"
-lipo -info "$APP/Contents/MacOS/PercyStar"
+lipo -info "$APP/Contents/MacOS/6Stars"

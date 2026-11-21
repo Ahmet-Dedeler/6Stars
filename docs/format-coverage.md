@@ -2,9 +2,9 @@
 
 The scan cache for the Xbox v1.0.2.1 dump contains 754,364 recognized entries from 76 archives with scan hits. The counts below come from the whole cache. The decoder audit used up to 65 entries per kind, so the success rates describe the sample, not every file.
 
-| Entries | Count | What PercyStar can show |
+| Entries | Count | What 6Stars can show |
 | --- | ---: | --- |
-| TTPF textures | 357,115 | 42,338 have a BCPack-compressed full-size mip, which PercyStar can't decode. For 13,888 of those (32.8%) a smaller mip is stored as zlib or raw data, so the preview shows that one, labelled "Reduced resolution". The other 28,450 stay blocked. See [BCPack and the lower-mip fallback](#bcpack-and-the-lower-mip-fallback). |
+| TTPF textures | 357,115 | 42,338 have a BCPack-compressed full-size mip, which 6Stars can't decode. For 13,888 of those (32.8%) a smaller mip is stored as zlib or raw data, so the preview shows that one, labelled "Reduced resolution". The other 28,450 stay blocked. See [BCPack and the lower-mip fallback](#bcpack-and-the-lower-mip-fallback). |
 | Models and vehicles | 260,502 | Mesh previews. 65/65 models and 65/65 vehicles produced geometry; this doesn't guarantee full materials, rigging or animation. |
 | AWC audio | 71,673 | 65/65 yielded at least one playable stream. |
 | NavMesh | 27,629 | 65/65 opened as triangles. |
@@ -21,7 +21,7 @@ The shader tab also inspects supported RDNA2 PSO caches separately. The archive 
 
 ## BCPack and the lower-mip fallback
 
-A `.ttpf` texture stores its whole mip chain, smallest mip first. The store compresses each chunk with zlib, stores it raw, or uses BCPack, the Xbox hardware texture codec, which has no public decoder. When the full-size mip falls in a BCPack chunk, PercyStar decodes the largest smaller mip that sits outside BCPack. The texture preview shows it as "Reduced resolution (WxH of FULLWxFULLH)", and the Model Viewer uses it for materials, so those models show texture colors instead of gray.
+A `.ttpf` texture stores its whole mip chain, smallest mip first. The store compresses each chunk with zlib, stores it raw, or uses BCPack, the Xbox hardware texture codec, which has no public decoder. When the full-size mip falls in a BCPack chunk, 6Stars decodes the largest smaller mip that sits outside BCPack. The texture preview shows it as "Reduced resolution (WxH of FULLWxFULLH)", and the Model Viewer uses it for materials, so those models show texture colors instead of gray.
 
 Every texture in all 57 stores of the Xbox v1.0.2.1 dump, measured on 2026-11-21:
 
@@ -50,6 +50,6 @@ PERCYSTAR_AUDIT=1 PERCYSTAR_AUDIT_N=65 cargo test --release format_audit -- --ig
 The audit only reads the BK2 headers. To verify decoded frames, pause and seek against a built Mac bundle, run the silent test with a local clip:
 
 ```sh
-PERCYSTAR_BINK_APP=dist/PercyStar.app PERCYSTAR_BK2=/path/to/sample.bk2 \
+PERCYSTAR_BINK_APP=dist/6Stars.app PERCYSTAR_BK2=/path/to/sample.bk2 \
   cargo test --release bink_embed -- --ignored --nocapture
 ```

@@ -1,11 +1,11 @@
 <p align="center">
-  <img src="assets/logo.png" alt="PercyStar Logo" width="140" />
+  <img src="assets/logo.png" alt="6Stars logo" width="140" />
 </p>
 
-<h1 align="center">PercyStar (Maintained Fork)</h1>
+<h1 align="center">6Stars</h1>
 
 <p align="center">
-  A maintained fork of <a href="https://github.com/rpatty-dev/PercyStar">rpatty-dev/PercyStar</a>, the Rust RPF9 and TTPF archive explorer.
+  A Rust RPF9 and TTPF archive explorer, built on <a href="https://github.com/rpatty-dev/PercyStar">PercyStar</a> by rpatty-dev.
 </p>
 
 <p align="center">
@@ -24,7 +24,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/demo_overview.webp" alt="PercyStar demo: Neon Sunset UI, search, and vehicle filters" width="920" />
+  <img src="assets/demo_overview.webp" alt="6Stars demo: Neon Sunset UI, search, and vehicle filters" width="920" />
 </p>
 
 ## What This Fork Adds
@@ -48,7 +48,7 @@ cd PercyStar
 
 1. Install Rust via `rustup`, Python 3, and the Xcode Command Line Tools.
 2. Run `bash scripts/build_macos.sh`.
-3. Open `dist/PercyStar.app`.
+3. Open `dist/6Stars.app`.
 
 The script fetches and verifies the pinned decoder and frame bridge, so video playback works offline. The app also builds for Intel, but the bundled decoder is ARM-only.
 
@@ -59,19 +59,19 @@ The script fetches and verifies the pinned decoder and frame bridge, so video pl
 
 1. Install Rust, the Visual Studio C++ Build Tools, and 7-Zip.
 2. In PowerShell, run `powershell -ExecutionPolicy Bypass -File .\scripts\build_windows.ps1`.
-3. Open `dist\PercyStar-Win64\PercyStar.exe`.
+3. Open `dist\6Stars-Win64\6Stars.exe`.
 
-The build fetches and verifies RAD's decoder and puts it next to PercyStar without running the RAD installer. Keep the two files together. A plain `cargo build` builds the app without bundling the player.
+The build fetches and verifies RAD's decoder and puts it next to 6Stars without running the RAD installer. Keep the two files together. A plain `cargo build` builds the app without bundling the player.
 
 </details>
 
 <details>
 <summary><b>Updating</b></summary>
 
-Run `git pull --ff-only` and rebuild. Set `-Destination` on Windows or `PERCYSTAR_APP_PATH` on macOS to keep your previous build:
+Run `git pull --ff-only` and rebuild. Set `-Destination` on Windows or `SIXSTARS_APP_PATH` on macOS to keep your previous build:
 
 ```sh
-PERCYSTAR_APP_PATH=dist/PercyStar-next.app bash scripts/build_macos.sh
+SIXSTARS_APP_PATH=dist/6Stars-next.app bash scripts/build_macos.sh
 ```
 
 </details>
@@ -91,18 +91,18 @@ PERCYSTAR_APP_PATH=dist/PercyStar-next.app bash scripts/build_macos.sh
 
 ### RAGE 9 3D Meshlet Viewer (`Textured/Mat` · `Clay Solid` · `Solid+Wire` · `Wire`)
 <p align="center">
-  <img src="assets/demo_3d.webp" alt="PercyStar 3D Meshlet Viewer — Shading Modes & Smooth Orbit" width="900" />
+  <img src="assets/demo_3d.webp" alt="6Stars 3D Meshlet Viewer — Shading Modes & Smooth Orbit" width="900" />
 </p>
 
 ### Pure-Rust Audio (`ADAT` Opus → WAV), `PSIN` Metadata & XML Inspector
 <p align="center">
-  <img src="assets/demo_inspector.webp" alt="PercyStar Pure-Rust Opus Audio, PSIN PSO Inspector & XML Viewer" width="900" />
+  <img src="assets/demo_inspector.webp" alt="6Stars Pure-Rust Opus Audio, PSIN PSO Inspector & XML Viewer" width="900" />
 </p>
 
 <details>
 <summary>Static High-Res Screenshot (Neon Sunset)</summary>
 <p align="center">
-  <img src="assets/preview.png" alt="PercyStar 3D Meshlet Viewer — Neon Sunset Theme" width="900" />
+  <img src="assets/preview.png" alt="6Stars 3D Meshlet Viewer — Neon Sunset Theme" width="900" />
 </p>
 </details>
 
@@ -133,15 +133,15 @@ PERCYSTAR_APP_PATH=dist/PercyStar-next.app bash scripts/build_macos.sh
 - **100% Native Runtime Dependencies for Audio, 3D, Textures, UI, XML & PSO**
   - **No Python, no FFmpeg, no external DLLs required** — `ADAT` (`.awc`) Opus streams decode natively via pure-Rust `rusty-opus` (RFC 6716). All crates pinned in [`Cargo.lock`](Cargo.lock).
 - **Whole-Folder & Single-Archive Scanning (`.rpf` & `.ttpf`)**
-  - Multi-threaded live scanning cached to `%LOCALAPPDATA%\PercyStar\scan_cache_v8.tsv`.
+  - Multi-threaded live scanning cached to `scan_cache_v9.tsv` in `%LOCALAPPDATA%\6Stars` (Windows) or `~/Library/Application Support/6Stars` (macOS). An existing PercyStar folder is moved over on first launch.
 - **In-app Bink 2 playback**
   - The Apple Silicon build includes the decoder and frame bridge. Windows docks RAD's native player for pause and seeking. The Windows loop toggle applies when you next open a video.
 - **CLI Batch Exporters (Models, Textures & RDNA2 Shaders)**
   ```powershell
-  PercyStar.exe --extract-vehicles "<path-to-levels.rpf>" "<output-dir>"
-  PercyStar.exe --extract-models "<path-to-archive.rpf>" "<output-dir>" "filter1,filter2"
-  PercyStar.exe --dump-textures "<path-to-archive.rpf|.ttpf>" "<output-dir>" [limit]
-  PercyStar.exe --disasm-shaders "<path-to-shaders.rpf|zlib_dir|.ps09>" "<output-dir>" [limit]
+  6Stars.exe --extract-vehicles "<path-to-levels.rpf>" "<output-dir>"
+  6Stars.exe --extract-models "<path-to-archive.rpf>" "<output-dir>" "filter1,filter2"
+  6Stars.exe --dump-textures "<path-to-archive.rpf|.ttpf>" "<output-dir>" [limit]
+  6Stars.exe --disasm-shaders "<path-to-shaders.rpf|zlib_dir|.ps09>" "<output-dir>" [limit]
   ```
 
 ---
@@ -151,7 +151,8 @@ PERCYSTAR_APP_PATH=dist/PercyStar-next.app bash scripts/build_macos.sh
 ```text
 PercyStar/
 ├── assets/
-│   ├── logo.png            # App & window icon
+│   ├── icon.png            # 1024px macOS app icon source
+│   ├── logo.png            # In-app logo & window icon
 │   ├── logo.ico            # Windows executable icon
 │   ├── demo_overview.webp  # 30fps Neon Sunset UI and search demo
 │   ├── demo_3d.webp        # 30fps 3D meshlet viewer shading modes showcase
@@ -169,7 +170,7 @@ PercyStar/
 ├── docs/
 │   └── breakthroughs.json  # Live-synced research & breakthroughs timeline feed
 ├── src/
-│   ├── main.rs             # PercyStar egui app, Model Viewer, RDNA2 Shader Lifter, RPF9/TTPF scanner & CLI
+│   ├── main.rs             # 6Stars egui app, Model Viewer, RDNA2 Shader Lifter, RPF9/TTPF scanner & CLI
 │   ├── rdna2.rs            # Xbox Scarlett PS\x00\x09 parser, AMD GFX10.3 disassembler, HLSL SM 6.6 & SPIR-V 1.5 lifter
 │   ├── model3d.rs          # RAGE 9 meshlet decoder, UV/TXD parser & Z-buffer renderer
 │   ├── tex.rs              # Xbox Scarlett RDNA2 4KB/64KB textures, TTPF, RBF0, GFx, 0DRPz & CNavMesh
@@ -189,11 +190,11 @@ The Xbox dump scan recognized 754,364 entries, including 797 videos. The [format
 
 ## Scope, Clean-Room Research & Legal Notice
 
-PercyStar is an independent archive viewer for **unencrypted, user-supplied files**. The Rust archive decoders are separate from video playback, which uses RAD's player.
+6Stars is an independent archive viewer for **unencrypted, user-supplied files**. The Rust archive decoders are separate from video playback, which uses RAD's player.
 
 - **Zero Circumvention / Zero Keys:** Contains **no** decryption routines, encryption keys, hashes, DRM bypasses, or access-control workarounds. Encrypted data is skipped untouched.
 - **No Game Files:** The source repo contains no RAD binaries or game assets. The Mac and Windows builds download their player from RAD for local use; the decoder remains under RAD's terms. Users supply their own archives.
-- **Independent Trademark Disclaimer:** PercyStar is an independent open-source project and is not affiliated with, endorsed by, or sponsored by any game studio or publisher.
+- **Independent Trademark Disclaimer:** 6Stars is an independent open-source project and is not affiliated with, endorsed by, or sponsored by any game studio or publisher.
 
 **Copyright (c) 2026 rpatty-dev — All Rights Reserved.**  
 See [LICENSE](LICENSE). You may download, run, and fork this repository on GitHub for personal use/reference, **but you may not modify, alter, or redistribute modified versions of the code or binaries without explicit written permission.**

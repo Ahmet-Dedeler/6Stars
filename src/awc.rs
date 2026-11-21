@@ -274,7 +274,7 @@ mod tests {
         adat[20..28].copy_from_slice(&entry_val.to_le_bytes());
         adat.extend_from_slice(&blk);
 
-        let tmp = std::env::temp_dir().join("percystar_awc_test");
+        let tmp = std::env::temp_dir().join("6stars_awc_test");
         let wavs = decode_awc_bytes_to_wavs(&adat, &tmp, "test");
         assert_eq!(wavs.len(), 1);
         let bytes = fs::read(&wavs[0].1).unwrap();

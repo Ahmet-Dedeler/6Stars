@@ -1487,7 +1487,7 @@ pub fn inspect_gfx(data: &[u8]) -> String {
 }
 
 /// Fast snippet extractor for naming `0DRPz` / standalone GTA VI text chunks in the archive list
-/// so users can Ctrl+F radio artists, weapons, vehicles, or dialogue directly in PercyStar.
+/// so users can Ctrl+F radio artists, weapons, vehicles, or dialogue directly in 6Stars.
 pub fn probe_gxt_snippet(head: &[u8]) -> Option<String> {
     let is_0drpz = head.len() >= 24 && &head[16..21] == b"0DRPz";
     let start = if is_0drpz { 0x60.min(head.len()) } else { 0 };

@@ -42,6 +42,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+// the GitHub repo still carries the upstream name; GitHub redirects if it is renamed
 const REPO_RELEASES_URL: &str = "https://github.com/Ahmet-Dedeler/PercyStar/releases";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -512,11 +513,11 @@ fn spawn_install_update(ver: String, upd: Arc<Mutex<UpdateState>>, ctx: egui::Co
     ctx.request_repaint();
     std::thread::spawn(move || {
         let res: Result<(), String> = (|| {
-            let tmp = std::env::temp_dir().join("percystar_self_update");
+            let tmp = std::env::temp_dir().join("6stars_self_update");
             let _ = fs::remove_dir_all(&tmp);
             fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
             let zip_p = tmp.join("update.zip");
-            let dl_url = format!("{REPO_RELEASES_URL}/download/v{ver}/PercyStar_v{ver}_Win64.zip");
+            let dl_url = format!("{REPO_RELEASES_URL}/download/v{ver}/6Stars_v{ver}_Win64.zip");
             let dl = silent_cmd("curl.exe")
                 .args(["-fsSL", "-o", zip_p.to_str().ok_or("bad zip path")?, &dl_url])
                 .output()
@@ -543,8 +544,8 @@ fn spawn_install_update(ver: String, upd: Arc<Mutex<UpdateState>>, ctx: egui::Co
                 return Err("Archive extraction failed".into());
             }
 
-            let new_exe = tmp.join("PercyStar.exe");
-            let head = fs::read(&new_exe).map_err(|_| "PercyStar.exe missing in release zip".to_string())?;
+            let new_exe = tmp.join("6Stars.exe");
+            let head = fs::read(&new_exe).map_err(|_| "6Stars.exe missing in release zip".to_string())?;
             if head.len() < 100_000 || !head.starts_with(b"MZ") {
                 return Err("Downloaded binary looks invalid".into());
             }
@@ -642,7 +643,7 @@ impl Rpf9App {
         setup_style(&cc.egui_ctx);
         let logo_tex = logo_rgba.map(|(raw, w, h)| {
             let ci = ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &raw);
-            cc.egui_ctx.load_texture("percystar_logo", ci, TextureOptions::LINEAR)
+            cc.egui_ctx.load_texture("app_logo", ci, TextureOptions::LINEAR)
         });
         let mut app = Self {
             target_path: None,
@@ -1268,7 +1269,7 @@ impl Rpf9App {
             #[cfg(not(target_os = "macos"))]
             let decoder = bink_dock::player_path();
             let Some(decoder) = decoder else {
-                m.status = "No video decoder in this build. Open the packaged PercyStar build.".into();
+                m.status = "No video decoder in this build. Open the packaged 6Stars build.".into();
                 return;
             };
             match video_clip::PendingClip::prepare(e.source_rpf, e.offset, e.comp_size) {
@@ -1783,7 +1784,7 @@ impl Rpf9App {
                 if media_loading {
                     ui.centered_and_justified(|ui| {
                         ui.vertical_centered(|ui| {
-                            draw_percystar_spinner(ui, 42.0);
+                            draw_spinner(ui, 42.0);
                             ui.add_space(10.0);
                             ui.label(RichText::new(media_status).size(14.0).color(Color32::from_rgb(252, 175, 23)));
                         });
@@ -1839,7 +1840,7 @@ impl Rpf9App {
                 } else {
                     ui.centered_and_justified(|ui| {
                         ui.vertical_centered(|ui| {
-                            ui.label(RichText::new("PERCYSTAR 3D MODEL VIEWER").size(20.0).strong().color(Color32::from_rgb(255, 168, 28)));
+                            ui.label(RichText::new("6STARS 3D MODEL VIEWER").size(20.0).strong().color(Color32::from_rgb(255, 168, 28)));
                             ui.add_space(6.0);
                             if self.mv_view.is_empty() {
                                 ui.label(
@@ -2199,14 +2200,22 @@ impl Rpf9App {
     }
 }
 
+/// Per-user data folder (scan cache, UI state, last folder).
 fn app_data_dir() -> Option<PathBuf> {
-    if cfg!(windows) {
-        std::env::var("LOCALAPPDATA").ok().map(|d| PathBuf::from(d).join("PercyStar"))
+    let base = if cfg!(windows) {
+        std::env::var("LOCALAPPDATA").ok().map(PathBuf::from)
     } else if cfg!(target_os = "macos") {
-        std::env::var("HOME").ok().map(|d| PathBuf::from(d).join("Library/Application Support/PercyStar"))
+        std::env::var("HOME").ok().map(|d| PathBuf::from(d).join("Library/Application Support"))
     } else {
-        std::env::var("HOME").ok().map(|d| PathBuf::from(d).join(".local/share/PercyStar"))
+        std::env::var("HOME").ok().map(|d| PathBuf::from(d).join(".local/share"))
+    }?;
+    let dir = base.join("6Stars");
+    // the app used to be called PercyStar: carry the old folder over once so the scan cache survives
+    let old = base.join("PercyStar");
+    if !dir.exists() && old.is_dir() {
+        let _ = fs::rename(&old, &dir);
     }
+    Some(dir)
 }
 
 fn cache_file_path() -> Option<PathBuf> {
@@ -2368,7 +2377,8 @@ fn clean_stale_temp_dirs() {
     for e in rd.flatten() {
         let name = e.file_name();
         let name = name.to_string_lossy();
-        if !(name.starts_with("percystar-video-") || name.starts_with("percystar-audio-")) {
+        // percystar-* are left by builds from before the rename
+        if !["6stars-video-", "6stars-audio-", "percystar-video-", "percystar-audio-"].iter().any(|p| name.starts_with(p)) {
             continue;
         }
         let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > Duration::from_secs(3600));
@@ -2425,7 +2435,7 @@ fn loose_media_entry(path: &Path) -> Option<RpfEntry> {
 
 fn decode_awc_for_player(e: &RpfEntry, media: &Arc<Mutex<MediaState>>) {
     let result = (|| -> std::io::Result<_> {
-        let tmp = tempfile::Builder::new().prefix("percystar-audio-").tempdir()?;
+        let tmp = tempfile::Builder::new().prefix("6stars-audio-").tempdir()?;
         let bytes = read_entry_bytes(e)?;
         let wavs = awc::decode_awc_bytes_to_wavs(&bytes, tmp.path(), "stream");
         Ok((tmp, wavs))
@@ -2482,7 +2492,7 @@ fn setup_style(ctx: &egui::Context) {
     ctx.set_visuals(vis);
 }
 
-fn draw_percystar_spinner(ui: &mut egui::Ui, size: f32) {
+fn draw_spinner(ui: &mut egui::Ui, size: f32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
     let t = ui.input(|i| i.time) as f32;
     let p = ui.painter();
@@ -3110,7 +3120,7 @@ impl eframe::App for Rpf9App {
                     ui.image((tex.id(), egui::vec2(28.0, 28.0)));
                 }
                 ui.add_space(6.0);
-                ui.label(RichText::new("PERCYSTAR").size(17.0).strong().color(Color32::from_rgb(255, 168, 28)));
+                ui.label(RichText::new("6STARS").size(17.0).strong().color(Color32::from_rgb(255, 168, 28)));
                 ui.label(RichText::new("RPF9").size(13.0).strong().color(Color32::from_rgb(255, 72, 165)));
                 ui.label(RichText::new(format!("v{APP_VERSION}")).size(11.5).color(Color32::from_rgb(165, 145, 195)));
                 ui.add_space(10.0);
@@ -3218,7 +3228,7 @@ impl eframe::App for Rpf9App {
                 (st.header_info.clone(), st.status.clone(), st.scanning)
             };
             ui.horizontal(|ui| {
-                if scanning { draw_percystar_spinner(ui, 18.0); }
+                if scanning { draw_spinner(ui, 18.0); }
                 ui.label(RichText::new(status).size(12.0).color(Color32::from_rgb(185, 190, 204)));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(RichText::new(hdr).size(11.5).color(Color32::from_rgb(115, 122, 136)));
@@ -3343,7 +3353,7 @@ impl eframe::App for Rpf9App {
             }
             if media_loading {
                 ui.horizontal(|ui| {
-                    draw_percystar_spinner(ui, 24.0);
+                    draw_spinner(ui, 24.0);
                     ui.label(RichText::new(&media_status).color(Color32::from_rgb(252, 175, 23)));
                 });
             } else if !awc_streams.is_empty() {
@@ -3415,7 +3425,7 @@ impl eframe::App for Rpf9App {
                 if need_upload {
                     let cur = &self.textures[self.tex_sel];
                     let ci = ColorImage { size: [cur.w, cur.h], pixels: cur.pixels.clone() };
-                    let h = ctx.load_texture(format!("percystar_tex_{}", self.tex_sel), ci, TextureOptions::LINEAR);
+                    let h = ctx.load_texture(format!("app_tex_{}", self.tex_sel), ci, TextureOptions::LINEAR);
                     self.tex_handle = Some((self.tex_sel, h));
                 }
                 if let Some((_, handle)) = &self.tex_handle {
@@ -3463,7 +3473,7 @@ impl eframe::App for Rpf9App {
                     .resizable(false)
                     .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                     .show(ctx, |ui| {
-                        ui.label(RichText::new(format!("PercyStar v{new_ver} is ready!")).size(15.0).strong().color(Color32::from_rgb(255, 168, 28)));
+                        ui.label(RichText::new(format!("6Stars v{new_ver} is ready!")).size(15.0).strong().color(Color32::from_rgb(255, 168, 28)));
                         ui.label(RichText::new(format!("Installed: v{APP_VERSION}  ->  Latest: v{new_ver}")).color(Color32::from_rgb(200, 190, 220)));
                         ui.add_space(8.0);
                         if !upd_status.is_empty() {
@@ -4084,7 +4094,7 @@ fn main() -> eframe::Result<()> {
         vb = vb.with_icon(egui::IconData { rgba: raw.clone(), width: w, height: h });
     }
     let opts = eframe::NativeOptions { viewport: vb, ..Default::default() };
-    let title = format!("PercyStar v{APP_VERSION}");
+    let title = format!("6Stars v{APP_VERSION}");
     // files or folders passed on the command line ("Open with", drop on the .exe); skips
     // flags like macOS's old -psn_ launch argument
     let open_paths: Vec<PathBuf> = args.iter().skip(1).filter(|a| !a.starts_with('-')).map(PathBuf::from).filter(|p| p.exists()).collect();

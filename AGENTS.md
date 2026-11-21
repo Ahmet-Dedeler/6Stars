@@ -1,12 +1,17 @@
-# PercyStar (maintained fork)
+# 6Stars
 
-Rust + egui explorer for RPF9/TTPF archives: Explorer list, previews (textures, BK2 video, AWC audio, text/XML/UI), and a 3D Model Viewer. Several agents (Claude, Devin, others) work here in parallel, so keep this file to stable rules.
+Formerly PercyStar (upstream `rpatty-dev/PercyStar`); renamed to 6Stars. Rust + egui explorer for RPF9/TTPF archives: Explorer list, previews (textures, BK2 video, AWC audio, text/XML/UI), and a 3D Model Viewer. Several agents (Claude, Devin, others) work here in parallel, so keep this file to stable rules.
 
 ## Remotes and branches
 - `origin` = upstream `rpatty-dev/PercyStar`. Never push there. Changes go upstream only as focused PRs from branches cut off `origin/main`.
 - `fork` = public `Ahmet-Dedeler/PercyStar`. `fork/main` is the maintained fork that the README tells people to clone and build. Work lands there through feature branches; don't force-push `main`.
 - `mine` = private `Ahmet-Dedeler/PercyStar-private` (`ahmet/main`): local-only experiments.
 - Before starting, `git fetch fork` and branch from `fork/main`. Other agents push often; rebase before you push.
+
+## Naming
+- User-facing name is **6Stars** (window title, bundle, exe, docs). Rust identifiers can't start with a digit, so code and env vars use `sixstars` / `SIXSTARS_` where a name is needed.
+- Kept on purpose: the GitHub repo URLs (`Ahmet-Dedeler/PercyStar`, until the repo is renamed), upstream references, `LICENSE` (upstream's, untouched), and the dev-only test gates (`PERCYSTAR_*`, `PERCY_*`).
+- Compatibility with pre-rename installs: the data folder `PercyStar` is moved to `6Stars` on first launch, old `percystar-*` temp folders are still cleaned, and `.obj` files with a `# PercyStar` header still load as z-up.
 
 ## Every change must work on macOS and Windows
 - Targets: macOS (Apple Silicon first, universal build) and Windows x64. Treat both as first-class.
@@ -33,10 +38,10 @@ Adding a kind, format or category means touching all the places it shows up. Mis
 ## Versioning and releases
 - The version lives in `Cargo.toml` (`APP_VERSION` reads it) and `app.rc` (Windows file version, both the numeric and string fields). Update both together, plus `Cargo.lock`.
 - Bump the minor version for user-visible features, patch for fixes.
-- The in-app updater checks `fork` releases. A Windows release asset must be named `PercyStar_v{ver}_Win64.zip` with `PercyStar.exe` at the zip's top level.
+- The in-app updater checks `fork` releases. A Windows release asset must be named `6Stars_v{ver}_Win64.zip` with `6Stars.exe` at the zip's top level.
 
 ## Build and test
-- macOS app: `bash scripts/build_macos.sh` builds `dist/PercyStar.app` (set `PERCYSTAR_APP_PATH` for a side-by-side test build). Windows: `scripts/build_windows.ps1` builds `dist\PercyStar-Win64`, with `binkplay.exe` next to the exe.
+- macOS app: `bash scripts/build_macos.sh` builds `dist/6Stars.app` (set `SIXSTARS_APP_PATH` for a side-by-side test build). Windows: `scripts/build_windows.ps1` builds `dist\6Stars-Win64`, with `binkplay.exe` next to the exe.
 - Data-gated tests: `PERCYSTAR_LEVELS_RPF=<levels.rpf>` (model regressions), `PERCYSTAR_BK2=<file.bk2>` (in-panel Bink, run with `-- --ignored`), `PERCYSTAR_AUDIT=1` (+ `PERCYSTAR_AUDIT_CACHE`, `PERCYSTAR_AUDIT_N`) for the per-format coverage audit in `src/audit_tests.rs`.
 - Never play sound or steal focus in tests: Bink tests run at volume 0. Don't click media in the live app to "verify".
 - Use your own `CARGO_TARGET_DIR` when another agent may be building at the same time.
@@ -44,6 +49,6 @@ Adding a kind, format or category means touching all the places it shows up. Mis
 ## Media notes
 - macOS BK2: `src/bink_embed.rs` hosts the bundled Bink decoder and frame bridge (`github.com/Ahmet-Dedeler/bink-player-mac`, `src/embed.inc`). Change both sides together.
 - Windows BK2: `src/bink_dock.rs` docks RAD's `binkplay.exe` inside the window. `scripts/setup_deps.ps1` pins the extracted player's hash, not the unversioned archive.
-- Clips are copied (or hard-linked, for standalone files) to a `percystar-video-*` temp folder as `clip.bk2`, which keeps odd paths safe. Never write to that file: for standalone clips it's a hard link to the user's original.
+- Clips are copied (or hard-linked, for standalone files) to a `6stars-video-*` temp folder as `clip.bk2`, which keeps odd paths safe. Never write to that file: for standalone clips it's a hard link to the user's original.
 - AWC: `src/awc.rs` decodes, `src/audio_player.rs` plays (afplay on macOS, `PlaySoundW` on Windows).
 - The SixNG project (GPLv3) is a reference only. Don't copy its code.
