@@ -4,7 +4,8 @@ mod rdna2;
 mod tex;
 use model3d::{
     Mesh3D, decode_rage9_model_from_rpf, extract_0drpz_mesh, extract_rage9_model_name,
-    is_vehicle_virtual, is_zlib_head, parse_obj, probe_large_rage9_model_in_buf, render_mesh3d_viewport,
+    has_rage9_meshlets, is_vehicle_virtual, is_zlib_head, parse_obj,
+    probe_large_rage9_model_in_buf, render_mesh3d_viewport,
 };
 use rdna2::{
     Ps09Cache, ShaderStage, format_gfx103_disasm, format_spirv_abi_summary, lift_to_hlsl,
@@ -2068,7 +2069,8 @@ fn app_data_dir() -> Option<PathBuf> {
 }
 
 fn cache_file_path() -> Option<PathBuf> {
-    app_data_dir().map(|d| d.join("scan_cache_v8.tsv"))
+    // v9: scanner rejects metadata/mid-resource chunks that v8 listed as MODEL entries
+    app_data_dir().map(|d| d.join("scan_cache_v9.tsv"))
 }
 
 fn load_last_folder() -> Option<PathBuf> {
@@ -2454,6 +2456,11 @@ fn probe_rage9_page(
     if vft != 0 || !(0x5000_0000..0x5800_0000).contains(&bmap) || &probe_out[0x10..0x15] == b"0DRPz" {
         return None;
     }
+    // Reject mid-resource virtual chunks that start directly with a grmGeometry struct
+    // (vft == 0, +0x08 == 0x5002xxxx ptr, +0x60 == 0x1601 magic) — never a resource root.
+    if u64::from_le_bytes(probe_out[0x60..0x68].try_into().ok()?) == 0x1601 {
+        return None;
+    }
     // 1. GTA VI CNavMesh tile (version 0x00010015)
     let ver = u32::from_le_bytes(probe_out[0x14..0x18].try_into().ok()?);
     if ver == 0x0001_0015 && olen >= 0xD0 {
@@ -2495,11 +2502,19 @@ fn probe_rage9_page(
         });
     }
     // 3. Drawable / FragType 3D Model (.#dr / .#ft / .#dd)
-    let (mname, is_veh, vlen) = if (bmap - 0x5000_0000) >= 32768 {
-        probe_large_rage9_model_in_buf(&buf[p..read_n], path, off + p as u64)?
-    } else {
+    let bmap_off = (bmap - 0x5000_0000) as usize;
+    let fits_single_chunk = olen < probe_out.len()
+        && bmap_off + 10 <= olen
+        && probe_out[bmap_off + 8] == 1
+        && (1..=64).contains(&probe_out[bmap_off + 9]);
+    let (mname, is_veh, vlen) = if fits_single_chunk {
+        if !has_rage9_meshlets(&probe_out[..olen]) {
+            return None;
+        }
         let (mname, _) = extract_rage9_model_name(&probe_out[..olen])?;
         (mname.clone(), is_vehicle_virtual(&probe_out[..olen], &mname), olen)
+    } else {
+        probe_large_rage9_model_in_buf(&buf[p..read_n], path, off + p as u64)?
     };
     Some(RpfEntry {
         source_rpf: path.to_path_buf(),
