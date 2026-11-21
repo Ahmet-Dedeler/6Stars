@@ -862,32 +862,69 @@ pub fn ttpf_index(path: &Path) -> Result<std::sync::Arc<TtpfIndex>, String> {
     Ok(ix)
 }
 
+/// Inflated RDS5 chunks, shared by every texture they hold. Neighbouring textures (and the
+/// mip-0 guesses below) mostly sit in the same chunk, so a gallery of one archive would
+/// otherwise inflate each chunk once per texture. Idea from paryzius/ttpf-viewer.
+struct ChunkCache {
+    map: HashMap<(std::path::PathBuf, u64), std::sync::Arc<Vec<u8>>>,
+    order: std::collections::VecDeque<(std::path::PathBuf, u64)>,
+    bytes: usize,
+}
+
+const CHUNK_CACHE_BYTES: usize = 384 << 20;
+static TTPF_CHUNKS: std::sync::Mutex<Option<ChunkCache>> = std::sync::Mutex::new(None);
+
+/// One chunk's bytes: inflated if zlib, as stored if raw, Err(codec) if BCPack.
+fn ttpf_chunk(path: &Path, f: &mut Option<File>, (cs, ce, vl, codec): (u64, u64, u64, u8)) -> Result<std::sync::Arc<Vec<u8>>, String> {
+    let key = (path.to_path_buf(), cs);
+    if let Some(c) = TTPF_CHUNKS.lock().unwrap().as_ref().and_then(|c| c.map.get(&key)) {
+        return Ok(c.clone());
+    }
+    if f.is_none() {
+        *f = Some(File::open(path).map_err(|e| e.to_string())?);
+    }
+    let file = f.as_mut().unwrap();
+    let mut ch = vec![0u8; (ce - cs) as usize];
+    file.seek(SeekFrom::Start(cs)).map_err(|e| e.to_string())?;
+    file.read_exact(&mut ch).map_err(|e| e.to_string())?;
+    let data = if is_zlib_head(&ch) {
+        let mut out = Vec::with_capacity(vl as usize);
+        let _ = Decompress::new(true).decompress_vec(&ch, &mut out, FlushDecompress::Finish); // partial output is still usable
+        out
+    } else if ch.len() as u64 == vl {
+        ch
+    } else {
+        let mode = match codec {
+            1 => "BC1", 2 => "BC2", 3 => "BC3", 4 => "BC4", 5 => "BC5", 6 => "BC6H", 7 => "BC7", _ => "HW",
+        };
+        return Err(format!("Texture uses Xbox Series X hardware BCPack ({mode}) — ASIC-only compression (not decodable on PC)"));
+    };
+    let data = std::sync::Arc::new(data);
+    let mut guard = TTPF_CHUNKS.lock().unwrap();
+    let c = guard.get_or_insert_with(|| ChunkCache { map: HashMap::new(), order: Default::default(), bytes: 0 });
+    if c.map.insert(key.clone(), data.clone()).is_none() {
+        c.bytes += data.len();
+        c.order.push_back(key);
+    }
+    while c.bytes > CHUNK_CACHE_BYTES {
+        let Some(old) = c.order.pop_front() else { break };
+        if let Some(b) = c.map.remove(&old) {
+            c.bytes -= b.len();
+        }
+    }
+    Ok(data)
+}
+
 /// Read `len` bytes of the RDS5 virtual stream starting at `off`, inflating only overlapping chunks.
 pub fn ttpf_read_virtual(path: &Path, ix: &TtpfIndex, off: u64, len: usize) -> Result<Vec<u8>, String> {
     let end = off + len as u64;
-    let mut f = File::open(path).map_err(|e| e.to_string())?;
+    let mut f = None;
     let mut out_buf = vec![0u8; len];
     let mut covered = 0usize;
-    let mut dec = Decompress::new(true);
     let first = ix.chunks.partition_point(|c| c.2 + c.3 <= off);
     for &(cs, ce, vs, vl, codec) in &ix.chunks[first..] {
         if vs >= end { break; }
-        let mut ch = vec![0u8; (ce - cs) as usize];
-        f.seek(SeekFrom::Start(cs)).map_err(|e| e.to_string())?;
-        f.read_exact(&mut ch).map_err(|e| e.to_string())?;
-        let data = if is_zlib_head(&ch) {
-            let mut out = Vec::with_capacity(vl as usize);
-            dec.reset(true);
-            let _ = dec.decompress_vec(&ch, &mut out, FlushDecompress::Finish); // partial output is still usable
-            out
-        } else if ch.len() as u64 == vl {
-            ch
-        } else {
-            let mode = match codec {
-                1 => "BC1", 2 => "BC2", 3 => "BC3", 4 => "BC4", 5 => "BC5", 6 => "BC6H", 7 => "BC7", _ => "HW",
-            };
-            return Err(format!("Texture uses Xbox Series X hardware BCPack ({mode}) — ASIC-only compression (not decodable on PC)"));
-        };
+        let data = ttpf_chunk(path, &mut f, (cs, ce, vl, codec))?;
         let s0 = vs.max(off);
         let s1 = (vs + data.len() as u64).min(end);
         if s1 > s0 {
@@ -1177,6 +1214,25 @@ struct Mip0Guess {
     use_64k: bool,
     /// Mip 1 location and the layout that untiles it (its mip index 1).
     mip1: Option<(u64, u64, TtpfMipLayout)>,
+    /// Untile with ttpf-viewer's bit patterns instead (see `ttpf_tile`); overrides `layout`.
+    pattern: Option<PatternGuess>,
+}
+
+/// ttpf-viewer's placement: padded element sizes of mip 0 and, if placed, mip 1's
+/// (offset, length, padded element size).
+struct PatternGuess {
+    pat: &'static str,
+    ew: usize,
+    eh: usize,
+    mip1: Option<(u64, u64, usize, usize)>,
+}
+
+/// Top-left `w` x `h` elements of a `src_w`-wide linear element grid.
+fn crop_elems(lin: &[u8], src_w: usize, w: usize, h: usize, bpe: usize) -> Vec<u8> {
+    if src_w == w && lin.len() == w * h * bpe {
+        return lin.to_vec();
+    }
+    (0..h).flat_map(|y| &lin[(y * src_w) * bpe..(y * src_w + w) * bpe]).copied().collect()
 }
 
 /// Decodes a texture's full-size mip, returning (linear blocks, pixels).
@@ -1203,8 +1259,16 @@ fn ttpf_decode_mip0_labeled(path: &Path, ix: &TtpfIndex, d: &TtpfTexMeta, is_bc:
         .iter()
         .map(|g| {
             let r = decode(g);
-            let score = match (&r, &g.mip1) {
-                (Ok((_, px0)), Some((o1, l1, lay))) => ttpf_read_virtual(path, ix, *o1, *l1 as usize).ok().and_then(|raw1| {
+            let score = match (&r, &g.mip1, &g.pattern) {
+                (Ok((_, px0)), _, Some(PatternGuess { pat, mip1: Some((o1, l1, ew1, eh1)), .. })) => {
+                    ttpf_read_virtual(path, ix, *o1, *l1 as usize).ok().and_then(|raw1| {
+                        let blk = if is_bc { 4 } else { 1 };
+                        let lin1 = crate::ttpf_tile::untile(&raw1, bpe, *ew1, *eh1, pat);
+                        let px1 = decode_linear_to_rgba(&lin1, ew1 * blk, eh1 * blk, d.dxgi)?;
+                        mip_pair_error(px0, d.w, d.h, &px1, ew1 * blk)
+                    })
+                }
+                (Ok((_, px0)), Some((o1, l1, lay)), None) => ttpf_read_virtual(path, ix, *o1, *l1 as usize).ok().and_then(|raw1| {
                     let s1 = &lay.mips[1];
                     let px1 = decode_linear_to_rgba(&lay.untile(&raw1, 1), s1.ew * 4, s1.eh * 4, d.dxgi)?;
                     mip_pair_error(px0, d.w, d.h, &px1, s1.ew * 4)
@@ -1226,11 +1290,38 @@ fn ttpf_decode_mip0_labeled(path: &Path, ix: &TtpfIndex, d: &TtpfTexMeta, is_bc:
         .filter(|&i| results[i].0.is_ok())
         .filter_map(|i| results[i].1.map(|e| (i, e)))
         .min_by(|a, b| a.1.total_cmp(&b.1));
-    let pick = match (best_alt, base_score) {
+    let mut pick = match (best_alt, base_score) {
         (Some((i, e)), Some(o)) if e < MIP_MATCH_MAX && e * 2.0 < o => i,
         (Some((i, e)), None) if e < MIP_MATCH_STRICT => i,
         _ => 0,
     };
+    // No mip pair to go by (single-tile icons, chains whose mip 1 shares a tile, 64 KB
+    // tiling): let ttpf-viewer's untiling win when it is clearly less blocky and doesn't
+    // land on more empty padding. Measured against ttpf-viewer's own output on the dump:
+    // where its image is the right one, its roughness is 0.4-0.67x ours.
+    const ROUGHNESS_WIN: f64 = 0.75;
+    let base_unscored = base_score.map_or(true, |o| o >= MIP_MATCH_MAX);
+    if pick == 0 && base_unscored {
+        if let (Ok((_, base_px)), Some(pi)) = (&results[0].0, guesses.iter().position(|g| g.pattern.is_some())) {
+            if let Ok((_, pat_px)) = &results[pi].0 {
+                let empty = |px: &[Color32]| px.iter().filter(|c| c.r() == 0 && c.g() == 0 && c.b() == 0).count() as f64 / px.len().max(1) as f64;
+                let (eb, ep) = (empty(base_px), empty(pat_px));
+                let smoother = match (roughness(base_px, d.w, d.h), roughness(pat_px, d.w, d.h)) {
+                    (Some(rb), Some(rp)) => rp < rb * ROUGHNESS_WIN,
+                    _ => false,
+                };
+                // Uncompressed textures read from the same bytes: only the untiling differs,
+                // and ttpf-viewer's per-format patterns were right on every such texture.
+                let same_bytes_uncompressed = !is_bc && guesses[pi].off == guesses[0].off;
+                // A baseline that decodes to nothing but black (tiny constant-colour
+                // textures read from the wrong spot) loses to any non-empty read.
+                let base_blank = eb >= 1.0 && ep < 1.0;
+                if base_blank || (ep <= eb + 0.05 && (smoother || same_bytes_uncompressed)) {
+                    pick = pi;
+                }
+            }
+        }
+    }
     let label = guesses[pick].label;
     // An unreadable baseline (BCPack) keeps its error so the lower-mip fallback runs.
     results.swap_remove(pick).0.map(|v| (label, v))
@@ -1239,10 +1330,17 @@ fn ttpf_decode_mip0_labeled(path: &Path, ix: &TtpfIndex, d: &TtpfTexMeta, is_bc:
 /// Read and untile one mip-0 guess, returning (linear blocks, pixels).
 fn ttpf_decode_guess(path: &Path, ix: &TtpfIndex, d: &TtpfTexMeta, is_bc: bool, bpe: usize, g: &Mip0Guess) -> Result<(Vec<u8>, Vec<Color32>), String> {
     let raw = ttpf_read_virtual(path, ix, g.off, g.len)?;
-    let lin = match &g.layout {
+    let lin = match (&g.pattern, &g.layout) {
+        (Some(pg), _) => {
+            let tiled = crate::ttpf_tile::untile(&raw, bpe, pg.ew, pg.eh, pg.pat);
+            let (ew, eh) = if is_bc { (d.w.div_ceil(4).max(1), d.h.div_ceil(4).max(1)) } else { (d.w, d.h) };
+            crop_elems(&tiled, pg.ew, ew, eh, bpe)
+        }
+        (None, layout) => match layout {
         Some(l) => l.untile(&raw, 0),
         None if g.use_64k => deswizzle_64kb_ttpf(&raw, d.w, d.h, is_bc, bpe),
         None => deswizzle_4kb_d(&raw, d.w, d.h, is_bc, bpe),
+        },
     };
     let px = decode_linear_to_rgba(&lin, d.w, d.h, d.dxgi).ok_or_else(|| format!("Pixel decode failed for DXGI {} ({}x{})", d.dxgi, d.w, d.h))?;
     Ok((lin, px))
@@ -1287,12 +1385,38 @@ fn mip_pair_error(px0: &[Color32], w0: usize, h0: usize, px1: &[Color32], stride
     Some(err as f64 / n.max(1) as f64)
 }
 
+/// How blocky an image is: mean RGBA difference between neighbouring pixels, divided by the
+/// image's spread so busy textures don't look rough. A wrong untiling scatters 4x4 blocks
+/// or whole tiles and leaves seams everywhere. None for (nearly) flat images, which is also
+/// what a guess that lands on zero padding decodes to.
+fn roughness(px: &[Color32], w: usize, h: usize) -> Option<f64> {
+    if w < 4 || h < 4 {
+        return None;
+    }
+    let step = ((w * h) as f64 / 65536.0).sqrt().ceil().max(1.0) as usize;
+    let v = |c: Color32| [c.r(), c.g(), c.b(), c.a()].map(f64::from);
+    let (mut sum, mut sum2, mut n, mut tv) = (0f64, 0f64, 0f64, 0f64);
+    for y in (0..h - 1).step_by(step) {
+        for x in (0..w - 1).step_by(step) {
+            let (c, r, d) = (v(px[y * w + x]), v(px[y * w + x + 1]), v(px[(y + 1) * w + x]));
+            for k in 0..4 {
+                sum += c[k];
+                sum2 += c[k] * c[k];
+                tv += (c[k] - r[k]).abs() + (c[k] - d[k]).abs();
+            }
+            n += 4.0;
+        }
+    }
+    let sd = (sum2 / n - (sum / n).powi(2)).max(0.0).sqrt();
+    (sd >= 4.0).then(|| tv / n / sd)
+}
+
 /// Candidate placements for mip 0, first = preferred when they can't be told apart.
 fn ttpf_mip0_guesses(d: &TtpfTexMeta, is_bc: bool, bpe: usize) -> Vec<Mip0Guess> {
     let (oo, ol, o64) = ttpf_mip0_range(d, is_bc, bpe);
-    let old = |mip1| Mip0Guess { label: "old", off: oo, len: ol, layout: None, use_64k: o64, mip1 };
+    let old = |mip1| Mip0Guess { label: "old", off: oo, len: ol, layout: None, use_64k: o64, mip1, pattern: None };
     let Some(ext) = (if is_bc && d.mip_count > 1 { ttpf_bc_layout(d, bpe) } else { None }) else {
-        return vec![old(None)];
+        return std::iter::once(old(None)).chain(pattern_guess(d, is_bc, bpe)).collect();
     };
     let (ew, eh) = (d.w.div_ceil(4).max(1), d.h.div_ceil(4).max(1));
     let noext = TtpfMipLayout::new_ext(ew, eh, d.mip_count as usize, bpe, ext.use_64k, false);
@@ -1314,7 +1438,7 @@ fn ttpf_mip0_guesses(d: &TtpfTexMeta, is_bc: bool, bpe: usize) -> Vec<Mip0Guess>
     let from_layout = |label: &'static str, l: TtpfMipLayout| {
         let (a, b) = l.span(0);
         let (a1, b1) = l.span(1);
-        Mip0Guess { label, off: d.byte_off + a, len: (b - a) as usize, use_64k: l.use_64k, mip1: Some((d.byte_off + a1, b1 - a1, l.clone())), layout: Some(l) }
+        Mip0Guess { label, off: d.byte_off + a, len: (b - a) as usize, use_64k: l.use_64k, mip1: Some((d.byte_off + a1, b1 - a1, l.clone())), layout: Some(l), pattern: None }
     };
     // Baseline first: what Percy6Stars decoded before guesses were compared. Tiny textures whose
     // mip 0 sits inside the shared tail block are read from the tail (reading the block's
@@ -1333,9 +1457,38 @@ fn ttpf_mip0_guesses(d: &TtpfTexMeta, is_bc: bool, bpe: usize) -> Vec<Mip0Guess>
         let off = d.byte_off + d.alloc_sz - n0;
         let mut one = ext.clone();
         one.mips.truncate(2);
-        push(&mut out, Mip0Guess { label: "end", off, len: n0 as usize, layout: Some(one.clone()), use_64k: one.use_64k, mip1: before(off, &one) });
+        push(&mut out, Mip0Guess { label: "end", off, len: n0 as usize, layout: Some(one.clone()), use_64k: one.use_64k, mip1: before(off, &one), pattern: None });
     }
+    out.extend(pattern_guess(d, is_bc, bpe));
     out
+}
+
+/// ttpf-viewer's placement and untiling as one more guess (see `ttpf_tile`): mip 0 padded to
+/// whole tiles at the end of the allocation, mip 1 right before it when that is tile-aligned.
+fn pattern_guess(d: &TtpfTexMeta, is_bc: bool, bpe: usize) -> Option<Mip0Guess> {
+    let use_64k = match d.tile_mode {
+        0 => true,
+        1..=3 => false,
+        _ => return None,
+    };
+    let pat = crate::ttpf_tile::pattern(bpe, use_64k)?;
+    let (ew, eh) = if is_bc { (d.w.div_ceil(4).max(1), d.h.div_ceil(4).max(1)) } else { (d.w, d.h) };
+    let lv = crate::ttpf_tile::levels(ew, eh, bpe, use_64k, d.mip_count as usize);
+    let l0 = lv.first()?;
+    if l0.from_end > d.alloc_sz {
+        return None;
+    }
+    let l1 = lv.get(1).filter(|l1| l1.from_end <= d.alloc_sz);
+    let end = d.byte_off + d.alloc_sz;
+    Some(Mip0Guess {
+        label: "pattern",
+        off: end - l0.from_end,
+        len: l0.len as usize,
+        layout: None,
+        use_64k,
+        mip1: None,
+        pattern: Some(PatternGuess { pat, ew: l0.ew, eh: l0.eh, mip1: l1.map(|l1| (end - l1.from_end, l1.len, l1.ew, l1.eh)) }),
+    })
 }
 
 /// Global 64-bit ETPF texture hash -> (ttpf archive path, descriptor index, w, h, dxgi) resolver.
@@ -1880,6 +2033,31 @@ mod tests {
     /// Dump root for the data-gated tests (folder holding `data/ttdb`).
     fn dump_root() -> Option<std::path::PathBuf> {
         std::env::var("PERCYSTAR_DUMP").ok().map(std::path::PathBuf::from).filter(|p| p.join("data/ttdb").is_dir())
+    }
+
+    /// ttpf-viewer's untiling (`ttpf_tile`) wins where the Gfx10 layout scrambles: a small
+    /// RGBA8 icon (same bytes, different tiling), an A8 strand atlas (proven by its mip
+    /// pair), and a 4x4 constant-colour texture that used to read as black.
+    /// `PERCYSTAR_DUMP=<dump root> cargo test --release ttpf_pattern_guess_wins`
+    #[test]
+    fn ttpf_pattern_guess_wins() {
+        let Some(root) = dump_root() else { return };
+        for (rel, idx) in [("data/ttdb/graphics/ttdb_graphics.ttpf", 0usize), ("data/ttdb/peds/ttdb_peds_1_3.ttpf", 1873), ("data/ttdb/peds/ttdb_peds_1_3.ttpf", 158)] {
+            let path = root.join(rel);
+            let ix = ttpf_index(&path).unwrap();
+            let d = &ix.descs[idx];
+            let (_, is_bc, bpe) = dxgi_info(d.dxgi).unwrap();
+            let (label, (_, px)) = ttpf_decode_mip0_labeled(&path, &ix, d, is_bc, bpe).unwrap();
+            assert_eq!(label, "pattern", "{rel} #{idx}");
+            assert!(px.iter().any(|c| c.r() > 0 || c.g() > 0 || c.b() > 0), "{rel} #{idx} decoded black");
+        }
+        // ...and the Gfx10 layout keeps the BC7 normal map that ttpf-viewer reads as padding.
+        let path = root.join("data/ttdb/graphics/ttdb_graphics.ttpf");
+        let ix = ttpf_index(&path).unwrap();
+        let d = &ix.descs[177];
+        let (_, is_bc, bpe) = dxgi_info(d.dxgi).unwrap();
+        let (label, _) = ttpf_decode_mip0_labeled(&path, &ix, d, is_bc, bpe).unwrap();
+        assert_ne!(label, "pattern");
     }
 
     #[test]

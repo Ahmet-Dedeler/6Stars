@@ -812,6 +812,7 @@ fn resolve_shader_material(
     const ALT0_TEX: u32 = 0x3463_94ea; // vehicle body/livery/detail slot 0
     const EMISSIVE_TEX: u32 = 0x8e0d_63ee; // joaat("emissiveTex")
     const GLASS_SHADER: u32 = 0xe3ba_3129;
+    const EYE_SHADER: u32 = 0x89a1_cf72; // ped and animal eyeballs
 
     let mut mat = GeomMaterial::default();
     if shader + 0x28 > v.len() || &v[shader + 4..shader + 8] != b"atem" { return mat; }
@@ -872,6 +873,11 @@ fn resolve_shader_material(
             MaterialTexture::Streamed(hash, hit) => streamed.decode(hash, hit),
         }
     });
+    if ru32(v, shader) == EYE_SHADER {
+        // The eye's diffuseTex is just the iris on a transparent background; the game
+        // shader fills the rest with the sclera. Bake that in so the preview isn't black.
+        mat.texture = mat.texture.map(|t| over_sclera(&t));
+    }
     if matches!(mat.pass, MaterialPass::Glass { .. }) {
         // Some glass uses a constant placeholder or has no decodable color map.
         // The game shader still draws it; use a translucent tint in the preview.
@@ -884,6 +890,24 @@ fn resolve_shader_material(
     }
     mat.is_vehicle_paint = paint_shader && !has_color_binding && mat.pass == MaterialPass::Opaque;
     mat
+}
+
+/// Composite a texture over an off-white eyeball color. `Color32` is premultiplied.
+fn over_sclera(t: &Arc<Texture2D>) -> Arc<Texture2D> {
+    const SCLERA: [u16; 3] = [236, 232, 226];
+    if t.pixels.iter().all(|p| p.a() == 255) {
+        return t.clone();
+    }
+    let pixels = t
+        .pixels
+        .iter()
+        .map(|p| {
+            let a = p.a() as u16;
+            let mix = |c: u8, bg: u16| (c as u16 + (bg * (255 - a) + 127) / 255).min(255) as u8;
+            Color32::from_rgb(mix(p.r(), SCLERA[0]), mix(p.g(), SCLERA[1]), mix(p.b(), SCLERA[2]))
+        })
+        .collect();
+    Arc::new(Texture2D { w: t.w, h: t.h, pixels })
 }
 
 /// Bind each geometry to its shader's own texture, whether embedded or streamed.
@@ -966,6 +990,15 @@ fn drawable_dictionary_entries(v: &[u8]) -> Vec<(String, usize)> {
         out.push((name, d));
     }
     out
+}
+
+/// The drawable inside a pgDictionary that holds exactly one entry (same layout as
+/// [`drawable_dictionary_entries`]). Such files have no shader group at the root.
+fn single_dictionary_drawable(v: &[u8]) -> Option<usize> {
+    if v.len() < 0x40 || ru16(v, 0x28) != 1 || ru16(v, 0x38) != 1 { return None; }
+    vptr(ru64(v, 0x20))?;
+    let d = vptr(ru64(v, vptr(ru64(v, 0x30))?))?;
+    (d != 0 && d + 0xb0 <= v.len() && vptr(ru64(v, d + 0x50)).is_some()).then_some(d)
 }
 
 #[derive(Default)]
@@ -1184,7 +1217,10 @@ pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name
         let label = format!("LOD0 · dictionary of {}", dict.len());
         (g, label)
     } else {
-        let mut bases = vec![0usize];
+        // A dictionary holding a single drawable (ped heads, eyes, animal parts) keeps
+        // its shader group on that drawable, not at the root, so try it first.
+        let mut bases: Vec<usize> = single_dictionary_drawable(&v).into_iter().collect();
+        bases.push(0);
         if v.len() >= 0x20 {
             if let Some(fo) = vptr(ru64(&v, 0x18)) {
                 if fo + 0x80 <= v.len() { bases.push(fo); }
@@ -1934,7 +1970,8 @@ mod dictionary_decode_tests {
         for (tag, off, texture_alpha) in [
             ("glass_door", 68_851_257_360, true),
             ("glass_table", 69_061_394_448, false),
-            ("wine_glass", 67_766_120_464, false),
+            // its 4x4 tint map is a constant white at 25% opacity
+            ("wine_glass", 67_766_120_464, true),
         ] {
             let mut m = decode_rage9_model_from_rpf(path, off, tag).unwrap();
             assert!(m.geom_materials.iter().any(|g| g.pass == MaterialPass::Glass { texture_alpha }), "{tag}");
@@ -1997,6 +2034,44 @@ mod dictionary_decode_tests {
         assert!(mesh.uvs.iter().any(|uv| uv[0] < 0.0), "UV0 includes signed fixed-point coordinates");
         eprintln!("[pack model] {}", mesh.tex_status);
         render_sample(mesh, "pack_model");
+    }
+
+    #[test]
+    fn single_entry_dictionary_points_at_its_drawable() {
+        // root: +0x20 hash array {ptr, 1}, +0x30 drawable array {ptr, 1}; drawable +0x50 set
+        let mut v = vec![0u8; 0x200];
+        let put = |v: &mut Vec<u8>, at: usize, q: u64| v[at..at + 8].copy_from_slice(&q.to_le_bytes());
+        put(&mut v, 0x20, 0x5000_0100);
+        v[0x28] = 1;
+        put(&mut v, 0x30, 0x5000_0108);
+        v[0x38] = 1;
+        put(&mut v, 0x108, 0x5000_0110);
+        put(&mut v, 0x110 + 0x50, 0x5000_0100);
+        assert_eq!(single_dictionary_drawable(&v), Some(0x110));
+        assert!(drawable_dictionary_entries(&v).is_empty(), "one entry is handled as a plain drawable");
+        v[0x38] = 2;
+        assert_eq!(single_dictionary_drawable(&v), None);
+    }
+
+    /// Ped eyes (and heads, clothing, animal parts) are dictionaries holding one drawable,
+    /// whose shader group lives on that drawable. The eye shader's diffuse is an iris on a
+    /// transparent background, baked over a sclera colour for the preview.
+    #[test]
+    fn ped_eyes_get_their_iris_texture() {
+        let Ok(levels) = std::env::var("PERCYSTAR_LEVELS_RPF") else { return };
+        let Some(root) = Path::new(&levels).parent() else { return };
+        let rpf = root.join("packs.rpf");
+        if !rpf.exists() {
+            return;
+        }
+        let mesh = decode_rage9_model_from_rpf(&rpf, 2_714_169_360, "eyes").unwrap();
+        assert_eq!(mesh.name, "head_mr1_cau_000_m_eyes_full.#dr");
+        let tex = mesh.geom_materials.iter().find_map(|m| m.texture.clone()).expect(&mesh.tex_status);
+        let n = tex.pixels.len() as u64;
+        let mean = tex.pixels.iter().map(|p| p.r() as u64 + p.g() as u64 + p.b() as u64).sum::<u64>() / (3 * n);
+        assert!(mean > 150, "sclera should be light, mean {mean}");
+        assert!(tex.pixels.iter().any(|p| p.r() < 40 && p.g() < 40 && p.b() < 40), "dark pupil");
+        render_sample(mesh, "ped_eyes");
     }
 
     #[test]
