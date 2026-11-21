@@ -4,7 +4,7 @@ The scan cache for the Xbox v1.0.2.1 dump contains 754,364 recognized entries fr
 
 | Entries | Count | What PercyStar can show |
 | --- | ---: | --- |
-| TTPF textures | 357,115 | 53/65 decoded. The other 12 hit BCPack chunks. The app knows the texture format but can't read the pixel data from those chunks. |
+| TTPF textures | 357,115 | 42,338 have a BCPack-compressed full-size mip, which PercyStar can't decode. For 13,888 of those (32.8%) a smaller mip is stored as zlib or raw data, so the preview shows that one, labelled "Reduced resolution". The other 28,450 stay blocked. See [BCPack and the lower-mip fallback](#bcpack-and-the-lower-mip-fallback). |
 | Models and vehicles | 260,502 | Mesh previews. 65/65 models and 65/65 vehicles produced geometry; this doesn't guarantee full materials, rigging or animation. |
 | AWC audio | 71,673 | 65/65 yielded at least one playable stream. |
 | NavMesh | 27,629 | 65/65 opened as triangles. |
@@ -18,6 +18,28 @@ The scan cache for the Xbox v1.0.2.1 dump contains 754,364 recognized entries fr
 | Scaleform GFx | 87 | Symbol and metadata inspection, not an interactive Flash preview. |
 
 The shader tab also inspects supported RDNA2 PSO caches separately. The archive scan doesn't inventory every container entry, and it doesn't open loose Xbox files such as DLLs, `gameos.xvd` or `resources.pri`. Files outside the scan or inside encrypted data aren't covered by these totals.
+
+## BCPack and the lower-mip fallback
+
+A `.ttpf` texture stores its whole mip chain, smallest mip first. The store compresses each chunk with zlib, stores it raw, or uses BCPack, the Xbox hardware texture codec, which has no public decoder. When the full-size mip falls in a BCPack chunk, PercyStar decodes the largest smaller mip that sits outside BCPack. The texture preview shows it as "Reduced resolution (WxH of FULLWxFULLH)", and the Model Viewer uses it for materials, so those models show texture colors instead of gray.
+
+Every texture in all 57 stores of the Xbox v1.0.2.1 dump, measured on 2026-11-21:
+
+| Stores | Textures | Full-size mip in BCPack | Recovered from a smaller mip |
+| --- | ---: | ---: | ---: |
+| `data/ttdb` (46 stores) | 352,461 | 41,390 | 13,784 (33.3%) |
+| All 57 (adds `pack/*`) | 357,115 | 42,338 | 13,888 (32.8%) |
+
+Most recovered textures come back at 1/2 to 1/8 of full width (mip 1 to mip 3). None of the 3,368 blocked UI textures could be recovered. 17 more textures sit in chunks flagged as BCPack that are exactly their uncompressed size; the reader treats those as raw data, and they aren't counted above.
+
+The mip layout follows AMD Gfx10 (4 KiB blocks for tile modes 1 to 3, 64 KiB for mode 0, small mips packed into a tail block). On 200 unblocked textures from `ttdb_vehicles.ttpf`, mip 1 matched a 2x2 downsample of mip 0 for all 200. Mip 0 matched the main decoder byte for byte for 197. In the other 3, the main decoder's guess for where mip 0 starts is wrong, so it shows the tail block instead of the image.
+
+To repeat the measurement (`PERCYSTAR_TTPF_ALL=1` covers every store; without it, two stores are checked):
+
+```sh
+PERCYSTAR_DUMP=/path/to/dump PERCYSTAR_TTPF_ALL=1 \
+  cargo test --release ttpf_lower_mip_fallback -- --ignored --nocapture
+```
 
 To repeat the decoder sampling with your own scan cache:
 

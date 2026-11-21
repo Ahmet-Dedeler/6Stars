@@ -19,7 +19,10 @@ fn check(e: &RpfEntry, tmp: &Path) -> Result<String, String> {
         "TXD" => tex::decode_txd_from_rpf(&e.source_rpf, e.offset).and_then(|t| {
             if t.is_empty() { Err("0 textures".into()) } else { Ok(format!("{} textures", t.len())) }
         }),
-        "TTPF" => decode_ttpf_texture(&e.source_rpf, e.tracks as usize).map(|t| format!("{}x{}", t.w, t.h)),
+        "TTPF" => decode_ttpf_texture(&e.source_rpf, e.tracks as usize).map(|t| match t.full_size {
+            Some((fw, fh)) => format!("{}x{} reduced from {fw}x{fh}", t.w, t.h),
+            None => format!("{}x{}", t.w, t.h),
+        }),
         _ => {
             let data = read_entry_bytes(e).map_err(|err| format!("read: {err}"))?;
             match e.kind {
@@ -62,7 +65,7 @@ fn format_audit() {
     let _ = fs::create_dir_all(&tmp);
     for (kind, list) in &by_kind {
         let step = (list.len() / per_kind).max(1);
-        let (mut ok, mut n) = (0usize, 0usize);
+        let (mut ok, mut n, mut reduced) = (0usize, 0usize, 0usize);
         let mut fails: BTreeMap<String, (usize, String)> = BTreeMap::new();
         let t0 = std::time::Instant::now();
         for e in list.iter().step_by(step).take(per_kind) {
@@ -70,7 +73,10 @@ fn format_audit() {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(e, &tmp)))
                 .unwrap_or_else(|p| Err(format!("PANIC {:?}", p.downcast_ref::<String>().cloned().or(p.downcast_ref::<&str>().map(|s| s.to_string())))));
             match r {
-                Ok(_) => ok += 1,
+                Ok(msg) => {
+                    ok += 1;
+                    reduced += msg.contains("reduced") as usize;
+                }
                 Err(err) => {
                     let key: String = err.chars().take(70).collect();
                     let f = fails.entry(key).or_insert((0, format!("{}:{}@{}", e.rpf_name, e.name, e.offset)));
@@ -79,6 +85,9 @@ fn format_audit() {
             }
         }
         println!("{kind:5} total={:7} sampled={n:3} ok={ok:3} ({:3.0}%) {:.1}s", list.len(), 100.0 * ok as f64 / n.max(1) as f64, t0.elapsed().as_secs_f32());
+        if reduced > 0 {
+            println!("        {reduced} of the ok entries decoded at reduced resolution");
+        }
         for (err, (c, ex)) in &fails {
             println!("        {c:3}x {err}  e.g. {ex}");
         }

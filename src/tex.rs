@@ -44,6 +44,9 @@ pub struct DecodedTexture {
     pub fmt_name: &'static str,
     pub pixels: Vec<Color32>,
     pub raw_dds_payload: Vec<u8>,
+    /// Full mip-0 size when only a smaller mip could be decoded (TTPF lower-mip fallback).
+    /// `w`/`h`/`pixels` then describe the reduced mip.
+    pub full_size: Option<(usize, usize)>,
 }
 
 pub fn dxgi_info(dxgi: u8) -> Option<(&'static str, bool, usize)> {
@@ -590,6 +593,7 @@ pub fn extract_txd_textures_by_ptr(v: &[u8], p: &[u8], dict_off: usize) -> Vec<(
                 fmt_name,
                 pixels,
                 raw_dds_payload: lin,
+                full_size: None,
             }));
         }
     }
@@ -739,6 +743,10 @@ pub struct TtpfTexMeta {
     pub fmt_byte: u8,
     pub dxgi: u8,
     pub has_mips: bool,
+    /// Mip levels in the chain (descriptor word 0, bits 28..31, plus one).
+    pub mip_count: u8,
+    /// Gfx10 swizzle mode (descriptor word 1, bits 24..27): 0 = 64 KiB blocks, 1..3 = 4 KiB blocks.
+    pub tile_mode: u8,
     pub byte_off: u64,
     pub alloc_sz: u64,
 }
@@ -778,8 +786,10 @@ pub fn scan_ttpf_descriptors(path: &Path) -> Result<(String, Vec<TtpfTexMeta>), 
         // ETPF u1 bits 3..9 ((u1 >> 3) & 0x7F) is the exact Microsoft DXGI_FORMAT enum!
         let dxgi = ((u1 >> 3) & 0x7F) as u8;
         let has_mips = (u1 >> 24) > 0;
+        let mip_count = ((u0 >> 28) + 1) as u8;
+        let tile_mode = ((u1 >> 24) & 0xF) as u8;
         let page4k = (u2 & 0x000F_FFFF) as u64;
-        out.push(TtpfTexMeta { idx: i, w, h, fmt_byte, dxgi, has_mips, byte_off: page4k * 0x1000, alloc_sz: 0 });
+        out.push(TtpfTexMeta { idx: i, w, h, fmt_byte, dxgi, has_mips, mip_count, tile_mode, byte_off: page4k * 0x1000, alloc_sz: 0 });
     }
     let mut offs: Vec<u64> = out.iter().map(|d| d.byte_off).collect();
     offs.sort_unstable();
@@ -884,13 +894,203 @@ pub fn ttpf_read_virtual(path: &Path, ix: &TtpfIndex, off: u64, len: usize) -> R
     Ok(out_buf)
 }
 
-/// Decode a single texture by descriptor index from a `.ttpf` archive.
-pub fn decode_ttpf_texture(path: &Path, tex_idx: usize) -> Result<DecodedTexture, String> {
-    let ix = ttpf_index(path)?;
-    let d = ix.descs.get(tex_idx).ok_or("Texture index out of range")?;
+// -----------------------------------------------------------------------------
+// TTPF mip chains and the lower-mip fallback
+//
+// A texture's allocation holds its whole mip chain in the AMD Gfx10 (RDNA2) layout: mips
+// are stored smallest first and mip 0 comes last. Mips small enough to fit in half a
+// swizzle block share one "mip tail" block at the start of the allocation, each at its own
+// 2D origin inside that block; every larger mip gets whole blocks of its own after it.
+//
+// The RDS5 store compresses each chunk with zlib, stores it raw, or uses BCPack (the Xbox
+// hardware texture codec, no public decoder). When mip 0 lands in a BCPack chunk the
+// smaller mips often still sit in a zlib or raw chunk, so we decode the largest of those.
+// -----------------------------------------------------------------------------
 
-    let (fmt_name, is_bc, bpe) = dxgi_info(d.dxgi)
-        .ok_or_else(|| format!("Unsupported DXGI format {} (fmt_byte=0x{:02x})", d.dxgi, d.fmt_byte))?;
+/// Element dimensions of one swizzle block (`use_64k`: 64 KiB block, else 4 KiB).
+/// Same block shapes the 4 KiB / 64 KiB deswizzlers above use.
+fn swizzle_block_dims(bpe: usize, use_64k: bool) -> (usize, usize) {
+    match (use_64k, bpe) {
+        (false, 16) => (16, 16),
+        (false, 8) => (32, 16),
+        (false, 4) => (32, 32),
+        (false, 2) => (64, 32),
+        (false, _) => (64, 64),
+        (true, 16) => (64, 64),
+        (true, 8) => (128, 64),
+        (true, 4) => (128, 128),
+        (true, 2) => (256, 128),
+        (true, _) => (256, 256),
+    }
+}
+
+/// Where one mip level lives inside a texture allocation.
+#[derive(Clone, Debug, PartialEq)]
+struct TtpfMipSlot {
+    /// Size in elements (4x4 blocks for BCn).
+    ew: usize,
+    eh: usize,
+    /// Byte offset of the mip's first block from the texture start. Tail mips share the
+    /// block at offset 0.
+    offset: u64,
+    /// Element origin inside the shared tail block, for mips in the tail.
+    tail_origin: Option<(usize, usize)>,
+}
+
+#[derive(Clone, Debug)]
+struct TtpfMipLayout {
+    use_64k: bool,
+    bpe: usize,
+    block_w: usize,
+    block_h: usize,
+    block_bytes: u64,
+    mips: Vec<TtpfMipSlot>,
+}
+
+impl TtpfMipLayout {
+    /// `ew`/`eh`: mip-0 size in elements. Mip n is `max(1, e >> n)` elements per axis.
+    fn new(ew: usize, eh: usize, mip_count: usize, bpe: usize, use_64k: bool) -> Self {
+        let (block_w, block_h) = swizzle_block_dims(bpe, use_64k);
+        let block_bytes = (block_w * block_h * bpe) as u64;
+        // Gfx10 caps how many trailing mips may share the tail block at log2(block bytes) - 4.
+        let max_in_tail = if use_64k { 12 } else { 8 };
+        let declared = mip_count.max(1);
+        let dim = |i: usize| ((ew >> i).max(1), (eh >> i).max(1));
+        // A mip joins the tail once it fits in half a block (half width, full height) and is
+        // among the last `max_in_tail` levels; every smaller mip is then in the tail too.
+        let find_tail = |n: usize| {
+            (0..n).find(|&i| dim(i).0 <= block_w / 2 && dim(i).1 <= block_h && n - i <= max_in_tail).unwrap_or(n)
+        };
+        // Measured on the stores: when the declared chain stops before reaching the tail
+        // (wide textures like 1024x256 with 5 mips), the allocation still holds the lower
+        // levels down to a tail block, so lay those out too and hide them afterwards.
+        let mut n = declared;
+        while find_tail(n) == n && n < 16 && dim(n - 1) != (1, 1) {
+            n += 1;
+        }
+        let first_tail = find_tail(n);
+        let dims: Vec<(usize, usize)> = (0..n).map(dim).collect();
+        // 256-byte micro block in elements; tail origins step in these units.
+        let (micro_w, micro_h) = match bpe {
+            16 => (4, 4),
+            8 => (8, 4),
+            4 => (8, 8),
+            2 => (16, 8),
+            _ => (16, 16),
+        };
+        let mut mips = vec![TtpfMipSlot { ew: 0, eh: 0, offset: 0, tail_origin: None }; n];
+        // Mips outside the tail follow the tail block (if any), smallest first.
+        let mut cursor = if first_tail < n { block_bytes } else { 0 };
+        for i in (0..first_tail).rev() {
+            let (w, h) = dims[i];
+            mips[i] = TtpfMipSlot { ew: w, eh: h, offset: cursor, tail_origin: None };
+            cursor += (w.div_ceil(block_w) * h.div_ceil(block_h)) as u64 * block_bytes;
+        }
+        for (k, i) in (first_tail..n).enumerate() {
+            // Slot ids count down from the largest tail mip. A slot's byte position in the
+            // block, split into 256-byte micro blocks, is a Morton code (y in the even bits,
+            // x in the odd bits) of the mip's origin in micro-block units.
+            let slot = (max_in_tail - 1 - k) as u32;
+            let byte_pos: u32 = if slot > 6 { 16 << slot } else { slot << 8 };
+            let morton = byte_pos >> 8;
+            let (mut mx, mut my) = (0usize, 0usize);
+            for bit in 0..6 {
+                my |= (((morton >> (2 * bit)) & 1) as usize) << bit;
+                mx |= (((morton >> (2 * bit + 1)) & 1) as usize) << bit;
+            }
+            mips[i] = TtpfMipSlot { ew: dims[i].0, eh: dims[i].1, offset: 0, tail_origin: Some((mx * micro_w, my * micro_h)) };
+        }
+        mips.truncate(declared);
+        TtpfMipLayout { use_64k, bpe, block_w, block_h, block_bytes, mips }
+    }
+
+    /// Byte range of mip `m` from the texture start (the whole tail block for tail mips).
+    fn span(&self, m: usize) -> (u64, u64) {
+        let s = &self.mips[m];
+        if s.tail_origin.is_some() {
+            return (0, self.block_bytes);
+        }
+        let blocks = (s.ew.div_ceil(self.block_w) * s.eh.div_ceil(self.block_h)) as u64;
+        (s.offset, s.offset + blocks * self.block_bytes)
+    }
+
+    /// Untile mip `m` from `raw` (the bytes of `span(m)`) into row-major elements.
+    fn untile(&self, raw: &[u8], m: usize) -> Vec<u8> {
+        let s = &self.mips[m];
+        let bpe = self.bpe;
+        // The deswizzlers divide pixel sizes by 4 for BCn; pass element sizes with
+        // is_bc = false so they work in elements directly.
+        let swz = |buf: &[u8], w: usize, h: usize| {
+            if self.use_64k { deswizzle_64kb_ttpf(buf, w, h, false, bpe) } else { deswizzle_4kb_d(buf, w, h, false, bpe) }
+        };
+        let Some((ox, oy)) = s.tail_origin else { return swz(raw, s.ew, s.eh) };
+        let block = swz(raw, self.block_w, self.block_h);
+        let mut out = vec![0u8; s.ew * s.eh * bpe];
+        let n = s.ew.min(self.block_w.saturating_sub(ox)) * bpe;
+        for y in 0..s.eh.min(self.block_h.saturating_sub(oy)) {
+            let src = ((oy + y) * self.block_w + ox) * bpe;
+            out[y * s.ew * bpe..][..n].copy_from_slice(&block[src..src + n]);
+        }
+        out
+    }
+}
+
+impl TtpfIndex {
+    /// True if any byte of the virtual range [off, off + len) lies in a BCPack chunk.
+    fn range_hits_bcpack(&self, off: u64, len: u64) -> bool {
+        let end = off + len;
+        let first = self.chunks.partition_point(|c| c.2 + c.3 <= off);
+        self.chunks[first..].iter().take_while(|c| c.2 < end).any(|c| (1..=7).contains(&c.4))
+    }
+}
+
+/// Mip-chain layout of a BCn texture, or None for tile modes we can't place.
+fn ttpf_bc_layout(d: &TtpfTexMeta, bpe: usize) -> Option<TtpfMipLayout> {
+    let use_64k = match d.tile_mode {
+        0 => true,
+        1..=3 => false,
+        _ => return None,
+    };
+    Some(TtpfMipLayout::new(d.w.div_ceil(4).max(1), d.h.div_ceil(4).max(1), d.mip_count as usize, bpe, use_64k))
+}
+
+/// A smaller mip decoded in place of a BCPack-compressed mip 0.
+struct TtpfLowerMip {
+    mip: usize,
+    w: usize,
+    h: usize,
+    lin: Vec<u8>,
+    pixels: Vec<Color32>,
+}
+
+/// Decode the largest mip below mip 0 that is stored outside BCPack chunks.
+fn ttpf_decode_lower_mip(path: &Path, ix: &TtpfIndex, d: &TtpfTexMeta) -> Option<TtpfLowerMip> {
+    let (_, is_bc, bpe) = dxgi_info(d.dxgi)?;
+    // BCPack only wraps BCn data, and the mip-chain layout is only verified for BCn.
+    if !is_bc || d.mip_count < 2 {
+        return None;
+    }
+    let layout = ttpf_bc_layout(d, bpe)?;
+    for m in 1..layout.mips.len() {
+        let (a, b) = layout.span(m);
+        if ix.range_hits_bcpack(d.byte_off + a, b - a) {
+            continue;
+        }
+        let Ok(raw) = ttpf_read_virtual(path, ix, d.byte_off + a, (b - a) as usize) else { continue };
+        let lin = layout.untile(&raw, m);
+        let s = &layout.mips[m];
+        // Decode whole 4x4 blocks, then trim to the mip's pixel size.
+        let (bw, bh) = (s.ew * 4, s.eh * 4);
+        let Some(px) = decode_linear_to_rgba(&lin, bw, bh, d.dxgi) else { continue };
+        let (w, h) = ((d.w >> m).max(1).min(bw), (d.h >> m).max(1).min(bh));
+        let pixels = if (w, h) == (bw, bh) { px } else { (0..h).flat_map(|y| px[y * bw..y * bw + w].iter().copied()).collect() };
+        return Some(TtpfLowerMip { mip: m, w, h, lin, pixels });
+    }
+    None
+}
+
+/// Virtual offset, padded length and 64 KiB-tiling flag of a texture's full-size mip.
+fn ttpf_mip0_range(d: &TtpfTexMeta, is_bc: bool, bpe: usize) -> (u64, usize, bool) {
     let ew = if is_bc { (d.w + 3) / 4 } else { d.w }.max(1);
     let eh = if is_bc { (d.h + 3) / 4 } else { d.h }.max(1);
     let mip0_lin = ew * eh * bpe;
@@ -908,8 +1108,41 @@ pub fn decode_ttpf_texture(path: &Path, tex_idx: usize) -> Result<DecodedTexture
     } else {
         d.byte_off
     };
+    (mip0_off, mip0_padded, use_64k)
+}
 
-    let raw_tex = ttpf_read_virtual(path, &ix, mip0_off, mip0_padded)?;
+/// Decode a single texture by descriptor index from a `.ttpf` archive.
+///
+/// When mip 0 is BCPack-compressed this falls back to the largest smaller mip stored as raw
+/// or zlib data: `full_size` is then set and `w`/`h`/`pixels` describe the reduced mip.
+pub fn decode_ttpf_texture(path: &Path, tex_idx: usize) -> Result<DecodedTexture, String> {
+    let ix = ttpf_index(path)?;
+    let d = ix.descs.get(tex_idx).ok_or("Texture index out of range")?;
+
+    let (fmt_name, is_bc, bpe) = dxgi_info(d.dxgi)
+        .ok_or_else(|| format!("Unsupported DXGI format {} (fmt_byte=0x{:02x})", d.dxgi, d.fmt_byte))?;
+    let (mip0_off, mip0_padded, use_64k) = ttpf_mip0_range(d, is_bc, bpe);
+
+    let raw_tex = match ttpf_read_virtual(path, &ix, mip0_off, mip0_padded) {
+        Ok(raw) => raw,
+        Err(err) if err.contains("BCPack") => {
+            let Some(low) = ttpf_decode_lower_mip(path, &ix, d) else {
+                return Err(format!("{err}; no smaller mip is stored outside BCPack"));
+            };
+            return Ok(DecodedTexture {
+                name: format!("tex_{:05}_{}x{}_{fmt_name}_mip{}", d.idx, d.w, d.h, low.mip),
+                w: low.w,
+                h: low.h,
+                mips: d.mip_count,
+                dxgi: d.dxgi,
+                fmt_name,
+                pixels: low.pixels,
+                raw_dds_payload: low.lin,
+                full_size: Some((d.w, d.h)),
+            });
+        }
+        Err(err) => return Err(err),
+    };
     let lin = if use_64k {
         deswizzle_64kb_ttpf(&raw_tex, d.w, d.h, is_bc, bpe)
     } else {
@@ -921,11 +1154,12 @@ pub fn decode_ttpf_texture(path: &Path, tex_idx: usize) -> Result<DecodedTexture
         name: format!("tex_{:05}_{}x{}_{fmt_name}", d.idx, d.w, d.h),
         w: d.w,
         h: d.h,
-        mips: if d.has_mips { 2 } else { 1 },
+        mips: d.mip_count,
         dxgi: d.dxgi,
         fmt_name,
         pixels,
         raw_dds_payload: lin,
+        full_size: None,
     })
 }
 
@@ -1431,4 +1665,194 @@ pub fn decode_navmesh_from_rpf(rpf_path: &Path, file_off: u64, fallback_name: &s
         poly_cnt,
         "NavMesh".into(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ttpf_mip_layout_places_tail_and_body() {
+        // 64x64 BC1 (16x16 elements, 8 bytes each), 6 mips: whole chain fits the 4 KiB tail.
+        let l = TtpfMipLayout::new(16, 16, 6, 8, false);
+        assert!(l.mips.iter().all(|m| m.tail_origin.is_some()));
+        assert_eq!(l.span(0), (0, 4096));
+        // 128x128 BC1, 7 mips: tail block first, then mip 0 in two 32x16 blocks.
+        let l = TtpfMipLayout::new(32, 32, 7, 8, false);
+        assert_eq!(l.mips[0].tail_origin, None);
+        assert_eq!(l.span(0), (4096, 12288));
+        assert_eq!(l.mips[1].tail_origin, Some((16, 0)));
+        assert_eq!(l.mips[1].ew, 16);
+        // 512x512 BC7 (128x128 elements, 16x16 per block), 10 mips: mips 0..3 own blocks,
+        // stored smallest first after the tail block; mip 4 (8x8 elements) starts the tail.
+        let l = TtpfMipLayout::new(128, 128, 10, 16, false);
+        assert_eq!(l.span(3), (4096, 2 * 4096));
+        assert_eq!(l.span(2), (2 * 4096, 6 * 4096));
+        assert_eq!(l.span(1), (6 * 4096, 22 * 4096));
+        assert_eq!(l.span(0), (22 * 4096, 86 * 4096));
+        assert_eq!(l.mips[3].tail_origin, None);
+        assert_eq!(l.mips[4].tail_origin, Some((8, 0)));
+    }
+
+    /// Dump root for the data-gated tests (folder holding `data/ttdb`).
+    fn dump_root() -> Option<std::path::PathBuf> {
+        std::env::var("PERCYSTAR_DUMP").ok().map(std::path::PathBuf::from).filter(|p| p.join("data/ttdb").is_dir())
+    }
+
+    /// Counts BCPack-blocked textures and how many the lower-mip fallback recovers.
+    ///
+    ///   PERCYSTAR_DUMP=<dump root> cargo test --release ttpf_lower_mip_fallback -- --ignored --nocapture
+    ///
+    /// `PERCYSTAR_TTPF_ALL=1` measures every `.ttpf` under the dump instead of two stores.
+    #[test]
+    #[ignore]
+    fn ttpf_lower_mip_fallback() {
+        let Some(root) = dump_root() else { return };
+        let all = std::env::var("PERCYSTAR_TTPF_ALL").is_ok();
+        let stores: Vec<std::path::PathBuf> = if all {
+            let mut v = Vec::new();
+            collect_ttpf_files(&root, 0, &mut v);
+            v.sort();
+            v
+        } else {
+            ["data/ttdb/vehicles/ttdb_vehicles.ttpf", "pack/core_restofworld/data/ttdb/props/ttdb_props.ttpf"]
+                .iter()
+                .map(|r| root.join(r))
+                .filter(|p| p.is_file())
+                .collect()
+        };
+        assert!(!stores.is_empty(), "no ttpf stores under {}", root.display());
+        let (mut all_blocked, mut all_recovered, mut all_textures, mut flagged_but_stored) = (0usize, 0usize, 0usize, 0usize);
+        for path in &stores {
+            let ix = ttpf_index(path).expect("index");
+            let (mut blocked, mut recovered) = (0usize, 0usize);
+            let mut by_mip = [0usize; 16];
+            let mut example = String::new();
+            for d in &ix.descs {
+                let Some((_, is_bc, bpe)) = dxgi_info(d.dxgi) else { continue };
+                let (off, len, _) = ttpf_mip0_range(d, is_bc, bpe);
+                if !ix.range_hits_bcpack(off, len as u64) {
+                    continue;
+                }
+                blocked += 1;
+                if let Ok(t) = decode_ttpf_texture(path, d.idx) {
+                    let Some((fw, fh)) = t.full_size else {
+                        // A few chunks carry a BCPack codec but are exactly their virtual size;
+                        // the reader takes those as stored data, so mip 0 isn't blocked.
+                        blocked -= 1;
+                        flagged_but_stored += 1;
+                        continue;
+                    };
+                    assert_eq!((fw, fh), (d.w, d.h));
+                    assert_eq!(t.pixels.len(), t.w * t.h);
+                    assert!(t.w < fw || t.h < fh);
+                    recovered += 1;
+                    if example.is_empty() {
+                        example = format!("e.g. #{} {}x{} of {fw}x{fh}", d.idx, t.w, t.h);
+                    }
+                    let m = t.name.rsplit("_mip").next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(15);
+                    by_mip[m.min(15)] += 1;
+                }
+            }
+            all_blocked += blocked;
+            all_recovered += recovered;
+            all_textures += ix.descs.len();
+            let rel = path.strip_prefix(&root).unwrap_or(path).display();
+            let mips: Vec<String> = by_mip.iter().enumerate().filter(|(_, &c)| c > 0).map(|(m, c)| format!("mip{m}={c}")).collect();
+            println!("{rel}: {} textures, blocked {blocked}, recovered {recovered} [{}] {example}", ix.descs.len(), mips.join(" "));
+        }
+        println!(
+            "TOTAL: {} stores, {all_textures} textures, blocked {all_blocked}, recovered {all_recovered} ({:.1}%); {flagged_but_stored} BCPack-flagged but stored",
+            stores.len(),
+            100.0 * all_recovered as f64 / all_blocked.max(1) as f64
+        );
+        assert!(all_recovered > 0, "fallback recovered nothing");
+
+        // Known case: ttdb_vehicles.ttpf #102 is a 2048x2048 BC texture whose top two mips
+        // are BCPack; mip 2 is stored as zlib. `PERCY_OUT=<dir>` also writes it as a PNG.
+        let veh = root.join("data/ttdb/vehicles/ttdb_vehicles.ttpf");
+        if veh.is_file() {
+            let t = decode_ttpf_texture(&veh, 102).expect("vehicles #102 via fallback");
+            assert_eq!(t.full_size, Some((2048, 2048)));
+            assert_eq!((t.w, t.h), (512, 512));
+            assert!(t.name.ends_with("_mip2"), "{}", t.name);
+            println!("vehicles #102: {} tile mode {}", t.name, ttpf_index(&veh).unwrap().descs[102].tile_mode);
+            if let Ok(out) = std::env::var("PERCY_OUT") {
+                let _ = std::fs::create_dir_all(&out);
+                export_texture_png(&t, &Path::new(&out).join(format!("{}.png", t.name))).expect("png");
+            }
+        }
+    }
+
+    /// The layout must agree with the existing full-size decoder on unblocked textures, and
+    /// its mip 1 must look like its mip 0 shrunk by half.
+    ///
+    ///   PERCYSTAR_DUMP=<dump root> cargo test --release ttpf_mip_layout_matches_real_data -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn ttpf_mip_layout_matches_real_data() {
+        let Some(root) = dump_root() else { return };
+        let path = root.join("data/ttdb/vehicles/ttdb_vehicles.ttpf");
+        if !path.is_file() {
+            return;
+        }
+        let ix = ttpf_index(&path).expect("index");
+        let (mut checked, mut mip0_same, mut mip1_close) = (0usize, 0usize, 0usize);
+        for d in ix.descs.iter().filter(|d| d.mip_count >= 3 && d.w >= 64 && d.h >= 64) {
+            // BC6H decodes to tonemapped floats; skip it to keep the comparison simple.
+            let Some((_, true, bpe)) = dxgi_info(d.dxgi) else { continue };
+            if matches!(d.dxgi, 95 | 96) {
+                continue;
+            }
+            let Some(l) = ttpf_bc_layout(d, bpe) else { continue };
+            let (a, b) = l.span(0);
+            if ix.range_hits_bcpack(d.byte_off, b) {
+                continue;
+            }
+            let Ok(full) = decode_ttpf_texture(&path, d.idx) else { continue };
+            let Ok(raw0) = ttpf_read_virtual(&path, &ix, d.byte_off + a, (b - a) as usize) else { continue };
+            checked += 1;
+            let lin0 = l.untile(&raw0, 0);
+            if lin0 == full.raw_dds_payload {
+                mip0_same += 1;
+            } else {
+                // Seen only where the main decoder's alloc-end guess for mip 0 is off (it then
+                // shows the tail block); the layout's mip 0 looks right in those cases.
+                println!("  #{} {}x{} dxgi {} tile {} mips {} alloc {:#x}: mip0 differs from main decoder", d.idx, d.w, d.h, d.dxgi, d.tile_mode, d.mip_count, d.alloc_sz);
+            }
+            let s0 = &l.mips[0];
+            let w0 = s0.ew * 4;
+            let px0 = decode_linear_to_rgba(&lin0, w0, s0.eh * 4, d.dxgi).unwrap();
+            let (a1, b1) = l.span(1);
+            let raw1 = ttpf_read_virtual(&path, &ix, d.byte_off + a1, (b1 - a1) as usize).unwrap();
+            let s1 = &l.mips[1];
+            let px1 = decode_linear_to_rgba(&l.untile(&raw1, 1), s1.ew * 4, s1.eh * 4, d.dxgi).unwrap();
+            // Mean absolute RGB difference between mip 1 and a 2x2 box filter of mip 0.
+            let (w1, h1) = (d.w / 2, d.h / 2);
+            let mut err = 0u64;
+            for y in 0..h1 {
+                for x in 0..w1 {
+                    let q = [(0, 0), (1, 0), (0, 1), (1, 1)].map(|(dx, dy)| px0[(2 * y + dy) * w0 + 2 * x + dx]);
+                    let c = px1[y * s1.ew * 4 + x];
+                    for (k, v) in [c.r(), c.g(), c.b()].into_iter().enumerate() {
+                        let avg = q.iter().map(|p| [p.r(), p.g(), p.b()][k] as i32).sum::<i32>() / 4;
+                        err += (avg - v as i32).unsigned_abs() as u64;
+                    }
+                }
+            }
+            let mean_err = err as f64 / (3 * w1 * h1) as f64;
+            if mean_err < 12.0 {
+                mip1_close += 1;
+            } else {
+                println!("  #{} {}x{} dxgi {} tile {} mips {}: mip1 mean error {mean_err:.1}", d.idx, d.w, d.h, d.dxgi, d.tile_mode, d.mip_count);
+            }
+            if checked >= 200 {
+                break;
+            }
+        }
+        println!("layout check: {checked} textures, mip0 identical {mip0_same}, mip1 close to downsampled mip0 {mip1_close}");
+        assert!(checked >= 20, "too few textures checked");
+        assert!(mip0_same * 100 >= checked * 95, "layout disagrees with the main decoder too often");
+        assert!(mip1_close * 100 >= checked * 98, "mip 1 does not look like mip 0 shrunk");
+    }
 }

@@ -3363,6 +3363,10 @@ impl eframe::App for Rpf9App {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(&t.name).strong().color(Color32::from_rgb(255, 168, 28)));
                     ui.label(RichText::new(format!("{}x{} · {} · mips={}", t.w, t.h, t.fmt_name, t.mips)).color(Color32::from_rgb(170, 210, 235)));
+                    if let Some((fw, fh)) = t.full_size {
+                        ui.label(RichText::new(format!("Reduced resolution ({}x{} of {fw}x{fh})", t.w, t.h)).color(Color32::from_rgb(255, 200, 90)))
+                            .on_hover_text("The full-size mip is BCPack-compressed (Xbox hardware codec), so a smaller mip stored as plain data is shown instead.");
+                    }
                     ui.add(egui::Slider::new(&mut self.tex_zoom, 0.25..=4.0).text("Zoom").fixed_decimals(2));
                     if ui.button("Export PNG").clicked() {
                         let safe: String = t.name.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') { c } else { '_' }).collect();
@@ -3747,7 +3751,7 @@ mod tests {
             eprintln!("tex {id} {}x{} f{:02x} mips={} alloc={:#x}", d.w, d.h, d.fmt_byte, d.has_mips, d.alloc_sz);
             for (k, (sc, dx, t64, off, px)) in res.iter().take(4).enumerate() {
                 eprintln!("   score {sc:.1} dxgi {dx} t64 {t64} off {off:#x}");
-                let t = tex::DecodedTexture { name: String::new(), w: d.w, h: d.h, mips: 1, dxgi: *dx, fmt_name: "", pixels: px.clone(), raw_dds_payload: vec![] };
+                let t = tex::DecodedTexture { name: String::new(), w: d.w, h: d.h, mips: 1, dxgi: *dx, fmt_name: "", pixels: px.clone(), raw_dds_payload: vec![], full_size: None };
                 let _ = export_texture_png(&t, &Path::new(&out).join(format!("{id}_{k}.png")));
             }
         }
