@@ -109,10 +109,40 @@ pub fn dock_child_hwnd(child_hwnd: isize, parent_hwnd: isize, x: i32, y: i32, w:
 }
 
 pub fn find_binkplay() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("binkplay.exe")))
-        .filter(|p| p.exists())
+    if let Ok(p) = std::env::var("BINKPLAY_PATH") {
+        let pb = PathBuf::from(p.trim().trim_matches('"'));
+        if pb.is_file() {
+            return pb;
+        }
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("binkplay.exe"));
+            candidates.push(dir.join("tools").join("binkplay.exe"));
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("binkplay.exe"));
+        candidates.push(cwd.join("tools").join("binkplay.exe"));
+    }
+    if let Some(path_os) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_os) {
+            candidates.push(dir.join("binkplay.exe"));
+        }
+    }
+    for env_key in ["ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA", "USERPROFILE"] {
+        if let Ok(base) = std::env::var(env_key) {
+            let b = PathBuf::from(base);
+            candidates.push(b.join("RADVideo").join("binkplay.exe"));
+            candidates.push(b.join("RAD Video Tools").join("binkplay.exe"));
+        }
+    }
+    candidates.push(PathBuf::from(r"C:\Program Files (x86)\RADVideo\binkplay.exe"));
+    candidates.push(PathBuf::from(r"C:\Program Files\RADVideo\binkplay.exe"));
+    candidates
+        .into_iter()
+        .find(|p| p.is_file())
         .unwrap_or_else(|| PathBuf::from(r"C:\Program Files (x86)\RADVideo\binkplay.exe"))
 }
 
@@ -1317,7 +1347,8 @@ impl Rpf9App {
                     return;
                 }
             }
-            match Command::new(find_binkplay())
+            let bink_path = find_binkplay();
+            match Command::new(&bink_path)
                 .args([bk2_p.to_str().unwrap(), "/NoBorder", "/DrawD3D11", "/L", "/W640", "/H360"])
                 .spawn()
             {
@@ -1330,7 +1361,10 @@ impl Rpf9App {
                     m.status = format!("Playing {} (D3D11 BinkPlay)", e.name);
                 }
                 Err(err) => {
-                    self.media.lock().unwrap().status = format!("binkplay.exe error: {err}");
+                    self.media.lock().unwrap().status = format!(
+                        "binkplay.exe error ({}): {err} — place binkplay.exe next to PercyStar.exe, add RADVideo to PATH, or set BINKPLAY_PATH",
+                        bink_path.display()
+                    );
                 }
             }
         } else if e.kind == "AWC" {

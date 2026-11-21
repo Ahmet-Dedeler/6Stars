@@ -603,6 +603,8 @@ struct GpuState {
     stream_total: usize,
     sgd5_count: usize,
     tex_bytes: usize,
+    geom_bytes: usize,
+    vram_oom: bool,
     frame_idx: u64,
     start_instant: Instant,
     has_hw_rt: bool,
@@ -1036,6 +1038,8 @@ impl GpuState {
             stream_total: 0,
             sgd5_count: 0,
             tex_bytes: 0,
+            geom_bytes: 0,
+            vram_oom: false,
             frame_idx: 0,
             start_instant: Instant::now(),
             has_hw_rt,
@@ -1065,17 +1069,21 @@ impl GpuState {
         if b.mesh.verts.is_empty() || b.mesh.tris.is_empty() || b.instances.is_empty() {
             return;
         }
+        const MAX_GEOM_BYTES: usize = 1024 * 1024 * 1024;
+        let is_terrain = b.mesh.name == "mhiu_world_terrain";
+        let est_geom_bytes = b.mesh.verts.len() * std::mem::size_of::<GpuVertex>()
+            + b.mesh.tris.len() * 12
+            + b.instances.len() * std::mem::size_of::<GpuInstance>();
+        if !is_terrain && (self.vram_oom || self.geom_bytes.saturating_add(est_geom_bytes) > MAX_GEOM_BYTES) {
+            return;
+        }
+
         let normals = compute_smooth_normals(&b.mesh);
         let insts: Vec<GpuInstance> = b
             .instances
             .iter()
             .map(|&(pos, rot, scale, col)| GpuInstance::from_mat4(Mat4::from_scale_rotation_translation(scale, rot, pos), col))
             .collect();
-        let inst_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("m_inst"),
-            contents: bytemuck::cast_slice(&insts),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
 
         let mut by_geom: HashMap<u16, Vec<u32>> = HashMap::new();
         for (ti, &[i0, i1, i2]) in b.mesh.tris.iter().enumerate() {
@@ -1097,11 +1105,36 @@ impl GpuState {
                 uv: b.mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]),
             })
             .collect();
+
+        self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let inst_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("m_inst"),
+            contents: bytemuck::cast_slice(&insts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
         let vb = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("m_vb"),
             contents: bytemuck::cast_slice(&gv),
             usage: wgpu::BufferUsages::VERTEX,
         });
+        let mut ibs = Vec::with_capacity(by_geom.len());
+        for (g, indices) in by_geom {
+            let ib = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("m_ib"),
+                contents: bytemuck::cast_slice(&indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+            ibs.push((g, indices.len() as u32, ib));
+        }
+        if let Some(err) = pollster_block_on(self.device.pop_error_scope()) {
+            self.vram_oom = true;
+            eprintln!(
+                "[world-gpu] GPU VRAM limit reached ({} MiB geom, {} MiB tex): {err}",
+                self.geom_bytes / (1024 * 1024),
+                self.tex_bytes / (1024 * 1024)
+            );
+            return;
+        }
 
         let mut lmin = Vec3::splat(f32::MAX);
         let mut lmax = Vec3::splat(f32::MIN);
@@ -1123,12 +1156,7 @@ impl GpuState {
         let bound_center = (wmin + wmax) * 0.5;
         let bound_radius = ((wmax - wmin) * 0.5).length().max(1.0);
 
-        for (g, indices) in by_geom {
-            let ib = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("m_ib"),
-                contents: bytemuck::cast_slice(&indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
+        for (g, index_count, ib) in ibs {
             let tex_bg = if self.tex_bytes < 512 * 1024 * 1024 {
                 b.mesh
                     .texture
@@ -1148,16 +1176,17 @@ impl GpuState {
                 vb: vb.clone(),
                 ib,
                 inst_buf: inst_buf.clone(),
-                index_count: indices.len() as u32,
+                index_count,
                 inst_count: insts.len() as u32,
                 tex_bind_group: tex_bg,
                 bound_center,
                 bound_radius,
                 is_box: b.mesh.name == "__placeholder_boxes__",
-                is_terrain: b.mesh.name == "mhiu_world_terrain",
+                is_terrain,
             });
         }
 
+        self.geom_bytes += est_geom_bytes;
         self.tri_count += b.mesh.tris.len() * insts.len();
         self.instance_count += insts.len();
         self.model_count += 1;
