@@ -9,6 +9,12 @@
 </p>
 
 <p align="center">
+  <a href="https://discord.gg/reADpA6Cd"><img src="https://img.shields.io/badge/Join%20the%20Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the Discord" height="36" /></a>
+  <br />
+  <sub>Questions, previews, bug reports and format research. Come say hi.</sub>
+</p>
+
+<p align="center">
   Built in Rust on top of <a href="https://github.com/rpatty-dev/PercyStar">PercyStar</a> by rpatty-dev.
 </p>
 
