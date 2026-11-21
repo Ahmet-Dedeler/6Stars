@@ -132,7 +132,9 @@ impl WorldMapData {
     }
 
     // The GPU world places buildings, camera, and terrain in the same world units (1:1),
-    // with the full 2048px hillshade texture.
+    // with the full 2048px hillshade texture. Upstream currently draws terrain only on the
+    // minimap (bd4b0ff), so this is kept for when the mesh comes back.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn build_world_terrain_mesh(&self, step: usize) -> Mesh3D {
         let mut m = self.build_terrain_mesh_scaled(step, 1.0, 1.0, 2048);
         m.name = "mhiu_world_terrain".into();
