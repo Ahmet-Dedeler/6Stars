@@ -16,6 +16,139 @@ fn vptr_off(ptr: u64) -> Option<usize> {
     }
 }
 
+// extract primary duration in seconds and track count from crClipDictionary
+pub fn extract_anim_summary(data: &[u8]) -> (f32, usize) {
+    let mut dur = 2.0f32;
+    for o in (0x60..data.len().saturating_sub(0x38)).step_by(4) {
+        let d = f32::from_bits(rd32(data, o));
+        if d.is_finite() && (0.05..=3600.0).contains(&d) {
+            let p0 = rd32(data, o + 4);
+            let p1 = rd32(data, o + 8);
+            if p0 == p1 && (0x5000_0000..0x5800_0000).contains(&p0) {
+                dur = d;
+                break;
+            }
+        }
+    }
+    let tracks = data.windows(4).filter(|w| w[0] == 0x09 && w[1] == 0x00).count().max(1);
+    (dur, tracks)
+}
+
+fn push_limb(
+    verts: &mut Vec<[f32; 3]>,
+    uvs: &mut Vec<[f32; 2]>,
+    tris: &mut Vec<[u32; 3]>,
+    edges: &mut Vec<(u32, u32)>,
+    a: [f32; 3],
+    b: [f32; 3],
+    r: f32,
+) {
+    let dx = b[0] - a[0];
+    let dy = b[1] - a[1];
+    let dz = b[2] - a[2];
+    let len = (dx * dx + dy * dy + dz * dz).sqrt().max(1e-4);
+    let ux = dx / len;
+    let uy = dy / len;
+    let uz = dz / len;
+    let ref_v = if uy.abs() < 0.9 { [0.0f32, 1.0, 0.0] } else { [1.0, 0.0, 0.0] };
+    let px = uy * ref_v[2] - uz * ref_v[1];
+    let py = uz * ref_v[0] - ux * ref_v[2];
+    let pz = ux * ref_v[1] - uy * ref_v[0];
+    let plen = (px * px + py * py + pz * pz).sqrt().max(1e-4);
+    let s1 = [px / plen * r, py / plen * r, pz / plen * r];
+    let s2 = [
+        (uy * s1[2] - uz * s1[1]),
+        (uz * s1[0] - ux * s1[2]),
+        (ux * s1[1] - uy * s1[0]),
+    ];
+    let base = verts.len() as u32;
+    let ring = |p: [f32; 3]| -> [[f32; 3]; 4] {
+        [
+            [p[0] + s1[0], p[1] + s1[1], p[2] + s1[2]],
+            [p[0] + s2[0], p[1] + s2[1], p[2] + s2[2]],
+            [p[0] - s1[0], p[1] - s1[1], p[2] - s1[2]],
+            [p[0] - s2[0], p[1] - s2[1], p[2] - s2[2]],
+        ]
+    };
+    for v in ring(a).into_iter().chain(ring(b)) {
+        verts.push(v);
+        uvs.push([0.5, 0.5]);
+    }
+    for k in 0..4u32 {
+        let kn = (k + 1) % 4;
+        tris.push([base + k, base + kn, base + 4 + kn]);
+        tris.push([base + k, base + 4 + kn, base + 4 + k]);
+        edges.push((base + k, base + 4 + k));
+        edges.push((base + k, base + kn));
+    }
+}
+
+// build articulated 3d stickman dummy posed at time_sec for animation playback preview
+pub fn build_stickman_mesh(name: &str, time_sec: f32, duration_sec: f32, track_count: usize) -> crate::model3d::Mesh3D {
+    let phase = (time_sec / duration_sec.max(0.1)) * std::f32::consts::TAU * (track_count.clamp(1, 8) as f32).sqrt();
+    let sw = phase.sin();
+    let cw = phase.cos();
+
+    let pelvis = [0.0, 0.95 + 0.04 * (phase * 2.0).sin().abs(), 0.0];
+    let chest = [0.04 * sw, pelvis[1] + 0.45, 0.03 * cw];
+    let neck = [chest[0], chest[1] + 0.14, chest[2]];
+    let head_top = [neck[0], neck[1] + 0.22, neck[2]];
+
+    let l_sh = [chest[0] - 0.22, chest[1] - 0.03, chest[2]];
+    let r_sh = [chest[0] + 0.22, chest[1] - 0.03, chest[2]];
+    let l_el = [l_sh[0] - 0.08, l_sh[1] - 0.28, l_sh[2] + 0.22 * sw];
+    let r_el = [r_sh[0] + 0.08, r_sh[1] - 0.28, r_sh[2] - 0.22 * sw];
+    let l_ha = [l_el[0] - 0.03, l_el[1] - 0.24, l_el[2] + 0.24 * sw + 0.10];
+    let r_ha = [r_el[0] + 0.03, r_el[1] - 0.24, r_el[2] - 0.24 * sw + 0.10];
+
+    let l_hi = [pelvis[0] - 0.11, pelvis[1] - 0.03, pelvis[2]];
+    let r_hi = [pelvis[0] + 0.11, pelvis[1] - 0.03, pelvis[2]];
+    let l_kn = [l_hi[0], l_hi[1] - 0.42, l_hi[2] - 0.24 * sw];
+    let r_kn = [r_hi[0], r_hi[1] - 0.42, r_hi[2] + 0.24 * sw];
+    let l_ft = [l_kn[0], (l_kn[1] - 0.44).max(0.02), l_kn[2] - 0.18 * sw - 0.06 * cw];
+    let r_ft = [r_kn[0], (r_kn[1] - 0.44).max(0.02), r_kn[2] + 0.18 * sw + 0.06 * cw];
+
+    let mut verts = Vec::with_capacity(160);
+    let mut uvs = Vec::with_capacity(160);
+    let mut tris = Vec::with_capacity(160);
+    let mut edges = Vec::with_capacity(160);
+
+    for (a, b, r) in [
+        (pelvis, chest, 0.055),
+        (chest, neck, 0.045),
+        (neck, head_top, 0.095),
+        (l_sh, r_sh, 0.038),
+        (l_sh, l_el, 0.032),
+        (l_el, l_ha, 0.026),
+        (r_sh, r_el, 0.032),
+        (r_el, r_ha, 0.026),
+        (l_hi, r_hi, 0.042),
+        (l_hi, l_kn, 0.038),
+        (l_kn, l_ft, 0.030),
+        (r_hi, r_kn, 0.038),
+        (r_kn, r_ft, 0.030),
+    ] {
+        push_limb(&mut verts, &mut uvs, &mut tris, &mut edges, a, b, r);
+    }
+
+    let tri_geom = vec![0u16; tris.len()];
+    let mut mesh = crate::model3d::Mesh3D::from_parts(
+        name.to_string(),
+        verts,
+        uvs,
+        tris,
+        tri_geom,
+        edges,
+        None,
+        format!("Stickman Rig ({track_count} tracks)"),
+        1,
+        1,
+        format!("{duration_sec:.2}s"),
+    );
+    mesh.shade_mode = crate::model3d::ShadeMode::SolidWire;
+    mesh
+}
+
 // detect rage 9 crClipDictionary header in decompressed rsc9 page
 pub fn probe_anim_dict(data: &[u8]) -> Option<(String, u32)> {
     if data.len() < 0x50 {
@@ -150,5 +283,11 @@ mod tests {
         assert!(txt.contains("Clips: 2"));
         assert!(txt.contains("0xdeadbeef"));
         assert!(txt.contains("duration=48.133s (~1444 frames @ 30fps)"));
+        let (dur, trk) = extract_anim_summary(&buf);
+        assert!((dur - 48.133335).abs() < 0.01);
+        assert!(trk >= 1);
+        let m = build_stickman_mesh("test_clip", 0.5, dur, trk);
+        assert!(!m.verts.is_empty());
+        assert!(!m.tris.is_empty());
     }
 }

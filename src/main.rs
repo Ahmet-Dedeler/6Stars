@@ -638,6 +638,11 @@ struct Rpf9App {
     clip_seq: u64,
     mesh3d: Option<Mesh3D>,
     show_3d: bool,
+    anim_playing: bool,
+    anim_time: f32,
+    anim_dur: f32,
+    anim_tracks: usize,
+    anim_name: String,
     textures: Vec<DecodedTexture>,
     tex_sel: usize,
     tex_handle: Option<(usize, TextureHandle)>,
@@ -755,6 +760,11 @@ impl Rpf9App {
             clip_seq: 0,
             mesh3d: None,
             show_3d: false,
+            anim_playing: false,
+            anim_time: 0.0,
+            anim_dur: 0.0,
+            anim_tracks: 0,
+            anim_name: String::new(),
             textures: Vec::new(),
             tex_sel: 0,
             tex_handle: None,
@@ -824,6 +834,8 @@ impl Rpf9App {
         self.last_dock_rect = [0; 4];
         self.mesh3d = None;
         self.show_3d = false;
+        self.anim_dur = 0.0;
+        self.anim_playing = false;
         self.textures.clear();
         self.tex_sel = 0;
         self.tex_handle = None;
@@ -1302,6 +1314,14 @@ impl Rpf9App {
                         self.preview = psin::parse_psin(&data);
                     } else if e.kind == "ANIM" {
                         self.preview = anim::parse_anim_dict(&data);
+                        let (dur, trk) = anim::extract_anim_summary(&data);
+                        self.anim_dur = dur;
+                        self.anim_tracks = trk;
+                        self.anim_name = e.name.clone();
+                        self.anim_time = 0.0;
+                        self.anim_playing = true;
+                        self.mesh3d = Some(anim::build_stickman_mesh(&e.name, 0.0, dur, trk));
+                        self.show_3d = true;
                     } else if e.kind == "DAT" {
                         self.preview = dat::parse_dat(&data);
                     } else if e.kind == "RSC9" {
@@ -3595,21 +3615,25 @@ impl eframe::App for Rpf9App {
         egui::SidePanel::left("tree").default_width(195.0).frame(egui::Frame::new().fill(Color32::from_rgb(18, 12, 28)).inner_margin(8.0)).show(ctx, |ui| {
             self.refresh_view();
             let c = self.counts;
-            ui.label(RichText::new("ARCHIVE TREE").size(11.0).color(Color32::from_rgb(110, 118, 134)));
+            ui.label(RichText::new("FILTER BY TYPE").size(11.0).color(Color32::from_rgb(145, 135, 175)));
             ui.add_space(4.0);
+            let has_entries = c[0] > 0;
             for (cat, label, count) in [
                 (Category::All, "All Files", c[0]),
-                (Category::Vehicles, "Vehicles (.#ft)", c[1]),
-                (Category::Models, "3D Models (.#dr/.#ft)", c[2] + c[1]),
-                (Category::Textures, "Textures (.#td/.ttpf)", c[3]),
-                (Category::Ui, "UI & Text (RBF0/GFX/GXT)", c[4]),
-                (Category::NavMesh, "NavMesh (.ynv)", c[5]),
-                (Category::Videos, "Videos (.bk2)", c[6]),
-                (Category::Audio, "Audio (.awc)", c[7]),
-                (Category::Xml, "Configs (.xml)", c[8]),
-                (Category::Resources, "Resources (.psin)", c[9]),
-                (Category::Binary, "Binary (.bin)", c[10]),
+                (Category::Vehicles, "Vehicles", c[1]),
+                (Category::Models, "3D Models", c[2] + c[1]),
+                (Category::Textures, "Textures", c[3]),
+                (Category::Ui, "UI & Text", c[4]),
+                (Category::NavMesh, "NavMesh 3D", c[5]),
+                (Category::Videos, "Videos", c[6]),
+                (Category::Audio, "Audio", c[7]),
+                (Category::Xml, "Configs (XML)", c[8]),
+                (Category::Resources, "Anim / PSO / RSC9", c[9]),
+                (Category::Binary, "Binary", c[10]),
             ] {
+                if has_entries && cat != Category::All && count == 0 {
+                    continue;
+                }
                 if ui.selectable_label(self.category == cat, format!("{label} ({count})")).clicked() {
                     self.category = cat;
                 }
@@ -3825,9 +3849,30 @@ impl eframe::App for Rpf9App {
             } else if let Some(mesh) = self.mesh3d.as_mut() {
                 let mut toggle_3d = self.show_3d;
                 ui.horizontal(|ui| {
-                    if ui.selectable_label(!toggle_3d, "Hex / Info").clicked() { toggle_3d = false; }
-                    if ui.selectable_label(toggle_3d, "3D Model View").clicked() { toggle_3d = true; }
+                    if ui.selectable_label(!toggle_3d, "Info").clicked() { toggle_3d = false; }
+                    if ui.selectable_label(toggle_3d, if self.anim_dur > 0.0 { "3D Dummy" } else { "3D View" }).clicked() { toggle_3d = true; }
+                    if self.anim_dur > 0.0 {
+                        ui.separator();
+                        if ui.button(if self.anim_playing { "Pause" } else { "Play" }).clicked() {
+                            self.anim_playing = !self.anim_playing;
+                        }
+                        let mut t = self.anim_time;
+                        if ui.add(egui::Slider::new(&mut t, 0.0..=self.anim_dur).suffix("s").fixed_decimals(2)).changed() {
+                            self.anim_time = t;
+                            let next = anim::build_stickman_mesh(&self.anim_name, t, self.anim_dur, self.anim_tracks);
+                            mesh.verts = next.verts;
+                            mesh.dirty = true;
+                        }
+                    }
                 });
+                if self.anim_dur > 0.0 && self.anim_playing && toggle_3d {
+                    let dt = ctx.input(|i| i.unstable_dt).clamp(0.001, 0.05);
+                    self.anim_time = (self.anim_time + dt) % self.anim_dur.max(0.1);
+                    let next = anim::build_stickman_mesh(&self.anim_name, self.anim_time, self.anim_dur, self.anim_tracks);
+                    mesh.verts = next.verts;
+                    mesh.dirty = true;
+                    ctx.request_repaint();
+                }
                 self.show_3d = toggle_3d;
                 ui.separator();
                 if self.show_3d {
