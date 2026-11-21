@@ -10,8 +10,8 @@ use model3d::{
     probe_large_rage9_model_in_buf, render_mesh3d_viewport,
 };
 use rdna2::{
-    Ps09Cache, ShaderStage, format_gfx103_disasm, format_spirv_abi_summary, lift_to_hlsl,
-    lift_to_spirv,
+    Ps09Cache, Ps09ShaderEntry, ShaderStage, format_gfx103_disasm, format_spirv_abi_summary,
+    lift_to_hlsl, lift_to_spirv,
 };
 use tex::{
     DecodedTexture, build_dds_dx10, decode_0drpz_text, decode_navmesh_from_rpf, decode_rbf0,
@@ -677,7 +677,48 @@ struct Rpf9App {
     sgd5_stage_filter: Option<&'static str>,
     sgd5_search: String,
     sgd5_selected: Option<usize>,
-    sgd5_cached_text: (Option<(usize, usize)>, String),
+    sgd5_cached_text: (Option<(usize, usize, ShaderViewMode)>, String),
+}
+
+fn sgd5_stage(stage: &str) -> ShaderStage {
+    match stage {
+        "VS" => ShaderStage::Vertex,
+        "PS" => ShaderStage::Pixel,
+        "GS" => ShaderStage::Geometry,
+        "DS" => ShaderStage::Domain,
+        "HS" => ShaderStage::Hull,
+        "CS" => ShaderStage::Compute,
+        _ => ShaderStage::Unknown,
+    }
+}
+
+fn sgd5_ps09_entry(shader: &sgd5::Sgd5Shader, fssm: &dxbc::FssmShader) -> Ps09ShaderEntry {
+    Ps09ShaderEntry {
+        index: shader.index,
+        code_offset: u32::try_from(fssm.code_offset).unwrap_or(0),
+        code_size: u32::try_from(fssm.code_size).unwrap_or(0),
+        stage: sgd5_stage(shader.stage),
+        num_threads: None,
+        rsrc1: None,
+        rsrc2: None,
+        bindings: Vec::new(),
+        pso_hash: shader.hash,
+        has_rt: false,
+        has_ngg: false,
+        insn_count: u32::try_from(rdna2::decode_gfx103(fssm.code(), 4000).len()).unwrap_or(0),
+    }
+}
+
+fn sgd5_stage_color(stage: &str) -> Color32 {
+    match stage {
+        "VS" => Color32::from_rgb(205, 145, 255),
+        "PS" => Color32::from_rgb(95, 235, 145),
+        "GS" => Color32::from_rgb(120, 220, 255),
+        "DS" => Color32::from_rgb(255, 190, 120),
+        "HS" => Color32::from_rgb(255, 140, 180),
+        "CS" => Color32::from_rgb(72, 210, 255),
+        _ => Color32::from_rgb(170, 170, 190),
+    }
 }
 
 impl Rpf9App {
@@ -1981,13 +2022,6 @@ impl Rpf9App {
                         }
                     }
                 });
-                ui.separator();
-                ui.label(
-                    RichText::new("SGD5 DXBC GROUPS")
-                        .size(12.0)
-                        .strong()
-                        .color(Color32::from_rgb(72, 210, 255)),
-                );
                 ui.add_space(4.0);
                 let running = self.sgd5_job.lock().unwrap().running;
                 if ui
@@ -2007,20 +2041,6 @@ impl Rpf9App {
                         }
                     }
                 }
-                if ui
-                    .add_enabled(
-                        !running,
-                        egui::Button::new("Browse SGD5 without extracting..."),
-                    )
-                    .clicked()
-                {
-                    if let Some(input) = rfd::FileDialog::new()
-                        .add_filter("SGD5 Containers", &["rpf", "bin"])
-                        .pick_file()
-                    {
-                        self.spawn_sgd5_load(ctx.clone(), input);
-                    }
-                }
                 let sgd5_status = self.sgd5_job.lock().unwrap().status.clone();
                 if !sgd5_status.is_empty() {
                     ui.add_space(4.0);
@@ -2036,10 +2056,15 @@ impl Rpf9App {
                     ui.horizontal_wrapped(|ui| {
                         for group_index in 0..files.len() {
                             let label = format!("Group {group_index}");
-                            if ui
-                                .selectable_label(self.sgd5_group == group_index, label)
-                                .clicked()
-                            {
+                            let active = self.sgd5_group == group_index;
+                            let button = egui::Button::new(
+                                RichText::new(label)
+                                    .size(11.5)
+                                    .strong()
+                                    .color(if active { Color32::BLACK } else { Color32::from_rgb(225, 215, 240) }),
+                            )
+                            .fill(if active { Color32::from_rgb(255, 168, 28) } else { Color32::from_rgb(38, 24, 58) });
+                            if ui.add(button).clicked() {
                                 self.sgd5_group = group_index;
                                 self.sgd5_selected = Some(0);
                                 self.sgd5_cached_text = (None, String::new());
@@ -2066,11 +2091,19 @@ impl Rpf9App {
                             let count = option.map_or(group.shaders.len(), |stage| {
                                 stage_counts.get(stage).copied().unwrap_or(0)
                             });
-                            let label = format!("{label} ({count})");
-                            if ui
-                                .selectable_label(self.sgd5_stage_filter == option, label)
-                                .clicked()
-                            {
+                            let color = option.map_or(
+                                Color32::from_rgb(225, 215, 240),
+                                sgd5_stage_color,
+                            );
+                            let active = self.sgd5_stage_filter == option;
+                            let button = egui::Button::new(
+                                RichText::new(format!("{label} ({count})"))
+                                    .size(11.0)
+                                    .strong()
+                                    .color(if active { Color32::BLACK } else { color }),
+                            )
+                            .fill(if active { color } else { Color32::from_rgb(36, 22, 54) });
+                            if ui.add(button).clicked() {
                                 self.sgd5_stage_filter = option;
                                 self.sgd5_selected = None;
                                 self.sh_source = ShaderSource::Sgd5;
@@ -2103,6 +2136,7 @@ impl Rpf9App {
                             for index in filtered[range].iter().copied() {
                                 let shader = &group.shaders[index];
                                 let selected = self.sgd5_selected == Some(index);
+                                let color = sgd5_stage_color(shader.stage);
                                 let label = format!(
                                     "[{}] #{:05} {} {:5}B",
                                     shader.stage,
@@ -2110,13 +2144,14 @@ impl Rpf9App {
                                     shader.name,
                                     shader.uncompressed_size
                                 );
-                                if ui
-                                    .selectable_label(
-                                        selected,
-                                        RichText::new(label).monospace().size(11.0),
-                                    )
-                                    .clicked()
-                                {
+                                let button = egui::Button::new(
+                                    RichText::new(label)
+                                        .monospace()
+                                        .size(11.0)
+                                        .color(if selected { Color32::BLACK } else { color }),
+                                )
+                                .fill(if selected { color } else { Color32::from_rgb(24, 15, 36) });
+                                if ui.add(button).clicked() {
                                     self.sgd5_selected = Some(index);
                                     self.sh_source = ShaderSource::Sgd5;
                                 }
@@ -2145,7 +2180,7 @@ impl Rpf9App {
                             ShaderStage::Vertex => vs += 1,
                             ShaderStage::MeshNgg => ngg += 1,
                             ShaderStage::RayTracing => rt += 1,
-                            ShaderStage::Unknown => {}
+                            _ => {}
                         }
                     }
                     (c.shaders.len(), cs, ps, vs, ngg, rt)
@@ -2233,7 +2268,7 @@ impl Rpf9App {
                                     ShaderStage::Compute => Color32::from_rgb(72, 210, 255),
                                     ShaderStage::Pixel => Color32::from_rgb(95, 235, 145),
                                     ShaderStage::Vertex => Color32::from_rgb(205, 145, 255),
-                                    ShaderStage::Unknown => Color32::from_rgb(170, 170, 190),
+                                    _ => Color32::from_rgb(170, 170, 190),
                                 };
                                 let lbl = format!(
                                     "[{}] #{:05} · {:4}B · {}i · {}b",
@@ -2298,74 +2333,112 @@ impl Rpf9App {
                     if let Some(shader_index) = self.sgd5_selected {
                         if let Some(shader) = files[group_index].shaders.get(shader_index) {
                             match sgd5::decompress_shader(&files[group_index], shader) {
-                                Ok(blob) => {
-                                    let source = format!(
-                                        "SGD5 group {group_index} | {} | {}",
-                                        shader.stage, shader.name
-                                    );
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "SGD5 group {} · {} · {} · {} bytes",
-                                                group_index,
-                                                shader.stage,
-                                                shader.name,
-                                                blob.len()
-                                            ))
-                                            .strong()
-                                            .size(13.0)
-                                            .color(Color32::from_rgb(255, 168, 28)),
+                                Ok(blob) => match dxbc::extract_fssm(&blob) {
+                                    Ok(fssm) => {
+                                        let code = fssm.code().to_vec();
+                                        let entry = sgd5_ps09_entry(shader, &fssm);
+                                        let stem = format!(
+                                            "sgd5_{:05}_{}_{}",
+                                            shader.index,
+                                            shader.stage.to_lowercase(),
+                                            shader.name.replace(['/', '\\', ':'], "_")
                                         );
-                                        ui.separator();
-                                        if ui.button("Export .dxbc").clicked() {
-                                            if let Some(path) = rfd::FileDialog::new()
-                                                .set_file_name(format!(
-                                                    "sgd5_{:05}_{}_{}.dxbc",
-                                                    shader.index,
-                                                    shader.stage.to_lowercase(),
-                                                    shader.name.replace(['/', '\\', ':'], "_")
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "SGD5 group {} · {} · {} · {} code bytes",
+                                                    group_index,
+                                                    shader.stage,
+                                                    shader.name,
+                                                    code.len()
                                                 ))
-                                                .save_file()
-                                            {
-                                                let _ = fs::write(&path, &blob);
-                                            }
-                                        }
-                                        if ui.button("Export .asm").clicked() {
-                                            if let Some(path) = rfd::FileDialog::new()
-                                                .set_file_name(format!(
-                                                    "sgd5_{:05}_{}_{}.asm",
-                                                    shader.index,
-                                                    shader.stage.to_lowercase(),
-                                                    shader.name.replace(['/', '\\', ':'], "_")
-                                                ))
-                                                .save_file()
-                                            {
-                                                let _ = fs::write(
-                                                    &path,
-                                                    dxbc::disassemble_with_source(&blob, &source),
-                                                );
-                                            }
-                                        }
-                                    });
-                                    ui.add_space(8.0);
-                                    let key = Some((group_index, shader_index));
-                                    if self.sgd5_cached_text.0 != key {
-                                        self.sgd5_cached_text =
-                                            (key, dxbc::disassemble_with_source(&blob, &source));
-                                    }
-                                    egui::ScrollArea::both()
-                                        .auto_shrink([false, false])
-                                        .show(ui, |ui| {
-                                            ui.add(
-                                                egui::TextEdit::multiline(
-                                                    &mut self.sgd5_cached_text.1.as_str(),
-                                                )
-                                                .font(egui::TextStyle::Monospace)
-                                                .desired_width(f32::INFINITY),
+                                                .strong()
+                                                .size(13.0)
+                                                .color(Color32::from_rgb(255, 168, 28)),
                                             );
+                                            ui.separator();
+                                            for (mode, label) in [
+                                                (ShaderViewMode::Asm, "GFX10.3 ASM"),
+                                                (ShaderViewMode::Hlsl, "Lifted HLSL (SM 6.6)"),
+                                                (ShaderViewMode::SpirvAbi, "SPIR-V 1.5 / SGPR ABI"),
+                                            ] {
+                                                let active = self.sh_mode == mode;
+                                                let button = egui::Button::new(
+                                                    RichText::new(label)
+                                                        .size(12.0)
+                                                        .strong()
+                                                        .color(if active { Color32::BLACK } else { Color32::from_rgb(225, 215, 240) }),
+                                                )
+                                                .fill(if active { Color32::from_rgb(255, 168, 28) } else { Color32::from_rgb(38, 24, 58) });
+                                                if ui.add(button).clicked() {
+                                                    self.sh_mode = mode;
+                                                }
+                                            }
+                                            ui.separator();
+                                            if ui.button("Export .dxbc").clicked() {
+                                                if let Some(path) = rfd::FileDialog::new()
+                                                    .set_file_name(format!("{stem}.dxbc"))
+                                                    .save_file()
+                                                {
+                                                    let _ = fs::write(&path, &blob);
+                                                }
+                                            }
+                                            if ui.button("Export .asm").clicked() {
+                                                if let Some(path) = rfd::FileDialog::new()
+                                                    .set_file_name(format!("{stem}.asm"))
+                                                    .save_file()
+                                                {
+                                                    let _ = fs::write(&path, format_gfx103_disasm(&entry, &code));
+                                                }
+                                            }
+                                            if ui.button("Export .hlsl").clicked() {
+                                                if let Some(path) = rfd::FileDialog::new()
+                                                    .set_file_name(format!("{stem}.hlsl"))
+                                                    .save_file()
+                                                {
+                                                    let _ = fs::write(&path, lift_to_hlsl(&entry, &code));
+                                                }
+                                            }
+                                            if ui.button("Export .spv").clicked() {
+                                                if let Some(path) = rfd::FileDialog::new()
+                                                    .set_file_name(format!("{stem}.spv"))
+                                                    .save_file()
+                                                {
+                                                    let _ = fs::write(&path, lift_to_spirv(&entry, &code));
+                                                }
+                                            }
                                         });
-                                    return;
-                                }
+                                        ui.add_space(8.0);
+                                        let key = Some((group_index, shader_index, self.sh_mode));
+                                        if self.sgd5_cached_text.0 != key {
+                                            let text = match self.sh_mode {
+                                                ShaderViewMode::Asm => format_gfx103_disasm(&entry, &code),
+                                                ShaderViewMode::Hlsl => lift_to_hlsl(&entry, &code),
+                                                ShaderViewMode::SpirvAbi => format_spirv_abi_summary(&entry, &code),
+                                            };
+                                            self.sgd5_cached_text = (key, text);
+                                        }
+                                        egui::ScrollArea::both()
+                                            .auto_shrink([false, false])
+                                            .show(ui, |ui| {
+                                                ui.add(
+                                                    egui::TextEdit::multiline(
+                                                        &mut self.sgd5_cached_text.1.as_str(),
+                                                    )
+                                                    .font(egui::TextStyle::Monospace)
+                                                    .desired_width(f32::INFINITY),
+                                                );
+                                            });
+                                        return;
+                                    }
+                                    Err(error) => {
+                                        ui.label(
+                                            RichText::new(format!("FSSM extraction failed: {error}"))
+                                                .color(Color32::from_rgb(255, 100, 120)),
+                                        );
+                                        return;
+                                    }
+                                },
                                 Err(error) => {
                                     ui.label(
                                         RichText::new(format!("DXBC decompression failed: {error}"))
@@ -3833,6 +3906,41 @@ mod tests {
     }
 
     #[test]
+    fn sgd5_shader_lifts_through_gfx103_paths() {
+        let shader = sgd5::Sgd5Shader {
+            stage: "VS",
+            index: 7,
+            name: "synthetic_vertex".into(),
+            wave_size: 32,
+            compressed_size: 8,
+            uncompressed_size: 8,
+            hash: 0x0123_4567_89ab_cdef,
+            register_count: 8,
+            cbuffer_count: 1,
+            texture_count: 0,
+            binary_offset: 0,
+        };
+        let mut data = vec![0u8; 0x20];
+        data.extend_from_slice(&0xBFA0_0003u32.to_le_bytes());
+        data.extend_from_slice(&0xBF81_0000u32.to_le_bytes());
+        let fssm = dxbc::FssmShader {
+            code_offset: 0x20,
+            code_size: 8,
+            data,
+        };
+        let entry = sgd5_ps09_entry(&shader, &fssm);
+
+        assert_eq!(entry.stage, ShaderStage::Vertex);
+        assert_eq!(entry.pso_hash, shader.hash);
+        assert_eq!(entry.insn_count, 2);
+        assert!(lift_to_hlsl(&entry, fssm.code()).contains("VSMain"));
+        assert_eq!(
+            &lift_to_spirv(&entry, fssm.code())[..4],
+            &0x0723_0203u32.to_le_bytes()
+        );
+    }
+
+    #[test]
     fn deswizzle_and_ui_decoders_work() {
         // 4KB SW_4KB_D bijective permutation test on 64x64 BC7 (16x16 blocks, 1 tile)
         let mut raw = vec![0u8; 4096];
@@ -4268,7 +4376,7 @@ fn disasm_shaders_cli(src: &Path, out_dir: &Path, limit: usize) {
             ShaderStage::Vertex => vs += 1,
             ShaderStage::MeshNgg => ngg += 1,
             ShaderStage::RayTracing => rt += 1,
-            ShaderStage::Unknown => {}
+            _ => {}
         }
         let nt = s.num_threads.map(|[x, y, z]| format!("{x}x{y}x{z}")).unwrap_or_default();
         csv.push_str(&format!(

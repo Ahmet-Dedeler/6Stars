@@ -99,7 +99,7 @@
   PercyStar.exe --extract-sgd5 "<path-to-shaders.rpf|SGD5.bin>" "<output-dir>" [limit]
   PercyStar.exe --disassemble-dxbc "<path-to-shader.dxbc>" ["<output.asm>"]
   ```
-  The Shaders tab is source-driven: opening a raw `shaders.rpf` loads the PS09 runtime cache and every SGD5 group, while separate buttons load a PS09 cache, zlib directory, or SGD5 `.bin`. Selecting either source or any shader switches the browser and viewer to that dataset. SGD5 extraction gives each group its own output folder and `sgd5_index.csv`; the DXBC viewer uses DXC when full DXIL bitcode is available, while GTA `Wrapped`/`NOBC` shaders are unwrapped to their zlib `FSSM` payload and disassembled as AMD RDNA2/GFX10.3 code.
+  The Shaders tab is source-driven: opening a raw `shaders.rpf` loads the PS09 runtime cache and every SGD5 group, while separate buttons load a PS09 cache, zlib directory, or SGD5 `.bin`. Selecting either source or any shader switches the browser and viewer to that dataset. Both sources support GFX10.3 disassembly plus experimental HLSL and SPIR-V lifting; SGD5 extraction gives each group its own output folder and `sgd5_index.csv`. GTA `Wrapped`/`NOBC` shaders are unwrapped to their zlib `FSSM` payload before RDNA2 decoding.
 
 ---
 
