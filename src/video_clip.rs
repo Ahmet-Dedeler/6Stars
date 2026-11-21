@@ -58,6 +58,11 @@ pub fn copy_clip(path: &Path, offset: u64, size: u64, cancel: &AtomicBool) -> io
     let mut archive = File::open(path)?;
     archive.seek(SeekFrom::Start(offset))?;
     let dir = tempfile::Builder::new().prefix("percystar-video-").tempdir()?;
+    // a standalone .bk2: link it instead of copying (multi-GB cutscenes), falling back to a
+    // copy when the temp folder is on another drive. The fixed name keeps odd paths safe.
+    if offset == 0 && std::fs::metadata(path)?.len() == size && std::fs::hard_link(path, dir.path().join("clip.bk2")).is_ok() {
+        return Ok(dir);
+    }
     let mut clip = File::create(dir.path().join("clip.bk2"))?;
     let mut buf = vec![0; size.min(1024 * 1024) as usize];
     let mut remaining = size;
@@ -88,6 +93,14 @@ mod tests {
             copy_clip(file.path(), 6, 100, &cancel).unwrap_err().kind(),
             io::ErrorKind::UnexpectedEof
         );
+    }
+
+    #[test]
+    fn standalone_clip_is_linked_whole() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"KB2nwholefile").unwrap();
+        let dir = copy_clip(file.path(), 0, 13, &AtomicBool::new(false)).unwrap();
+        assert_eq!(std::fs::read(dir.path().join("clip.bk2")).unwrap(), b"KB2nwholefile");
     }
 
     #[test]

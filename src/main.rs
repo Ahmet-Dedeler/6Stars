@@ -1,3 +1,6 @@
+// Release builds on Windows are GUI apps (no console window next to the UI). The CLI
+// modes reattach to the parent console in main().
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 mod audio_player;
 mod awc;
 #[cfg(not(target_os = "macos"))]
@@ -708,7 +711,10 @@ impl Rpf9App {
         };
         load_ui_state(&mut app);
         spawn_update_check(Arc::clone(&app.update), cc.egui_ctx.clone());
-        if let Some(last) = load_last_folder() {
+        clean_stale_temp_dirs();
+        // reopen the last folder, unless we were launched to open a folder or archive
+        let opens_archive = open_paths.iter().any(|p| p.is_dir() || loose_media_entry(p).is_none());
+        if let Some(last) = load_last_folder().filter(|_| !opens_archive) {
             if last.is_dir() {
                 app.start_folder_scan(last);
             }
@@ -729,14 +735,21 @@ impl Rpf9App {
     fn open_paths(&mut self, paths: Vec<PathBuf>) {
         let mut loose = Vec::new();
         let mut archive = None;
+        let mut unsupported = Vec::new();
         for p in paths {
             if p.is_dir() {
                 archive = Some(p);
             } else if let Some(e) = loose_media_entry(&p) {
                 loose.push(e);
-            } else if p.is_file() {
+            } else if p.is_file() && is_archive_file(&p) {
                 archive = Some(p);
+            } else {
+                unsupported.push(p.file_name().unwrap_or_default().to_string_lossy().into_owned());
             }
+        }
+        if !unsupported.is_empty() {
+            // don't throw away a loaded folder for a stray .png
+            self.state.lock().unwrap().status = format!("Can't open {}: not an .rpf, .ttpf, .bk2 or .awc", unsupported.join(", "));
         }
         if let Some(p) = archive {
             self.tab = AppTab::Explorer;
@@ -904,7 +917,7 @@ impl Rpf9App {
         self.is_folder = false;
         self.selected_rpf = "All RPFs".into();
         self.reset_selection();
-        let _gen = self.bump_gen();
+        let gen = self.bump_gen();
         {
             let mut st = self.state.lock().unwrap();
             st.scanning = true;
@@ -915,6 +928,7 @@ impl Rpf9App {
             st.status = "Scanning RPF9 archive...".into();
         }
         let state = Arc::clone(&self.state);
+        let watch_gen = Arc::clone(&self.watch_gen);
         std::thread::spawn(move || {
             if path.file_name().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("levels.rpf")).unwrap_or(false) {
                 let _ = scan_levels_vehicle_zone(&path, Some(&state));
@@ -922,6 +936,7 @@ impl Rpf9App {
             match scan_single_rpf(&path, Some(&state)) {
                 Ok((hdr, mut entries)) => {
                     let mut st = state.lock().unwrap();
+                    if *watch_gen.lock().unwrap() != gen { return; } // replaced by a newer scan
                     st.header_info = hdr;
                     st.rpf_names = vec![archive_label(&path)];
                     let n = entries.len();
@@ -932,6 +947,7 @@ impl Rpf9App {
                 }
                 Err(e) => {
                     let mut st = state.lock().unwrap();
+                    if *watch_gen.lock().unwrap() != gen { return; } // replaced by a newer scan
                     st.scanning = false;
                     st.status = format!("Error: {e}");
                 }
@@ -981,6 +997,7 @@ impl Rpf9App {
                             if !already_loaded {
                                 if let Some(cached_vehs) = disk_cache.get(&vkey) {
                                     let mut st = state.lock().unwrap();
+                                    if *watch_gen.lock().unwrap() != gen { return; } // replaced by a newer scan
                                     st.entries.extend(cached_vehs.iter().cloned());
                                     st.ver += 1;
                                     if !st.rpf_names.contains(&"levels.rpf".to_string()) {
@@ -994,6 +1011,7 @@ impl Rpf9App {
                                     if !veh_entries.is_empty() {
                                         {
                                             let mut st = state.lock().unwrap();
+                                            if *watch_gen.lock().unwrap() != gen { return; } // replaced by a newer scan
                                             if !st.rpf_names.contains(&"levels.rpf".to_string()) {
                                                 st.rpf_names.push("levels.rpf".into());
                                                 st.rpf_names.sort();
@@ -1016,6 +1034,7 @@ impl Rpf9App {
                 let mut cache_hits = 0usize;
                 {
                     let mut st = state.lock().unwrap();
+                    if *watch_gen.lock().unwrap() != gen { return; } // replaced by a newer scan
                     for (p, meta) in &rpfs {
                         {
                             let mtime_s = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
@@ -1074,6 +1093,7 @@ impl Rpf9App {
                                 if let Ok((_, new_entries)) = scan_single_rpf(p, None) {
                                     {
                                         let mut st = state.lock().unwrap();
+                                        if *watch_gen.lock().unwrap() != gen { return; } // replaced by a newer scan
                                         let is_levels = rname.eq_ignore_ascii_case("levels.rpf");
                                         st.entries.retain(|e| &e.source_rpf != p || (is_levels && e.offset >= VEH_ZONE_OFF));
                                         st.entries.extend(new_entries.iter().cloned());
@@ -1098,10 +1118,12 @@ impl Rpf9App {
                     disk_cache = Arc::try_unwrap(cache_arc).unwrap().into_inner().unwrap();
                     save_disk_cache(&disk_cache);
                     let mut st = state.lock().unwrap();
+                    if *watch_gen.lock().unwrap() != gen { return; } // replaced by a newer scan
                     st.scanning = false;
                     st.status = format!("{} RPFs · {} entries (cached + auto-updating)", st.rpf_names.len(), st.entries.len());
                 } else {
                     let mut st = state.lock().unwrap();
+                    if *watch_gen.lock().unwrap() != gen { return; } // replaced by a newer scan
                     st.scanning = false;
                     if cache_hits > 0 {
                         st.status = format!("{} RPFs · {} entries (instant cache)", st.rpf_names.len(), st.entries.len());
@@ -2319,6 +2341,33 @@ fn collect_rpfs(dir: &Path, out: &mut Vec<PathBuf>) {
             } else if ft.is_file() && (is_loose_media_ext(&p) || p.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("rpf") || s.eq_ignore_ascii_case("ttpf")).unwrap_or(false)) {
                 out.push(p);
             }
+        }
+    }
+}
+
+/// An RPF or TTPF archive, by extension or by the RPF magic ("RPF" in either byte order).
+fn is_archive_file(p: &Path) -> bool {
+    if p.extension().and_then(|s| s.to_str()).is_some_and(|s| s.eq_ignore_ascii_case("rpf") || s.eq_ignore_ascii_case("ttpf")) {
+        return true;
+    }
+    let mut m = [0u8; 4];
+    File::open(p).and_then(|mut f| f.read_exact(&mut m)).is_ok() && (m.starts_with(b"RPF") || m[1..] == *b"FPR")
+}
+
+/// Deletes video/audio scratch folders left by a crash or forced quit (they can hold full
+/// copies of large clips). Only folders older than an hour, so a second running instance
+/// keeps its files.
+fn clean_stale_temp_dirs() {
+    let Ok(rd) = fs::read_dir(std::env::temp_dir()) else { return };
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with("percystar-video-") || name.starts_with("percystar-audio-")) {
+            continue;
+        }
+        let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > Duration::from_secs(3600));
+        if old {
+            let _ = fs::remove_dir_all(e.path());
         }
     }
 }
@@ -3982,6 +4031,15 @@ fn main() -> eframe::Result<()> {
         let _ = fs::remove_file(cur.with_extension("exe.old"));
     }
     let args: Vec<String> = std::env::args().collect();
+    // GUI-subsystem exe: give the CLI modes the console they were started from
+    #[cfg(all(windows, not(debug_assertions)))]
+    if args.get(1).is_some_and(|a| a.starts_with("--")) {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn AttachConsole(pid: u32) -> i32;
+        }
+        unsafe { AttachConsole(u32::MAX) };
+    }
     if args.len() >= 4 && args[1] == "--disasm-shaders" {
         let lim = args.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(25);
         disasm_shaders_cli(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), lim);

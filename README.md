@@ -57,7 +57,7 @@ The script fetches and verifies the pinned decoder and frame bridge, so video pl
 <summary><b>Windows x64</b></summary>
 
 1. Install Rust, the Visual Studio C++ Build Tools, and 7-Zip.
-2. Run `.\scripts\build_windows.ps1` in PowerShell.
+2. In PowerShell, run `powershell -ExecutionPolicy Bypass -File .\scripts\build_windows.ps1`.
 3. Open `dist\PercyStar-Win64\PercyStar.exe`.
 
 The build fetches and verifies RAD's decoder and puts it next to PercyStar without running the RAD installer. Keep the two files together. A plain `cargo build` builds the app without bundling the player.
