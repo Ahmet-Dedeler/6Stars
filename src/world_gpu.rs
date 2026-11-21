@@ -746,7 +746,7 @@ impl GpuState {
         if let Some(ref terrain) = cfg.terrain {
             st.map_min = [terrain.bmin[0], terrain.bmin[1]];
             st.map_span = [terrain.bmax[0] - terrain.bmin[0], terrain.bmax[1] - terrain.bmin[1]];
-            let tmesh = terrain.build_terrain_mesh(4);
+            let tmesh = terrain.build_world_terrain_mesh(4);
             if let Some(ref t) = tmesh.texture {
                 st.minimap_bg = upload_texture(&st.device, &st.queue, &st.tex_bgl, &st.tex_samp, t);
             }

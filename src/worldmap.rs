@@ -119,6 +119,15 @@ impl WorldMapData {
 
     // build downsampled 3d terrain mesh (z-up, scaled 1:100 for smooth orbiting)
     pub fn build_terrain_mesh(&self, step: usize) -> Mesh3D {
+        self.build_terrain_mesh_scaled(step, 0.01, 0.04)
+    }
+
+    // The GPU world places buildings, camera, and terrain in the same world units.
+    pub fn build_world_terrain_mesh(&self, step: usize) -> Mesh3D {
+        self.build_terrain_mesh_scaled(step, 1.0, 1.0)
+    }
+
+    fn build_terrain_mesh_scaled(&self, step: usize, xy_scale: f32, z_scale: f32) -> Mesh3D {
         let step = step.max(4);
         let gw = (self.w + step - 1) / step;
         let gh = (self.h + step - 1) / step;
@@ -131,7 +140,7 @@ impl WorldMapData {
                 let px = (gx * step).min(self.w - 1);
                 let wx = self.bmin[0] + (px as f32 / self.w as f32) * (self.bmax[0] - self.bmin[0]);
                 let wz = self.elevation_m(px, py).max(0.0);
-                verts.push([wx * 0.01, wy * 0.01, wz * 0.04]);
+                verts.push([wx * xy_scale, wy * xy_scale, wz * z_scale]);
                 uvs.push([px as f32 / self.w as f32, py as f32 / self.h as f32]);
             }
         }
@@ -457,12 +466,18 @@ mod tests {
         buf[24..28].copy_from_slice(&(1000.0f32).to_le_bytes());
         buf[28..32].copy_from_slice(&(1000.0f32).to_le_bytes());
         buf[32..36].copy_from_slice(&(500.0f32).to_le_bytes());
+        buf[46..48].copy_from_slice(&1u16.to_le_bytes());
+        buf[44 + 8 * 8] = 255;
         let d = parse_mhiu_data(&buf).expect("should parse mhiu");
         assert_eq!(d.w, 8);
         assert_eq!(d.h, 8);
         let mesh = d.build_terrain_mesh(4);
         assert!(!mesh.verts.is_empty());
         assert!(!mesh.tris.is_empty());
+        let world = d.build_world_terrain_mesh(4);
+        assert_eq!(mesh.verts[0], [-10.0, 10.0, 20.0]);
+        assert_eq!(world.verts[0], [-1000.0, 1000.0, 500.0]);
+        assert_eq!(world.verts[3], [0.0, 0.0, 0.0]);
         assert_eq!(parse_nav_coords("nav_256_256_(0,0).ynv"), Some((0.0, 0.0)));
     }
 }

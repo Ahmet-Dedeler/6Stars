@@ -44,6 +44,9 @@ pub fn helper_dir() -> Option<PathBuf> {
     if let Some(app) = std::env::var_os("PERCYSTAR_BINK_APP") {
         return Some(PathBuf::from(app).join("Contents/Helpers"));
     }
+    if !cfg!(target_arch = "aarch64") {
+        return None;
+    }
     let exe = std::env::current_exe().ok()?;
     let macos = exe.parent()?;
     let contents = macos.parent()?;
