@@ -48,7 +48,7 @@ When we added video previews, searching for "video" still found nothing. This ch
 
 ## Build and test
 - macOS app: `bash scripts/build_macos.sh` builds `dist/Percy6Stars.app` (set `SIXSTARS_APP_PATH` for a side-by-side test build). Windows: `scripts/build_windows.ps1` builds `dist\Percy6Stars-Win64`, with `binkplay.exe` next to the exe.
-- Data-gated tests: `PERCYSTAR_LEVELS_RPF=<levels.rpf>` (model regressions), `PERCYSTAR_BK2=<file.bk2>` (in-panel Bink, run with `-- --ignored`), `PERCYSTAR_AUDIT=1` (+ `PERCYSTAR_AUDIT_CACHE`, `PERCYSTAR_AUDIT_N`) for the per-format coverage audit in `src/audit_tests.rs`.
+- Data-gated tests: `PERCYSTAR_LEVELS_RPF=<levels.rpf>` (model regressions), `PERCYSTAR_BK2=<file.bk2>` (in-panel Bink, run with `-- --ignored`), `PERCYSTAR_AUDIT=1` (+ `PERCYSTAR_AUDIT_CACHE`, `PERCYSTAR_AUDIT_N`) for the per-format coverage audit in `src/audit_tests.rs`, `PERCYSTAR_AUDIO_RPF=<audio.rpf>` (DAT catalog; with `PERCYSTAR_AUDIT_CACHE` also bank naming coverage and decode parity), `PERCYSTAR_TTPF=<file.ttpf>` (texture channel views match the displayed pixels).
 - Keep Developer ID / Apple Development signing in `build_macos.sh` so the app keeps its Downloads permission across rebuilds. Use a separate test folder for throwaway builds so we don't trigger new privacy prompts for Downloads.
 - Use the silent Bink tests (volume 0) instead of clicking media in the live app. Tests should leave the user's audio and focus alone.
 - Use your own `CARGO_TARGET_DIR` when another agent may be building at the same time.
@@ -63,3 +63,4 @@ When we added video previews, searching for "video" still found nothing. This ch
 - AWC: `src/awc.rs` decodes (upstream's in-memory chunk decoder, or our stream-table decoder when it recovers more audio, e.g. multichannel banks). `src/audio_player.rs` (upstream's player) plays through `waveOut` on Windows and `afplay` on a temporary WAV on macOS; Linux has no output yet.
 - Upstream sync: `rpatty-dev/PercyStar` is merged into the fork with a real merge (not cherry-picks), keeping both histories. Keep our decoders where they measure better and note the measurement in the commit.
 - Use SixNG (GPLv3) to read up on formats, not as a source of code to copy into this repo.
+- Other PercyStar forks share upstream's license, so their code can be merged with credit (asm512's LOD switching, GamingChelsea's audio catalog). Their open upstream PRs may land upstream later; expect the next upstream sync to touch the same code. asm512's per-texture material layers (rpatty-dev/PercyStar#19) were not taken because they replace our material resolver.

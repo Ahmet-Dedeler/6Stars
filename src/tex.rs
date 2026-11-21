@@ -2484,3 +2484,135 @@ mod mhiu_tests {
         assert!(mip1_close * 100 >= checked * 98, "mip 1 does not look like mip 0 shrunk");
     }
 }
+
+/// Which channels the texture preview shows. Idea from ttpf-viewer / TTPF Studio;
+/// this is our own implementation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum TexChannel {
+    /// As stored, alpha blended over the panel.
+    #[default]
+    Rgba,
+    /// Colour with alpha forced opaque (shows what alpha hides).
+    Rgb,
+    R,
+    G,
+    B,
+    A,
+}
+
+impl TexChannel {
+    pub const ALL: [(TexChannel, &'static str); 6] = [
+        (TexChannel::Rgba, "RGBA"),
+        (TexChannel::Rgb, "RGB"),
+        (TexChannel::R, "R"),
+        (TexChannel::G, "G"),
+        (TexChannel::B, "B"),
+        (TexChannel::A, "A"),
+    ];
+}
+
+/// Straight (not premultiplied) RGBA8 for formats that carry real alpha. `Color32` is
+/// premultiplied, so colour under alpha 0 is gone from `DecodedTexture::pixels`; the channel
+/// views re-decode the stored payload instead. `None` for formats without separate alpha
+/// (their `pixels` are opaque and lossless) or a payload that doesn't fit.
+pub fn decode_linear_straight_rgba(lin: &[u8], w: usize, h: usize, dxgi: u8) -> Option<Vec<[u8; 4]>> {
+    let n = w.checked_mul(h)?;
+    match dxgi {
+        71 | 72 | 77 | 78 | 98 | 99 => {
+            let mut out = vec![0u32; n];
+            let res = match dxgi {
+                71 | 72 => texture2ddecoder::decode_bc1a(lin, w, h, &mut out),
+                77 | 78 => texture2ddecoder::decode_bc3(lin, w, h, &mut out),
+                _ => texture2ddecoder::decode_bc7(lin, w, h, &mut out),
+            };
+            res.ok()?;
+            // texture2ddecoder packs 0xAARRGGBB
+            Some(out.into_iter().map(|v| [(v >> 16) as u8, (v >> 8) as u8, v as u8, (v >> 24) as u8]).collect())
+        }
+        28 | 29 | 87 | 91 => {
+            let bytes = lin.get(..n * 4)?;
+            let bgra = matches!(dxgi, 87 | 91);
+            Some(bytes.chunks_exact(4).map(|p| if bgra { [p[2], p[1], p[0], p[3]] } else { [p[0], p[1], p[2], p[3]] }).collect())
+        }
+        _ => None,
+    }
+}
+
+/// Pixels for the preview: an isolated channel as greyscale, or colour with alpha dropped.
+/// `rebuild_z` recomputes blue as `sqrt(1 - x^2 - y^2)` from red/green, for normal maps
+/// that only store X and Y (BC5 already gets this in the decoder).
+pub fn channel_view(rgba: impl IntoIterator<Item = [u8; 4]>, channel: TexChannel, rebuild_z: bool) -> Vec<Color32> {
+    rgba.into_iter()
+        .map(|[r, g, mut b, a]| {
+            if rebuild_z {
+                let x = r as f32 / 127.5 - 1.0;
+                let y = g as f32 / 127.5 - 1.0;
+                let z = (1.0 - x * x - y * y).max(0.0).sqrt();
+                b = ((z * 0.5 + 0.5) * 255.0).round() as u8;
+            }
+            let grey = |v: u8| Color32::from_rgb(v, v, v);
+            match channel {
+                TexChannel::Rgba => Color32::from_rgba_unmultiplied(r, g, b, a),
+                TexChannel::Rgb => Color32::from_rgb(r, g, b),
+                TexChannel::R => grey(r),
+                TexChannel::G => grey(g),
+                TexChannel::B => grey(b),
+                TexChannel::A => grey(a),
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod channel_view_tests {
+    use super::*;
+
+    #[test]
+    fn isolates_channels_and_drops_alpha() {
+        let px = [[200, 100, 50, 0]];
+        assert_eq!(channel_view(px, TexChannel::R, false)[0], Color32::from_rgb(200, 200, 200));
+        assert_eq!(channel_view(px, TexChannel::G, false)[0], Color32::from_rgb(100, 100, 100));
+        assert_eq!(channel_view(px, TexChannel::A, false)[0], Color32::from_rgb(0, 0, 0));
+        // colour hidden under alpha 0 comes back in the RGB view
+        assert_eq!(channel_view(px, TexChannel::Rgb, false)[0], Color32::from_rgb(200, 100, 50));
+    }
+
+    /// The re-decoded payload must line up with the displayed pixels (same mip, same layout).
+    /// Gate: PERCYSTAR_TTPF=<some .ttpf>.
+    #[test]
+    fn straight_rgba_matches_displayed_pixels() {
+        let Some(path) = std::env::var_os("PERCYSTAR_TTPF").map(std::path::PathBuf::from) else { return };
+        let (mut checked, mut fmts) = (0, std::collections::BTreeSet::new());
+        for idx in 0..400 {
+            let Ok(t) = decode_ttpf_texture(&path, idx) else { continue };
+            let Some(raw) = decode_linear_straight_rgba(&t.raw_dds_payload, t.w, t.h, t.dxgi) else { continue };
+            assert_eq!(raw.len(), t.pixels.len(), "#{idx} {}", t.fmt_name);
+            for (r, p) in raw.iter().zip(&t.pixels) {
+                assert_eq!(Color32::from_rgba_unmultiplied(r[0], r[1], r[2], r[3]), *p, "#{idx} {}", t.fmt_name);
+            }
+            checked += 1;
+            fmts.insert(t.fmt_name);
+        }
+        eprintln!("checked {checked} textures: {fmts:?}");
+        assert!(checked > 0);
+    }
+
+    #[test]
+    fn straight_rgba_keeps_colour_under_zero_alpha() {
+        let raw = decode_linear_straight_rgba(&[10, 20, 30, 0, 1, 2, 3, 255], 2, 1, 28).unwrap();
+        assert_eq!(raw, vec![[10, 20, 30, 0], [1, 2, 3, 255]]);
+        let bgra = decode_linear_straight_rgba(&[30, 20, 10, 0], 1, 1, 87).unwrap();
+        assert_eq!(bgra, vec![[10, 20, 30, 0]]);
+        assert!(decode_linear_straight_rgba(&[0; 3], 1, 1, 28).is_none());
+    }
+
+    #[test]
+    fn rebuilds_flat_normal_blue() {
+        // A flat tangent-space normal stores (0.5, 0.5) in red/green; z should come back as 1.
+        let [_, _, b, _] = channel_view([[128, 128, 0, 255]], TexChannel::Rgb, true)[0].to_array();
+        assert!(b >= 254, "blue {b}");
+        // A normal pointing fully along +x has no z left.
+        let [_, _, b, _] = channel_view([[255, 128, 0, 255]], TexChannel::Rgb, true)[0].to_array();
+        assert!((126..=129).contains(&b), "blue {b}");
+    }
+}

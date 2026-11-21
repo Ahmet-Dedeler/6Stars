@@ -4,6 +4,7 @@
 mod audio_player;
 mod anim;
 mod awc;
+mod bink2;
 mod boot;
 mod dat;
 mod dxbc;
@@ -30,7 +31,7 @@ mod audit_tests;
 #[cfg(test)]
 mod demo_capture;
 use model3d::{
-    Mesh3D, decode_rage9_model_from_rpf, extract_0drpz_mesh, extract_rage9_model_name,
+    Mesh3D, decode_rage9_model_from_rpf, decode_rage9_model_from_rpf_lod, extract_0drpz_mesh, extract_rage9_model_name,
     has_rage9_meshlets, is_vehicle_virtual, is_zlib_head, model_detail_score, parse_obj,
     probe_large_rage9_model_in_buf, render_mesh3d_viewport,
 };
@@ -401,6 +402,56 @@ enum Category {
     Binary,
 }
 
+/// A LOD switch requested from the 3D viewer header (ported from asm512's fork,
+/// rpatty-dev/PercyStar#19).
+#[derive(Clone, Copy)]
+enum LodPick {
+    /// Entry index of a sibling detail file (`_hi` / `_mid` / base).
+    File(usize),
+    /// LOD slot inside the current file.
+    Level(usize),
+}
+
+/// File names of a model's three detail files, high to low: `stem_hi`, `stem_mid`, `stem`.
+fn lod_sibling_names(name: &str) -> Option<[String; 3]> {
+    let (stem, ext) = name.rsplit_once('.')?;
+    let lower = stem.to_ascii_lowercase();
+    let cut = if lower.ends_with("_hi") { 3 } else if lower.ends_with("_mid") { 4 } else { 0 };
+    let base = &stem[..stem.len() - cut];
+    if base.is_empty() {
+        return None;
+    }
+    Some([format!("{base}_hi.{ext}"), format!("{base}_mid.{ext}"), format!("{base}.{ext}")])
+}
+
+/// Detail-file and in-file LOD buttons for the viewer header. Returns the clicked switch.
+fn lod_switch_ui(ui: &mut egui::Ui, mesh: &Mesh3D, siblings: &[(&'static str, usize)], selected: Option<usize>) -> Option<LodPick> {
+    let mut pick = None;
+    let levels = mesh.lod_geoms.iter().filter(|&&n| n > 0).count();
+    if siblings.is_empty() && levels < 2 {
+        return None;
+    }
+    ui.separator();
+    ui.label(RichText::new("Detail:").size(11.0).color(Color32::from_rgb(130, 138, 156)));
+    for &(lbl, idx) in siblings {
+        if ui.selectable_label(selected == Some(idx), lbl).on_hover_text("Separate detail-level file of this model").clicked() && selected != Some(idx) {
+            pick = Some(LodPick::File(idx));
+        }
+    }
+    if levels >= 2 {
+        for (l, &n) in mesh.lod_geoms.iter().enumerate() {
+            if n == 0 {
+                continue;
+            }
+            let tip = format!("{n} geometries stored in this file");
+            if ui.selectable_label(mesh.lod == l, model3d::LOD_NAMES[l]).on_hover_text(tip).clicked() && mesh.lod != l {
+                pick = Some(LodPick::Level(l));
+            }
+        }
+    }
+    pick
+}
+
 #[derive(Clone, Debug)]
 struct RpfEntry {
     source_rpf: PathBuf,
@@ -448,6 +499,7 @@ struct ScanState {
     entries: Vec<RpfEntry>,
     rpf_names: Vec<String>,
     file_sig: HashMap<PathBuf, (u64, Option<SystemTime>)>,
+    audio_bank_meta: HashMap<u64, dat::ResolvedAwcMeta>,
     ver: u64,
 }
 
@@ -456,6 +508,7 @@ struct MediaState {
     loading: bool,
     status: String,
     loaded_tracks: Option<(Vec<audio_player::LoadedWavTrack>, Arc<Vec<u8>>)>,
+    loaded_bank_ctx: Option<audio_player::AudioBankContext>,
     loaded_mesh: Option<Mesh3D>,
     loaded_textures: Option<Vec<DecodedTexture>>,
 }
@@ -634,12 +687,18 @@ struct Rpf9App {
     tex_sel: usize,
     tex_handle: Option<(usize, TextureHandle)>,
     tex_zoom: f32,
+    /// Preview channel and normal-map Z rebuild; the uploaded handle is keyed on these too.
+    tex_channel: tex::TexChannel,
+    tex_rebuild_z: bool,
+    tex_view_key: (tex::TexChannel, bool),
     vehicles_only: bool,
+    audio_named: bool,
     // cachd ui list so huge scans never re filter or clone evry fram
     view: Vec<usize>,
-    view_key: Option<(u64, String, Category, String, bool)>,
+    view_key: Option<(u64, String, Category, String, bool, bool)>,
     hay: Vec<String>,
     hay_ver: u64,
+    hay_audio_named: bool,
     counts: [usize; 11],
     cached_rpf_names: Vec<String>,
     last_rebuild: Instant,
@@ -649,9 +708,16 @@ struct Rpf9App {
     mv_cat: ModelCat,
     mv_filter: String,
     mv_hide_lods: bool,
+    /// Detail-level files of the selected model (label, entry index), high to low.
+    lod_siblings: Vec<(&'static str, usize)>,
+    /// LOD switch clicked in a viewer header, applied at the start of the next frame.
+    lod_pick: Option<LodPick>,
+    /// Camera (yaw, pitch, zoom, pan x, pan y) carried across a LOD switch.
+    lod_keep_cam: Option<[f32; 5]>,
     mv_high_detail: bool,
     mv_detail_index: Option<DetailIndex>,
     mv_detail_job: Option<mpsc::Receiver<DetailIndex>>,
+    mv_drawer_open: bool,
     mv_entries: Vec<(usize, ModelCat, String)>,
     mv_counts: [usize; 11],
     mv_video_count: usize,
@@ -772,11 +838,16 @@ impl Rpf9App {
             tex_sel: 0,
             tex_handle: None,
             tex_zoom: 1.0,
+            tex_channel: tex::TexChannel::Rgba,
+            tex_rebuild_z: false,
+            tex_view_key: (tex::TexChannel::Rgba, false),
             vehicles_only: false,
+            audio_named: true,
             view: Vec::new(),
             view_key: None,
             hay: Vec::new(),
             hay_ver: u64::MAX,
+            hay_audio_named: true,
             counts: [0; 11],
             cached_rpf_names: Vec::new(),
             last_rebuild: Instant::now(),
@@ -785,9 +856,13 @@ impl Rpf9App {
             mv_cat: ModelCat::All,
             mv_filter: String::new(),
             mv_hide_lods: true,
+            lod_siblings: Vec::new(),
+            lod_pick: None,
+            lod_keep_cam: None,
             mv_high_detail: false,
             mv_detail_index: None,
             mv_detail_job: None,
+            mv_drawer_open: true,
             mv_entries: Vec::new(),
             mv_counts: [0; 11],
             mv_video_count: 0,
@@ -967,6 +1042,9 @@ impl Rpf9App {
 
     fn reset_selection(&mut self) {
         self.selected = None;
+        self.lod_siblings.clear();
+        self.lod_pick = None;
+        self.lod_keep_cam = None;
         self.preview.clear();
         self.mesh3d = None;
         self.show_3d = false;
@@ -1192,6 +1270,7 @@ impl Rpf9App {
 
                 let mut changed = Vec::new();
                 let mut cache_hits = 0usize;
+                let mut disk_cache_dirty = false;
                 {
                     let mut st = state.lock().unwrap();
                     if *watch_gen.lock().unwrap() != gen { return; } // replaced by a newer scan
@@ -1201,7 +1280,25 @@ impl Rpf9App {
                             let sig = (meta.len(), meta.modified().ok());
                             if st.file_sig.get(p) != Some(&sig) {
                                 let key = format!("{}|{}|{}", p.display(), meta.len(), mtime_s);
-                                if let Some(cached_entries) = disk_cache.get(&key) {
+                                if let Some(cached_entries) = disk_cache.get_mut(&key) {
+                                    let is_audio = p.file_name().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("audio.rpf")).unwrap_or(false);
+                                    if is_audio {
+                                        let needs_enrich = !cached_entries.iter().any(|e| e.kind == "DAT")
+                                            || cached_entries.iter().any(|e| e.kind == "AWC" && e.name.contains(['/', '\\', ':']))
+                                            || cached_entries.iter().filter(|e| e.kind == "AWC").any(|e| e.name.contains("_Radio_Music_") || e.name.contains("_Score_Streams_"))
+                                            || cached_entries.iter().filter(|e| e.kind == "AWC").take(10).all(|e| e.name.starts_with("sound_00") && e.name.matches('_').count() == 2);
+                                        if needs_enrich {
+                                            for e in cached_entries.iter_mut() {
+                                                if e.kind == "AWC" {
+                                                    e.name = display_entry_name(e, false).into_owned();
+                                                }
+                                            }
+                                            st.audio_bank_meta = enrich_audio_rpf_entries(p, meta.len(), cached_entries);
+                                            disk_cache_dirty = true;
+                                        } else if st.audio_bank_meta.is_empty() {
+                                            st.audio_bank_meta = enrich_audio_rpf_entries(p, meta.len(), cached_entries);
+                                        }
+                                    }
                                     let is_levels = p.file_name().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("levels.rpf")).unwrap_or(false);
                                     st.entries.retain(|e| &e.source_rpf != p || (is_levels && e.offset >= VEH_ZONE_OFF));
                                     st.entries.extend(cached_entries.iter().cloned());
@@ -1222,6 +1319,9 @@ impl Rpf9App {
                         st.rpf_names.sort();
                         st.status = format!("Loaded {cache_hits} cached RPFs ({} entries)...", st.entries.len());
                     }
+                }
+                if disk_cache_dirty {
+                    save_disk_cache(&disk_cache);
                 }
 
                 if !changed.is_empty() {
@@ -1298,36 +1398,89 @@ impl Rpf9App {
         });
     }
 
+    /// Other detail-level files of `e` in the same archive (`stem_hi`, `stem_mid`, `stem`).
+    fn find_lod_siblings(&self, e: &RpfEntry) -> Vec<(&'static str, usize)> {
+        let Some(names) = lod_sibling_names(&e.name) else { return Vec::new() };
+        let mut found: [Option<usize>; 3] = [None; 3];
+        let st = self.state.lock().unwrap();
+        for (i, o) in st.entries.iter().enumerate() {
+            if (o.kind != "MODEL" && o.kind != "VEH") || o.source_rpf != e.source_rpf {
+                continue;
+            }
+            for (k, n) in names.iter().enumerate() {
+                if found[k].is_none() && o.name.eq_ignore_ascii_case(n) {
+                    found[k] = Some(i);
+                }
+            }
+        }
+        let out: Vec<_> = ["Hi", "Mid", "Low"].into_iter().zip(found).filter_map(|(l, f)| f.map(|i| (l, i))).collect();
+        if out.len() < 2 { Vec::new() } else { out }
+    }
+
+    fn spawn_model_decode(&self, e: &RpfEntry, lod: usize) {
+        let media = Arc::clone(&self.media);
+        {
+            let mut m = media.lock().unwrap();
+            m.loading = true;
+            m.status = format!("Decoding RAGE9 meshlets: {}...", e.name);
+        }
+        let src = e.source_rpf.clone();
+        let off = e.offset;
+        let nm = e.name.clone();
+        std::thread::spawn(move || {
+            let res = decode_rage9_model_from_rpf_lod(&src, off, &nm, lod);
+            let mut m = media.lock().unwrap();
+            m.loading = false;
+            match res {
+                Ok(mesh) => {
+                    m.status.clear();
+                    m.loaded_mesh = Some(mesh);
+                }
+                Err(err) => m.status = format!("Model decode error ({nm}): {err}"),
+            }
+        });
+    }
+
+    /// Switches the viewed model to another detail file or in-file LOD, keeping the camera.
+    fn apply_lod_pick(&mut self, pick: LodPick) {
+        let cam = self.mesh3d.as_ref().map(|m| [m.yaw, m.pitch, m.zoom, m.pan_x, m.pan_y]);
+        match pick {
+            LodPick::File(idx) => {
+                // Rows can move if a rescan lands between the click and now; only follow the
+                // index if it is still a detail file of the model being viewed.
+                let still_sibling = {
+                    let st = self.state.lock().unwrap();
+                    match (self.selected.and_then(|i| st.entries.get(i)), st.entries.get(idx)) {
+                        (Some(cur), Some(next)) => {
+                            next.source_rpf == cur.source_rpf
+                                && lod_sibling_names(&cur.name).is_some_and(|names| names.iter().any(|n| n.eq_ignore_ascii_case(&next.name)))
+                        }
+                        _ => false,
+                    }
+                };
+                if !still_sibling {
+                    return;
+                }
+                let show = self.show_3d;
+                self.select_entry(idx);
+                self.show_3d = show;
+            }
+            LodPick::Level(lod) => {
+                let Some(e) = self.selected.and_then(|i| self.state.lock().unwrap().entries.get(i).cloned()) else { return };
+                self.spawn_model_decode(&e, lod);
+            }
+        }
+        self.lod_keep_cam = cam;
+    }
+
     fn select_entry(&mut self, idx: usize) {
         let Some(e) = self.state.lock().unwrap().entries.get(idx).cloned() else { return };
         self.reset_selection();
         self.selected = Some(idx);
 
         if e.kind == "MODEL" || e.kind == "VEH" {
-            let media = Arc::clone(&self.media);
-            {
-                let mut m = media.lock().unwrap();
-                m.loading = true;
-                m.status = format!("Decoding RAGE9 meshlets: {}...", e.name);
-            }
-            let src = e.source_rpf.clone();
-            let off = e.offset;
-            let nm = e.name.clone();
-            std::thread::spawn(move || {
-                match decode_rage9_model_from_rpf(&src, off, &nm) {
-                    Ok(mesh) => {
-                        let mut m = media.lock().unwrap();
-                        m.loading = false;
-                        m.status.clear();
-                        m.loaded_mesh = Some(mesh);
-                    }
-                    Err(err) => {
-                        let mut m = media.lock().unwrap();
-                        m.loading = false;
-                        m.status = format!("Model decode error ({nm}): {err}");
-                    }
-                }
-            });
+            self.lod_siblings = self.find_lod_siblings(&e);
+            self.spawn_model_decode(&e, 0);
             return;
         }
 
@@ -1429,7 +1582,7 @@ impl Rpf9App {
                     "In-app Bink playback requires Apple Silicon."
                 };
                 #[cfg(not(target_os = "macos"))]
-                let message = "No video decoder in this build. Open the packaged Percy6Stars build.";
+                let message = "binkplay.exe not found. Put it next to Percy6Stars.exe, install RAD Video Tools, or set BINKPLAY_PATH.";
                 m.status = message.into();
                 return;
             };
@@ -1444,10 +1597,21 @@ impl Rpf9App {
             return;
         }
         if e.kind == "AWC" {
+            let bank_ctx = if e.rpf_name.eq_ignore_ascii_case("audio.rpf") {
+                self.state.lock().unwrap().audio_bank_meta.get(&e.offset).map(|meta| {
+                    audio_player::AudioBankContext {
+                        pack_name: meta.pack_name.clone(),
+                        used_by: meta.used_by.clone(),
+                    }
+                })
+            } else {
+                None
+            };
             let media = Arc::clone(&self.media);
             {
                 let mut m = media.lock().unwrap();
                 m.loading = true;
+                m.loaded_bank_ctx = bank_ctx;
                 m.status = format!("Decoding {} Opus streams...", e.name);
             }
             std::thread::spawn(move || decode_awc_for_player(&e, &media));
@@ -1510,13 +1674,13 @@ impl Rpf9App {
     // throtled view rebuilder runs 4x a sec during live scans
     fn refresh_view(&mut self) {
         let ver = self.state.lock().unwrap().ver;
-        let key = (ver, self.filter.clone(), self.category.clone(), self.selected_rpf.clone(), self.vehicles_only);
+        let key = (ver, self.filter.clone(), self.category.clone(), self.selected_rpf.clone(), self.vehicles_only, self.audio_named);
         if self.view_sort != self.sort_mode {
             self.view_key = None;
         }
         if let Some(old) = &self.view_key {
             if *old == key { return; }
-            let only_ver = old.1 == key.1 && old.2 == key.2 && old.3 == key.3 && old.4 == key.4;
+            let only_ver = old.1 == key.1 && old.2 == key.2 && old.3 == key.3 && old.4 == key.4 && old.5 == key.5;
             if only_ver && self.last_rebuild.elapsed() < Duration::from_millis(1000) {
                 return;
             }
@@ -1527,12 +1691,13 @@ impl Rpf9App {
         self.rebuild_view(key);
     }
 
-    fn rebuild_view(&mut self, key: (u64, String, Category, String, bool)) {
+    fn rebuild_view(&mut self, key: (u64, String, Category, String, bool, bool)) {
         let st = self.state.lock().unwrap();
-        if self.hay_ver != st.ver {
-            self.hay = st.entries.iter().map(|e| format!("{}|{}|{}|{}", e.name, e.rpf_name, e.kind, kind_search_words(e.kind)).to_lowercase()).collect();
+        if self.hay_ver != st.ver || self.hay_audio_named != self.audio_named {
+            self.hay = st.entries.iter().map(|e| format!("{}|{}|{}|{}|{}", e.name, display_entry_name(e, false), e.rpf_name, e.kind, kind_search_words(e.kind)).to_lowercase()).collect();
             self.cached_rpf_names = st.rpf_names.clone();
             self.hay_ver = st.ver;
+            self.hay_audio_named = self.audio_named;
             let mut c = [0usize; 11];
             for e in &st.entries {
                 c[0] += 1;
@@ -1773,12 +1938,13 @@ impl Rpf9App {
         let mut to_select: Option<usize> = None;
         let mut browse_videos = false;
 
-        egui::SidePanel::left("mv_sidebar")
-            .default_width(360.0)
-            .frame(egui::Frame::new().fill(Color32::from_rgb(20, 13, 31)).inner_margin(10.0))
-            .show(ctx, |ui| {
+        if self.mv_drawer_open {
+            egui::SidePanel::left("mv_sidebar")
+                .default_width(360.0)
+                .frame(egui::Frame::new().fill(Color32::from_rgb(20, 13, 31)).inner_margin(10.0))
+                .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("MODEL VIEWER").size(12.0).strong().color(Color32::from_rgb(255, 168, 28)));
+                    ui.label(RichText::new("MODELS").size(12.0).strong().color(Color32::from_rgb(255, 168, 28)));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             RichText::new(format!("{} shown · {} in category", self.mv_view.len(), self.mv_counts[model_cat_idx(self.mv_cat)]))
@@ -1787,9 +1953,50 @@ impl Rpf9App {
                         );
                     });
                 });
-                ui.add_space(6.0);
+                ui.add_space(5.0);
 
-                // Quick catalog & OBJ loaders
+                ui.horizontal(|ui| {
+                    let sr = ui.add(
+                        egui::TextEdit::singleline(&mut self.mv_filter)
+                            .desired_width(ui.available_width() - 28.0)
+                            .hint_text("Search models (Ctrl+F) · words AND · -exclude"),
+                    );
+                    if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
+                        sr.request_focus();
+                    }
+                    if sr.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        self.mv_filter.clear();
+                    }
+                    if ui.button("✕").on_hover_text("Clear filter").clicked() {
+                        self.mv_filter.clear();
+                    }
+                });
+
+                ui.add_space(5.0);
+                ui.horizontal_wrapped(|ui| {
+                    for (cat, label) in MODEL_CATS {
+                        let cnt = self.mv_counts[model_cat_idx(cat)];
+                        let active = self.mv_cat == cat;
+                        let (_, col) = model_cat_tag(cat);
+                        let txt = RichText::new(format!("{label} {cnt}"))
+                            .size(11.0)
+                            .strong()
+                            .color(if active { Color32::WHITE } else { col });
+                        let btn = egui::Button::new(txt)
+                            .fill(if active { Color32::from_rgb(28, 122, 198) } else { Color32::from_rgb(32, 20, 48) });
+                        if ui.add(btn).clicked() {
+                            self.mv_cat = cat;
+                        }
+                    }
+                    let videos = RichText::new(format!("Videos {}", self.mv_video_count))
+                        .size(11.0)
+                        .strong()
+                        .color(kind_color("BK2"));
+                    browse_videos = ui.add(egui::Button::new(videos).fill(Color32::from_rgb(32, 20, 48)))
+                        .on_hover_text("Browse all .bk2 clips in Explorer").clicked();
+                });
+
+                ui.add_space(4.0);
                 let curated_p = self.find_local_catalog("models_vehicles_weapons_peds.csv");
                 let master_p = self.find_local_catalog("models_catalog_master.csv");
                 ui.horizontal_wrapped(|ui| {
@@ -1818,54 +2025,7 @@ impl Rpf9App {
                     }
                 });
 
-                ui.add_space(6.0);
-                ui.label(RichText::new("CATEGORIES").size(10.5).color(Color32::from_rgb(120, 128, 148)));
-                ui.add_space(3.0);
-
-                // 2-column category chip grid
-                egui::Grid::new("mv_cat_grid").num_columns(2).spacing([6.0, 4.0]).show(ui, |ui| {
-                    for (idx, &(cat, label)) in MODEL_CATS.iter().enumerate() {
-                        let cnt = self.mv_counts[model_cat_idx(cat)];
-                        let active = self.mv_cat == cat;
-                        let (_, col) = model_cat_tag(cat);
-                        let txt = RichText::new(format!("{label} ({cnt})"))
-                            .size(11.5)
-                            .strong()
-                            .color(if active { Color32::BLACK } else { col });
-                        let btn = egui::Button::new(txt)
-                            .min_size(egui::vec2(162.0, 22.0))
-                            .fill(if active { Color32::from_rgb(255, 168, 28) } else { Color32::from_rgb(32, 20, 48) });
-                        if ui.add(btn).clicked() {
-                            self.mv_cat = cat;
-                        }
-                        if idx % 2 == 1 {
-                            ui.end_row();
-                        }
-                    }
-                    let videos = RichText::new(format!("Videos ({})", self.mv_video_count))
-                        .size(11.5)
-                        .strong()
-                        .color(kind_color("BK2"));
-                    let button = egui::Button::new(videos)
-                        .min_size(egui::vec2(162.0, 22.0))
-                        .fill(Color32::from_rgb(32, 20, 48));
-                    browse_videos = ui.add(button).on_hover_text("Browse all .bk2 clips in Explorer").clicked();
-                    ui.end_row();
-                });
-
-                ui.add_space(8.0);
-                let sr = ui.add(
-                    egui::TextEdit::singleline(&mut self.mv_filter)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("Search models (Ctrl+F) · words AND · -exclude"),
-                );
-                if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
-                    sr.request_focus();
-                }
-                if sr.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    self.mv_filter.clear();
-                }
-
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.mv_high_detail, "Highest detail only")
                         .on_hover_text("For same-name character and clothing draws in one archive, keep the variant with the most meshlet data.");
@@ -1881,39 +2041,18 @@ impl Rpf9App {
                     self.mv_view.iter().position(|&mi| self.mv_entries[mi].0 == sel)
                 });
                 ui.horizontal(|ui| {
-                    let lod_btn = egui::Button::new(
-                        RichText::new(if self.mv_hide_lods { "Hide LODs/Bounds: ON" } else { "Hide LODs/Bounds: OFF" })
-                            .size(11.0)
-                            .color(if self.mv_hide_lods { Color32::BLACK } else { Color32::from_rgb(185, 180, 205) }),
-                    )
-                    .fill(if self.mv_hide_lods { Color32::from_rgb(95, 235, 145) } else { Color32::from_rgb(36, 24, 54) });
-                    if ui.add(lod_btn).clicked() {
-                        self.mv_hide_lods = !self.mv_hide_lods;
-                    }
+                    ui.checkbox(&mut self.mv_hide_lods, "hide LOD copies");
                     sort_combo(ui, "mv_sort_combo", &mut self.sort_mode);
                     let has_any = !self.mv_view.is_empty();
-                    if ui.add_enabled(has_any, egui::Button::new("◀ Prev")).clicked() {
-                        let next_i = match cur_pos {
-                            Some(0) | None => self.mv_view.len() - 1,
-                            Some(p) => p - 1,
-                        };
-                        to_select = Some(self.mv_entries[self.mv_view[next_i]].0);
-                    }
-                    if ui.add_enabled(has_any, egui::Button::new("Next ▶")).clicked() {
-                        let next_i = match cur_pos {
-                            Some(p) if p + 1 < self.mv_view.len() => p + 1,
-                            _ => 0,
-                        };
-                        to_select = Some(self.mv_entries[self.mv_view[next_i]].0);
-                    }
                     if ui.add_enabled(has_any, egui::Button::new("Random")).clicked() {
                         let r = self.next_rand() % self.mv_view.len();
                         to_select = Some(self.mv_entries[self.mv_view[r]].0);
                     }
                 });
+                ui.label(RichText::new("Up/Down arrow keys step through the list").size(10.5).color(Color32::from_rgb(130, 134, 150)));
 
                 // Arrow key / W-S navigation when search box is not focused
-                if !sr.has_focus() && !ctx.wants_keyboard_input() && !self.mv_view.is_empty() {
+                if !ctx.wants_keyboard_input() && !self.mv_view.is_empty() {
                     if ui.input(|i| i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::S)) {
                         let next_i = match cur_pos {
                             Some(p) if p + 1 < self.mv_view.len() => p + 1,
@@ -1970,6 +2109,7 @@ impl Rpf9App {
                     self.state.lock().unwrap().status = msg;
                 }
             });
+        }
 
         if browse_videos {
             self.browse_videos();
@@ -1987,6 +2127,36 @@ impl Rpf9App {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(Color32::from_rgb(13, 9, 21)).inner_margin(12.0))
             .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let dr_btn = egui::Button::new(RichText::new("☰ Models").strong().color(Color32::WHITE))
+                        .fill(if self.mv_drawer_open { Color32::from_rgb(28, 122, 198) } else { Color32::from_rgb(36, 24, 54) });
+                    if ui.add(dr_btn).clicked() {
+                        self.mv_drawer_open = !self.mv_drawer_open;
+                    }
+                    let has_any = !self.mv_view.is_empty();
+                    let cur_pos = self.selected.and_then(|sel| self.mv_view.iter().position(|&mi| self.mv_entries[mi].0 == sel));
+                    if ui.add_enabled(has_any, egui::Button::new("◀")).clicked() {
+                        let next_i = match cur_pos { Some(0) | None => self.mv_view.len() - 1, Some(p) => p - 1 };
+                        self.select_entry(self.mv_entries[self.mv_view[next_i]].0);
+                        self.show_3d = true;
+                    }
+                    if ui.add_enabled(has_any, egui::Button::new("▶")).clicked() {
+                        let next_i = match cur_pos { Some(p) if p + 1 < self.mv_view.len() => p + 1, _ => 0 };
+                        self.select_entry(self.mv_entries[self.mv_view[next_i]].0);
+                        self.show_3d = true;
+                    }
+                    let sel_label = self.selected.and_then(|s| self.state.lock().unwrap().entries.get(s).map(|e| format!("{}@{}", e.rpf_name, e.offset)))
+                        .unwrap_or_else(|| "none".into());
+                    ui.label(RichText::new(format!("Model: {sel_label}")).size(12.0).color(Color32::from_rgb(185, 190, 210)));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Open .OBJ").clicked() {
+                            if let Some(p) = rfd::FileDialog::new().add_filter("OBJ 3D Model", &["obj"]).pick_file() {
+                                self.open_obj_path(&p);
+                            }
+                        }
+                    });
+                });
+                ui.separator();
                 if media_loading {
                     ui.centered_and_justified(|ui| {
                         ui.vertical_centered(|ui| {
@@ -2021,6 +2191,9 @@ impl Rpf9App {
                             .size(11.5)
                             .color(Color32::from_rgb(170, 200, 230)),
                         );
+                        if let Some(pick) = lod_switch_ui(ui, mesh, &self.lod_siblings, self.selected) {
+                            self.lod_pick = Some(pick);
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             // Quick camera presets
                             for (lbl, yaw, pitch) in [
@@ -2859,7 +3032,7 @@ impl Rpf9App {
 }
 
 /// Per-user data folder (scan cache, UI state, last folder).
-fn app_data_dir() -> Option<PathBuf> {
+pub(crate) fn app_data_dir() -> Option<PathBuf> {
     let base = if cfg!(windows) {
         std::env::var("LOCALAPPDATA").ok().map(PathBuf::from)
     } else if cfg!(target_os = "macos") {
@@ -2879,7 +3052,7 @@ fn app_data_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
-fn cache_file_path() -> Option<PathBuf> {
+pub(crate) fn cache_file_path() -> Option<PathBuf> {
     // v9 scanner rejects metadata and mid resource chunks that v8 listed as model entries
     app_data_dir().map(|d| d.join("scan_cache_v10.tsv"))
 }
@@ -3851,11 +4024,96 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
                     }
                 }
             }
-            i += 16;
+                i += 16;
         }
     }
 
+    if rname.eq_ignore_ascii_case("audio.rpf") {
+        enrich_audio_rpf_entries(path, sz, &mut found);
+    }
+
     Ok((hdr_info, found))
+}
+
+fn display_entry_name(e: &RpfEntry, audio_named: bool) -> std::borrow::Cow<'_, str> {
+    if !audio_named && e.kind == "AWC" && e.name.starts_with("sound_") && e.name.matches('_').count() > 2 {
+        // Generated names look like "sound_0001_<pack>_<n>st.awc"; leave anything else
+        // (loose files can have any name, including non-ASCII) untouched.
+        if let (Some(head), Some(tail)) = (e.name.get(..10), e.name.rsplit('_').next()) {
+            if head[6..].bytes().all(|b| b.is_ascii_digit()) && tail.ends_with("st.awc") {
+                return std::borrow::Cow::Owned(format!("{head}_{tail}"));
+            }
+        }
+    }
+    std::borrow::Cow::Borrowed(&e.name)
+}
+
+fn enrich_audio_rpf_entries(audio_rpf: &PathBuf, total_sz: u64, entries: &mut Vec<RpfEntry>) -> HashMap<u64, dat::ResolvedAwcMeta> {
+    let mut meta_map = HashMap::new();
+    let awc_indices: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.kind == "AWC")
+        .map(|(i, _)| i)
+        .collect();
+    let first_awc_off = awc_indices
+        .first()
+        .map(|&i| entries[i].offset)
+        .unwrap_or(19_509_248);
+    let Some(cat) = dat::parse_audio_rpf_catalog(audio_rpf, first_awc_off) else {
+        return meta_map;
+    };
+    let rname = audio_rpf
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    if !entries.iter().any(|e| e.kind == "DAT") {
+        for (name, kind, off, raw_size, chunks) in &cat.metadata_chunks {
+            let comp_size: u64 = chunks.iter().map(|c| c.1).sum();
+            entries.push(RpfEntry {
+                source_rpf: audio_rpf.clone(),
+                rpf_name: rname.clone(),
+                name: name.clone(),
+                kind,
+                offset: *off,
+                comp_size,
+                raw_size: *raw_size,
+                tracks: 0,
+                chunks: chunks.clone(),
+            });
+        }
+    }
+    if !awc_indices.is_empty() && !cat.banks.is_empty() {
+        let awc_offs_tracks: Vec<(u64, u32)> = awc_indices
+            .iter()
+            .map(|&i| (entries[i].offset, entries[i].tracks))
+            .collect();
+        let resolved = dat::resolve_awc_names_from_catalog(&awc_offs_tracks, total_sz, &cat);
+        for (k, &entry_idx) in awc_indices.iter().enumerate() {
+            if let Some(Some(meta)) = resolved.get(k) {
+                entries[entry_idx].name = meta.name.clone();
+                if meta.exact_size > 0 {
+                    entries[entry_idx].comp_size = meta.exact_size;
+                    entries[entry_idx].raw_size = meta.exact_size;
+                }
+                meta_map.insert(entries[entry_idx].offset, meta.clone());
+            }
+        }
+    }
+    // A bank never extends into the next one or past EOF. This also repairs caches written
+    // by builds that applied oversized catalog sizes (reads would fail with UnexpectedEof).
+    let mut by_off: Vec<usize> = awc_indices.clone();
+    by_off.sort_unstable_by_key(|&i| entries[i].offset);
+    for (k, &i) in by_off.iter().enumerate() {
+        let end = by_off.get(k + 1).map_or(total_sz, |&j| entries[j].offset);
+        let room = end.saturating_sub(entries[i].offset);
+        if entries[i].comp_size > room {
+            entries[i].comp_size = room;
+            entries[i].raw_size = entries[i].raw_size.min(room);
+        }
+    }
+    meta_map
 }
 
 impl eframe::App for Rpf9App {
@@ -3882,11 +4140,20 @@ impl eframe::App for Rpf9App {
         }
         self.poll_bink_player(ctx);
         self.poll_sgd5_cache();
+        if let Some(pick) = self.lod_pick.take() {
+            self.apply_lod_pick(pick);
+        }
         let (media_loading, media_status) = {
             let mut m = self.media.lock().unwrap();
-            if let Some(mesh) = m.loaded_mesh.take() {
+            if let Some(mut mesh) = m.loaded_mesh.take() {
                 self.textures.clear();
                 self.tex_handle = None;
+                if let Some([yaw, pitch, zoom, pan_x, pan_y]) = self.lod_keep_cam.take() {
+                    (mesh.yaw, mesh.pitch, mesh.zoom, mesh.pan_x, mesh.pan_y) = (yaw, pitch, zoom, pan_x, pan_y);
+                }
+                if let Some((lbl, _)) = self.lod_siblings.iter().find(|(_, i)| Some(*i) == self.selected) {
+                    mesh.lod_label = format!("{lbl} detail file · {}", mesh.lod_label);
+                }
                 self.mesh3d = Some(mesh);
                 self.show_3d = true;
             }
@@ -3900,9 +4167,14 @@ impl eframe::App for Rpf9App {
             }
             if let Some((tracks, awc_bytes)) = m.loaded_tracks.take() {
                 self.audio_player.set_tracks(tracks, awc_bytes);
+                self.audio_player.bank_ctx = m.loaded_bank_ctx.take();
             }
             (m.loading, m.status.clone())
         };
+        if let Some(q) = self.audio_player.requested_search.take() {
+            self.category = Category::Audio;
+            self.filter = q;
+        }
 
         egui::TopBottomPanel::top("top").frame(egui::Frame::new().fill(Color32::from_rgb(24, 14, 36)).inner_margin(10.0)).show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -4137,12 +4409,26 @@ impl eframe::App for Rpf9App {
                 });
                 ui.add_space(4.0);
             }
+            if self.category == Category::Audio {
+                ui.horizontal(|ui| {
+                    let btn = egui::Button::new(
+                        RichText::new(if self.audio_named { "Audio Names: ON" } else { "Audio Names: OFF (Raw)" })
+                            .strong()
+                            .color(if self.audio_named { Color32::BLACK } else { Color32::from_rgb(255, 72, 165) }),
+                    )
+                    .fill(if self.audio_named { Color32::from_rgb(90, 235, 165) } else { Color32::from_rgb(38, 24, 56) });
+                    if ui.add(btn).clicked() {
+                        self.audio_named = !self.audio_named;
+                    }
+                });
+                ui.add_space(4.0);
+            }
             self.refresh_view();
             // Thumbnails make sense for the Textures category and for an opened .ttpf.
             let texture_view = self.category == Category::Textures
                 || self.target_path.as_deref().is_some_and(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("ttpf")));
             // list keyboard navigation (upstream); the grid handles its own arrow keys
-            if !(texture_view && self.grid_view) && !ctx.wants_keyboard_input() && !self.view.is_empty() && self.audio_player.tracks.is_empty() {
+            if !(texture_view && self.grid_view) && !ctx.wants_keyboard_input() && !self.view.is_empty() {
                 let cur_pos = self.selected.and_then(|sel| self.view.iter().position(|&i| i == sel));
                 let allow_wasd = !self.show_3d;
                 let step_to: Option<usize> = ctx.input(|i| {
@@ -4240,10 +4526,11 @@ impl eframe::App for Rpf9App {
                         ui.set_height(ROW_H);
                         ui.label(RichText::new(format!("{:<4}", e.kind)).strong().size(11.5).color(kind_color(e.kind)));
                         let sz_s = format_size(e.raw_size);
+                        let dname = display_entry_name(e, self.audio_named);
                         let label = if self.is_folder {
-                            format!("{} / {}  ({})", e.rpf_name, e.name, sz_s)
+                            format!("{} / {}  ({})", e.rpf_name, dname, sz_s)
                         } else {
-                            format!("{}  ({})", e.name, sz_s)
+                            format!("{}  ({})", dname, sz_s)
                         };
                         let is_sel = self.selected == Some(*idx);
                         let resp = ui.selectable_label(is_sel, RichText::new(label).size(12.5));
@@ -4371,11 +4658,34 @@ impl eframe::App for Rpf9App {
                         });
                     });
                 }
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Channels:").size(11.0).color(Color32::from_rgb(150, 145, 175)));
+                    for (ch, lbl) in tex::TexChannel::ALL {
+                        if ui.selectable_label(self.tex_channel == ch, lbl).clicked() {
+                            self.tex_channel = ch;
+                        }
+                    }
+                    ui.separator();
+                    ui.checkbox(&mut self.tex_rebuild_z, "Normal map: rebuild blue").on_hover_text(
+                        "Normal maps that store only X/Y in red/green look olive. This recomputes Z into blue. \
+                         BC5 normal maps already get it.",
+                    );
+                });
                 ui.separator();
-                let need_upload = self.tex_handle.as_ref().map(|(idx, _)| *idx != self.tex_sel).unwrap_or(true);
+                let view_key = (self.tex_channel, self.tex_rebuild_z);
+                let need_upload = self.tex_view_key != view_key
+                    || self.tex_handle.as_ref().map(|(idx, _)| *idx != self.tex_sel).unwrap_or(true);
                 if need_upload {
+                    self.tex_view_key = view_key;
                     let cur = &self.textures[self.tex_sel];
-                    let ci = ColorImage { size: [cur.w, cur.h], pixels: cur.pixels.clone() };
+                    let pixels = if view_key == (tex::TexChannel::Rgba, false) {
+                        cur.pixels.clone()
+                    } else if let Some(raw) = tex::decode_linear_straight_rgba(&cur.raw_dds_payload, cur.w, cur.h, cur.dxgi) {
+                        tex::channel_view(raw, view_key.0, view_key.1)
+                    } else {
+                        tex::channel_view(cur.pixels.iter().map(|p| p.to_srgba_unmultiplied()), view_key.0, view_key.1)
+                    };
+                    let ci = ColorImage { size: [cur.w, cur.h], pixels };
                     let h = ctx.load_texture(format!("app_tex_{}", self.tex_sel), ci, TextureOptions::LINEAR);
                     self.tex_handle = Some((self.tex_sel, h));
                 }
@@ -4405,6 +4715,8 @@ impl eframe::App for Rpf9App {
                             mesh.verts = next.verts;
                             mesh.dirty = true;
                         }
+                    } else if let Some(pick) = lod_switch_ui(ui, mesh, &self.lod_siblings, self.selected) {
+                        self.lod_pick = Some(pick);
                     }
                 });
                 if self.anim_dur > 0.0 && self.anim_playing && toggle_3d {
@@ -4484,6 +4796,91 @@ impl eframe::App for Rpf9App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Names AWC banks from audio.rpf's DAT catalog using entries from an existing scan cache.
+    /// Gate: PERCYSTAR_AUDIT_CACHE=<scan_cache_vN.tsv> and PERCYSTAR_AUDIO_RPF=<audio.rpf>.
+    #[test]
+    fn audio_rpf_banks_get_catalog_names() {
+        let (Some(cache), Some(audio)) = (std::env::var_os("PERCYSTAR_AUDIT_CACHE"), std::env::var_os("PERCYSTAR_AUDIO_RPF")) else { return };
+        let audio = PathBuf::from(audio);
+        let Some(mut entries) = load_disk_cache_from(Path::new(&cache))
+            .into_iter()
+            .find(|(k, _)| k.starts_with(&format!("{}|", audio.display())))
+            .map(|(_, v)| v)
+        else { return };
+        let awc = entries.iter().filter(|e| e.kind == "AWC").count();
+        let size = fs::metadata(&audio).unwrap().len();
+        let meta = enrich_audio_rpf_entries(&audio, size, &mut entries);
+        let dat = entries.iter().filter(|e| e.kind == "DAT").count();
+        let mut offs: Vec<(u64, u64)> = entries.iter().filter(|e| e.kind == "AWC").map(|e| (e.offset, e.comp_size)).collect();
+        offs.sort_unstable();
+        let overrun = offs.windows(2).filter(|w| w[0].0 + w[0].1 > w[1].0).count()
+            + offs.last().map_or(0, |&(o, c)| usize::from(o + c > size));
+        assert_eq!(overrun, 0, "catalog sizes must not run into the next bank or past EOF");
+        assert!(entries.iter().all(|e| e.kind != "AWC" || !e.name.contains(['/', '\\', ':'])));
+        eprintln!("awc={awc} named={} dat={dat}", meta.len());
+        for e in entries.iter().filter(|e| e.kind == "AWC").take(6) {
+            eprintln!("  {} @ {:#x} size {}", e.name, e.offset, e.comp_size);
+        }
+        assert!(dat > 0 && meta.len() * 2 > awc, "catalog should name most banks");
+        // Renamed banks use the catalog's exact size; they must still decode at least as well.
+        let before: HashMap<u64, RpfEntry> = load_disk_cache_from(Path::new(&cache))
+            .into_values()
+            .flatten()
+            .filter(|e| e.source_rpf == audio && e.kind == "AWC")
+            .map(|e| (e.offset, e))
+            .collect();
+        let (mut worse, mut checked) = (0, 0);
+        for e in entries.iter().filter(|e| e.kind == "AWC" && meta.contains_key(&e.offset)).step_by(97).take(40) {
+            let Some(old) = before.get(&e.offset) else { continue };
+            let n = |x: &RpfEntry| read_entry_bytes(x).map(|b| awc::decode_awc_bytes_in_memory(&b, "t", |_, _| {}).tracks.len()).unwrap_or(0);
+            let (a, b) = (n(old), n(e));
+            checked += 1;
+            if b < a {
+                worse += 1;
+                eprintln!("  fewer tracks: {} {a} -> {b}", e.name);
+            }
+        }
+        eprintln!("checked={checked} worse={worse}");
+        assert!(checked > 0 && worse == 0);
+        // Banks whose size had to be capped must now read and decode.
+        for e in entries.iter().filter(|e| e.kind == "AWC" && before.get(&e.offset).is_some_and(|o| o.comp_size > e.comp_size)) {
+            let tracks = read_entry_bytes(e).map(|b| awc::decode_awc_bytes_in_memory(&b, "t", |_, _| {}).tracks.len());
+            eprintln!("  capped {} -> {:?} tracks", e.name, tracks);
+            assert!(tracks.is_ok_and(|n| n > 0), "{}", e.name);
+        }
+    }
+
+    #[test]
+    fn raw_audio_names_only_shorten_generated_names() {
+        let e = |name: &str| RpfEntry {
+            source_rpf: PathBuf::new(),
+            rpf_name: String::new(),
+            name: name.into(),
+            kind: "AWC",
+            offset: 0,
+            comp_size: 0,
+            raw_size: 0,
+            tracks: 0,
+            chunks: Vec::new(),
+        };
+        assert_eq!(display_entry_name(&e("sound_0001_Ambience_Nature_6st.awc"), false), "sound_0001_6st.awc");
+        // non-ASCII at the old fixed byte cut used to panic
+        for n in ["sound_abcé_1st.awc", "sound_x_é_y.awc", "sound_0001_a_b.wav"] {
+            assert_eq!(display_entry_name(&e(n), false), n);
+        }
+    }
+
+    #[test]
+    fn lod_sibling_names_cover_hi_mid_and_base() {
+        let want = ["a_b_bonnet_01_hi.#ft".to_string(), "a_b_bonnet_01_mid.#ft".into(), "a_b_bonnet_01.#ft".into()];
+        for n in ["a_b_bonnet_01_hi.#ft", "a_b_bonnet_01_mid.#ft", "a_b_bonnet_01.#ft", "A_B_BONNET_01_HI.#ft"] {
+            let got = lod_sibling_names(n).unwrap();
+            assert!(got.iter().zip(&want).all(|(g, w)| g.eq_ignore_ascii_case(w)), "{n}: {got:?}");
+        }
+        assert!(lod_sibling_names("noext").is_none());
+        assert!(lod_sibling_names("_hi.#ft").is_none());
+    }
 
     #[test]
     fn model_viewer_categories_classify_correctly() {
@@ -5155,6 +5552,33 @@ fn main() -> eframe::Result<()> {
     }
     if args.len() >= 3 && args[1] == "--probe-maps" {
         mapdata::probe_maps_cli(&PathBuf::from(&args[2]));
+        return Ok(());
+    }
+    if args.len() >= 3 && args[1] == "--export-psin" {
+        let tsv = args.iter().any(|a| a == "--tsv");
+        match fs::read(&args[2]) {
+            Ok(data) => match psin::parse_psin_doc(&data) {
+                Ok(doc) => print!("{}", doc.export_placements_csv(None, tsv)),
+                Err(e) => eprintln!("PSIN error: {e}"),
+            },
+            Err(e) => eprintln!("Read error: {e}"),
+        }
+        return Ok(());
+    }
+    if args.len() >= 4 && args[1] == "--decode-bk2" {
+        let bk2 = PathBuf::from(&args[2]);
+        let out_dir = PathBuf::from(&args[3]);
+        let max_f = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(30);
+        // Load the decoder only from an explicit path or next to our own exe, never from
+        // the video's folder (a DLL planted beside a clip would run as our code).
+        let dll = std::env::var_os("BINK2_DLL")
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("bink2w64.dll"))))
+            .unwrap_or_else(|| PathBuf::from("bink2w64.dll"));
+        match bink2::decode_bk2_to_pngs(&dll, &bk2, &out_dir, max_f) {
+            Ok((info, n)) => println!("Decoded {n} frames ({}x{}) to {}", info.width, info.height, out_dir.display()),
+            Err(e) => eprintln!("BK2 decode error: {e}"),
+        }
         return Ok(());
     }
     if args.len() >= 3 && args[1] == "--inspect-exe" {

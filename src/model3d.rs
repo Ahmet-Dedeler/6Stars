@@ -99,6 +99,9 @@ pub struct Mesh3D {
     pub meshlet_count: usize,
     pub bone_count: usize,
     pub lod_label: String,
+    /// Decoded LOD level and geometry count per level (all zero without a LOD table).
+    pub lod: usize,
+    pub lod_geoms: [usize; MAX_LODS],
     /// Separate drawables (dictionary entries); empty for single-drawable meshes.
     pub parts: Vec<MeshPart>,
     /// `None` = show every part (grid layout), `Some(i)` = isolate `parts[i]`.
@@ -202,6 +205,8 @@ impl Mesh3D {
             meshlet_count,
             bone_count: 0,
             lod_label,
+            lod: 0,
+            lod_geoms: [0; MAX_LODS],
             parts: Vec::new(),
             active_part: None,
             yaw: DEFAULT_YAW,
@@ -689,12 +694,17 @@ fn resolve_meshlet_buffer(v: &[u8], link_ptr: u64) -> Option<(usize, usize)> {
 /// One meshlet geometry: (vertex buffer phys offset, vertex buffer bytes, meshlet buffer phys offset, meshlet buffer bytes).
 type GeomRef = (usize, usize, usize, usize);
 
-/// LOD0 (high detail) meshlet geometries of the drawable at `base`.
-fn drawable_lod0_geoms(v: &[u8], base: usize) -> Vec<GeomRef> {
+/// Drawables keep four LOD slots (high, medium, low, very low) at +0x50/+0x58/+0x60/+0x68.
+/// LOD selection ported from asm512's PercyStar fork (rpatty-dev/PercyStar#19).
+pub const MAX_LODS: usize = 4;
+pub const LOD_NAMES: [&str; MAX_LODS] = ["LOD0", "LOD1", "LOD2", "LOD3"];
+
+/// Meshlet geometries of one LOD level (0 = high detail) of the drawable at `base`.
+fn drawable_lod_geoms(v: &[u8], base: usize, lod: usize) -> Vec<GeomRef> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    if base + 0x80 > v.len() { return out; }
-    let Some(lod0_off) = vptr(ru64(v, base + 0x50)) else { return out };
+    if lod >= MAX_LODS || base + 0x80 > v.len() { return out; }
+    let Some(lod0_off) = vptr(ru64(v, base + 0x50 + lod * 8)) else { return out };
     if lod0_off + 0x10 > v.len() { return out; }
     let Some(models_off) = vptr(ru64(v, lod0_off)) else { return out };
     let model_cnt = ru16(v, lod0_off + 8) as usize;
@@ -743,7 +753,7 @@ fn collect_all_geoms(v: &[u8]) -> Vec<GeomRef> {
 
 pub fn model_detail_score(file: &mut File, offset: u64) -> Option<usize> {
     let (v, _, _) = read_virtual_from_file(file, offset).ok()?;
-    let mut geoms = drawable_lod0_geoms(&v, 0);
+    let mut geoms = drawable_lod_geoms(&v, 0, 0);
     if geoms.is_empty() {
         geoms = collect_all_geoms(&v);
     }
@@ -752,11 +762,11 @@ pub fn model_detail_score(file: &mut File, offset: u64) -> Option<usize> {
     (bytes > 0).then_some(bytes)
 }
 
-/// Maps each LOD0 `(vb_poff, mb_poff)` to its shader index and owning model's render mask.
-fn drawable_lod0_shader_map(v: &[u8], base: usize) -> HashMap<(usize, usize), (u16, u8)> {
+/// Maps each `(vb_poff, mb_poff)` of one LOD to its shader index and owning model's render mask.
+fn drawable_lod_shader_map(v: &[u8], base: usize, lod: usize) -> HashMap<(usize, usize), (u16, u8)> {
     let mut out = HashMap::new();
-    if base + 0x80 > v.len() { return out; }
-    let Some(lod0_off) = vptr(ru64(v, base + 0x50)) else { return out };
+    if lod >= MAX_LODS || base + 0x80 > v.len() { return out; }
+    let Some(lod0_off) = vptr(ru64(v, base + 0x50 + lod * 8)) else { return out };
     if lod0_off + 0x10 > v.len() { return out; }
     let Some(models_off) = vptr(ru64(v, lod0_off)) else { return out };
     let model_cnt = ru16(v, lod0_off + 8) as usize;
@@ -926,6 +936,7 @@ fn resolve_drawable_materials(
     v: &[u8],
     p: &[u8],
     base: usize,
+    lod: usize,
     geoms: &[GeomRef],
     ttpf_idx: Option<&HashMap<u64, crate::tex::TtpfHashHit>>,
     is_vehicle: bool,
@@ -943,7 +954,7 @@ fn resolve_drawable_materials(
         .flat_map(|txd| crate::tex::extract_txd_textures_by_ptr(v, p, txd))
         .map(|(ptr, tex)| (ptr, (tex.dxgi, Arc::new(crate::tex::to_model_tex(tex)))))
         .collect();
-    let smap = drawable_lod0_shader_map(v, base);
+    let smap = drawable_lod_shader_map(v, base, lod);
     let has_main_pass = smap.values().any(|&(_, mask)| mask & 1 != 0);
     let mut shader_cache: HashMap<u16, GeomMaterial> = HashMap::new();
 
@@ -1264,6 +1275,11 @@ fn extract_rage9_bone_count(v: &[u8]) -> usize {
 }
 
 pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name: &str) -> Result<Mesh3D, String> {
+    decode_rage9_model_from_rpf_lod(rpf_path, file_off, fallback_name, 0)
+}
+
+/// Decodes one LOD level (0 = high .. 3 = very low); falls back to the nearest populated level.
+pub fn decode_rage9_model_from_rpf_lod(rpf_path: &Path, file_off: u64, fallback_name: &str, want_lod: usize) -> Result<Mesh3D, String> {
     let mut f = File::open(rpf_path).map_err(|e| format!("Open error: {e}"))?;
     let (v, mut next_off, p_cnt) = read_virtual_from_file(&mut f, file_off)?;
 
@@ -1284,16 +1300,9 @@ pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name
 
     // Each group becomes one MeshPart: dictionary entries, or the single drawable.
     let dict = drawable_dictionary_entries(&v);
-    // (part name, drawable offset for material lookup, LOD0 geometries)
-    type Group = (String, Option<usize>, Vec<GeomRef>);
-    let (groups, lod_label): (Vec<Group>, String) = if !dict.is_empty() {
-        let g: Vec<_> = dict
-            .iter()
-            .map(|(nm, base)| (nm.clone(), Some(*base), drawable_lod0_geoms(&v, *base)))
-            .filter(|(_, _, gs)| !gs.is_empty())
-            .collect();
-        let label = format!("LOD0 · dictionary of {}", dict.len());
-        (g, label)
+    // Drawable bases that carry LOD tables.
+    let lod_bases: Vec<(String, usize)> = if !dict.is_empty() {
+        dict.clone()
     } else {
         // A dictionary holding a single drawable (ped heads, eyes, animal parts) keeps
         // its shader group on that drawable, not at the root, so try it first.
@@ -1304,15 +1313,35 @@ pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name
                 if fo + 0x80 <= v.len() { bases.push(fo); }
             }
         }
-        let lod0_with_base = bases
+        bases
             .into_iter()
-            .map(|b| (b, drawable_lod0_geoms(&v, b)))
-            .find(|(_, gs)| !gs.is_empty());
-        if let Some((b_off, lod0)) = lod0_with_base {
-            (vec![(model_name.clone(), Some(b_off), lod0)], "LOD0".into())
+            .find(|&b| (0..MAX_LODS).any(|l| !drawable_lod_geoms(&v, b, l).is_empty()))
+            .map(|b| vec![(model_name.clone(), b)])
+            .unwrap_or_default()
+    };
+    let mut lod_geoms = [0usize; MAX_LODS];
+    for (l, slot) in lod_geoms.iter_mut().enumerate() {
+        *slot = lod_bases.iter().map(|(_, b)| drawable_lod_geoms(&v, *b, l).len()).sum();
+    }
+    // The requested level, else the nearest more detailed one, else any populated one.
+    let want_lod = want_lod.min(MAX_LODS - 1);
+    let lod = (0..=want_lod).rev().chain(want_lod + 1..MAX_LODS).find(|&l| lod_geoms[l] > 0).unwrap_or(0);
+    // (part name, drawable offset for material lookup, geometries of the chosen LOD)
+    type Group = (String, Option<usize>, Vec<GeomRef>);
+    let (groups, lod_label): (Vec<Group>, String) = if lod_geoms[lod] > 0 {
+        let g: Vec<_> = lod_bases
+            .iter()
+            .map(|(nm, base)| (nm.clone(), Some(*base), drawable_lod_geoms(&v, *base, lod)))
+            .filter(|(_, _, gs)| !gs.is_empty())
+            .collect();
+        let label = if dict.is_empty() {
+            LOD_NAMES[lod].to_string()
         } else {
-            (vec![(model_name.clone(), None, collect_all_geoms(&v))], "All".into())
-        }
+            format!("{} · dictionary of {}", LOD_NAMES[lod], dict.len())
+        };
+        (g, label)
+    } else {
+        (vec![(model_name.clone(), None, collect_all_geoms(&v))], "All".into())
     };
     let geom_count: usize = groups.iter().map(|(_, _, g)| g.len()).sum();
     if geom_count == 0 {
@@ -1329,7 +1358,7 @@ pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name
     let mut gi_idx = 0u16;
     for (name, base_opt, geoms) in &groups {
         let mats = if let Some(base) = *base_opt {
-            resolve_drawable_materials(&v, &p, base, geoms, ttpf_idx.as_deref(), is_vehicle, &mut streamed)
+            resolve_drawable_materials(&v, &p, base, lod, geoms, ttpf_idx.as_deref(), is_vehicle, &mut streamed)
         } else {
             vec![GeomMaterial::default(); geoms.len()]
         };
@@ -1378,6 +1407,8 @@ pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name
     mesh.geom_materials = geom_materials;
     mesh.has_paint_geom = paint_geoms > 0;
     mesh.bone_count = extract_rage9_bone_count(&v);
+    mesh.lod = lod;
+    mesh.lod_geoms = lod_geoms;
     if parts.len() > 1 {
         mesh.parts = parts;
     }
@@ -2117,6 +2148,66 @@ mod tests {
 #[cfg(test)]
 mod dictionary_decode_tests {
     use super::*;
+
+    /// Props keep several LOD levels in one file; each decodes and detail never increases
+    /// (test from asm512's fork, rpatty-dev/PercyStar#19).
+    #[test]
+    fn in_file_lod_levels_decode() {
+        let Ok(rpf) = std::env::var("PERCYSTAR_LEVELS_RPF") else { return };
+        let Some(root) = Path::new(&rpf).parent() else { return };
+        let pack = root.join("pack").join("shared_minigame000").join("shared_minigame000.rpf");
+        if !pack.exists() {
+            return;
+        }
+        for (tag, off, want) in [
+            ("td_resi_wall_windows_b_3", 798_629_904u64, [6usize, 6, 6, 5]),
+            ("a_td_resdoor_double_l", 800_751_632u64, [8, 8, 8, 5]),
+        ] {
+            let base = decode_rage9_model_from_rpf(&pack, off, tag).expect("decode lod0");
+            assert_eq!(base.lod, 0);
+            assert_eq!(base.lod_geoms, want, "{tag} lod table");
+            let mut prev_tris = base.tris.len();
+            for l in 1..MAX_LODS {
+                let m = decode_rage9_model_from_rpf_lod(&pack, off, tag, l).expect("decode lod");
+                eprintln!("[{tag}] {} geoms={} tris={}", m.lod_label, m.geom_count, m.tris.len());
+                assert_eq!((m.lod, m.geom_count), (l, want[l]));
+                assert!(!m.tris.is_empty() && m.tris.len() <= prev_tris, "{tag} lod{l} gained triangles");
+                prev_tris = m.tris.len();
+            }
+            assert!(prev_tris < base.tris.len(), "{tag} lowest lod should be lighter than lod0");
+        }
+    }
+
+    /// Vehicles split detail across `_hi`, `_mid` and base files; the mid file adds a second level.
+    #[test]
+    fn vehicle_detail_files_decode() {
+        let Ok(rpf) = std::env::var("PERCYSTAR_LEVELS_RPF") else { return };
+        if !Path::new(&rpf).exists() {
+            return;
+        }
+        let mut prev_tris = usize::MAX;
+        for (tag, off, want) in [
+            ("cheetah2_hi", 74_053_521_424u64, [35usize, 0, 0, 0]),
+            ("cheetah2_mid", 74_058_629_136u64, [34, 30, 0, 0]),
+            ("cheetah2", 74_051_276_816u64, [3, 0, 0, 0]),
+        ] {
+            let m = decode_rage9_model_from_rpf(Path::new(&rpf), off, tag).expect("decode vehicle");
+            assert_eq!(m.lod_geoms, want, "{tag} lod table");
+            assert!(m.tris.len() < prev_tris, "{tag} should be lighter than the file above");
+            prev_tris = m.tris.len();
+            // a missing level falls back to the nearest populated one
+            let last = want.iter().rposition(|&n| n > 0).unwrap();
+            let low = decode_rage9_model_from_rpf_lod(Path::new(&rpf), off, tag, 3).expect("fallback");
+            eprintln!("[{tag}] lod0 tris={} lowest {} tris={}", m.tris.len(), low.lod_label, low.tris.len());
+            assert_eq!(low.lod, last);
+            if last > 0 {
+                assert!(low.tris.len() < m.tris.len(), "{tag} lower level should be lighter");
+                prev_tris = low.tris.len();
+            } else {
+                assert_eq!(low.tris.len(), m.tris.len());
+            }
+        }
+    }
 
     #[test]
     fn glass_props_blend_without_filling_the_depth_buffer() {

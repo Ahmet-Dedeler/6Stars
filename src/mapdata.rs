@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 pub const ENTITY_STRUCT_HASH: u32 = 0xce50_1483;
 pub const MAPDATA_STRUCT_HASH: u32 = 0xd359_3fa6;
+pub const ARCHETYPE_DEF_HASH: u32 = 0x82d6_fc83;
 
 #[derive(Clone, Copy, Debug)]
 pub struct EntityPlacement {
@@ -108,11 +109,71 @@ pub fn parse_0drpz_map_entities(sys: &[u8]) -> Option<Vec<EntityPlacement>> {
     }
 }
 
+pub fn parse_0drpz_archetype_aliases(sys: &[u8]) -> Vec<(u32, u32)> {
+    if sys.len() < 0x50 || sys.get(0x10..0x15) != Some(b"0DRPz") {
+        return Vec::new();
+    }
+    let nbl = ru16(sys, 0x4C) as usize;
+    let Some(it) = vptr(ru64(sys, 0x38)) else { return Vec::new() };
+    if it + nbl * 16 > sys.len() {
+        return Vec::new();
+    }
+    let mut aliases = Vec::new();
+    for i in 0..nbl {
+        let o = it + i * 16;
+        let hash = ru32(sys, o);
+        let sz = ru32(sys, o + 4) as usize;
+        if hash != ARCHETYPE_DEF_HASH || sz < 0x90 {
+            continue;
+        }
+        let Some(base) = vptr(ru64(sys, o + 8)) else { continue };
+        let end = base.saturating_add(sz).min(sys.len());
+        let mut cur = base;
+        while cur + 0x90 <= end {
+            let arch = ru32(sys, cur + 0x74);
+            let draw = ru32(sys, cur + 0x7C);
+            let asset = ru32(sys, cur + 0x88);
+            if arch != 0 && draw != 0 && draw != arch {
+                aliases.push((arch, draw));
+            }
+            if arch != 0 && asset != 0 && asset != arch {
+                aliases.push((arch, asset));
+            }
+            cur += 0x90;
+        }
+    }
+    aliases
+}
+
+/// Adds model offsets the Explorer's folder scan found to the world index. Reads the
+/// current scan cache in our data folder (upstream read `%LOCALAPPDATA%\PercyStar\
+/// scan_cache_v9.tsv`, which is stale for Percy6Stars and absent on macOS).
+fn merge_scan_cache_models(ix: &mut WorldIndex) {
+    let Some(tsv) = crate::cache_file_path() else { return };
+    let Ok(f) = File::open(tsv) else { return };
+    use std::io::BufRead;
+    let r = BufReader::new(f);
+    for line in r.lines().map_while(Result::ok) {
+        if !line.contains("\tlevels.rpf\t") {
+            continue;
+        }
+        let mut cols = line.split('\t');
+        let (_k, _p, _rpf, Some(name), Some(kind), Some(off_s)) = (
+            cols.next(), cols.next(), cols.next(), cols.next(), cols.next(), cols.next()
+        ) else { continue };
+        if kind != "MODEL" && kind != "VEH" {
+            continue;
+        }
+        let Ok(off) = off_s.parse::<u64>() else { continue };
+        let stem = name.split(".#").next().unwrap_or(name);
+        ix.models.entry(joaat(stem)).or_insert(off);
+    }
+}
+
+/// v2: lives in our data folder, and is rebuilt once so archetype aliases resolve
+/// against scan-cache models too (v1 files predate the aliases).
 fn cache_path() -> Option<PathBuf> {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    Some(base.join("PercyStar").join("world_index_v1.bin"))
+    crate::app_data_dir().map(|d| d.join("world_index_v2.bin"))
 }
 
 fn save_world_index(path: &Path, rpf_len: u64, ix: &WorldIndex) {
@@ -172,67 +233,118 @@ fn load_world_index(path: &Path, rpf_len: u64) -> Option<WorldIndex> {
 }
 
 pub fn build_or_load_world_index(levels_rpf: &Path) -> WorldIndex {
-    let Ok(mut f) = File::open(levels_rpf) else { return WorldIndex::default() };
+    let Ok(f) = File::open(levels_rpf) else { return WorldIndex::default() };
     let sz = f.metadata().map(|m| m.len()).unwrap_or(0);
     if let Some(cp) = cache_path() {
-        if let Some(ix) = load_world_index(&cp, sz) {
+        if let Some(mut ix) = load_world_index(&cp, sz) {
+            merge_scan_cache_models(&mut ix);
             return ix;
         }
     }
 
-    let mut ix = WorldIndex::default();
-    let chunk_sz = 64 * 1024 * 1024usize;
-    let mut buf = vec![0u8; chunk_sz];
-    let mut off = 0u64;
-    let mut dec = Decompress::new(true);
-    let mut out = vec![0u8; 32768];
-    let mut f_res = File::open(levels_rpf).unwrap();
+    let chunk_sz = 64 * 1024 * 1024u64;
+    let next_off = std::sync::atomic::AtomicU64::new(0);
+    let done_bytes = std::sync::atomic::AtomicU64::new(0);
+    let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).clamp(2, 12);
 
-    while off < sz {
-        let _ = f.seek(SeekFrom::Start(off));
-        let mut read_n = 0usize;
-        while read_n < chunk_sz {
-            match f.read(&mut buf[read_n..]) {
-                Ok(0) => break,
-                Ok(n) => read_n += n,
-                Err(_) => break,
-            }
-        }
-        if read_n < 64 {
-            break;
-        }
-        let mut pos = 0usize;
-        while pos + 0x20 <= read_n {
-            let p = pos + 0x10;
-            if is_zlib(&buf[p..]) {
-                dec.reset(true);
-                let _ = dec.decompress(&buf[p..(p + 32768).min(read_n)], &mut out, FlushDecompress::None);
-                let olen = dec.total_out() as usize;
-                if olen >= 0x80 {
-                    let vft = ru64(&out, 0);
-                    let bmap = ru64(&out, 8);
-                    if vft == 0 && (0x5000_0000..0x5800_0000).contains(&bmap) {
-                        let abs_off = off + p as u64;
-                        if out.get(0x10..0x15) == Some(b"0DRPz") {
-                            if let Ok((sys, _, _)) = read_virtual_from_file(&mut f_res, abs_off) {
-                                if let Some(ents) = parse_0drpz_map_entities(&sys) {
-                                    ix.map_count += 1;
-                                    ix.entities.extend(ents);
-                                }
-                            }
-                        } else if has_rage9_meshlets(&out[..olen]) {
-                            if let Some((nm, ext)) = extract_rage9_model_name(&out[..olen]) {
-                                let stem = nm.strip_suffix(ext).unwrap_or(&nm);
-                                ix.models.entry(joaat(stem)).or_insert(abs_off);
-                            }
+    let mut ix = std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(n_threads);
+        for tid in 0..n_threads {
+            let next_off = &next_off;
+            let done_bytes = &done_bytes;
+            handles.push(s.spawn(move || {
+                let mut local = WorldIndex::default();
+                let mut local_aliases: Vec<(u32, u32)> = Vec::new();
+                let Ok(mut f_scan) = File::open(levels_rpf) else { return (local, local_aliases) };
+                let Ok(mut f_res) = File::open(levels_rpf) else { return (local, local_aliases) };
+                let mut buf = vec![0u8; chunk_sz as usize];
+                let mut dec = Decompress::new(true);
+                let mut head = [0u8; 64];
+                let mut out = vec![0u8; 32768];
+                loop {
+                    let off = next_off.fetch_add(chunk_sz, std::sync::atomic::Ordering::Relaxed);
+                    if off >= sz {
+                        break;
+                    }
+                    if f_scan.seek(SeekFrom::Start(off)).is_err() {
+                        break;
+                    }
+                    let want = (sz - off).min(chunk_sz) as usize;
+                    let mut read_n = 0usize;
+                    while read_n < want {
+                        match f_scan.read(&mut buf[read_n..want]) {
+                            Ok(0) => break,
+                            Ok(n) => read_n += n,
+                            Err(_) => break,
                         }
                     }
+                    let mut pos = 0usize;
+                    while pos + 0x20 <= read_n {
+                        let p = pos + 0x10;
+                        if is_zlib(&buf[p..]) {
+                            dec.reset(true);
+                            let _ = dec.decompress(&buf[p..(p + 256).min(read_n)], &mut head, FlushDecompress::None);
+                            if dec.total_out() >= 0x20 {
+                                let vft = ru64(&head, 0);
+                                let bmap = ru64(&head, 8);
+                                if vft == 0 && (0x5000_0000..0x5800_0000).contains(&bmap) {
+                                    let abs_off = off + p as u64;
+                                    if head.get(0x10..0x15) == Some(b"0DRPz") {
+                                        if let Ok((sys, _, _)) = read_virtual_from_file(&mut f_res, abs_off) {
+                                            if let Some(ents) = parse_0drpz_map_entities(&sys) {
+                                                local.map_count += 1;
+                                                local.entities.extend(ents);
+                                            }
+                                            for (arch, draw) in parse_0drpz_archetype_aliases(&sys) {
+                                                local_aliases.push((arch, draw));
+                                            }
+                                        }
+                                    } else {
+                                        dec.reset(true);
+                                        let _ = dec.decompress(&buf[p..(p + 32768).min(read_n)], &mut out, FlushDecompress::None);
+                                        let olen = dec.total_out() as usize;
+                                        if olen >= 0x80 && has_rage9_meshlets(&out[..olen]) {
+                                            if let Some((nm, ext)) = extract_rage9_model_name(&out[..olen]) {
+                                                let stem = nm.strip_suffix(ext).unwrap_or(&nm);
+                                                local.models.entry(joaat(stem)).or_insert(abs_off);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        pos += 0x1000;
+                    }
+                    let done = done_bytes.fetch_add(read_n as u64, std::sync::atomic::Ordering::Relaxed) + read_n as u64;
+                    if tid == 0 {
+                        eprintln!("[world-index] {:.1} / {:.1} GB...", done as f64 / 1e9, sz as f64 / 1e9);
+                    }
                 }
-            }
-            pos += 0x1000;
+                (local, local_aliases)
+            }));
         }
-        off += read_n as u64;
-    }
+        let mut merged = WorldIndex::default();
+        let mut all_aliases = Vec::new();
+        for h in handles {
+            if let Ok((local, aliases)) = h.join() {
+                merged.map_count += local.map_count;
+                merged.entities.extend(local.entities);
+                for (k, v) in local.models {
+                    merged.models.entry(k).or_insert(v);
+                }
+                all_aliases.extend(aliases);
+            }
+        }
+        // Scan-cache models first, so an alias whose drawable only the folder scan found
+        // still resolves.
+        merge_scan_cache_models(&mut merged);
+        for (arch, draw) in all_aliases {
+            if let Some(&off) = merged.models.get(&draw) {
+                merged.models.entry(arch).or_insert(off);
+            }
+        }
+        merged
+    });
 
     if let Some(cp) = cache_path() {
         save_world_index(&cp, sz, &ix);
