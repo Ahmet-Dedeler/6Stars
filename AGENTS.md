@@ -20,8 +20,9 @@ If you're here to make a PR, start with [CONTRIBUTING.md](CONTRIBUTING.md). This
 - We support macOS (Apple Silicon first, universal build) and Windows x64.
 - Put platform code behind `#[cfg(target_os = "macos")]` or `#[cfg(windows)]`. Give the other OS a working path or a message that explains what's not supported, so people aren't left wondering if a button is broken.
 - For code changes, run both before opening a PR when possible. Docs and license notices don't need a Rust build.
-  - `cargo test --release`
-  - `cargo check --release --all-targets --target x86_64-pc-windows-msvc` (install with `rustup target add x86_64-pc-windows-msvc`)
+  - `cargo test` (debug, ~20 s once warm; `--release` re-runs fat LTO and takes ~10 min, so save it for the data-gated audits below)
+  - `cargo check --all-targets --target x86_64-pc-windows-msvc` (install with `rustup target add x86_64-pc-windows-msvc`)
+- Windows CI (`windows`) is a required check on `main`: it runs the tests on Windows and builds the package, without fat LTO. A red check blocks the merge, so fix it rather than bypassing it.
 - On Windows, release builds use the GUI subsystem (no console; CLI `--` modes call `AttachConsole`). Helpers need `CREATE_NO_WINDOW`, and paths can have spaces, Unicode, and apostrophes. PowerShell 5.1 needs TLS 1.2 forced, and scripts are run with `-ExecutionPolicy Bypass`.
 - On macOS, Finder opens files through `application:openURLs:` (`src/mac_open.rs`), not argv. For a new file type, also update `UTImportedTypeDeclarations` / `CFBundleDocumentTypes` in `scripts/build_macos.sh`.
 - If you don't have both platforms, say what you tested and what you couldn't run. Windows CI runs on PRs; don't describe a compile check as a runtime test.
