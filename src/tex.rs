@@ -924,9 +924,7 @@ pub fn decode_ttpf_texture(path: &Path, tex_idx: usize) -> Result<DecodedTexture
     })
 }
 
-/// Global 64-bit ETPF texture hash -> (ttpf archive path, descriptor index, w, h, dxgi) resolver.
-/// Each RDS5/ETPF archive stores `tex_count` 64-bit texture hashes immediately after the
-/// `tex_count * 16`-byte descriptor table, 1:1 indexed with the descriptors.
+// global 64 bit etpf texture hash to ttpf archive path and descriptor index resolver
 #[derive(Clone, Debug)]
 pub struct TtpfHashHit {
     pub path: std::path::PathBuf,
@@ -948,12 +946,12 @@ impl TtpfHashHit {
     }
 }
 
-/// Texture hash -> location, built once per game dump root (keyed by that root).
+// texture hash to location map built once per dump root
 type TtpfHashIndex = std::sync::Arc<HashMap<u64, TtpfHashHit>>;
 static TTPF_HASH_INDEX: std::sync::OnceLock<std::sync::Mutex<HashMap<std::path::PathBuf, TtpfHashIndex>>> =
     std::sync::OnceLock::new();
 
-/// Decoded external textures by hash (`None` = known undecodable); cleared past 512 entries.
+// decoded external textures cached by hash cleared past 512 entries
 type TtpfTexCache = HashMap<u64, Option<std::sync::Arc<Texture2D>>>;
 static TTPF_TEX_CACHE: std::sync::OnceLock<std::sync::Mutex<TtpfTexCache>> = std::sync::OnceLock::new();
 
@@ -1246,8 +1244,7 @@ pub fn inspect_gfx(data: &[u8]) -> String {
     out
 }
 
-/// Fast snippet extractor for naming `0DRPz` / standalone GTA VI text chunks in the archive list
-/// so users can Ctrl+F radio artists, weapons, vehicles, or dialogue directly in PercyStar.
+// fast snippet extractor for naming 0drpz and standalone text chunks across all 13 localizations
 pub fn probe_gxt_snippet(head: &[u8]) -> Option<String> {
     let is_0drpz = head.len() >= 24 && &head[16..21] == b"0DRPz";
     let start = if is_0drpz { 0x60.min(head.len()) } else { 0 };
@@ -1257,15 +1254,20 @@ pub fn probe_gxt_snippet(head: &[u8]) -> Option<String> {
         let Ok(s) = std::str::from_utf8(raw) else { continue };
         let s = s.trim();
         if s.len() < 4 || s == "0DRPz" { continue; }
-        let ok_chars = s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_' | '\'' | '.' | '!' | '?' | ',')).count();
-        let letters = s.chars().filter(|c| c.is_ascii_alphabetic()).count();
-        if ok_chars * 100 / s.chars().count().max(1) >= 92 && letters >= 3 {
+        let ok_chars = s.chars().filter(|c| c.is_alphanumeric() || !c.is_control()).count();
+        let letters = s.chars().filter(|c| c.is_alphabetic()).count();
+        if ok_chars * 100 / s.chars().count().max(1) >= 92 && letters >= 2 {
             good.push(s);
             if good.len() >= 2 { break; }
         }
     }
     if is_0drpz || good.len() >= 2 {
-        let slug: String = good.first().copied().unwrap_or("text")
+        let slug: String = good
+            .iter()
+            .find(|s| s.chars().any(|c| c.is_ascii_alphabetic()))
+            .or_else(|| good.first())
+            .copied()
+            .unwrap_or("text")
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .take(32)
@@ -1276,8 +1278,7 @@ pub fn probe_gxt_snippet(head: &[u8]) -> Option<String> {
     None
 }
 
-/// Extract clean readable UTF-8 strings from a GTA VI RAGE9 `0DRPz` localization/text table
-/// (or standalone null-terminated string pool chunk in `data.rpf`).
+// extract clean readable utf8 strings from a rage9 0drpz localization text table across all 13 languages
 pub fn decode_0drpz_text(data: &[u8]) -> Option<String> {
     let start = if data.len() >= 0x60 && &data[0x10..0x15] == b"0DRPz" { 0x60 } else { 0 };
     let end = if start == 0x60 {
@@ -1292,15 +1293,16 @@ pub fn decode_0drpz_text(data: &[u8]) -> Option<String> {
     };
     let mut lines = Vec::new();
     for raw in data[start..end].split(|&b| b == 0) {
-        if raw.len() < 3 || raw.len() > 2000 { continue; }
+        if raw.len() < 2 || raw.len() > 2000 { continue; }
         let Ok(s) = std::str::from_utf8(raw) else { continue };
         let s = s.trim();
-        if s.len() < 3 || s == "0DRPz" { continue; }
+        if s.chars().count() < 2 || s == "0DRPz" { continue; }
         let printable = s.chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t')).count();
         let letters = s.chars().filter(|c| c.is_alphabetic()).count();
-        if printable * 100 / s.chars().count().max(1) >= 96 && letters >= 2 {
-            // Skip tiny binary hash-table noise
-            if s.len() <= 5 && s.chars().any(|c| !c.is_alphanumeric()) && !s.starts_with('~') {
+        if printable * 100 / s.chars().count().max(1) >= 96 && letters >= 1 {
+            // skip tiny binary hash table noise while keeping short cjk and tag strings
+            let has_non_ascii_letter = s.chars().any(|c| !c.is_ascii() && c.is_alphabetic());
+            if !has_non_ascii_letter && s.len() <= 5 && s.chars().any(|c| !c.is_alphanumeric()) && !s.starts_with('~') {
                 continue;
             }
             lines.push(s.to_string());
@@ -1310,7 +1312,7 @@ pub fn decode_0drpz_text(data: &[u8]) -> Option<String> {
     if lines.len() < 3 {
         return None;
     }
-    let header = format!("=== GTA VI RAGE9 Text Table ({} strings) ===\n\n", lines.len());
+    let header = format!("=== RAGE9 Text Table ({} strings) ===\n\n", lines.len());
     Some(header + &lines.join("\n"))
 }
 // =============================================================================

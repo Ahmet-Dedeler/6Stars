@@ -642,11 +642,11 @@ struct Rpf9App {
     mv_view: Vec<usize>,
     mv_view_key: Option<(u64, ModelCat, String, bool)>,
     mv_rng: u64,
-    // list ordering shared by Explorer + Model Viewer; *_sort = order the cached view was built with
+    // list ordering shared by explorer and model viewer
     sort_mode: SortMode,
     view_sort: SortMode,
     mv_sort: SortMode,
-    // dedicated RDNA2 (GFX10.3) PS\x00\x09 Shader Disassembler & HLSL/SPIR-V Lifter tab
+    // dedicated rdna2 gfx103 ps09 shader disassembler and hlsl spirv lifter tab
     sh_cache: Option<Ps09Cache>,
     sh_status: String,
     sh_stage_filter: Option<ShaderStage>,
@@ -1601,34 +1601,42 @@ impl Rpf9App {
                 ui.separator();
 
                 const ROW_H: f32 = 22.0;
+                let mut copied_msg: Option<String> = None;
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                 egui::ScrollArea::vertical()
                     .id_salt("mv_list_scroll")
                     .auto_shrink([false, false])
                     .show_rows(ui, ROW_H, self.mv_view.len(), |ui, range| {
-                        let rows: Vec<(usize, ModelCat, String, String, u64)> = {
+                        let rows: Vec<(usize, ModelCat, RpfEntry)> = {
                             let st = self.state.lock().unwrap();
                             self.mv_view[range]
                                 .iter()
                                 .filter_map(|&mi| {
                                     let (eidx, cat, _) = &self.mv_entries[mi];
-                                    st.entries.get(*eidx).map(|e| (*eidx, *cat, e.name.clone(), e.rpf_name.clone(), e.raw_size))
+                                    st.entries.get(*eidx).map(|e| (*eidx, *cat, e.clone()))
                                 })
                                 .collect()
                         };
-                        for (eidx, cat, name, rpf_name, raw_size) in rows {
+                        for (eidx, cat, e) in &rows {
                             let w = ui.available_width();
-                            let (tag, col) = model_cat_tag(cat);
+                            let (tag, col) = model_cat_tag(*cat);
                             ui.allocate_ui_with_layout(egui::vec2(w, ROW_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                 ui.set_height(ROW_H);
                                 ui.label(RichText::new(tag).strong().size(10.5).color(col));
-                                let label = format!("{name}  ·  {rpf_name}  ·  {}", format_size(raw_size));
-                                if ui.selectable_label(self.selected == Some(eidx), RichText::new(label).size(12.0)).clicked() {
-                                    to_select = Some(eidx);
+                                let label = format!("{}  ·  {}  ·  {}", e.name, e.rpf_name, format_size(e.raw_size));
+                                let resp = ui.selectable_label(self.selected == Some(*eidx), RichText::new(label).size(12.0));
+                                if resp.clicked() {
+                                    to_select = Some(*eidx);
+                                }
+                                if let Some(msg) = entry_context_menu(&resp, e) {
+                                    copied_msg = Some(msg);
                                 }
                             });
                         }
                     });
+                if let Some(msg) = copied_msg {
+                    self.state.lock().unwrap().status = msg;
+                }
             });
 
         if let Some(i) = to_select {
@@ -2069,7 +2077,7 @@ fn app_data_dir() -> Option<PathBuf> {
 }
 
 fn cache_file_path() -> Option<PathBuf> {
-    // v9: scanner rejects metadata/mid-resource chunks that v8 listed as MODEL entries
+    // v9 scanner rejects metadata and mid resource chunks that v8 listed as model entries
     app_data_dir().map(|d| d.join("scan_cache_v9.tsv"))
 }
 
@@ -2221,19 +2229,48 @@ fn decode_awc_for_player(e: &RpfEntry, media: &Arc<Mutex<MediaState>>) {
 fn setup_style(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
     let mut font_dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(windir) = std::env::var("WINDIR") {
+        font_dirs.push(PathBuf::from(windir).join("Fonts"));
+    }
+    if cfg!(windows) {
+        font_dirs.push(PathBuf::from(r"C:\Windows\Fonts"));
+    }
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
         font_dirs.push(PathBuf::from(local).join(r"Microsoft\Windows\Fonts"));
     }
     if let Ok(home) = std::env::var("HOME") {
-        font_dirs.push(PathBuf::from(home).join("Library/Fonts"));
+        font_dirs.push(PathBuf::from(&home).join("Library/Fonts"));
+        font_dirs.push(PathBuf::from(home).join(".local/share/fonts"));
     }
     font_dirs.push(PathBuf::from("/Library/Fonts"));
-    'dirs: for base in font_dirs {
+    font_dirs.push(PathBuf::from("/System/Library/Fonts"));
+    font_dirs.push(PathBuf::from("/usr/share/fonts"));
+
+    'dirs: for base in &font_dirs {
         for name in ["SF-Pro-Display-Regular.otf", "SF-Pro-Display-Medium.otf", "SF-Pro-Display-Semibold.otf"] {
             if let Ok(bytes) = fs::read(base.join(name)) {
                 fonts.font_data.insert("sf_pro".into(), Arc::new(FontData::from_owned(bytes)));
                 fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "sf_pro".into());
                 break 'dirs;
+            }
+        }
+    }
+
+    // load system unicode cjk korean japanese cyrillic fallback fonts so all 13 localizations render cleanly
+    let fallbacks: &[(&str, &[&str])] = &[
+        ("fb_ui", &["segoeui.ttf", "arial.ttf", "SFNS.ttf", "DejaVuSans.ttf"]),
+        ("fb_cjk", &["msyh.ttc", "YuGothR.ttc", "msgothic.ttc", "simsun.ttc", "PingFang.ttc", "Hiragino Sans GB.ttc", "NotoSansCJK-Regular.ttc"]),
+        ("fb_kr", &["malgun.ttf", "AppleSDGothicNeo.ttc"]),
+    ];
+    for (key, candidates) in fallbacks {
+        'cand: for cand in *candidates {
+            for base in &font_dirs {
+                if let Ok(bytes) = fs::read(base.join(cand)) {
+                    fonts.font_data.insert((*key).into(), Arc::new(FontData::from_owned(bytes)));
+                    fonts.families.entry(FontFamily::Proportional).or_default().push((*key).into());
+                    fonts.families.entry(FontFamily::Monospace).or_default().push((*key).into());
+                    break 'cand;
+                }
             }
         }
     }
@@ -2332,7 +2369,7 @@ fn parse_psin(data: &[u8]) -> String {
     out
 }
 
-/// Result-list ordering. `Relevance` = scan order, or best name match first while searching.
+// result list ordering relevance is scan order or best name match first while searching
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SortMode {
     Relevance,
@@ -2354,7 +2391,7 @@ impl SortMode {
     }
 }
 
-/// Compact "Sort:" dropdown; lists pick up the change on their next refresh.
+// compact sort dropdown lists pick up the change on next refresh
 fn sort_combo(ui: &mut egui::Ui, id: &str, mode: &mut SortMode) {
     egui::ComboBox::from_id_salt(id)
         .selected_text(RichText::new(format!("Sort: {}", mode.label())).size(11.0))
@@ -2364,6 +2401,45 @@ fn sort_combo(ui: &mut egui::Ui, id: &str, mode: &mut SortMode) {
                 ui.selectable_value(mode, m, m.label());
             }
         });
+}
+
+// right click context menu on file rows to copy name archive path directory or hex offset
+fn entry_context_menu(resp: &egui::Response, e: &RpfEntry) -> Option<String> {
+    let mut copied = None;
+    resp.context_menu(|ui| {
+        if ui.button("Copy File Name").clicked() {
+            ui.ctx().copy_text(e.name.clone());
+            copied = Some(format!("Copied name: {}", e.name));
+            ui.close_menu();
+        }
+        let rel = format!("{} / {}", e.rpf_name, e.name);
+        if ui.button("Copy Archive / File Path").clicked() {
+            ui.ctx().copy_text(rel.clone());
+            copied = Some(format!("Copied: {rel}"));
+            ui.close_menu();
+        }
+        let full = e.source_rpf.display().to_string();
+        if ui.button("Copy Source Archive Path").clicked() {
+            ui.ctx().copy_text(full.clone());
+            copied = Some(format!("Copied archive path: {full}"));
+            ui.close_menu();
+        }
+        if let Some(dir) = e.source_rpf.parent() {
+            let dir_s = dir.display().to_string();
+            if ui.button("Copy Directory Path").clicked() {
+                ui.ctx().copy_text(dir_s.clone());
+                copied = Some(format!("Copied directory: {dir_s}"));
+                ui.close_menu();
+            }
+        }
+        let loc = format!("{} @ 0x{:08x} ({})", e.rpf_name, e.offset, e.name);
+        if ui.button("Copy Offset Location").clicked() {
+            ui.ctx().copy_text(loc.clone());
+            copied = Some(format!("Copied: {loc}"));
+            ui.close_menu();
+        }
+    });
+    copied
 }
 
 fn format_size(bytes: u64) -> String {
@@ -2456,8 +2532,7 @@ fn probe_rage9_page(
     if vft != 0 || !(0x5000_0000..0x5800_0000).contains(&bmap) || &probe_out[0x10..0x15] == b"0DRPz" {
         return None;
     }
-    // Reject mid-resource virtual chunks that start directly with a grmGeometry struct
-    // (vft == 0, +0x08 == 0x5002xxxx ptr, +0x60 == 0x1601 magic) — never a resource root.
+    // reject mid resource virtual chunks that start directly with a grmgeometry struct
     if u64::from_le_bytes(probe_out[0x60..0x68].try_into().ok()?) == 0x1601 {
         return None;
     }
@@ -2920,6 +2995,18 @@ impl eframe::App for Rpf9App {
                             self.export_entries(&[i]);
                         }
                     }
+                    if ui.button("Copy Path").on_hover_text("Copy selected file path (or right-click any row for more copy options)").clicked() {
+                        if let Some(i) = self.selected {
+                            let copied = {
+                                let st = self.state.lock().unwrap();
+                                st.entries.get(i).map(|e| format!("{} / {}", e.rpf_name, e.name))
+                            };
+                            if let Some(s) = copied {
+                                ui.ctx().copy_text(s.clone());
+                                self.state.lock().unwrap().status = format!("Copied: {s}");
+                            }
+                        }
+                    }
                     let r = ui.add(egui::TextEdit::singleline(&mut self.filter).desired_width(250.0).hint_text("Search (Ctrl+F) · words AND · -exclude"));
                     if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
                         r.request_focus();
@@ -3012,7 +3099,8 @@ impl eframe::App for Rpf9App {
                 });
             });
             let mut clicked = None;
-            // Rows MUST be exactly ROW_H tall or show_rows miscomputes the total height (blank space / jumpy scroll)
+            let mut copied_msg: Option<String> = None;
+            // rows must be exactly row_h tall or show_rows miscomputes total height
             const ROW_H: f32 = 20.0;
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
             egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, ROW_H, self.view.len(), |ui, range| {
@@ -3031,12 +3119,19 @@ impl eframe::App for Rpf9App {
                         } else {
                             format!("{}  ({})", e.name, sz_s)
                         };
-                        if ui.selectable_label(self.selected == Some(*idx), RichText::new(label).size(12.5)).clicked() {
+                        let resp = ui.selectable_label(self.selected == Some(*idx), RichText::new(label).size(12.5));
+                        if resp.clicked() {
                             clicked = Some(*idx);
+                        }
+                        if let Some(msg) = entry_context_menu(&resp, e) {
+                            copied_msg = Some(msg);
                         }
                     });
                 }
             });
+            if let Some(msg) = copied_msg {
+                self.state.lock().unwrap().status = msg;
+            }
             if let Some(i) = clicked {
                 self.select_entry(i);
             }
@@ -3330,7 +3425,7 @@ mod tests {
         let xml = decode_rbf0(&rbf).expect("RBF0 should decode");
         assert!(xml.contains("<Root id=\"42\" />"), "got: {xml}");
 
-        // Scaleform GFX inspector test
+        // scaleform gfx inspector test
         let mut gfx = Vec::new();
         gfx.extend_from_slice(b"GFX\x2a");
         gfx.extend_from_slice(&128u32.to_le_bytes());
@@ -3338,6 +3433,14 @@ mod tests {
         let dump = inspect_gfx(&gfx);
         assert!(dump.contains("Version: 42"));
         assert!(dump.contains("com.rockstargames.gtav.HudMap"));
+
+        // unicode 13 language gxt text table probe and decode test
+        let mut gxt = vec![0u8; 0x60];
+        gxt[0x10..0x15].copy_from_slice(b"0DRPz");
+        gxt.extend_from_slice("彩色字幕\0Привет мир\0한국어 자막\0日本語テキスト\0".as_bytes());
+        assert!(tex::probe_gxt_snippet(&gxt).is_some());
+        let txt = decode_0drpz_text(&gxt).expect("unicode gxt should decode");
+        assert!(txt.contains("彩色字幕") && txt.contains("Привет мир") && txt.contains("한국어 자막") && txt.contains("日本語テキスト"));
     }
 
     /// Writes sample PNGs from a big .ttpf so decode quality can be eyeballed:

@@ -73,9 +73,9 @@ pub struct Mesh3D {
     pub geom_count: usize,
     pub meshlet_count: usize,
     pub lod_label: String,
-    /// Separate drawables (dictionary entries); empty for single-drawable meshes.
+    // separate drawables in dictionary entries empty for single drawable meshes
     pub parts: Vec<MeshPart>,
-    /// `None` = show every part (grid layout), `Some(i)` = isolate `parts[i]`.
+    // none shows every part on grid some isolates a single part
     pub active_part: Option<usize>,
     pub yaw: f32,
     pub pitch: f32,
@@ -191,7 +191,7 @@ impl Mesh3D {
         }
     }
 
-    /// Triangle range currently shown (the active part, or everything).
+    // triangle range currently shown either active part or everything
     pub fn visible_tris(&self) -> std::ops::Range<usize> {
         self.active_part
             .and_then(|i| self.parts.get(i))
@@ -199,7 +199,7 @@ impl Mesh3D {
             .unwrap_or(0..self.tris.len())
     }
 
-    /// Isolates one part (or all with `None`) and re-frames the camera on it.
+    // isolates one part or all with none and reframes camera on it
     pub fn set_active_part(&mut self, part: Option<usize>) {
         self.active_part = part.filter(|&i| i < self.parts.len());
         let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
@@ -223,8 +223,7 @@ impl Mesh3D {
         self.dirty = true;
     }
 
-    /// Writes the visible part(s) as OBJ, one `o` group per drawable. A single isolated
-    /// part is re-centred on its own origin (undoing the grid offset).
+    // writes visible parts as obj one group per drawable and recenters isolated part
     pub fn export_obj(&self, path: &Path) -> std::io::Result<()> {
         let mut w = BufWriter::new(File::create(path)?);
         writeln!(w, "# PercyStar RAGE9 Model Export: {}", self.name)?;
@@ -445,8 +444,7 @@ fn read_virtual_from_file(f: &mut File, file_off: u64) -> Result<(Vec<u8>, u64, 
     if v.len() < 0x80 {
         return Err("Virtual chunk too small".into());
     }
-    // Mid-resource virtual chunks can start directly with a grmGeometry struct
-    // (vft == 0, +0x08 == 0x5002xxxx ptr, +0x60 == 0x1601 magic) — never a resource root.
+    // mid resource virtual chunks starting directly with grmgeometry are never a resource root
     if ru64(&v, 0x60) == 0x1601 {
         return Err("Mid-resource geometry chunk (not a RAGE9 resource root)".into());
     }
@@ -651,10 +649,10 @@ fn resolve_meshlet_buffer(v: &[u8], link_ptr: u64) -> Option<(usize, usize)> {
     Some((mb_poff, mb_words * 4))
 }
 
-/// One meshlet geometry: (vertex buffer phys offset, vertex buffer bytes, meshlet buffer phys offset, meshlet buffer bytes).
+// one meshlet geometry vb phys offset vb bytes mb phys offset mb bytes
 type GeomRef = (usize, usize, usize, usize);
 
-/// LOD0 (high detail) meshlet geometries of the gtaDrawable at `base`.
+// lod0 high detail meshlet geometries of drawable at base
 fn drawable_lod0_geoms(v: &[u8], base: usize) -> Vec<GeomRef> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -738,7 +736,7 @@ fn try_extract_embedded_texture(v: &[u8], p: &[u8]) -> (Option<Texture2D>, Strin
     (None, "External .#td (Material Shading)".into())
 }
 
-/// Maps each LOD0 `(vb_poff, mb_poff)` of the drawable at `base` to its `grmModel::m_ShaderIndex` entry (`mp + 0x20`).
+// maps each lod0 vb and mb offset of drawable at base to its shader index entry
 fn drawable_lod0_shader_map(v: &[u8], base: usize) -> HashMap<(usize, usize), u16> {
     let mut out = HashMap::new();
     if base + 0x80 > v.len() { return out; }
@@ -768,8 +766,7 @@ fn drawable_lod0_shader_map(v: &[u8], base: usize) -> HashMap<(usize, usize), u1
     out
 }
 
-/// Resolves external `.ttpf` diffuse textures and vehicle-paint shader flags for each shader
-/// referenced by LOD0 geometries of the drawable at `base`.
+// resolves external ttpf diffuse textures and vehicle paint shader flags for lod0 geoms
 fn resolve_drawable_materials(
     v: &[u8],
     base: usize,
@@ -779,11 +776,11 @@ fn resolve_drawable_materials(
     seen_hashes: &mut HashSet<u64>,
     decode_budget: &mut usize,
 ) -> Vec<GeomMaterial> {
-    const DIFFUSE_TEX: u32 = 0xc8e8_c282; // joaat("diffuseTex")
-    const TINT_PALETTE_TEX: u32 = 0x2c8d_7182; // joaat("tintPaletteTex")
-    const ALT0_TEX: u32 = 0x3463_94ea; // vehicle body/livery/detail slot 0
-    const EMISSIVE_TEX: u32 = 0x8e0d_63ee; // joaat("emissiveTex")
-    const DIRT_DIFFUSE_TEX: u32 = 0x7485_dafb; // joaat("dirtDiffuseTex")
+    const DIFFUSE_TEX: u32 = 0xc8e8_c282; // diffuseTex
+    const TINT_PALETTE_TEX: u32 = 0x2c8d_7182; // tintPaletteTex
+    const ALT0_TEX: u32 = 0x3463_94ea; // vehicle body livery detail slot 0
+    const EMISSIVE_TEX: u32 = 0x8e0d_63ee; // emissiveTex
+    const DIRT_DIFFUSE_TEX: u32 = 0x7485_dafb; // dirtDiffuseTex
     const SHARED_LUT_PARAM: u32 = 0x19df_25d7; // shared 128x256 vehicle lookup texture
 
     let mut mats = vec![GeomMaterial::default(); geoms.len()];
@@ -793,7 +790,7 @@ fn resolve_drawable_materials(
     let Some(sp) = vptr(ru64(v, sg + 0x10)) else { return mats };
     let scnt = ru16(v, sg + 0x18) as usize;
     if scnt == 0 || scnt > 512 || sp + scnt * 8 > v.len() { return mats; }
-    // Verify RAGE9 "atem" (meta) shader table tag
+    // verify rage9 atem meta shader table tag
     let Some(s0) = vptr(ru64(v, sp)) else { return mats };
     if s0 + 8 > v.len() || (ru64(v, s0) >> 32) != 0x6d65_7461 { return mats; }
 
@@ -886,22 +883,16 @@ fn resolve_drawable_materials(
     mats
 }
 
-/// One drawable inside a decoded resource. Plain drawables have a single part;
-/// drawable dictionaries (pgDictionary<gtaDrawable>) have one per entry.
+// one drawable inside a decoded resource plain drawables have single part dictionaries have one per entry
 #[derive(Clone)]
 pub struct MeshPart {
     pub name: String,
     pub geoms: usize,
-    /// Triangle range in `Mesh3D::tris` (also indexes `tri_geom` / `normals`).
+    // triangle range in mesh3d tris
     pub tris: std::ops::Range<usize>,
 }
 
-/// Detects a RAGE9 drawable dictionary root and returns `(name, drawable_offset)` per entry.
-///
-/// Layout (pgDictionary): +0x20 hash array {ptr, u16 count}, +0x30 drawable ptr array
-/// {ptr, u16 count}. Each entry is an independent gtaDrawable modelled around its own
-/// origin, so entries must NOT be merged into one mesh (that stacks them on top of each
-/// other). Map placement lives in ymap entities, which this resource does not carry.
+// detects rage9 drawable dictionary root and returns name and drawable offset per entry
 fn drawable_dictionary_entries(v: &[u8]) -> Vec<(String, usize)> {
     if v.len() < 0x40 { return Vec::new(); }
     let (Some(hashes), Some(arr)) = (vptr(ru64(v, 0x20)), vptr(ru64(v, 0x30))) else { return Vec::new() };
@@ -934,7 +925,7 @@ struct MeshBuild {
     meshlets: usize,
 }
 
-/// Decodes one meshlet geometry from the physical buffer and appends it to `b`.
+// decodes one meshlet geometry from physical buffer and appends it to mesh build
 fn append_meshlet_geom(p: &[u8], (vb_off, vb_size, mb_off, _mb_size): GeomRef, geom_id: u16, b: &mut MeshBuild) {
     if mb_off + 0x10 > p.len() || vb_off + 0x80 > p.len() {
         return;
@@ -985,10 +976,7 @@ fn append_meshlet_geom(p: &[u8], (vb_off, vb_size, mb_off, _mb_size): GeomRef, g
     let sx = rf32(p, vb_off + 0x70);
     let sy = rf32(p, vb_off + 0x74);
     let sz = rf32(p, vb_off + 0x78);
-    // +0x6C picks which world axis sits in the 16-bit slot (the shortest extent); the two
-    // 24-bit slots follow. Verified against drawable bboxes on 1.6k geoms (levels.rpf):
-    //   0 -> slots (z, y, x)   1 -> slots (z, x, y)   2 -> slots (x, y, z)
-    // Other values are a different vertex layout; keep the legacy (x, y, z) read for them.
+    // +0x6c picks which world axis sits in the 16 bit slot 0 is zyx 1 is zxy 2 is xyz
     let slot_axis: [usize; 3] = match ru32(p, vb_off + 0x6c) {
         0 => [2, 1, 0],
         1 => [2, 0, 1],
@@ -1053,8 +1041,7 @@ fn append_meshlet_geom(p: &[u8], (vb_off, vb_size, mb_off, _mb_size): GeomRef, g
     b.meshlets += num_meshlets;
 }
 
-/// Lays dictionary parts out on a square-ish XY grid so independent drawables sit side
-/// by side instead of overlapping at the origin. Z (height) is left untouched.
+// lays dictionary parts out on a square xy grid so independent drawables sit side by side
 fn layout_parts_in_grid(verts: &mut [[f32; 3]], part_verts: &[std::ops::Range<usize>]) {
     let n = part_verts.len();
     if n < 2 { return; }
@@ -1108,9 +1095,9 @@ pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name
         .map(|(n, _)| n)
         .unwrap_or_else(|| fallback_name.to_string());
 
-    // Each group becomes one MeshPart: dictionary entries, or the single drawable.
+    // each group becomes one meshpart dictionary entries or single drawable
     let dict = drawable_dictionary_entries(&v);
-    // (part name, drawable offset for material lookup, LOD0 geometries)
+    // part name drawable offset for material lookup lod0 geometries
     type Group = (String, Option<usize>, Vec<GeomRef>);
     let (groups, lod_label): (Vec<Group>, String) = if !dict.is_empty() {
         let g: Vec<_> = dict
@@ -1500,7 +1487,7 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
     }
 }
 
-/// Drawable picker for multi-part meshes (drawable dictionaries). No-op otherwise.
+// drawable picker for multi part meshes drawable dictionaries noop otherwise
 pub fn part_picker(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
     if mesh.parts.len() < 2 {
         return;
@@ -1722,10 +1709,7 @@ mod tests {
 mod dictionary_decode_tests {
     use super::*;
 
-    /// Regression for bk_02_road_str_slod.#dr (levels.rpf, Xbox build): a drawable dictionary
-    /// of 8 Brickell SLOD blocks that used to render stacked at the origin, with towers on
-    /// their side because the +0x6C position axis mode was ignored. Runs only when
-    /// PERCYSTAR_LEVELS_RPF points at levels.rpf from the Xbox v1.0.2.1 dump.
+    // regression for bk_02_road_str_slod drawable dictionary splitting and +0x6c axis order
     #[test]
     fn brickell_slod_dictionary_splits_and_stands_upright() {
         let Ok(rpf) = std::env::var("PERCYSTAR_LEVELS_RPF") else { return };
@@ -1745,13 +1729,12 @@ mod dictionary_decode_tests {
                 }
             }
         }
-        // Drawable bbox: x 224 m, y 197 m, z 208 m (towers). Mis-decoded axes swap these.
+        // drawable bbox x 224m y 197m z 208m
         let ext = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
         assert!((ext[0] - 224.2).abs() < 2.0 && (ext[1] - 197.1).abs() < 2.0 && (ext[2] - 207.7).abs() < 2.0, "extents {ext:?}");
     }
 
-    /// External .ttpf material resolution on a vehicle (paint + textures) and a world SLOD.
-    /// Same PERCYSTAR_LEVELS_RPF gate; set PERCYSTAR_RENDER_DIR to also dump PNG renders.
+    // external ttpf material resolution on vehicle paint and world slod
     #[test]
     fn ttpf_vehicle_and_world_materials() {
         let Ok(rpf) = std::env::var("PERCYSTAR_LEVELS_RPF") else { return };
