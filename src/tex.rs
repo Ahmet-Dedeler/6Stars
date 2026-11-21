@@ -296,7 +296,7 @@ pub fn decode_linear_to_rgba(lin: &[u8], w: usize, h: usize, dxgi: u8) -> Option
     if matches!(dxgi, 71 | 72 | 77 | 78 | 80 | 81 | 83 | 84 | 95 | 96 | 98 | 99) {
         let mut out_u32 = vec![0u32; w * h];
         let res = match dxgi {
-            71 | 72 => texture2ddecoder::decode_bc1(lin, w, h, &mut out_u32),
+            71 | 72 => texture2ddecoder::decode_bc1a(lin, w, h, &mut out_u32),
             77 | 78 => texture2ddecoder::decode_bc3(lin, w, h, &mut out_u32),
             80 | 81 => texture2ddecoder::decode_bc4(lin, w, h, &mut out_u32),
             83 | 84 => texture2ddecoder::decode_bc5(lin, w, h, &mut out_u32),
@@ -601,8 +601,15 @@ pub fn extract_txd_textures_by_ptr(v: &[u8], p: &[u8], dict_off: usize) -> Vec<(
 }
 
 /// Convert DecodedTexture into model3d::Texture2D.
-pub fn to_model_tex(t: &DecodedTexture) -> Texture2D {
-    Texture2D { w: t.w, h: t.h, pixels: t.pixels.clone() }
+pub fn to_model_tex(t: DecodedTexture) -> Texture2D {
+    let mut pixels = t.pixels;
+    if t.dxgi == 65 {
+        // The texture browser shows A8 as grayscale; models use it as opacity.
+        for c in &mut pixels {
+            *c = Color32::from_white_alpha(c.r());
+        }
+    }
+    Texture2D { w: t.w, h: t.h, pixels }
 }
 
 /// Read RAGE9 resource virtual + physical buffers from RPF at `file_off` and decode all TXD textures.
@@ -1121,7 +1128,16 @@ pub fn decode_ttpf_texture(path: &Path, tex_idx: usize) -> Result<DecodedTexture
 
     let (fmt_name, is_bc, bpe) = dxgi_info(d.dxgi)
         .ok_or_else(|| format!("Unsupported DXGI format {} (fmt_byte=0x{:02x})", d.dxgi, d.fmt_byte))?;
-    let (mip0_off, mip0_padded, use_64k) = ttpf_mip0_range(d, is_bc, bpe);
+    // Small BCn textures can have mip 0 inside the shared tail rather than at
+    // the origin of the tile. Reading the origin can look like an empty mask.
+    let tail = if is_bc && d.mip_count > 1 {
+        ttpf_bc_layout(d, bpe).filter(|l| l.mips[0].tail_origin.is_some() && l.block_bytes <= d.alloc_sz)
+    } else {
+        None
+    };
+    let (mip0_off, mip0_padded, use_64k) = tail.as_ref()
+        .map(|l| (d.byte_off, l.block_bytes as usize, l.use_64k))
+        .unwrap_or_else(|| ttpf_mip0_range(d, is_bc, bpe));
 
     let raw_tex = match ttpf_read_virtual(path, &ix, mip0_off, mip0_padded) {
         Ok(raw) => raw,
@@ -1143,7 +1159,9 @@ pub fn decode_ttpf_texture(path: &Path, tex_idx: usize) -> Result<DecodedTexture
         }
         Err(err) => return Err(err),
     };
-    let lin = if use_64k {
+    let lin = if let Some(l) = tail {
+        l.untile(&raw_tex, 0)
+    } else if use_64k {
         deswizzle_64kb_ttpf(&raw_tex, d.w, d.h, is_bc, bpe)
     } else {
         deswizzle_4kb_d(&raw_tex, d.w, d.h, is_bc, bpe)
@@ -1311,7 +1329,7 @@ pub fn decode_ttpf_texture_cached(hit: &TtpfHashHit) -> Option<std::sync::Arc<Te
     }
     let decoded = decode_ttpf_texture(&hit.path, hit.tex_idx)
         .ok()
-        .map(|t| std::sync::Arc::new(to_model_tex(&t)));
+        .map(|t| std::sync::Arc::new(to_model_tex(t)));
     let mut g = cache.lock().unwrap();
     if g.len() > 512 {
         g.clear();
@@ -1670,6 +1688,14 @@ pub fn decode_navmesh_from_rpf(rpf_path: &Path, file_off: u64, fallback_name: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bc1_preserves_one_bit_transparency() {
+        // c0 <= c1 selects BC1's transparent color index; first pixel uses it.
+        let px = decode_linear_to_rgba(&[0, 0, 255, 255, 3, 0, 0, 0], 4, 4, 72).unwrap();
+        assert_eq!(px[0], Color32::TRANSPARENT);
+        assert_eq!(px[1], Color32::BLACK);
+    }
 
     #[test]
     fn ttpf_mip_layout_places_tail_and_body() {

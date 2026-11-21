@@ -25,6 +25,8 @@ pub struct Texture2D {
 pub struct GeomMaterial {
     pub texture: Option<Arc<Texture2D>>,
     pub is_vehicle_paint: bool,
+    alpha_test: bool,
+    auxiliary_pass: bool,
 }
 
 const DEFAULT_PAINT_COLOR: [f32; 3] = [0.78, 0.11, 0.14];
@@ -718,8 +720,8 @@ pub fn model_detail_score(file: &mut File, offset: u64) -> Option<usize> {
     (bytes > 0).then_some(bytes)
 }
 
-/// Maps each LOD0 `(vb_poff, mb_poff)` of the drawable at `base` to its `grmModel::m_ShaderIndex` entry (`mp + 0x20`).
-fn drawable_lod0_shader_map(v: &[u8], base: usize) -> HashMap<(usize, usize), u16> {
+/// Maps each LOD0 `(vb_poff, mb_poff)` to its shader index and owning model's render mask.
+fn drawable_lod0_shader_map(v: &[u8], base: usize) -> HashMap<(usize, usize), (u16, u8)> {
     let mut out = HashMap::new();
     if base + 0x80 > v.len() { return out; }
     let Some(lod0_off) = vptr(ru64(v, base + 0x50)) else { return out };
@@ -735,6 +737,7 @@ fn drawable_lod0_shader_map(v: &[u8], base: usize) -> HashMap<(usize, usize), u1
         let gcnt = ru16(v, mp + 0x10) as usize;
         if gcnt == 0 || gcnt > 256 || garr + gcnt * 8 > v.len() { continue; }
         let smap_off = vptr(ru64(v, mp + 0x20)).filter(|&so| so + gcnt * 2 <= v.len());
+        let render_mask = v.get(mp + 0x34).copied().unwrap_or(0xff);
 
         for gi in 0..gcnt {
             let Some(gp) = vptr(ru64(v, garr + gi * 8)) else { continue };
@@ -742,7 +745,11 @@ fn drawable_lod0_shader_map(v: &[u8], base: usize) -> HashMap<(usize, usize), u1
             let Some(vb_poff) = pptr(ru64(v, gp + 0x68)) else { continue };
             let Some((mb_poff, _)) = resolve_meshlet_buffer(v, ru64(v, gp + 0x40)) else { continue };
             let sidx = smap_off.map(|so| ru16(v, so + gi * 2)).unwrap_or(gi as u16);
-            out.entry((vb_poff, mb_poff)).or_insert(sidx);
+            // Shared GPU buffers can be referenced by both passes; prefer the visible binding.
+            let binding = out.entry((vb_poff, mb_poff)).or_insert((sidx, render_mask));
+            if binding.1 & 1 == 0 && render_mask & 1 != 0 {
+                *binding = (sidx, render_mask);
+            }
         }
     }
     out
@@ -786,6 +793,8 @@ fn resolve_shader_material(
 
     let mut mat = GeomMaterial::default();
     if shader + 0x28 > v.len() || &v[shader + 4..shader + 8] != b"atem" { return mat; }
+    // Render bucket 3 is used by masked meshes such as fence wire and leaves.
+    mat.alpha_test = v.get(shader + 0x3c) == Some(&(1 << 3));
     let Some(params) = vptr(ru64(v, shader + 0x20)) else { return mat };
     let Some(slots) = vptr(ru64(v, shader + 0x10)) else { return mat };
     if params + 8 > v.len() { return mat; }
@@ -821,7 +830,7 @@ fn resolve_shader_material(
             if hit.w < min_size || hit.h < min_size { continue; }
             (MaterialTexture::Streamed(hash, hit), hit.dxgi)
         };
-        if !matches!(dxgi, 65 | 80 | 81 | 83 | 84) {
+        if !matches!(dxgi, 65 | 80 | 81 | 83 | 84) || (dxgi == 65 && mat.alpha_test && rank == 0) {
             candidates[rank] = Some(candidate);
         }
     }
@@ -859,13 +868,19 @@ fn resolve_drawable_materials(
     let embedded: HashMap<_, _> = vptr(ru64(v, sg + 8))
         .into_iter()
         .flat_map(|txd| crate::tex::extract_txd_textures_by_ptr(v, p, txd))
-        .map(|(ptr, tex)| (ptr, (tex.dxgi, Arc::new(Texture2D { w: tex.w, h: tex.h, pixels: tex.pixels }))))
+        .map(|(ptr, tex)| (ptr, (tex.dxgi, Arc::new(crate::tex::to_model_tex(tex)))))
         .collect();
     let smap = drawable_lod0_shader_map(v, base);
+    let has_main_pass = smap.values().any(|&(_, mask)| mask & 1 != 0);
     let mut shader_cache: HashMap<u16, GeomMaterial> = HashMap::new();
 
     for (gi, &(vb_poff, _, mb_poff, _)) in geoms.iter().enumerate() {
-        let Some(sidx) = smap.get(&(vb_poff, mb_poff)).copied().or_else(|| (scnt == 1).then_some(0)) else { continue };
+        let Some((sidx, mask)) = smap.get(&(vb_poff, mb_poff)).copied().or_else(|| (scnt == 1).then_some((0, 0xff))) else { continue };
+        // Keep shadow proxies in raw mesh modes and exports, not the material preview.
+        if has_main_pass && mask & 1 == 0 {
+            mats[gi].auxiliary_pass = true;
+            continue;
+        }
         if sidx as usize >= scnt { continue; }
         mats[gi] = shader_cache.entry(sidx).or_insert_with(|| {
             vptr(ru64(v, sp + sidx as usize * 8))
@@ -1186,12 +1201,13 @@ pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name
 
     let resolved_tex_geoms = geom_materials.iter().filter(|m| m.texture.is_some()).count();
     let paint_geoms = geom_materials.iter().filter(|m| m.is_vehicle_paint).count();
+    let preview_geoms = geom_materials.iter().filter(|m| !m.auxiliary_pass).count();
     let tex_status = match (resolved_tex_geoms, paint_geoms) {
         (0, 0) if ttpf_idx.is_none() => "No .ttpf archives found; neutral preview".into(),
         (0, 0) => "No usable color textures; neutral preview".into(),
-        (0, paint) => format!("Preview paint: {paint}/{geom_count} geoms"),
-        (tex, 0) => format!("Textures: {tex}/{geom_count} geoms"),
-        (tex, paint) => format!("Textures: {tex}/{geom_count} geoms + preview paint ({paint})"),
+        (0, paint) => format!("Preview paint: {paint}/{preview_geoms} geoms"),
+        (tex, 0) => format!("Textures: {tex}/{preview_geoms} geoms"),
+        (tex, paint) => format!("Textures: {tex}/{preview_geoms} geoms + preview paint ({paint})"),
     };
 
     let mut mesh = Mesh3D::from_parts(
@@ -1317,7 +1333,26 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
 
         if do_solid {
             let vis = mesh.visible_tris();
+            // A missing cutout mask should not cover other textured geometry with
+            // a solid panel. Keep the clay fallback when nothing can be textured.
+            let has_preview_texture = do_textured && has_uvs
+                && mesh.geom_materials.iter().any(|m| m.alpha_test && m.texture.is_none())
+                && mesh.tri_geom.get(vis.clone()).is_some_and(|ids| {
+                    ids.iter().any(|&g| mesh.geom_materials.get(g as usize).is_some_and(|m| m.texture.is_some()))
+                });
             for (ti, t) in mesh.tris.iter().enumerate().skip(vis.start).take(vis.len()) {
+                let g = mesh.tri_geom.get(ti).copied().unwrap_or(0) as usize;
+                let gmat = mesh.geom_materials.get(g);
+                let active_tex: Option<&Texture2D> = if do_textured && has_uvs {
+                    mesh.texture.as_ref().or_else(|| gmat.and_then(|m| m.texture.as_deref()))
+                } else {
+                    None
+                };
+                if do_textured && gmat.is_some_and(|m| m.auxiliary_pass
+                    || (m.alpha_test && active_tex.is_none() && has_preview_texture))
+                {
+                    continue;
+                }
                 let i0 = t[0] as usize;
                 let i1 = t[1] as usize;
                 let i2 = t[2] as usize;
@@ -1353,14 +1388,6 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                 let shade_r = (0.18 + ndl1 * 0.72 + spec + rim * 0.45).min(1.15);
                 let shade_g = (0.18 + ndl1 * 0.72 + ndl2 * 0.18 + spec + rim * 0.40).min(1.15);
                 let shade_b = (0.20 + ndl1 * 0.70 + ndl2 * 0.28 + spec + rim * 0.55).min(1.15);
-
-                let g = mesh.tri_geom.get(ti).copied().unwrap_or(0) as usize;
-                let gmat = mesh.geom_materials.get(g);
-                let active_tex: Option<&Texture2D> = if do_textured && has_uvs {
-                    mesh.texture.as_ref().or_else(|| gmat.and_then(|m| m.texture.as_deref()))
-                } else {
-                    None
-                };
 
                 let is_paint = do_textured
                     && active_tex.is_none()
@@ -1406,6 +1433,7 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                 let span_len = ix1 - ix0 + 1;
 
                 if let Some(tex) = active_tex {
+                    let alpha_test = mesh.texture.is_some() || gmat.is_some_and(|m| m.alpha_test);
                     let uv0 = mesh.uvs[i0];
                     let uv1 = mesh.uvs[i1];
                     let uv2 = mesh.uvs[i2];
@@ -1419,16 +1447,24 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                                 let (b0, b1, b2) = (w0 * inv_abs, w1 * inv_abs, w2 * inv_abs);
                                 let z = b0 * p0[2] + b1 * p1[2] + b2 * p2[2];
                                 if z > z_row[x] {
-                                    z_row[x] = z;
                                     let tc = tex.sample(
                                         b0 * uv0[0] + b1 * uv1[0] + b2 * uv2[0],
                                         b0 * uv0[1] + b1 * uv1[1] + b2 * uv2[1],
                                     );
-                                    c_row[x] = Color32::from_rgb(
-                                        ((tc.r() as f32 * shade_r).min(255.0)) as u8,
-                                        ((tc.g() as f32 * shade_g).min(255.0)) as u8,
-                                        ((tc.b() as f32 * shade_b).min(255.0)) as u8,
-                                    );
+                                    // Holes must leave both color and depth untouched.
+                                    if !alpha_test || tc.a() >= 128 {
+                                        let [r, g, b, _] = if alpha_test && tc.a() != 255 {
+                                            tc.to_srgba_unmultiplied()
+                                        } else {
+                                            tc.to_array()
+                                        };
+                                        z_row[x] = z;
+                                        c_row[x] = Color32::from_rgb(
+                                            ((r as f32 * shade_r).min(255.0)) as u8,
+                                            ((g as f32 * shade_g).min(255.0)) as u8,
+                                            ((b as f32 * shade_b).min(255.0)) as u8,
+                                        );
+                                    }
                                 }
                             }
                             w0 += e12_dx;
@@ -1613,9 +1649,9 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
         }
         let status = ui.label(RichText::new(&mesh.tex_status).size(11.0).color(Color32::from_rgb(130, 145, 168)));
         if !mesh.geom_materials.is_empty() {
-            status.on_hover_text("Textured/Mat uses available color textures and optional preview paint. \
-                Unresolved geometry uses a gray fallback. Some game shaders, tints and texture \
-                variants are not reproduced.");
+            status.on_hover_text("Textured/Mat uses available color textures, opacity masks and optional preview paint. \
+                Untextured solid surfaces use a gray fallback. Use Clay Solid to see auxiliary geometry and \
+                cutouts whose opacity mask could not be loaded.");
         }
     });
     ui.add_space(4.0);
@@ -1712,6 +1748,38 @@ mod tests {
     }
 
     #[test]
+    fn cutout_holes_do_not_occlude_geometry() {
+        let verts = vec![
+            [-1.0, -0.1, -1.0], [1.0, -0.1, -1.0], [0.0, -0.1, 1.0],
+            [-1.0, 0.1, -1.0], [1.0, 0.1, -1.0], [0.0, 0.1, 1.0],
+        ];
+        let mut m = Mesh3D::from_parts(
+            "cutout".into(), verts, vec![[0.0; 2]; 6], vec![[0, 1, 2], [3, 4, 5]],
+            vec![0, 1], vec![], None, String::new(), 2, 0, String::new(),
+        );
+        m.yaw = 0.0;
+        m.pitch = 0.0;
+        m.geom_materials = vec![
+            GeomMaterial {
+                texture: Some(Arc::new(Texture2D { w: 1, h: 1, pixels: vec![Color32::TRANSPARENT] })),
+                alpha_test: true,
+                ..Default::default()
+            },
+            GeomMaterial {
+                texture: Some(Arc::new(Texture2D { w: 1, h: 1, pixels: vec![Color32::GREEN] })),
+                ..Default::default()
+            },
+        ];
+        let center = 50 * 100 + 50;
+        rasterize_mesh(&mut m, 100, 100);
+        assert!(m.color_buf[center].g() > 0, "the back triangle shows through the hole");
+        assert!(m.z_buf[center] < 0.0, "the hole must not write depth");
+        Arc::get_mut(m.geom_materials[0].texture.as_mut().unwrap()).unwrap().pixels[0] = Color32::RED;
+        rasterize_mesh(&mut m, 100, 100);
+        assert!(m.color_buf[center].r() > 0 && m.z_buf[center] > 0.0, "the wire still writes depth");
+    }
+
+    #[test]
     fn model_name_and_vehicle_filter() {
         let mut buf = vec![0u8; 30_000];
         buf[100..116].copy_from_slice(b"test_vehicle.#ft");
@@ -1727,6 +1795,29 @@ mod tests {
 #[cfg(test)]
 mod dictionary_decode_tests {
     use super::*;
+
+    #[test]
+    fn chainlink_preview_excludes_shadow_meshes_and_keeps_wire_holes() {
+        let Ok(rpf) = std::env::var("PERCYSTAR_LEVELS_RPF") else { return };
+        let path = Path::new(&rpf);
+        if !path.exists() { return; }
+        for (tag, off, proxies) in [
+            ("01e", 70_271_725_584, 2), ("01a", 70_270_861_328, 2), ("01h", 70_272_725_008, 2),
+            ("02e", 70_274_981_904, 2), ("01e_batchlod", 70_267_998_224, 0),
+        ] {
+            let mut m = decode_rage9_model_from_rpf(path, off, tag).unwrap();
+            assert!(m.name.starts_with(&format!("prop_am_fence_chainlink_{tag}.")), "{}", m.name);
+            assert_eq!(m.geom_materials.iter().filter(|mat| mat.auxiliary_pass).count(), proxies, "{tag}");
+            rasterize_mesh(&mut m, 800, 600);
+            let textured = m.z_buf.iter().filter(|z| z.is_finite()).count();
+            m.shade_mode = ShadeMode::Solid;
+            rasterize_mesh(&mut m, 800, 600);
+            let solid = m.z_buf.iter().filter(|z| z.is_finite()).count();
+            assert!(textured > 1_000 && textured * 2 < solid, "{tag}: {textured} textured vs {solid} solid pixels");
+            m.shade_mode = ShadeMode::Textured;
+            render_sample(m, &format!("fence_{tag}"));
+        }
+    }
 
     fn render_sample(mut mesh: Mesh3D, tag: &str) {
         let Ok(dir) = std::env::var("PERCYSTAR_RENDER_DIR") else { return };
