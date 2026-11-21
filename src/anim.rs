@@ -66,6 +66,30 @@ pub fn parse_anim_dict(data: &[u8]) -> String {
         p_hashes, p_clips, p_anims, p_skel
     );
 
+    // scan for crAnimation duration floats (followed by 0x50xxxxxx block pointers)
+    let mut durations = Vec::new();
+    for o in (0x60..data.len().saturating_sub(0x38)).step_by(4) {
+        let dur = f32::from_bits(rd32(data, o));
+        if dur.is_finite() && (0.05..=3600.0).contains(&dur) {
+            let p0 = rd32(data, o + 4);
+            let p1 = rd32(data, o + 8);
+            if p0 == p1 && (0x5000_0000..0x5800_0000).contains(&p0) {
+                durations.push((o, dur));
+                if durations.len() >= 16 {
+                    break;
+                }
+            }
+        }
+    }
+    if !durations.is_empty() {
+        let _ = writeln!(out, "--- Decoded crAnimation Timelines ---");
+        for (o, dur) in &durations {
+            let frames = (dur * 30.0).round() as u32;
+            let _ = writeln!(out, "  @0x{o:05x} duration={dur:.3}s (~{frames} frames @ 30fps)");
+        }
+        out.push('\n');
+    }
+
     if let Some(hoff) = vptr_off(p_hashes) {
         let _ = writeln!(out, "--- Clip Hash Entries ---");
         for idx in 0..(count as usize).min(64) {
@@ -116,11 +140,15 @@ mod tests {
         buf[0x28..0x30].copy_from_slice(&0x5000_0060u64.to_le_bytes());
         buf[0x38..0x40].copy_from_slice(&0x5000_00a0u64.to_le_bytes());
         buf[0x60..0x64].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        buf[0x8c..0x90].copy_from_slice(&48.133335f32.to_le_bytes());
+        buf[0x90..0x94].copy_from_slice(&0x5015_02f9u32.to_le_bytes());
+        buf[0x94..0x98].copy_from_slice(&0x5015_02f9u32.to_le_bytes());
         let (name, cnt) = probe_anim_dict(&buf).expect("should detect clip dict");
         assert_eq!(cnt, 2);
         assert!(name.contains("deadbeef"));
         let txt = parse_anim_dict(&buf);
         assert!(txt.contains("Clips: 2"));
         assert!(txt.contains("0xdeadbeef"));
+        assert!(txt.contains("duration=48.133s (~1444 frames @ 30fps)"));
     }
 }
