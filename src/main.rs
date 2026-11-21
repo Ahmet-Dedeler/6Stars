@@ -4,9 +4,11 @@ mod awc;
 mod boot;
 mod dat;
 mod dxbc;
+mod mapdata;
 mod psin;
 mod rsc9;
 mod sgd5;
+mod world_gpu;
 mod worldmap;
 mod model3d;
 mod rdna2;
@@ -4725,6 +4727,10 @@ fn main() -> eframe::Result<()> {
         let _ = fs::remove_file(cur.with_extension("exe.old"));
     }
     let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 3 && args[1] == "--probe-maps" {
+        mapdata::probe_maps_cli(&PathBuf::from(&args[2]));
+        return Ok(());
+    }
     if args.len() >= 3 && args[1] == "--inspect-exe" {
         let exe_path = PathBuf::from(&args[2]);
         match fs::read(&exe_path) {

@@ -5,6 +5,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+#[derive(Clone)]
 pub struct WorldMapData {
     pub w: usize,
     pub h: usize,
@@ -328,6 +329,23 @@ pub fn render_world_map_ui(
                 wm.zoom = 1.0;
                 wm.pan = [0.0, 0.0];
             }
+        }
+        if ui.button("Launch 3D GPU World (wgpu)").on_hover_text("Open DX12/Vulkan GPU 3D World with PBR, Sun/Time-of-Day (F6), Minimap & Raytracing (R)").clicked() {
+            let mut batches = Vec::new();
+            if let Some(ref m) = wm.terrain_mesh {
+                if m.name.contains("brickell") {
+                    batches.push(crate::world_gpu::WorldBatchInput {
+                        mesh: m.clone(),
+                        instances: vec![(glam::Vec3::ZERO, glam::Quat::IDENTITY, glam::Vec3::ONE, [1.0; 4])],
+                    });
+                }
+            }
+            crate::world_gpu::launch_world_gpu_window(crate::world_gpu::WorldLaunchConfig {
+                terrain: wm.data.clone().map(Arc::new),
+                batches,
+                map_count: 0,
+                start_pos: [-2351.0, -5533.0, 120.0],
+            });
         }
         ui.label(egui::RichText::new(&wm.status).size(11.5).color(Color32::from_rgb(175, 195, 220)));
     });

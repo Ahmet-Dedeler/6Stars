@@ -17,6 +17,7 @@ pub enum ShadeMode {
     Wireframe,
 }
 
+#[derive(Clone)]
 pub struct Texture2D {
     pub w: usize,
     pub h: usize,
@@ -78,6 +79,7 @@ impl Texture2D {
 const DEFAULT_YAW: f32 = 2.45;
 const DEFAULT_PITCH: f32 = 0.38;
 
+#[derive(Clone)]
 pub struct Mesh3D {
     pub name: String,
     pub verts: Vec<[f32; 3]>,
