@@ -1648,9 +1648,7 @@ impl Rpf9App {
         let mut browse_videos = false;
 
         if self.mv_drawer_open {
-            egui::SidePanel::left("mv_sidebar")
-                .default_width(360.0)
-                .frame(egui::Frame::new().fill(Color32::from_rgb(20, 13, 31)).inner_margin(10.0))
+            model_viewer_sidebar(ctx)
                 .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("MODELS").size(12.0).strong().color(Color32::from_rgb(255, 168, 28)));
@@ -1664,22 +1662,13 @@ impl Rpf9App {
                 });
                 ui.add_space(5.0);
 
-                ui.horizontal(|ui| {
-                    let sr = ui.add(
-                        egui::TextEdit::singleline(&mut self.mv_filter)
-                            .desired_width(ui.available_width() - 28.0)
-                            .hint_text("Search models (Ctrl+F) · words AND · -exclude"),
-                    );
-                    if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
-                        sr.request_focus();
-                    }
-                    if sr.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                        self.mv_filter.clear();
-                    }
-                    if ui.button("✕").on_hover_text("Clear filter").clicked() {
-                        self.mv_filter.clear();
-                    }
-                });
+                let sr = model_search_row(ui, &mut self.mv_filter);
+                if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
+                    sr.request_focus();
+                }
+                if sr.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    self.mv_filter.clear();
+                }
 
                 ui.add_space(5.0);
                 ui.horizontal_wrapped(|ui| {
@@ -1739,15 +1728,10 @@ impl Rpf9App {
                 let cur_pos = self.selected.and_then(|sel| {
                     self.mv_view.iter().position(|&mi| self.mv_entries[mi].0 == sel)
                 });
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.mv_hide_lods, "hide LOD copies");
-                    sort_combo(ui, "mv_sort_combo", &mut self.sort_mode);
-                    let has_any = !self.mv_view.is_empty();
-                    if ui.add_enabled(has_any, egui::Button::new("Random")).clicked() {
-                        let r = self.next_rand() % self.mv_view.len();
-                        to_select = Some(self.mv_entries[self.mv_view[r]].0);
-                    }
-                });
+                if model_browser_options(ui, &mut self.mv_hide_lods, &mut self.sort_mode, !self.mv_view.is_empty()) {
+                    let r = self.next_rand() % self.mv_view.len();
+                    to_select = Some(self.mv_entries[self.mv_view[r]].0);
+                }
                 ui.label(RichText::new("Up/Down arrow keys step through the list").size(10.5).color(Color32::from_rgb(130, 134, 150)));
 
                 // Arrow key / W-S navigation when search box is not focused
@@ -3041,6 +3025,46 @@ impl SortMode {
     }
 }
 
+fn model_viewer_sidebar(ctx: &egui::Context) -> egui::SidePanel {
+    let max_width = (ctx.available_rect().width() * 0.45).min(480.0);
+    egui::SidePanel::left("mv_sidebar")
+        .default_width(360.0)
+        .width_range(240.0_f32.min(max_width)..=max_width)
+        .resizable(true)
+        .frame(egui::Frame::new().fill(Color32::from_rgb(20, 13, 31)).inner_margin(10.0))
+}
+
+fn model_search_row(ui: &mut egui::Ui, filter: &mut String) -> egui::Response {
+    ui.horizontal(|ui| {
+        // Lay out the button first, then give the field the remaining outer width.
+        // TextEdit::desired_width alone excludes its own horizontal margins.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("✕").on_hover_text("Clear filter").clicked() {
+                filter.clear();
+            }
+            ui.add_sized(
+                egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
+                egui::TextEdit::singleline(filter)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("Search models (Ctrl+F) · words AND · -exclude"),
+            )
+        }).inner
+    }).inner
+}
+
+fn model_browser_options(ui: &mut egui::Ui, hide_lods: &mut bool, sort: &mut SortMode, has_models: bool) -> bool {
+    let random = ui.horizontal(|ui| {
+        ui.checkbox(hide_lods, "hide LOD copies");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_enabled(has_models, egui::Button::new("Random")).clicked()
+        }).inner
+    }).inner;
+    // ComboBox contains its own horizontal layout and cannot reliably wrap as
+    // one widget alongside the checkbox; give it a row of its own.
+    sort_combo(ui, "mv_sort_combo", sort);
+    random
+}
+
 // compact sort dropdown lists pick up the change on next refresh
 fn sort_combo(ui: &mut egui::Ui, id: &str, mode: &mut SortMode) {
     egui::ComboBox::from_id_salt(id)
@@ -4176,6 +4200,60 @@ impl eframe::App for Rpf9App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_sidebar_width_stays_stable_across_frames() {
+        let ctx = egui::Context::default();
+        let mut filter = String::new();
+        let mut widths = Vec::new();
+        for frame in 0..64 {
+            if frame == 16 { filter = "long_model_search_".repeat(100); }
+            let _ = ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1320.0, 800.0))),
+                ..Default::default()
+            }, |ctx| {
+                let panel = model_viewer_sidebar(ctx).show(ctx, |ui| {
+                    model_search_row(ui, &mut filter);
+                });
+                widths.push(panel.response.rect.width());
+                egui::CentralPanel::default().show(ctx, |_| {});
+            });
+        }
+        assert!(widths.iter().all(|w| (w - widths[0]).abs() <= 1.0),
+            "Sidebar expands without input: first={} last={}", widths[0], widths.last().unwrap());
+    }
+
+    #[test]
+    fn model_sidebar_recovers_from_an_oversized_saved_width() {
+        let ctx = egui::Context::default();
+        ctx.data_mut(|data| data.insert_persisted(
+            egui::Id::new("mv_sidebar"),
+            egui::containers::panel::PanelState {
+                rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(2000.0, 800.0)),
+            },
+        ));
+        let mut filter = "long_search_".repeat(100);
+        let mut hide_lods = true;
+        let mut sort = SortMode::Relevance;
+        for width in [1320.0_f32, 640.0, 960.0] {
+            for _ in 0..8 {
+                let _ = ctx.run(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 800.0))),
+                    ..Default::default()
+                }, |ctx| {
+                    let panel = model_viewer_sidebar(ctx).show(ctx, |ui| {
+                        model_search_row(ui, &mut filter);
+                        let _ = model_browser_options(ui, &mut hide_lods, &mut sort, true);
+                    });
+                    assert!(panel.response.rect.width() <= (width * 0.45).min(480.0) + 1.0,
+                        "Sidebar {} exceeds limit for window {width}", panel.response.rect.width());
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        assert!(ui.available_width() > width * 0.5);
+                    });
+                });
+            }
+        }
+    }
 
     #[test]
     fn model_viewer_categories_classify_correctly() {
