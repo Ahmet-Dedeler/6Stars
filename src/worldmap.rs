@@ -1,4 +1,4 @@
-use crate::model3d::{Mesh3D, ShadeMode};
+use crate::model3d::{Mesh3D, ShadeMode, Texture2D};
 use eframe::egui::{self, Color32, ColorImage, CornerRadius, TextureHandle, TextureOptions};
 use flate2::{Decompress, FlushDecompress};
 use std::fs;
@@ -145,6 +145,43 @@ impl WorldMapData {
                 tris.push([i1, i2, i3]);
             }
         }
+        // bake hillshaded elevation texture for crisp 3d terrain
+        let tw = self.w.min(512);
+        let th = self.h.min(512);
+        let mut tpix = Vec::with_capacity(tw * th);
+        for ty in 0..th {
+            let py = (ty * self.h / th).min(self.h - 1);
+            let py1 = (py + 1).min(self.h - 1);
+            for tx in 0..tw {
+                let px = (tx * self.w / tw).min(self.w - 1);
+                let px1 = (px + 1).min(self.w - 1);
+                let v = self.heights[py * self.w + px];
+                let vx = self.heights[py * self.w + px1] as f32;
+                let vy = self.heights[py1 * self.w + px] as f32;
+                let shade = (0.85 + ((v as f32 - vx) + (v as f32 - vy)) * 0.04).clamp(0.45, 1.25);
+                let (r, g, b) = if v <= 23 {
+                    (18.0, 52.0, 108.0)
+                } else if v <= 26 {
+                    (182.0, 170.0, 128.0)
+                } else if v <= 55 {
+                    let t = (v - 26) as f32 / 29.0;
+                    (58.0 + t * 52.0, 128.0 + t * 24.0, 62.0)
+                } else if v <= 110 {
+                    let t = (v - 55) as f32 / 55.0;
+                    (110.0 + t * 48.0, 152.0 - t * 22.0, 62.0 + t * 18.0)
+                } else {
+                    let t = ((v - 110) as f32 / 145.0).min(1.0);
+                    (158.0 + t * 75.0, 130.0 + t * 90.0, 80.0 + t * 130.0)
+                };
+                tpix.push(Color32::from_rgb(
+                    (r * shade).min(255.0) as u8,
+                    (g * shade).min(255.0) as u8,
+                    (b * shade).min(255.0) as u8,
+                ));
+            }
+        }
+        let tex = Some(Texture2D { w: tw, h: th, pixels: tpix });
+
         let tri_geom = vec![0u16; tris.len()];
         let mut m = Mesh3D::from_parts(
             format!("world_terrain_{gw}x{gh}"),
@@ -153,13 +190,13 @@ impl WorldMapData {
             tris,
             tri_geom,
             Vec::new(),
-            None,
-            format!("MHIU Terrain ({}x{} -> {gw}x{gh})", self.w, self.h),
+            tex,
+            format!("MHIU 3D Terrain ({}x{} -> {gw}x{gh})", self.w, self.h),
             1,
             1,
             "World Terrain".into(),
         );
-        m.shade_mode = ShadeMode::Solid;
+        m.shade_mode = ShadeMode::Textured;
         m.sky_bg = true;
         m
     }
@@ -279,11 +316,11 @@ pub fn render_world_map_ui(
             if ui.selectable_label(!wm.show_3d_terrain, "2D Map").clicked() {
                 wm.show_3d_terrain = false;
             }
-            if ui.selectable_label(wm.show_3d_terrain, "3D World").clicked() {
+            if ui.selectable_label(wm.show_3d_terrain, "3D Terrain").clicked() {
                 wm.show_3d_terrain = true;
-                if wm.terrain_mesh.is_none() {
-                    if let Some(d) = &wm.data {
-                        wm.terrain_mesh = Some(d.build_terrain_mesh(16));
+                if let Some(d) = &wm.data {
+                    if wm.terrain_mesh.as_ref().map(|m| m.name.contains("brickell")).unwrap_or(true) {
+                        wm.terrain_mesh = Some(d.build_terrain_mesh(8));
                     }
                 }
             }
