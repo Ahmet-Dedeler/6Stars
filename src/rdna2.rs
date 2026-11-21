@@ -1353,7 +1353,7 @@ mod tests {
 
     #[test]
     fn decodes_and_lifts_real_gfx103_tent_filter_snippet() {
-        // Real GFX10.3 dwords observed in GTA VI shaders.rpf:
+        // Real GFX10.3 dwords observed in shaders.rpf PSO caches:
         // v_rcp_f32 v5, s17; v_add_f32 v3, 0.5, v3; v_mul_f32 v4, v4, v2;
         // image_sample_l (12B NSA); v_fmac_f32 v8, s11, v24; exp mrt0; s_endpgm
         let words: &[u32] = &[

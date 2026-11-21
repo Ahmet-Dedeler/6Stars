@@ -1,5 +1,5 @@
 //! Native Xbox Series X (Scarlett / RDNA2) texture, TTPF (RDS5/ETPF), RBF0, Scaleform GFX,
-//! and CNavMesh decoders for GTA VI (RAGE 9). Zero external runtime dependencies.
+//! and CNavMesh decoders for RPF9-era archives. Zero external runtime dependencies.
 
 use crate::model3d::{is_zlib_head, Mesh3D, Texture2D};
 use eframe::egui::Color32;
@@ -1186,7 +1186,7 @@ struct Mip0Guess {
 /// small-mip strip for many multi-mip textures, and the computed mip-chain layout is off
 /// for many UI and short-chain textures. So for mipmapped BCn textures we try each
 /// plausible placement and keep the one whose mip 1 is a 2x downscale of its mip 0;
-/// a wrong placement pairs two unrelated images. Measured on the Xbox dump, see
+/// a wrong placement pairs two unrelated images. Measured with
 /// `ttpf_mip0_choice_audit`. When every guess agrees (most textures) only one is decoded.
 fn ttpf_decode_mip0(path: &Path, ix: &TtpfIndex, d: &TtpfTexMeta, is_bc: bool, bpe: usize) -> Result<(Vec<u8>, Vec<Color32>), String> {
     ttpf_decode_mip0_labeled(path, ix, d, is_bc, bpe).map(|(_, v)| v)
@@ -1350,7 +1350,7 @@ pub struct TtpfHashHit {
     pub dxgi: u8,
 }
 
-/// Texture hash -> location, built once per game dump root (keyed by that root).
+/// Texture hash -> location, built once per archive folder (keyed by that root).
 type TtpfHashIndex = std::sync::Arc<HashMap<u64, TtpfHashHit>>;
 static TTPF_HASH_INDEX: std::sync::OnceLock<std::sync::Mutex<HashMap<std::path::PathBuf, TtpfHashIndex>>> =
     std::sync::OnceLock::new();
@@ -1496,7 +1496,7 @@ pub fn decode_ttpf_texture_cached(hit: &TtpfHashHit) -> Option<std::sync::Arc<Te
 }
 
 // =============================================================================
-// RBF0 (GTA 6 fwui UIObject) -> Readable XML Decoder
+// RBF0 (fwui UIObject) -> Readable XML Decoder
 // =============================================================================
 
 pub fn decode_rbf0(data: &[u8]) -> Option<String> {
@@ -1661,7 +1661,7 @@ pub fn inspect_gfx(data: &[u8]) -> String {
     out
 }
 
-/// Fast snippet extractor for naming `0DRPz` / standalone GTA VI text chunks in the archive list
+/// Fast snippet extractor for naming `0DRPz` / standalone text chunks in the archive list
 /// so users can Ctrl+F radio artists, weapons, vehicles, or dialogue directly in 6Stars.
 pub fn probe_gxt_snippet(head: &[u8]) -> Option<String> {
     let is_0drpz = head.len() >= 24 && &head[16..21] == b"0DRPz";
@@ -1691,7 +1691,7 @@ pub fn probe_gxt_snippet(head: &[u8]) -> Option<String> {
     None
 }
 
-/// Extract clean readable UTF-8 strings from a GTA VI RAGE9 `0DRPz` localization/text table
+/// Extract clean readable UTF-8 strings from a RAGE9 `0DRPz` localization/text table
 /// (or standalone null-terminated string pool chunk in `data.rpf`).
 pub fn decode_0drpz_text(data: &[u8]) -> Option<String> {
     decode_0drpz_text_min(data, 3)
@@ -1732,7 +1732,7 @@ pub fn decode_0drpz_text_min(data: &[u8], min_lines: usize) -> Option<String> {
     if lines.len() < min_lines.max(1) {
         return None;
     }
-    let header = format!("=== GTA VI RAGE9 Text Table ({} strings) ===\n\n", lines.len());
+    let header = format!("=== Text Table ({} strings) ===\n\n", lines.len());
     Some(header + &lines.join("\n"))
 }
 // =============================================================================
@@ -1741,7 +1741,7 @@ pub fn decode_navmesh_from_rpf(rpf_path: &Path, file_off: u64, fallback_name: &s
     let mut f = File::open(rpf_path).map_err(|e| format!("Open error: {e}"))?;
     let (v, _) = read_rage9_vp(&mut f, file_off)?;
     if v.len() < 0xD0 || ru32(&v, 0x14) != 0x0001_0015 {
-        return Err("Not a valid GTA VI CNavMesh (0x00010015)".into());
+        return Err("Not a valid CNavMesh tile (0x00010015)".into());
     }
     let ext = [rf32(&v, 0x60), rf32(&v, 0x64), rf32(&v, 0x68)];
     let qt = vptr(ru64(&v, 0xA0)).ok_or("Missing QuadTree")?;

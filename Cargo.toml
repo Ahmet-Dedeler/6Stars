@@ -25,3 +25,6 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
+
+[dev-dependencies]
+egui_kittest = { version = "0.31.1", features = ["wgpu", "eframe"] }

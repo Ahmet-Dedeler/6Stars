@@ -15,6 +15,8 @@ mod mac_open;
 mod video_clip;
 #[cfg(test)]
 mod audit_tests;
+#[cfg(test)]
+mod demo_capture;
 use model3d::{
     Mesh3D, decode_rage9_model_from_rpf, extract_0drpz_mesh, extract_rage9_model_name,
     has_rage9_meshlets, is_vehicle_virtual, is_zlib_head, model_detail_score, parse_obj,
@@ -883,7 +885,7 @@ impl Rpf9App {
     fn import_catalog_csv(&mut self, csv_path: &Path) {
         let base_dir = self.target_path.as_ref().map(|p| {
             if self.is_folder { p.clone() } else { p.parent().unwrap_or(p).to_path_buf() }
-        }).or_else(load_last_folder).unwrap_or_else(|| PathBuf::from(r"D:\Grand Theft Auto VI Build"));
+        }).or_else(load_last_folder).unwrap_or_else(|| std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default());
 
         let mut rpf_map: HashMap<String, PathBuf> = HashMap::new();
         let mut all_paths = Vec::new();
@@ -1655,7 +1657,7 @@ impl Rpf9App {
                         }
                     }
                     if let Some(mp) = master_p {
-                        if ui.button("Master (144k)").on_hover_text("Load all 144,655 discovered GTA VI 3D models").clicked() {
+                        if ui.button("Master (144k)").on_hover_text("Load every model listed in the master catalog CSV").clicked() {
                             self.import_catalog_csv(&mp);
                             self.refresh_mv_view();
                         }
@@ -1897,7 +1899,7 @@ impl Rpf9App {
                             ui.add_space(6.0);
                             if self.mv_view.is_empty() {
                                 ui.label(
-                                    RichText::new("Open a GTA VI folder, import a catalog CSV (32k / 144k models), or open a .OBJ file.")
+                                    RichText::new("Open a folder of your own archives, import a catalog CSV, or open a .OBJ file.")
                                         .size(13.0)
                                         .color(Color32::from_rgb(185, 180, 210)),
                                 );
@@ -2190,7 +2192,7 @@ impl Rpf9App {
                 ui.centered_and_justified(|ui| {
                     ui.label(
                         RichText::new(
-                            "Click '★ Load Local PS09' or 'Open shaders.rpf / .ps09' on the left to inspect all 21,522 GTA VI AMD RDNA2 (GFX10.3) shaders.",
+                            "Click '★ Load Local PS09' or 'Open shaders.rpf / .ps09' on the left to inspect the AMD RDNA2 (GFX10.3) shaders in a PSO cache.",
                         )
                         .size(13.5)
                         .color(Color32::from_rgb(185, 180, 210)),
@@ -2780,7 +2782,7 @@ fn probe_rage9_page(
     if u64::from_le_bytes(probe_out[0x60..0x68].try_into().ok()?) == 0x1601 {
         return None;
     }
-    // 1. GTA VI CNavMesh tile (version 0x00010015)
+    // 1. CNavMesh tile (version 0x00010015)
     let ver = u32::from_le_bytes(probe_out[0x14..0x18].try_into().ok()?);
     if ver == 0x0001_0015 && olen >= 0xD0 {
         let n_polys = u32::from_le_bytes(probe_out[0xC4..0xC8].try_into().ok()?);
@@ -3688,10 +3690,10 @@ mod tests {
         }
         assert!(seen64.iter().all(|&b| b), "TTPF 64KB 128bpp must be a full bijection");
 
-        // RBF0 GTA6 header (0xFB 0xFF 0x01 0x00) decode test
+        // RBF0 header (0xFB 0xFF 0x01 0x00) decode test
         let mut rbf = Vec::new();
         rbf.extend_from_slice(b"RBF0");
-        rbf.extend_from_slice(&[0xFB, 0xFF, 0x01, 0x00]); // GTA6 header
+        rbf.extend_from_slice(&[0xFB, 0xFF, 0x01, 0x00]); // RBF0 header
         rbf.extend_from_slice(&[0x00, 0x00, 0x04, 0x00]); // idx=0, struct, name len=4
         rbf.extend_from_slice(b"Root");
         rbf.extend_from_slice(&[0u8; 6]); // struct header
@@ -3706,10 +3708,10 @@ mod tests {
         let mut gfx = Vec::new();
         gfx.extend_from_slice(b"GFX\x2a");
         gfx.extend_from_slice(&128u32.to_le_bytes());
-        gfx.extend_from_slice(b"\0com.rockstargames.gtav.HudMap\0");
+        gfx.extend_from_slice(b"\0com.example.hud.HudMap\0");
         let dump = inspect_gfx(&gfx);
         assert!(dump.contains("Version: 42"));
-        assert!(dump.contains("com.rockstargames.gtav.HudMap"));
+        assert!(dump.contains("com.example.hud.HudMap"));
     }
 
     /// Writes sample PNGs from a big .ttpf so decode quality can be eyeballed:
@@ -3829,8 +3831,9 @@ mod tests {
     }
 
     #[test]
-    fn real_gta6_archives_smoke_test() {
-        let base = Path::new(r"D:\Grand Theft Auto VI Build");
+    fn real_archives_smoke_test() {
+        // opt-in: PERCYSTAR_DUMP=<folder of your own archives>
+        let Some(base) = std::env::var_os("PERCYSTAR_DUMP").map(PathBuf::from) else { return };
         if !base.exists() { return; }
 
         // 1. TTPF native scan + decode

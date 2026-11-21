@@ -39,6 +39,11 @@ pub struct EmbedStatus {
 }
 
 pub fn helper_dir() -> Option<PathBuf> {
+    // test binaries live outside a bundle; let data-gated tests borrow an installed app's helpers
+    #[cfg(test)]
+    if let Some(app) = std::env::var_os("PERCYSTAR_BINK_APP") {
+        return Some(PathBuf::from(app).join("Contents/Helpers"));
+    }
     let exe = std::env::current_exe().ok()?;
     let macos = exe.parent()?;
     let contents = macos.parent()?;
