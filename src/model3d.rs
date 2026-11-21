@@ -72,6 +72,7 @@ pub struct Mesh3D {
     pub radius: f32,
     pub geom_count: usize,
     pub meshlet_count: usize,
+    pub bone_count: usize,
     pub lod_label: String,
     // separate drawables in dictionary entries empty for single drawable meshes
     pub parts: Vec<MeshPart>,
@@ -170,6 +171,7 @@ impl Mesh3D {
             radius,
             geom_count,
             meshlet_count,
+            bone_count: 0,
             lod_label,
             parts: Vec::new(),
             active_part: None,
@@ -1076,6 +1078,27 @@ fn layout_parts_in_grid(verts: &mut [[f32; 3]], part_verts: &[std::ops::Range<us
     }
 }
 
+// reads rage9 crSkeletonData bone count from drawable+0x18 -> skel+0x6c
+fn extract_rage9_bone_count(v: &[u8]) -> usize {
+    let mut bases = vec![0usize];
+    if v.len() >= 0x20 {
+        if let Some(fo) = vptr(ru64(v, 0x18)) {
+            if fo + 0x20 <= v.len() { bases.push(fo); }
+        }
+    }
+    for base in bases {
+        if base + 0x20 > v.len() { continue; }
+        let Some(so) = vptr(ru64(v, base + 0x18)) else { continue };
+        if so + 0x70 <= v.len() {
+            let cnt = ru16(v, so + 0x6c) as usize;
+            if (1..=1024).contains(&cnt) && vptr(ru64(v, so + 0x28)).is_some() {
+                return cnt;
+            }
+        }
+    }
+    0
+}
+
 pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name: &str) -> Result<Mesh3D, String> {
     let mut f = File::open(rpf_path).map_err(|e| format!("Open error: {e}"))?;
     let (v, mut next_off, p_cnt) = read_virtual_from_file(&mut f, file_off)?;
@@ -1197,6 +1220,7 @@ pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name
     );
     mesh.geom_materials = geom_materials;
     mesh.has_paint_geom = paint_geoms > 0;
+    mesh.bone_count = extract_rage9_bone_count(&v);
     if parts.len() > 1 {
         mesh.parts = parts;
     }
@@ -1515,10 +1539,11 @@ pub fn part_picker(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
 
 pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
     ui.horizontal_wrapped(|ui| {
+        let bone_s = if mesh.bone_count > 0 { format!("  ·  {} bones", mesh.bone_count) } else { String::new() };
         ui.label(
             RichText::new(format!(
-                "{}  ·  {} verts  ·  {} tris  ·  {} geoms / {} meshlets ({})",
-                mesh.name, mesh.verts.len(), mesh.tris.len(), mesh.geom_count, mesh.meshlet_count, mesh.lod_label
+                "{}  ·  {} verts  ·  {} tris  ·  {} geoms / {} meshlets ({}){}",
+                mesh.name, mesh.verts.len(), mesh.tris.len(), mesh.geom_count, mesh.meshlet_count, mesh.lod_label, bone_s
             ))
             .strong()
             .color(Color32::from_rgb(252, 175, 23)),

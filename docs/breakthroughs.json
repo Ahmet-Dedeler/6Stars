@@ -1,11 +1,11 @@
 {
   "title": "RAGE 9 Research & PercyStar Breakthroughs",
   "author": "@rpatty",
-  "lastUpdated": "2026-11-21 08:46 UTC",
-  "percystarVersion": "1.3.0",
+  "lastUpdated": "2026-11-21 08:59 UTC",
+  "percystarVersion": "1.3.3",
   "links": {
     "github": "https://github.com/rpatty-dev/PercyStar",
-    "latestRelease": "https://github.com/rpatty-dev/PercyStar/releases/tag/v1.3.0",
+    "latestRelease": "https://github.com/rpatty-dev/PercyStar/releases/tag/v1.3.3",
     "navmeshMap": "https://mapnavmeshsite.vercel.app",
     "heightmap": "https://mapnavmeshsite.vercel.app/HEIGHT.png"
   },
@@ -21,11 +21,24 @@
   ],
   "breakthroughs": [
     {
+      "id": "crskeletondata-bones",
+      "timestamp": "2026-11-21 08:58 UTC",
+      "category": "3D & Skeletons",
+      "badge": "CRACKED · BONE TREES",
+      "latest": true,
+      "title": "RAGE 9 crSkeletonData & crBoneData (0x50B/bone) Hierarchy Cracked in .#ft Models",
+      "summary": "Decoded the RAGE 9 crSkeletonData structure (drawable+0x18 -> skel+0x28 bone array, skel+0x6C u16 bone_count) and 0x50-byte crBoneData records (+0x00 quat, +0x10 local pos, +0x20 scale, +0x30 name ptr, +0x46 s16 parent_idx) across vehicle and prop .#ft rigs.",
+      "details": [
+        "Verified full 39-bone vehicle rig hierarchy (Root -> bodyshell -> door_dside_f -> mirror_l/window_lf, interior -> seat_base_lf -> seat_back_lf, steeringcolumn -> steeringwheel, suspension_lf -> wheel_lf) with exact 3D local offsets.",
+        "Also indexed 3,146 RSC9 particle/fx virtual resources (ptfx_model_*) and 2,281 PSIN blocks (273 root schemas) inside data.rpf (481.5 MB).",
+        "Integrated native crSkeletonData bone extraction directly into PercyStar's 3D model viewer."
+      ]
+    },
+    {
       "id": "rpf9-header-toc-proof",
       "timestamp": "2026-11-21 08:46 UTC",
       "category": "Archive Format",
       "badge": "9FPR HEADER CRACKED",
-      "latest": true,
       "title": "RPF9 (9FPR) 64-Byte Header Layout & Static-Key TOC Cipher Proven",
       "summary": "Mapped the 64-byte 9FPR header across all 22 archives (data_offset at +0x04, toc_size at +0x08, names_len at +0x0C, entry_count at +0x24) and proved the encrypted TOC (7.998 bits/byte) uses a static key + fixed IV because +0x40..+0x60 (32 bytes) is byte-for-byte identical across four distinct archives.",
       "details": [
