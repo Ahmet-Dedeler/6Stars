@@ -2,7 +2,7 @@ use flate2::read::ZlibDecoder;
 use std::ffi::c_void;
 use std::fmt::Write as _;
 use std::io::Read;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use std::sync::OnceLock;
 
 const DXBC_MAGIC: &[u8; 4] = b"DXBC";
@@ -10,7 +10,7 @@ const FSSM_MAGIC: &[u8; 4] = b"FSSM";
 const GFX103_CODE_START: [u8; 4] = 0xBFA0_0003u32.to_le_bytes();
 const GFX103_CODE_END: [u8; 4] = 0xBF81_0000u32.to_le_bytes();
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 const CLSID_DXC_COMPILER: Guid = Guid::from_values(
     0x73e22d93,
     0xe6ce,
@@ -18,7 +18,7 @@ const CLSID_DXC_COMPILER: Guid = Guid::from_values(
     [0xb5, 0xbf, 0xf0, 0x66, 0x4f, 0x39, 0xc1, 0xb0],
 );
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 const IID_IDXC_COMPILER3: Guid = Guid::from_values(
     0x228b4687,
     0x5a6a,
@@ -26,7 +26,7 @@ const IID_IDXC_COMPILER3: Guid = Guid::from_values(
     [0x90, 0x0c, 0x97, 0x02, 0xb2, 0x20, 0x3f, 0x54],
 );
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 const IID_IDXC_RESULT: Guid = Guid::from_values(
     0x58346cda,
     0xdde7,
@@ -54,7 +54,7 @@ impl Guid {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[repr(C)]
 struct DxcBuffer {
     ptr: *const c_void,
@@ -132,7 +132,7 @@ pub fn extract_fssm(data: &[u8]) -> Result<FssmShader, String> {
     Err("DXIL payload does not contain a zlib FSSM stream".into())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn disassemble_with_dxc(data: &[u8]) -> Result<String, String> {
     if data.len() < 32 || &data[..4] != DXBC_MAGIC {
         return Err("not a DXBC container".into());
@@ -209,12 +209,14 @@ fn disassemble_with_dxc(data: &[u8]) -> Result<String, String> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 fn disassemble_with_dxc(_data: &[u8]) -> Result<String, String> {
-    Err("DXC disassembly is only available on Windows with dxcompiler.dll".into())
+    Err("DXC disassembly is only available on Windows (dxcompiler.dll) and Linux (libdxcompiler.so)".into())
 }
 
-#[cfg(windows)]
+/// Linux DXC emulates COM in `WinAdapter.h`; current releases (checked v1.9.2609) give `IUnknown`
+/// no virtual destructor, so the vtable slots match Windows.
+#[cfg(any(windows, target_os = "linux"))]
 unsafe fn com_call<F>(instance: *mut c_void, slot: usize) -> F {
     debug_assert!(!instance.is_null());
     let vtable = *(instance as *const *const *mut c_void);
@@ -222,7 +224,7 @@ unsafe fn com_call<F>(instance: *mut c_void, slot: usize) -> F {
     std::mem::transmute_copy(&function)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 unsafe fn release(instance: *mut c_void) {
     if instance.is_null() {
         return;
@@ -231,11 +233,11 @@ unsafe fn release(instance: *mut c_void) {
     release(instance);
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 type DxcCreateInstanceFn =
     unsafe extern "system" fn(*const c_void, *const c_void, *mut *mut c_void) -> i32;
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn cached_dxc_create_instance() -> Result<DxcCreateInstanceFn, String> {
     static DXC_CREATE: OnceLock<Result<DxcCreateInstanceFn, String>> = OnceLock::new();
     DXC_CREATE
@@ -277,6 +279,52 @@ fn get_dxc_create_instance(
         return Err("dxcompiler.dll does not export DxcCreateInstance".into());
     }
     Ok(unsafe { std::mem::transmute(address) })
+}
+
+/// Looks for `libdxcompiler.so` from Microsoft's DirectXShaderCompiler Linux release:
+/// `$SIXSTARS_DXCOMPILER`, next to the executable, then the normal library search path.
+#[cfg(target_os = "linux")]
+fn load_dxc_library() -> Result<*mut c_void, String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    extern "C" {
+        fn dlopen(name: *const std::ffi::c_char, flags: i32) -> *mut c_void;
+    }
+    const RTLD_NOW: i32 = 2;
+
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(path) = std::env::var_os("SIXSTARS_DXCOMPILER") {
+        candidates.push(path.into());
+    }
+    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        candidates.push(dir.join("libdxcompiler.so"));
+    }
+    candidates.push("libdxcompiler.so".into());
+
+    for candidate in &candidates {
+        let Ok(name) = CString::new(candidate.as_os_str().as_bytes()) else { continue };
+        let library = unsafe { dlopen(name.as_ptr(), RTLD_NOW) };
+        if !library.is_null() {
+            return Ok(library);
+        }
+    }
+    Err("libdxcompiler.so was not found. Download the Linux release of microsoft/DirectXShaderCompiler \
+         and put lib/libdxcompiler.so next to Percy6Stars, or set SIXSTARS_DXCOMPILER to its path"
+        .into())
+}
+
+#[cfg(target_os = "linux")]
+fn get_dxc_create_instance(library: *mut c_void) -> Result<DxcCreateInstanceFn, String> {
+    extern "C" {
+        fn dlsym(library: *mut c_void, name: *const std::ffi::c_char) -> *mut c_void;
+    }
+
+    let address = unsafe { dlsym(library, c"DxcCreateInstance".as_ptr()) };
+    if address.is_null() {
+        return Err("libdxcompiler.so does not export DxcCreateInstance".into());
+    }
+    Ok(unsafe { std::mem::transmute::<*mut c_void, DxcCreateInstanceFn>(address) })
 }
 
 fn find_dxil_payload(data: &[u8]) -> Result<&[u8], String> {
@@ -466,5 +514,17 @@ mod tests {
         assert!(text.contains("s_setprio"));
         assert!(text.contains("s_endpgm"));
         assert!(text.contains("synthetic SGD5 shader"));
+    }
+
+    /// Data-gated: `PERCYSTAR_DXIL=<shader.cso> cargo test dxc_disassembles -- --ignored`
+    /// (any DXIL container, e.g. from `dxc -T ps_6_0 -Fo shader.cso`). Needs dxcompiler.
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    #[ignore]
+    fn dxc_disassembles_real_dxil() {
+        let path = std::env::var_os("PERCYSTAR_DXIL").expect("set PERCYSTAR_DXIL");
+        let data = std::fs::read(path).unwrap();
+        let text = disassemble_with_dxc(&data).unwrap();
+        assert!(text.contains("define void @main") || text.contains("dx.op"), "{text}");
     }
 }
