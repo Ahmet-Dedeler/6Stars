@@ -72,6 +72,11 @@ pub struct WorldLaunchConfig {
     pub start_pos: [f32; 3],
 }
 
+pub enum WorldStreamMsg {
+    Batch(WorldBatchInput),
+    MapCount(usize),
+}
+
 pub fn launch_world_gpu_process(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let mut cmd = std::process::Command::new(exe);
@@ -102,12 +107,75 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
     };
     let (tx, rx) = mpsc::channel();
     if let Some(lp) = cfg.levels_rpf.clone() {
+        let start = cfg.start_pos;
         std::thread::spawn(move || {
+            // 1. fast-load brickell slod city blocks immediately
             if let Ok(mesh) = crate::model3d::decode_rage9_model_from_rpf(&lp, 8_679_358_480, "brickell_slod") {
-                let _ = tx.send(WorldBatchInput {
+                let _ = tx.send(WorldStreamMsg::Batch(WorldBatchInput {
                     mesh,
                     instances: vec![(Vec3::ZERO, Quat::IDENTITY, Vec3::ONE, [1.0; 4])],
-                });
+                }));
+            }
+            // 2. build/load cached 0DRPz map placements + model index and stream nearest models
+            let ix = crate::mapdata::build_or_load_world_index(&lp);
+            let _ = tx.send(WorldStreamMsg::MapCount(ix.map_count));
+            let mut by_arch: HashMap<u32, Vec<(Vec3, Quat, Vec3, [f32; 4], f32)>> = HashMap::new();
+            for e in &ix.entities {
+                let Some(&moff) = ix.models.get(&e.archetype_hash) else { continue };
+                let dx = e.pos[0] - start[0];
+                let dy = e.pos[1] - start[1];
+                let d2 = dx * dx + dy * dy;
+                if d2 > 3500.0 * 3500.0 {
+                    continue;
+                }
+                let q = Quat::from_xyzw(e.rot[0], e.rot[1], e.rot[2], e.rot[3]).normalize();
+                let sc = Vec3::new(e.scale_xy, e.scale_xy, e.scale_z);
+                by_arch.entry(moff as u32 ^ e.archetype_hash).or_default().push((
+                    Vec3::from_array(e.pos),
+                    q,
+                    sc,
+                    [1.0; 4],
+                    d2,
+                ));
+                let _ = moff;
+            }
+            // group by archetype_hash cleanly, sorted nearest-first to start_pos
+            let mut arch_groups: Vec<(u32, u64, f32, Vec<(Vec3, Quat, Vec3, [f32; 4])>)> = Vec::new();
+            let mut grouped: HashMap<u32, (f32, Vec<(Vec3, Quat, Vec3, [f32; 4])>)> = HashMap::new();
+            for e in &ix.entities {
+                if !ix.models.contains_key(&e.archetype_hash) {
+                    continue;
+                }
+                let dx = e.pos[0] - start[0];
+                let dy = e.pos[1] - start[1];
+                let d2 = dx * dx + dy * dy;
+                if d2 > 2500.0 * 2500.0 {
+                    continue;
+                }
+                let q = Quat::from_xyzw(e.rot[0], e.rot[1], e.rot[2], e.rot[3]).normalize();
+                let sc = Vec3::new(e.scale_xy, e.scale_xy, e.scale_z);
+                let entry = grouped.entry(e.archetype_hash).or_insert_with(|| (d2, Vec::new()));
+                if d2 < entry.0 {
+                    entry.0 = d2;
+                }
+                entry.1.push((Vec3::from_array(e.pos), q, sc, [1.0; 4]));
+            }
+            for (h, (d2, insts)) in grouped {
+                if let Some(&moff) = ix.models.get(&h) {
+                    arch_groups.push((h, moff, d2, insts));
+                }
+            }
+            arch_groups.sort_by(|a, b| a.2.total_cmp(&b.2));
+            for (h, moff, _, insts) in arch_groups.into_iter().take(600) {
+                if let Ok(mesh) = crate::model3d::decode_rage9_model_from_rpf(&lp, moff, &format!("arch_{h:08x}")) {
+                    let lo = mesh.name.to_ascii_lowercase();
+                    if lo.ends_with("_shadow") || lo.ends_with("_pxy") || lo.ends_with("_lit_proxy") {
+                        continue;
+                    }
+                    if tx.send(WorldStreamMsg::Batch(WorldBatchInput { mesh, instances: insts })).is_err() {
+                        break;
+                    }
+                }
             }
         });
     }
@@ -804,7 +872,7 @@ impl GpuState {
 struct GpuWorldApp {
     cfg: Option<WorldLaunchConfig>,
     terrain_ref: Option<Arc<WorldMapData>>,
-    stream_rx: Receiver<WorldBatchInput>,
+    stream_rx: Receiver<WorldStreamMsg>,
     gpu: Option<GpuState>,
     cam_pos: Vec3,
     vel_z: f32,
@@ -822,7 +890,7 @@ struct GpuWorldApp {
 }
 
 impl GpuWorldApp {
-    fn new(cfg: WorldLaunchConfig, stream_rx: Receiver<WorldBatchInput>) -> Self {
+    fn new(cfg: WorldLaunchConfig, stream_rx: Receiver<WorldStreamMsg>) -> Self {
         Self {
             cam_pos: Vec3::from_array(cfg.start_pos),
             terrain_ref: cfg.terrain.clone(),
@@ -932,8 +1000,11 @@ impl ApplicationHandler for GpuWorldApp {
                 self.last_frame = now;
 
                 if let Some(g) = &mut self.gpu {
-                    while let Ok(batch) = self.stream_rx.try_recv() {
-                        g.add_batch(&batch);
+                    while let Ok(msg) = self.stream_rx.try_recv() {
+                        match msg {
+                            WorldStreamMsg::Batch(batch) => g.add_batch(&batch),
+                            WorldStreamMsg::MapCount(mc) => g.map_count = mc,
+                        }
                     }
                 }
 

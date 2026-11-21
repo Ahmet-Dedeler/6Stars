@@ -194,6 +194,7 @@ Requires **Rust** (`x86_64-pc-windows-gnu` with MinGW `windres`/`dlltool`, or `m
   - `@kotelkonrad` (Issue #11) — suggested arrow-key / WASD asset browsing navigation.
   - `@techfoundrynz` (PRs #12, #13) — 40-bit/21-bit `>4 GiB` TTPF texture addressing and format 99 `float3` meshlet vertex-stream decoder.
   - `@paryzius` ([ttpf-viewer](https://github.com/paryzius/ttpf-viewer)) — `.ttpf` reduced-mip fallback when mip 0 sits in unreadable BCPack/truncated chunks.
+  - `@holdmysocks` ([SixNG](https://github.com/holdmysocks/SixNG)) — `0DRPz` (`0x7a`) map placement schema (`0xd3593fa6` / `0xce501483`) for world entity streaming.
   - `@Xyzstk` — `SGD5` & `DXBC`/`FSSM` RDNA2 shader PR (#8).
 
 ```powershell

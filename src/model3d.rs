@@ -469,7 +469,7 @@ fn find_next_zlib(f: &mut File, start_off: u64) -> std::io::Result<Option<u64>> 
 }
 
 // reads all virtual chnks from a rage9 resource stopping right after blockmap
-fn read_virtual_from_file(f: &mut File, file_off: u64) -> Result<(Vec<u8>, u64, usize), String> {
+pub fn read_virtual_from_file(f: &mut File, file_off: u64) -> Result<(Vec<u8>, u64, usize), String> {
     let (mut v, mut next_off) = decompress_zlib_at(f, file_off, 16 * 1024 * 1024)
         .map_err(|e| format!("Virtual chunk 0 error: {e}"))?;
     if v.len() < 0x80 {

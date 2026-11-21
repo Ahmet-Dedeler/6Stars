@@ -1,27 +1,27 @@
+use crate::model3d::{extract_rage9_model_name, has_rage9_meshlets, read_virtual_from_file};
+use crate::psin::joaat;
 use flate2::{Decompress, FlushDecompress};
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::fs::{self, File};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
-pub const CMAPDATA_HASH: u32 = 0x62ca_d9f0;
-pub const CENTITYDEF_HASH: u32 = 0x2231_3605;
-pub const CMAPTYPES_HASH: u32 = 0x3ba1_fc1e;
+pub const ENTITY_STRUCT_HASH: u32 = 0xce50_1483;
+pub const MAPDATA_STRUCT_HASH: u32 = 0xd359_3fa6;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct EntityPlacement {
     pub archetype_hash: u32,
     pub pos: [f32; 3],
-    pub rot: [f32; 4],
-    pub scale: [f32; 3],
-    pub lod_dist: f32,
+    pub rot: [f32; 4], // world-space quaternion (x, y, z, w)
+    pub scale_xy: f32,
+    pub scale_z: f32,
 }
 
-#[derive(Clone, Debug)]
-pub struct MapSector {
-    pub offset: u64,
-    pub min: [f32; 3],
-    pub max: [f32; 3],
+#[derive(Default)]
+pub struct WorldIndex {
+    pub map_count: usize,
+    pub models: HashMap<u32, u64>,
     pub entities: Vec<EntityPlacement>,
 }
 
@@ -29,26 +29,164 @@ pub struct MapSector {
 fn is_zlib(b: &[u8]) -> bool {
     b.len() >= 2 && b[0] == 0x78 && matches!(b[1], 0x01 | 0x5e | 0x9c | 0xda)
 }
+#[inline]
+fn ru16(b: &[u8], o: usize) -> u16 {
+    u16::from_le_bytes([b[o], b[o + 1]])
+}
+#[inline]
+fn ru32(b: &[u8], o: usize) -> u32 {
+    u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+}
+#[inline]
+fn ru64(b: &[u8], o: usize) -> u64 {
+    u64::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3], b[o + 4], b[o + 5], b[o + 6], b[o + 7]])
+}
+#[inline]
+fn rf32(b: &[u8], o: usize) -> f32 {
+    f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+}
+#[inline]
+fn vptr(p: u64) -> Option<usize> {
+    ((p >> 28) == 5).then_some((p & 0x0FFF_FFFF) as usize)
+}
 
-pub fn probe_maps_cli(rpf_path: &Path) {
-    let Ok(mut f) = File::open(rpf_path) else {
-        eprintln!("Failed to open {}", rpf_path.display());
-        return;
-    };
+// decode 0DRPz (0x7a) map placement resource into world-space EntityPlacements
+// layout credited to @holdmysocks (SixNG meta7a.rs)
+pub fn parse_0drpz_map_entities(sys: &[u8]) -> Option<Vec<EntityPlacement>> {
+    if sys.len() < 0x50 || sys.get(0x10..0x15) != Some(b"0DRPz") {
+        return None;
+    }
+    let nbl = ru16(sys, 0x4C) as usize;
+    let it = vptr(ru64(sys, 0x38))?;
+    if it + nbl * 16 > sys.len() {
+        return None;
+    }
+
+    let mut out = Vec::new();
+    let mut has_map_root = false;
+    for i in 0..nbl {
+        let o = it + i * 16;
+        let hash = ru32(sys, o);
+        let sz = ru32(sys, o + 4) as usize;
+        if hash == MAPDATA_STRUCT_HASH {
+            has_map_root = true;
+        }
+        if hash != ENTITY_STRUCT_HASH || sz < 0x90 {
+            continue;
+        }
+        let Some(base) = vptr(ru64(sys, o + 8)) else { continue };
+        let end = base.saturating_add(sz).min(sys.len());
+        let mut cur = base;
+        while cur + 0x90 <= end {
+            let arch = ru32(sys, cur + 0x44);
+            let pos = [rf32(sys, cur + 0x38), rf32(sys, cur + 0x3C), rf32(sys, cur + 0x40)];
+            // stored quaternion is inverse rotation; conjugate gives world rotation
+            let rot = [
+                -rf32(sys, cur + 0x10),
+                -rf32(sys, cur + 0x14),
+                -rf32(sys, cur + 0x18),
+                rf32(sys, cur + 0x1C),
+            ];
+            let sxy = rf32(sys, cur + 0x54);
+            let sz_s = rf32(sys, cur + 0x58);
+            if pos.iter().all(|v| v.is_finite() && v.abs() < 30_000.0) && rot.iter().all(|v| v.is_finite()) {
+                out.push(EntityPlacement {
+                    archetype_hash: arch,
+                    pos,
+                    rot,
+                    scale_xy: if sxy.is_finite() && sxy > 0.01 && sxy < 100.0 { sxy } else { 1.0 },
+                    scale_z: if sz_s.is_finite() && sz_s > 0.01 && sz_s < 100.0 { sz_s } else { 1.0 },
+                });
+            }
+            cur += 0x90;
+        }
+    }
+    if has_map_root || !out.is_empty() {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+fn cache_path() -> Option<PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    Some(base.join("PercyStar").join("world_index_v1.bin"))
+}
+
+fn save_world_index(path: &Path, rpf_len: u64, ix: &WorldIndex) {
+    if let Some(par) = path.parent() {
+        let _ = fs::create_dir_all(par);
+    }
+    let Ok(f) = File::create(path) else { return };
+    let mut w = BufWriter::new(f);
+    let _ = w.write_all(b"PSW1");
+    let _ = w.write_all(&rpf_len.to_le_bytes());
+    let _ = w.write_all(&(ix.map_count as u64).to_le_bytes());
+    let _ = w.write_all(&(ix.models.len() as u64).to_le_bytes());
+    let _ = w.write_all(&(ix.entities.len() as u64).to_le_bytes());
+    for (&h, &off) in &ix.models {
+        let _ = w.write_all(&h.to_le_bytes());
+        let _ = w.write_all(&off.to_le_bytes());
+    }
+    for e in &ix.entities {
+        let _ = w.write_all(&e.archetype_hash.to_le_bytes());
+        for v in e.pos { let _ = w.write_all(&v.to_le_bytes()); }
+        for v in e.rot { let _ = w.write_all(&v.to_le_bytes()); }
+        let _ = w.write_all(&e.scale_xy.to_le_bytes());
+        let _ = w.write_all(&e.scale_z.to_le_bytes());
+    }
+    let _ = w.flush();
+}
+
+fn load_world_index(path: &Path, rpf_len: u64) -> Option<WorldIndex> {
+    let mut r = BufReader::new(File::open(path).ok()?);
+    let mut hdr = [0u8; 36];
+    r.read_exact(&mut hdr).ok()?;
+    if &hdr[..4] != b"PSW1" || ru64(&hdr, 4) != rpf_len {
+        return None;
+    }
+    let map_count = ru64(&hdr, 12) as usize;
+    let n_models = ru64(&hdr, 20) as usize;
+    let n_ents = ru64(&hdr, 28) as usize;
+    let mut models = HashMap::with_capacity(n_models);
+    let mut mbuf = [0u8; 12];
+    for _ in 0..n_models {
+        r.read_exact(&mut mbuf).ok()?;
+        models.insert(ru32(&mbuf, 0), ru64(&mbuf, 4));
+    }
+    let mut entities = Vec::with_capacity(n_ents);
+    let mut ebuf = [0u8; 40];
+    for _ in 0..n_ents {
+        r.read_exact(&mut ebuf).ok()?;
+        entities.push(EntityPlacement {
+            archetype_hash: ru32(&ebuf, 0),
+            pos: [rf32(&ebuf, 4), rf32(&ebuf, 8), rf32(&ebuf, 12)],
+            rot: [rf32(&ebuf, 16), rf32(&ebuf, 20), rf32(&ebuf, 24), rf32(&ebuf, 28)],
+            scale_xy: rf32(&ebuf, 32),
+            scale_z: rf32(&ebuf, 36),
+        });
+    }
+    Some(WorldIndex { map_count, models, entities })
+}
+
+pub fn build_or_load_world_index(levels_rpf: &Path) -> WorldIndex {
+    let Ok(mut f) = File::open(levels_rpf) else { return WorldIndex::default() };
     let sz = f.metadata().map(|m| m.len()).unwrap_or(0);
-    println!("Probing {} ({:.2} GB)...", rpf_path.display(), sz as f64 / 1e9);
+    if let Some(cp) = cache_path() {
+        if let Some(ix) = load_world_index(&cp, sz) {
+            return ix;
+        }
+    }
 
+    let mut ix = WorldIndex::default();
     let chunk_sz = 64 * 1024 * 1024usize;
     let mut buf = vec![0u8; chunk_sz];
     let mut off = 0u64;
     let mut dec = Decompress::new(true);
-    let mut out = vec![0u8; 4096];
-
-    let mut psin_cnt = 0usize;
-    let mut rsc_cnt = 0usize;
-    let mut model_cnt = 0usize;
-    let mut psin_structs: HashMap<u32, (usize, u64)> = HashMap::new();
-    let mut rsc_sigs: HashMap<(u32, u32), (usize, u64)> = HashMap::new();
+    let mut out = vec![0u8; 32768];
+    let mut f_res = File::open(levels_rpf).unwrap();
 
     while off < sz {
         let _ = f.seek(SeekFrom::Start(off));
@@ -65,42 +203,28 @@ pub fn probe_maps_cli(rpf_path: &Path) {
         }
         let mut pos = 0usize;
         while pos + 0x20 <= read_n {
-            // check direct psin at page start
-            if is_zlib(&buf[pos..]) {
-                dec.reset(true);
-                let _ = dec.decompress(&buf[pos..(pos + 16384).min(read_n)], &mut out, FlushDecompress::None);
-                let olen = dec.total_out() as usize;
-                if olen >= 16 && &out[..4] == b"PSIN" {
-                    psin_cnt += 1;
-                    // find LSCH first struct hash if present in first 4kb
-                    if let Some(lsch_p) = out[..olen].windows(4).position(|w| w == b"LSCH") {
-                        if lsch_p + 12 <= olen {
-                            let h = u32::from_le_bytes([out[lsch_p + 8], out[lsch_p + 9], out[lsch_p + 10], out[lsch_p + 11]]);
-                            let e = psin_structs.entry(h).or_insert((0, off + pos as u64));
-                            e.0 += 1;
-                        }
-                    }
-                }
-            }
-            // check rage9 resource at pos + 0x10
             let p = pos + 0x10;
-            if p + 8 <= read_n && is_zlib(&buf[p..]) {
+            if is_zlib(&buf[p..]) {
                 dec.reset(true);
-                let _ = dec.decompress(&buf[p..(p + 16384).min(read_n)], &mut out, FlushDecompress::None);
+                let _ = dec.decompress(&buf[p..(p + 32768).min(read_n)], &mut out, FlushDecompress::None);
                 let olen = dec.total_out() as usize;
                 if olen >= 0x80 {
-                    let vft = u64::from_le_bytes(out[0..8].try_into().unwrap());
-                    let bmap = u64::from_le_bytes(out[8..16].try_into().unwrap());
+                    let vft = ru64(&out, 0);
+                    let bmap = ru64(&out, 8);
                     if vft == 0 && (0x5000_0000..0x5800_0000).contains(&bmap) {
-                        rsc_cnt += 1;
-                        let sig0 = u32::from_le_bytes(out[0x10..0x14].try_into().unwrap());
-                        let sig1 = u32::from_le_bytes(out[0x14..0x18].try_into().unwrap());
-                        let m60 = u64::from_le_bytes(out[0x60..0x68].try_into().unwrap());
-                        if m60 == 0x1601 || (sig0 == 0 && sig1 == 0) {
-                            model_cnt += 1;
-                        } else if sig1 != 0x0001_0015 && &out[0x10..0x14] != b"0DRP" {
-                            let e = rsc_sigs.entry((sig0, sig1)).or_insert((0, off + pos as u64));
-                            e.0 += 1;
+                        let abs_off = off + p as u64;
+                        if out.get(0x10..0x15) == Some(b"0DRPz") {
+                            if let Ok((sys, _, _)) = read_virtual_from_file(&mut f_res, abs_off) {
+                                if let Some(ents) = parse_0drpz_map_entities(&sys) {
+                                    ix.map_count += 1;
+                                    ix.entities.extend(ents);
+                                }
+                            }
+                        } else if has_rage9_meshlets(&out[..olen]) {
+                            if let Some((nm, ext)) = extract_rage9_model_name(&out[..olen]) {
+                                let stem = nm.strip_suffix(ext).unwrap_or(&nm);
+                                ix.models.entry(joaat(stem)).or_insert(abs_off);
+                            }
                         }
                     }
                 }
@@ -108,22 +232,49 @@ pub fn probe_maps_cli(rpf_path: &Path) {
             pos += 0x1000;
         }
         off += read_n as u64;
-        if (off / (1024 * 1024 * 1024)) != ((off - read_n as u64) / (1024 * 1024 * 1024)) {
-            println!("  {:.1} / {:.1} GB | psin={psin_cnt} rsc={rsc_cnt} models={model_cnt}", off as f64 / 1e9, sz as f64 / 1e9);
-        }
     }
 
-    println!("Done: psin={psin_cnt}, rsc={rsc_cnt}, models={model_cnt}");
-    let mut ps: Vec<_> = psin_structs.into_iter().collect();
-    ps.sort_by(|a, b| b.1.0.cmp(&a.1.0));
-    println!("Top PSIN root hashes:");
-    for (h, (cnt, first_off)) in ps.into_iter().take(15) {
-        println!("  0x{h:08x}: {cnt} (first @ 0x{first_off:x})");
+    if let Some(cp) = cache_path() {
+        save_world_index(&cp, sz, &ix);
     }
-    let mut rs: Vec<_> = rsc_sigs.into_iter().collect();
-    rs.sort_by(|a, b| b.1.0.cmp(&a.1.0));
-    println!("Top non-model RSC sigs (u32@0x10, u32@0x14):");
-    for ((s0, s1), (cnt, first_off)) in rs.into_iter().take(15) {
-        println!("  (0x{s0:08x}, 0x{s1:08x}): {cnt} (first @ 0x{first_off:x})");
+    ix
+}
+
+pub fn probe_maps_cli(rpf_path: &Path) {
+    let ix = build_or_load_world_index(rpf_path);
+    println!("WorldIndex: {} maps, {} models, {} entity placements", ix.map_count, ix.models.len(), ix.entities.len());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_synthetic_0drpz_map_entities() {
+        let mut sys = vec![0u8; 0x180];
+        sys[0x10..0x15].copy_from_slice(b"0DRPz");
+        sys[0x4C..0x4E].copy_from_slice(&2u16.to_le_bytes()); // 2 blocks
+        sys[0x38..0x40].copy_from_slice(&(0x5000_0080u64).to_le_bytes());
+        // block 0: MAPDATA
+        sys[0x80..0x84].copy_from_slice(&MAPDATA_STRUCT_HASH.to_le_bytes());
+        // block 1: ENTITY (1 * 0x90) at 0x5000_00E0
+        sys[0x90..0x94].copy_from_slice(&ENTITY_STRUCT_HASH.to_le_bytes());
+        sys[0x94..0x98].copy_from_slice(&0x90u32.to_le_bytes());
+        sys[0x98..0xA0].copy_from_slice(&(0x5000_00E0u64).to_le_bytes());
+        let e = 0xE0;
+        sys[e + 0x44..e + 0x48].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        sys[e + 0x38..e + 0x3C].copy_from_slice(&(-2351.0f32).to_le_bytes());
+        sys[e + 0x3C..e + 0x40].copy_from_slice(&(-5533.0f32).to_le_bytes());
+        sys[e + 0x40..e + 0x44].copy_from_slice(&8.0f32.to_le_bytes());
+        sys[e + 0x1C..e + 0x20].copy_from_slice(&1.0f32.to_le_bytes());
+        sys[e + 0x54..e + 0x58].copy_from_slice(&1.5f32.to_le_bytes());
+        sys[e + 0x58..e + 0x5C].copy_from_slice(&2.0f32.to_le_bytes());
+
+        let ents = parse_0drpz_map_entities(&sys).unwrap();
+        assert_eq!(ents.len(), 1);
+        assert_eq!(ents[0].archetype_hash, 0x1234_5678);
+        assert_eq!(ents[0].pos, [-2351.0, -5533.0, 8.0]);
+        assert_eq!(ents[0].scale_xy, 1.5);
+        assert_eq!(ents[0].scale_z, 2.0);
     }
 }
