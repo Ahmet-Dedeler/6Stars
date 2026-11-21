@@ -4,13 +4,13 @@ Formerly PercyStar (upstream `rpatty-dev/PercyStar`); renamed to 6Stars. Rust + 
 
 ## Remotes and branches
 - `origin` = upstream `rpatty-dev/PercyStar`. Never push there. Changes go upstream only as focused PRs from branches cut off `origin/main`.
-- `fork` = public `Ahmet-Dedeler/PercyStar`. `fork/main` is the maintained fork that the README tells people to clone and build. Work lands there through feature branches; don't force-push `main`.
+- `fork` = public `Ahmet-Dedeler/6Stars` (renamed from `Ahmet-Dedeler/PercyStar`; old URLs redirect). `fork/main` is the maintained fork that the README tells people to clone and build. Work lands there through feature branches; don't force-push `main`.
 - `mine` = private `Ahmet-Dedeler/PercyStar-private` (`ahmet/main`): local-only experiments.
 - Before starting, `git fetch fork` and branch from `fork/main`. Other agents push often; rebase before you push.
 
 ## Naming
 - User-facing name is **6Stars** (window title, bundle, exe, docs). Rust identifiers can't start with a digit, so code and env vars use `sixstars` / `SIXSTARS_` where a name is needed.
-- Kept on purpose: the GitHub repo URLs (`Ahmet-Dedeler/PercyStar`, until the repo is renamed), upstream references, `LICENSE` (upstream's, untouched), and the dev-only test gates (`PERCYSTAR_*`, `PERCY_*`).
+- Kept on purpose: upstream references (`rpatty-dev/PercyStar`), `LICENSE` (upstream's, untouched), and the dev-only test gates (`PERCYSTAR_*`, `PERCY_*`).
 - Compatibility with pre-rename installs: the data folder `PercyStar` is moved to `6Stars` on first launch, old `percystar-*` temp folders are still cleaned, and `.obj` files with a `# PercyStar` header still load as z-up.
 
 ## Every change must work on macOS and Windows

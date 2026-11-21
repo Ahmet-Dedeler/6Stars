@@ -42,8 +42,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-// the GitHub repo still carries the upstream name; GitHub redirects if it is renamed
-const REPO_RELEASES_URL: &str = "https://github.com/Ahmet-Dedeler/PercyStar/releases";
+const REPO_RELEASES_URL: &str = "https://github.com/Ahmet-Dedeler/6Stars/releases";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 

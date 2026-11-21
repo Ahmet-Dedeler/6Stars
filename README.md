@@ -39,8 +39,8 @@
 ## Build from Source
 
 ```sh
-git clone https://github.com/Ahmet-Dedeler/PercyStar.git
-cd PercyStar
+git clone https://github.com/Ahmet-Dedeler/6Stars.git
+cd 6Stars
 ```
 
 <details>
@@ -149,7 +149,7 @@ SIXSTARS_APP_PATH=dist/6Stars-next.app bash scripts/build_macos.sh
 ## Project Layout
 
 ```text
-PercyStar/
+6Stars/
 ├── assets/
 │   ├── icon.png            # 1024px macOS app icon source
 │   ├── logo.png            # In-app logo & window icon
