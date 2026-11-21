@@ -506,7 +506,6 @@ struct ScanState {
     rpf_names: Vec<String>,
     file_sig: HashMap<PathBuf, (u64, Option<SystemTime>)>,
     audio_bank_meta: HashMap<u64, dat::ResolvedAwcMeta>,
-    radio_stations: Vec<String>,
     ver: u64,
 }
 
@@ -1137,18 +1136,10 @@ impl Rpf9App {
                                                     e.name = display_entry_name(e, false).into_owned();
                                                 }
                                             }
-                                            let (meta_map, stations) = enrich_audio_rpf_entries(p, meta.len(), cached_entries);
-                                            st.audio_bank_meta = meta_map;
-                                            if !stations.is_empty() {
-                                                st.radio_stations = stations;
-                                            }
+                                            st.audio_bank_meta = enrich_audio_rpf_entries(p, meta.len(), cached_entries);
                                             disk_cache_dirty = true;
                                         } else if st.audio_bank_meta.is_empty() {
-                                            let (meta_map, stations) = enrich_audio_rpf_entries(p, meta.len(), cached_entries);
-                                            st.audio_bank_meta = meta_map;
-                                            if !stations.is_empty() {
-                                                st.radio_stations = stations;
-                                            }
+                                            st.audio_bank_meta = enrich_audio_rpf_entries(p, meta.len(), cached_entries);
                                         }
                                     }
                                     let is_levels = p.file_name().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("levels.rpf")).unwrap_or(false);
@@ -1412,8 +1403,6 @@ impl Rpf9App {
                 self.state.lock().unwrap().audio_bank_meta.get(&e.offset).map(|meta| {
                     audio_player::AudioBankContext {
                         pack_name: meta.pack_name.clone(),
-                        bank_hash: meta.bank_hash,
-                        exact_size: meta.exact_size,
                         used_by: meta.used_by.clone(),
                     }
                 })
@@ -3653,7 +3642,7 @@ fn display_entry_name(e: &RpfEntry, audio_named: bool) -> std::borrow::Cow<'_, s
     std::borrow::Cow::Borrowed(&e.name)
 }
 
-fn enrich_audio_rpf_entries(audio_rpf: &PathBuf, total_sz: u64, entries: &mut Vec<RpfEntry>) -> (HashMap<u64, dat::ResolvedAwcMeta>, Vec<String>) {
+fn enrich_audio_rpf_entries(audio_rpf: &PathBuf, total_sz: u64, entries: &mut Vec<RpfEntry>) -> HashMap<u64, dat::ResolvedAwcMeta> {
     let mut meta_map = HashMap::new();
     let awc_indices: Vec<usize> = entries
         .iter()
@@ -3666,7 +3655,7 @@ fn enrich_audio_rpf_entries(audio_rpf: &PathBuf, total_sz: u64, entries: &mut Ve
         .map(|&i| entries[i].offset)
         .unwrap_or(19_509_248);
     let Some(cat) = dat::parse_audio_rpf_catalog(audio_rpf, first_awc_off) else {
-        return (meta_map, Vec::new());
+        return meta_map;
     };
     let rname = audio_rpf
         .file_name()
@@ -3706,7 +3695,7 @@ fn enrich_audio_rpf_entries(audio_rpf: &PathBuf, total_sz: u64, entries: &mut Ve
             }
         }
     }
-    (meta_map, cat.radio_stations)
+    meta_map
 }
 
 impl eframe::App for Rpf9App {
@@ -3731,10 +3720,6 @@ impl eframe::App for Rpf9App {
             if let Some((tracks, awc_bytes)) = m.loaded_tracks.take() {
                 self.audio_player.set_tracks(tracks, awc_bytes);
                 self.audio_player.bank_ctx = m.loaded_bank_ctx.take();
-                if self.audio_player.radio_stations.is_empty() {
-                    let stations = self.state.lock().unwrap().radio_stations.clone();
-                    self.audio_player.radio_stations = stations;
-                }
             }
             (m.loading, m.status.clone())
         };

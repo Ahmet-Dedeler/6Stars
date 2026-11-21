@@ -425,8 +425,6 @@ mod backend {
 #[derive(Clone, Debug, Default)]
 pub struct AudioBankContext {
     pub pack_name: String,
-    pub bank_hash: u32,
-    pub exact_size: u64,
     pub used_by: Vec<String>,
 }
 
@@ -443,9 +441,6 @@ pub struct AudioPlayerState {
     pub loop_track: bool,
     pub filter: String,
     pub bank_ctx: Option<AudioBankContext>,
-    pub radio_stations: Vec<String>,
-    pub inspector_open: bool,
-    pub radio_filter: String,
     pub requested_search: Option<String>,
     pub status_msg: String,
     pub error: Option<String>,
@@ -472,9 +467,6 @@ impl Default for AudioPlayerState {
             loop_track: false,
             filter: String::new(),
             bank_ctx: None,
-            radio_stations: Vec::new(),
-            inspector_open: true,
-            radio_filter: String::new(),
             requested_search: None,
             status_msg: String::new(),
             error: None,
@@ -741,16 +733,6 @@ pub fn render_awc_audio_view(
             }
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let insp_btn = egui::Button::new(
-                RichText::new(if player.inspector_open { "Inspector: ON" } else { "Inspector" })
-                    .size(11.5)
-                    .color(if player.inspector_open { Color32::BLACK } else { Color32::from_rgb(255, 168, 28) }),
-            )
-            .fill(if player.inspector_open { Color32::from_rgb(255, 168, 28) } else { Color32::from_rgb(38, 24, 56) });
-            if ui.add(insp_btn).clicked() {
-                player.inspector_open = !player.inspector_open;
-            }
-            ui.add_space(6.0);
             ui.label(
                 RichText::new(format!("{} stream(s)", player.tracks.len()))
                     .size(11.5)
@@ -758,91 +740,22 @@ pub fn render_awc_audio_view(
             );
         });
     });
-    ui.add_space(4.0);
-    ui.separator();
-
-    if player.inspector_open && (player.bank_ctx.is_some() || !player.radio_stations.is_empty()) {
-        egui::SidePanel::right("audio_xref_panel")
-            .resizable(true)
-            .default_width(280.0)
-            .min_width(220.0)
-            .frame(egui::Frame::new().fill(Color32::from_rgb(20, 14, 32)).inner_margin(10.0))
-            .show_inside(ui, |ui| {
-                if let Some(ref bctx) = player.bank_ctx {
-                    ui.label(RichText::new("Audio Bank Metadata").strong().size(13.0).color(Color32::from_rgb(255, 168, 28)));
-                    ui.add_space(4.0);
-                    ui.horizontal_wrapped(|ui| {
-                        let pack_slug = bctx.pack_name.replace('.', "_");
-                        let pbtn = egui::Button::new(RichText::new(&bctx.pack_name).strong().size(11.5).color(Color32::BLACK))
-                            .fill(Color32::from_rgb(90, 235, 165));
-                        if ui.add(pbtn).on_hover_text("Click to filter Explorer by this pack").clicked() {
-                            player.requested_search = Some(pack_slug);
-                        }
-                    });
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new(format!("Bank Hash: 0x{:08x}\nExact Size: {} B ({:.1} KB)", bctx.bank_hash, bctx.exact_size, bctx.exact_size as f64 / 1024.0))
-                            .size(11.5)
-                            .color(Color32::from_rgb(205, 195, 225)),
-                    );
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.label(RichText::new(format!("Used By / Game Events ({})", bctx.used_by.len())).strong().size(12.5).color(Color32::from_rgb(255, 72, 165)));
-                    ui.add_space(4.0);
-                    if bctx.used_by.is_empty() {
-                        ui.label(RichText::new("No direct WaveSlot or DAT166/DAT581 cross-references for this bank.").size(11.0).color(Color32::from_rgb(145, 135, 165)));
-                    } else {
-                        egui::ScrollArea::vertical().id_salt("used_by_scroll").max_height(190.0).show(ui, |ui| {
-                            for item in &bctx.used_by {
-                                if ui.selectable_label(false, RichText::new(format!("• {item}")).size(11.5).color(Color32::from_rgb(155, 225, 195)))
-                                    .on_hover_text("Click to copy / filter")
-                                    .clicked()
-                                {
-                                    ctx.copy_text(item.clone());
-                                    player.requested_search = Some(item.replace('.', "_"));
-                                }
-                            }
-                        });
+    if let Some(ref bctx) = player.bank_ctx {
+        if !bctx.used_by.is_empty() {
+            ui.add_space(2.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(format!("Pack: {} | Used by:", bctx.pack_name)).size(11.0).color(Color32::from_rgb(175, 160, 200)));
+                for item in bctx.used_by.iter().take(6) {
+                    if ui.small_button(RichText::new(item).size(11.0).color(Color32::from_rgb(155, 225, 195))).clicked() {
+                        ctx.copy_text(item.clone());
+                        player.requested_search = Some(item.replace('.', "_"));
                     }
-                    ui.add_space(8.0);
-                    ui.separator();
-                }
-
-                if !player.radio_stations.is_empty() {
-                    ui.label(RichText::new(format!("Radio Stations & Podcasts ({})", player.radio_stations.len())).strong().size(12.5).color(Color32::from_rgb(255, 168, 28)));
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        if ui.small_button("Music Streams").on_hover_text("Filter Streams_Music_Radio").clicked() {
-                            player.requested_search = Some("Streams_Music_Radio".into());
-                        }
-                        if ui.small_button("DJ Speech").on_hover_text("Filter Radio_DjSpeech").clicked() {
-                            player.requested_search = Some("Radio_DjSpeech".into());
-                        }
-                    });
-                    ui.add_space(4.0);
-                    ui.add(
-                        egui::TextEdit::singleline(&mut player.radio_filter)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("Filter stations..."),
-                    );
-                    ui.add_space(4.0);
-                    let rf = player.radio_filter.trim().to_ascii_lowercase();
-                    egui::ScrollArea::vertical().id_salt("radio_stations_scroll").show(ui, |ui| {
-                        for st in &player.radio_stations {
-                            if !rf.is_empty() && !st.to_ascii_lowercase().contains(&rf) {
-                                continue;
-                            }
-                            if ui.selectable_label(false, RichText::new(st).size(11.5).color(Color32::from_rgb(215, 205, 235)))
-                                .on_hover_text("Click to copy station ID")
-                                .clicked()
-                            {
-                                ctx.copy_text(st.clone());
-                            }
-                        }
-                    });
                 }
             });
+        }
     }
+    ui.add_space(4.0);
+    ui.separator();
 
     let needle = player.filter.trim().to_ascii_lowercase();
     let visible_indices: Vec<usize> = if needle.is_empty() {
