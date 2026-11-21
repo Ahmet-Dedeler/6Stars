@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Ahmet Dedeler
+
 //! Files opened from Finder on macOS: double-click, "Open With", or a drop on the Dock icon.
 //!
 //! Finder does not pass these as command-line arguments. AppKit delivers an Apple Event and
