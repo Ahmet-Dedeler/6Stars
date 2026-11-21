@@ -911,29 +911,56 @@ pub fn decode_ttpf_texture(path: &Path, tex_idx: usize) -> Result<DecodedTexture
     } else {
         None
     };
-    let raw_tex = match tail_off {
+    let raw_try = match tail_off {
         Some(off) => {
-            let t = ttpf_read_virtual(path, &ix, off, mip0_padded)?;
-            if t.iter().take(256).all(|&b| b == t[0]) {
-                ttpf_read_virtual(path, &ix, d.byte_off, mip0_padded)?
-            } else {
-                t
+            match ttpf_read_virtual(path, &ix, off, mip0_padded) {
+                Ok(t) if t.iter().take(256).all(|&b| b == t[0]) => ttpf_read_virtual(path, &ix, d.byte_off, mip0_padded),
+                other => other,
             }
         }
-        None => ttpf_read_virtual(path, &ix, d.byte_off, mip0_padded)?,
+        None => ttpf_read_virtual(path, &ix, d.byte_off, mip0_padded),
     };
-    let lin = if use_64k {
-        deswizzle_64kb_ttpf(&raw_tex, d.w, d.h, is_bc, bpe)
+    let (raw_tex, dec_w, dec_h, dec_64k, dec_mips) = match raw_try {
+        Ok(raw) => (raw, d.w, d.h, use_64k, if d.has_mips { 2 } else { 1 }),
+        Err(first_err) if d.has_mips => {
+            // reduced mip fallback (credited to @paryzius ttpf-viewer) when mip0 sits in unreadable bcpack/cutoff chunk
+            let mut found = None;
+            let mut cursor_end = tail_off.unwrap_or(d.byte_off + d.alloc_sz);
+            for mip in 1..=6u8 {
+                let mw = (d.w >> mip).max(4);
+                let mh = (d.h >> mip).max(4);
+                let m_ew = if is_bc { (mw + 3) / 4 } else { mw }.max(1);
+                let m_eh = if is_bc { (mh + 3) / 4 } else { mh }.max(1);
+                let m_lin = m_ew * m_eh * bpe;
+                let m_64k = !is_bc && m_lin > 65536;
+                let m_pad = if m_64k { padded_64kb_size(mw, mh, is_bc, bpe) } else { padded_4kb_size(mw, mh, is_bc, bpe) };
+                if cursor_end < d.byte_off + (m_pad as u64) {
+                    break;
+                }
+                cursor_end -= m_pad as u64;
+                if let Ok(raw) = ttpf_read_virtual(path, &ix, cursor_end, m_pad) {
+                    if !raw.iter().take(256).all(|&b| b == raw[0]) {
+                        found = Some((raw, mw, mh, m_64k, 1u8));
+                        break;
+                    }
+                }
+            }
+            found.ok_or(first_err)?
+        }
+        Err(e) => return Err(e),
+    };
+    let lin = if dec_64k {
+        deswizzle_64kb_ttpf(&raw_tex, dec_w, dec_h, is_bc, bpe)
     } else {
-        deswizzle_4kb_d(&raw_tex, d.w, d.h, is_bc, bpe)
+        deswizzle_4kb_d(&raw_tex, dec_w, dec_h, is_bc, bpe)
     };
-    let pixels = decode_linear_to_rgba(&lin, d.w, d.h, d.dxgi)
-        .ok_or_else(|| format!("Pixel decode failed for {fmt_name} ({}x{})", d.w, d.h))?;
+    let pixels = decode_linear_to_rgba(&lin, dec_w, dec_h, d.dxgi)
+        .ok_or_else(|| format!("Pixel decode failed for {fmt_name} ({dec_w}x{dec_h})"))?;
     Ok(DecodedTexture {
-        name: format!("tex_{:05}_{}x{}_{fmt_name}", d.idx, d.w, d.h),
-        w: d.w,
-        h: d.h,
-        mips: if d.has_mips { 2 } else { 1 },
+        name: format!("tex_{:05}_{}x{}_{fmt_name}", d.idx, dec_w, dec_h),
+        w: dec_w,
+        h: dec_h,
+        mips: dec_mips,
         dxgi: d.dxgi,
         fmt_name,
         pixels,
