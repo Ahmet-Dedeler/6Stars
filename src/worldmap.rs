@@ -288,6 +288,7 @@ pub fn render_world_map_ui(
                         wm.status = format!("Loaded {}x{} MHIU ({:.0}..{:.0}, {:.0}..{:.0})", d.w, d.h, d.bmin[0], d.bmax[0], d.bmin[1], d.bmax[1]);
                         wm.data = Some(d);
                         wm.terrain_mesh = None;
+                        wm.show_3d_terrain = false;
                     }
                     Err(e) => wm.status = e,
                 }
@@ -330,7 +331,7 @@ pub fn render_world_map_ui(
                 wm.pan = [0.0, 0.0];
             }
         }
-        if ui.button("Launch 3D GPU World (wgpu)").on_hover_text("Open DX12/Vulkan GPU 3D World with PBR, Sun/Time-of-Day (F6), Minimap & Raytracing (R)").clicked() {
+        if ui.button("Launch 3D GPU World (wgpu)").on_hover_text("Open the GPU world with a minimap, time-of-day (F6), and enhanced lighting (R)").clicked() {
             match crate::world_gpu::launch_world_gpu_process(common_rpf, levels_rpf) {
                 Ok(()) => wm.status = "Launched 3D GPU World window (streaming MHIU + Brickell SLOD)".into(),
                 Err(e) => wm.status = e,

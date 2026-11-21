@@ -23,16 +23,28 @@ matches_sha() {
 
 rad="$cache/BinkMacArmPlayer"
 if ! matches_sha "$rad" "$rad_sha"; then
-  curl -fsSL --retry 2 "$rad_url" -o "$tmp/rad.dmg"
-  mkdir "$tmp/rad"
-  hdiutil attach "$tmp/rad.dmg" -nobrowse -readonly -mountpoint "$tmp/rad" -quiet
-  mounted=1
-  candidate="$tmp/rad/BinkMacArmPlayer.app/Contents/MacOS/BinkMacArmPlayer"
-  matches_sha "$candidate" "$rad_sha" || { echo "RAD player changed; the frame bridge needs updating." >&2; exit 1; }
-  cp -X "$candidate" "$tmp/player"
-  hdiutil detach "$tmp/rad" -quiet
-  mounted=0
-  cp "$tmp/player" "$rad"
+  if [[ -n "${SIXSTARS_BINK_PLAYER:-}" ]]; then
+    matches_sha "$SIXSTARS_BINK_PLAYER" "$rad_sha" || {
+      echo "SIXSTARS_BINK_PLAYER must point to the original, unpatched RAD player (SHA-256: $rad_sha)." >&2
+      exit 1
+    }
+    cp "$SIXSTARS_BINK_PLAYER" "$rad"
+  else
+    curl -fsSL --retry 2 "$rad_url" -o "$tmp/rad.dmg"
+    mkdir "$tmp/rad"
+    hdiutil attach "$tmp/rad.dmg" -nobrowse -readonly -mountpoint "$tmp/rad" -quiet
+    mounted=1
+    candidate="$tmp/rad/BinkMacArmPlayer.app/Contents/MacOS/BinkMacArmPlayer"
+    matches_sha "$candidate" "$rad_sha" || {
+      echo "RAD player changed; the frame bridge needs updating." >&2
+      echo "If you have the original unpatched player, set SIXSTARS_BINK_PLAYER to its path (SHA-256: $rad_sha)." >&2
+      exit 1
+    }
+    cp -X "$candidate" "$tmp/player"
+    hdiutil detach "$tmp/rad" -quiet
+    mounted=0
+    cp "$tmp/player" "$rad"
+  fi
 fi
 
 bridge="$cache/bridge-$bridge_rev.tar.gz"

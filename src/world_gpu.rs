@@ -55,7 +55,7 @@ struct FrameUniforms {
     sun_dir: [f32; 4],
     sky_zenith: [f32; 4],
     sky_horizon: [f32; 4],
-    flags: [f32; 4], // x=rt_on, y=time_hours, z=map_min_x, w=map_span_x
+    flags: [f32; 4], // x=enhanced_lighting, y=time_hours, z=map_min_x, w=map_span_x
     map_y: [f32; 4], // x=map_min_y, y=map_span_y, z=viewport_w, w=viewport_h
 }
 
@@ -277,8 +277,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let ndv = max(dot(n, v), 0.0);
 
     var sh = sample_shadow(in.shadow_coord, ndl);
-    let rt_on = u.flags.x > 0.5;
-    if (rt_on) {
+    let enhanced_lighting = u.flags.x > 0.5;
+    if (enhanced_lighting) {
         sh = smoothstep(0.08, 0.92, sh);
     }
 
@@ -287,9 +287,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let spec = pow(ndh, 48.0) * 0.28 * ndl;
     let hemi = n.z * 0.5 + 0.5;
     let sky_gi = mix(vec3<f32>(0.16, 0.17, 0.20), u.sky_zenith.rgb * 0.55 + u.sky_horizon.rgb * 0.35, hemi);
-    let rt_bounce = select(0.0, 0.18 * (1.0 - ndv) * (0.4 + 0.6 * hemi), rt_on);
+    let bounce = select(0.0, 0.18 * (1.0 - ndv) * (0.4 + 0.6 * hemi), enhanced_lighting);
 
-    let lit = albedo * (sky_gi * 0.65 + sun_col * ndl * sh) + vec3<f32>(spec * sh) + sky_gi * rt_bounce;
+    let lit = albedo * (sky_gi * 0.65 + sun_col * ndl * sh) + vec3<f32>(spec * sh) + sky_gi * bounce;
 
     let dist = length(u.cam_pos.xyz - in.world_pos);
     let fog = 1.0 - exp(-dist * 0.00011);
@@ -389,7 +389,6 @@ struct GpuState {
     instance_count: usize,
     model_count: usize,
     map_count: usize,
-    has_hw_rt: bool,
     map_min: [f32; 2],
     map_span: [f32; 2],
 }
@@ -478,15 +477,10 @@ impl GpuState {
         }))
         .expect("No GPU adapter found");
 
-        let has_hw_rt = adapter.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY);
-        let mut req_features = wgpu::Features::empty();
-        if has_hw_rt {
-            req_features |= wgpu::Features::EXPERIMENTAL_RAY_QUERY;
-        }
         let (device, queue) = pollster_block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("percystar_world_device"),
-                required_features: req_features,
+                required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits::default(),
                 memory_hints: Default::default(),
             },
@@ -745,7 +739,6 @@ impl GpuState {
             instance_count: 0,
             model_count: 0,
             map_count: cfg.map_count,
-            has_hw_rt,
             map_min: [-13000.0, -9000.0],
             map_span: [20000.0, 20000.0],
         };
@@ -864,7 +857,7 @@ struct GpuWorldApp {
     pitch: f32,
     time_h: f32,
     auto_sun: bool,
-    rt_on: bool,
+    enhanced_lighting: bool,
     walk_mode: bool,
     keys: [bool; 8], // W A S D Q E Shift Space
     dragging: bool,
@@ -886,7 +879,7 @@ impl GpuWorldApp {
             pitch: -0.18,
             time_h: 10.50,
             auto_sun: false,
-            rt_on: true,
+            enhanced_lighting: true,
             walk_mode: false,
             keys: [false; 8],
             dragging: false,
@@ -913,7 +906,7 @@ impl ApplicationHandler for GpuWorldApp {
             return;
         }
         let attrs = Window::default_attributes()
-            .with_title("PercyStar 3D World (wgpu)")
+            .with_title("Percy6Stars 3D World (wgpu)")
             .with_inner_size(winit::dpi::LogicalSize::new(1440.0, 860.0));
         let Ok(win) = event_loop.create_window(attrs) else {
             return;
@@ -967,7 +960,7 @@ impl ApplicationHandler for GpuWorldApp {
                         KeyCode::ShiftLeft | KeyCode::ShiftRight => self.keys[6] = down,
                         KeyCode::Space => self.keys[7] = down,
                         KeyCode::F6 if down => self.auto_sun = !self.auto_sun,
-                        KeyCode::KeyR if down => self.rt_on = !self.rt_on,
+                        KeyCode::KeyR if down => self.enhanced_lighting = !self.enhanced_lighting,
                         KeyCode::KeyG if down => {
                             self.walk_mode = !self.walk_mode;
                             self.vel_z = 0.0;
@@ -1030,14 +1023,14 @@ impl ApplicationHandler for GpuWorldApp {
 
                 if now - self.last_title >= std::time::Duration::from_millis(120) {
                     self.last_title = now;
-                    let rt_lbl = if !self.rt_on { "OFF" } else if g.has_hw_rt { "HW-RT" } else { "SS-RT/GI" };
+                    let lighting = if self.enhanced_lighting { "Enhanced" } else { "Basic" };
                     let mode_lbl = if self.walk_mode { "WALK(G)" } else { "FLY(G)" };
                     g.window.set_title(&format!(
-                        "PercyStar 3D World | pos {:.0} {:.0} {:.0} | {} | Sun az {:.1} el {:+.1} (F6) | Time {:.2}h | {} maps | {} models | {} instances | {:.2} M tris | RT: {}",
+                        "Percy6Stars 3D World | pos {:.0} {:.0} {:.0} | {} | Sun az {:.1} el {:+.1} (F6) | Time {:.2}h | {} maps | {} models | {} instances | {:.2} M tris | Lighting (R): {}",
                         self.cam_pos.x, self.cam_pos.y, self.cam_pos.z, mode_lbl,
                         az.to_degrees().rem_euclid(360.0), el.to_degrees(),
                         self.time_h, g.map_count, g.model_count, g.instance_count,
-                        g.tri_count as f64 / 1e6, rt_lbl
+                        g.tri_count as f64 / 1e6, lighting
                     ));
                 }
 
@@ -1063,7 +1056,7 @@ impl ApplicationHandler for GpuWorldApp {
                     sun_dir: [sun_dir.x, sun_dir.y, sun_dir.z, 0.0],
                     sky_zenith,
                     sky_horizon,
-                    flags: [if self.rt_on { 1.0 } else { 0.0 }, self.time_h, g.map_min[0], g.map_span[0]],
+                    flags: [if self.enhanced_lighting { 1.0 } else { 0.0 }, self.time_h, g.map_min[0], g.map_span[0]],
                     map_y: [g.map_min[1], g.map_span[1], g.config.width as f32, g.config.height as f32],
                 };
                 g.queue.write_buffer(&g.uniform_buf, 0, bytemuck::bytes_of(&uni));
