@@ -1,25 +1,25 @@
 # Contributing to 6Stars
 
-Small fixes are welcome, even if this is your first PR. You can also help by reproducing bugs, testing on macOS or Windows, improving the docs, or writing down what you learned about a file format.
+Thanks for taking a look at 6Stars. You don't need to know Rust or understand the whole codebase to help. If a build step tripped you up, a preview looked wrong, or you worked out what a few bytes mean, we'd like to hear about it.
 
 ## Issues and ideas
 
-[Open an issue](https://github.com/Ahmet-Dedeler/6Stars/issues/new) if something breaks or you have an idea. For bugs, tell us your 6Stars version, OS, what you tried, and what happened. Screenshots, logs, and small synthetic examples help. Please don't attach copyrighted game files, keys, or private data.
+[Open an issue](https://github.com/Ahmet-Dedeler/6Stars/issues/new) with what you saw. Something like "on macOS, I opened an AWC bank in 6Stars 1.4.1 and the second stream wouldn't play" is enough to get started. Screenshots, logs, and little examples you made yourself can help. Leave out game files, keys, and anything private.
 
-If you're planning a bigger change or aren't sure where to start, open an issue first so we can figure it out together. No need to ask before fixing a typo.
+Have a bigger change in mind, or want an idea for a first PR? Tell us what you're interested in and we can find a place to start. For something small like a typo, you can go straight to the PR.
 
 ## Commits and pull requests
 
-1. Make a branch from the 6Stars `main` branch and open your PR against `Ahmet-Dedeler/6Stars:main`. You don't need write access to send a PR.
-2. Keep the change focused. Any clear commit message is fine, like `Fix audio seek after pausing`. You don't need a signed-off commit or a separate contributor agreement.
-3. Tell us what changed, why, and how you checked it. Add a test if it would catch the bug again. For Rust changes, run `cargo test --release` if you can. If you only have one OS, say what you tested; Windows CI runs on PRs. For docs, just check the text and links.
+1. Start from 6Stars `main` and point your PR at `Ahmet-Dedeler/6Stars:main`. You don't need write access. If you're not sure what you can send, see [what you can share](#what-you-can-share).
+2. A small PR is easier to review. Give the commit a name that says what it does, like `Fix audio seek after pausing`. No special format, sign-off, or separate contributor agreement.
+3. A sentence or two on what you changed and how you checked it is fine. For Rust changes, try `cargo test --release` and add a test if it would catch the bug again. Only have one OS? Say which one you tested. Windows CI runs on PRs. For docs, reading the edit and checking the links is enough.
 
-PRs are reviewed before they land. If you'd like to help regularly, say hi in an issue. We'd love help reviewing PRs, sorting bugs, and testing releases, and we can talk about maintainer access once we've worked together.
+We'll review the PR before merging. If you'd like to stick around, say hi in an issue. You can help review changes, sort through bug reports, or try new releases. Once we've worked together a bit, we can talk about maintainer access.
 
 ## What you can share
 
-PRs are welcome for work you have permission to share, including new docs and changes to the [MIT-licensed modules](README.md#license). You keep your copyright. Submit changes to MIT-licensed files under MIT, and flag any third-party material before adding it.
+New docs and changes to the [MIT-licensed modules](README.md#license) are good places to start. You keep your copyright, and changes to MIT files come in under MIT too. If you want to include something someone else wrote, let us know before adding it.
 
-The [PercyStar license](LICENSE) still applies to inherited code. If you can share your change but can't open a PR without redistributing inherited code, post just your change in an issue. For fixes that need the copyright holder's written permission, describe the fix in an issue and wait for permission before posting a patch. 6Stars can't grant that permission.
+The [PercyStar license](LICENSE) still applies to code we inherited. If you have a change you're allowed to share but can't send a PR without redistributing that code, post just your change in an issue. If the patch itself needs the copyright holder's written permission, describe the fix in the issue for now. 6Stars can't give permission on their behalf.
 
-Please follow the [code of conduct](CODE_OF_CONDUCT.md) in issues, reviews, and PRs.
+See the [code of conduct](CODE_OF_CONDUCT.md) for how we work together in issues and reviews.

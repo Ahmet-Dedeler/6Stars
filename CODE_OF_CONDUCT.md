@@ -1,7 +1,7 @@
 # Code of Conduct
 
-You don't need to know Rust or how the archive formats work to take part. Ask questions, explain what you know, and give people room to learn. In a review, point to the problem and say what would fix it. Don't make it personal.
+It's fine to ask a basic question or say you don't know. When you review a change, say what you saw and what you'd try next. You can disagree without making it about the person.
 
-No harassment, threats, slurs, personal attacks, spam, or sharing someone else's private information. This applies to issues, pull requests, and other 6Stars spaces.
+In issues, PRs, and other 6Stars spaces, we don't allow harassment, threats, slurs, personal attacks, spam, or sharing someone else's private information.
 
-If something happens, contact a maintainer privately if you can. On GitHub you can also use **Report content** on the relevant post. Include a link and what happened if you have it, and don't repost sensitive information in public. Maintainers may remove content, close threads, or block accounts when needed to keep the project usable for everyone.
+If you see something like that, you can tell a maintainer privately or use GitHub's **Report content** option. A link and a short note about what happened are enough to start. Please keep sensitive details out of public threads. Maintainers may remove posts, close threads, or block accounts when needed.

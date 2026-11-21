@@ -5,7 +5,11 @@
 <h1 align="center">6Stars</h1>
 
 <p align="center">
-  A Rust explorer for RPF9 and TTPF archives you already have on disk, built on <a href="https://github.com/rpatty-dev/PercyStar">PercyStar</a> by rpatty-dev.
+  Open an RPF9 or TTPF archive you already have and see what's inside. Preview a model, look through textures, or play a clip without extracting it first.
+</p>
+
+<p align="center">
+  Built in Rust on top of <a href="https://github.com/rpatty-dev/PercyStar">PercyStar</a> by rpatty-dev.
 </p>
 
 <p align="center">
@@ -29,7 +33,9 @@
 
 ## Contribute
 
-We'd love help with 6Stars. If you found a bug, figured out part of a file format, or got something working on a machine we haven't tested, [open an issue](https://github.com/Ahmet-Dedeler/6Stars/issues/new). Small PRs and first-time contributors are welcome. The [contributing guide](CONTRIBUTING.md) covers what to send and which code you can patch.
+Tried 6Stars and something looked off? [Tell us what you saw](https://github.com/Ahmet-Dedeler/6Stars/issues/new). Even "this car shows up gray on my Mac" gives us somewhere to start. Questions, notes on a format you've been looking at, and small fixes are all welcome.
+
+If this is your first PR, a typo fix is a good place to start. The [contributing guide](CONTRIBUTING.md) shows how to send one and what to do if you're unsure whether you can share a patch.
 
 ## What This Fork Adds
 
@@ -79,6 +85,8 @@ SIXSTARS_APP_PATH=dist/6Stars-next.app bash scripts/build_macos.sh
 ```
 
 </details>
+
+If the build gets stuck, [open an issue](https://github.com/Ahmet-Dedeler/6Stars/issues/new) with your OS and the error you saw. It's useful to know where the setup stops working.
 
 ---
 
