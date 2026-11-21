@@ -167,6 +167,13 @@ PercyStar/
 
 Requires **Rust** (`x86_64-pc-windows-gnu` with MinGW `windres`/`dlltool`, or `msvc`). Cargo fetches all pinned dependencies from `Cargo.lock`:
 
+---
+
+## Credits & Community
+
+- **Original Creator**: `@rpatty-dev` (`@rpatty`)
+- **Contributors**: `@Ahmet-Dedeler` ([Percy6Stars](https://github.com/Ahmet-Dedeler/Percy6Stars)) — macOS build & 3D viewer PRs (#6, #7), `RADTools.exe` installer fix, and mip0/mip1 placement insight; `@Xyzstk` — `SGD5` & `DXBC`/`FSSM` RDNA2 shader PR (#8).
+
 ```powershell
 cargo test --release
 cargo build --release

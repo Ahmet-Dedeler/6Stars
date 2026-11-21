@@ -1,4 +1,4 @@
-# installs optional bink2 playback depndency binkplay exe beside percystar exe
+﻿# installs optional bink2 playback dependency binkplay.exe beside percystar.exe
 $ErrorActionPreference = "Stop"
 $dir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $root = Split-Path -Parent $dir
@@ -11,17 +11,18 @@ if (Test-Path $radDefault) {
     exit 0
 }
 
-$tmpZip = Join-Path $env:TEMP "RADTools.7z"
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+$tmpExe = Join-Path $env:TEMP "RADTools.exe"
 $tmpExt = Join-Path $env:TEMP "radtools_ext"
 Write-Host "Downloading official RAD Video Tools..."
-Invoke-WebRequest -Uri "https://www.radgametools.com/down/Bink/RADTools.7z" -OutFile $tmpZip
+Invoke-WebRequest -UseBasicParsing -Uri "https://www.radgametools.com/down/Bink/RADTools.exe" -OutFile $tmpExe
 if (Get-Command 7z -ErrorAction SilentlyContinue) {
-    7z x $tmpZip "-pRAD" "-o$tmpExt" -y | Out-Null
+    7z x $tmpExe "-o$tmpExt" -y | Out-Null
     $bp = Get-ChildItem $tmpExt -Recurse -Filter "binkplay.exe" | Select-Object -First 1
     if ($bp) {
         Copy-Item $bp.FullName "$outDir\binkplay.exe" -Force
         Write-Host "Installed binkplay.exe to $outDir"
     }
 } else {
-    Write-Host "Downloaded $tmpZip password RAD extract binkplay.exe beside PercyStar.exe"
+    Write-Host "Downloaded $tmpExe — extract binkplay.exe beside PercyStar.exe"
 }

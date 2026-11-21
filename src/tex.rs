@@ -897,14 +897,24 @@ pub fn decode_ttpf_texture(path: &Path, tex_idx: usize) -> Result<DecodedTexture
     } else {
         padded_4kb_size(d.w, d.h, is_bc, bpe)
     };
-    // Mips are stored smallest-first, so mip0 sits at the END of the allocation
-    let mip0_off = if d.alloc_sz > mip0_padded as u64 && d.alloc_sz <= (mip0_padded as f64 * 1.65) as u64 {
-        d.byte_off + (d.alloc_sz - mip0_padded as u64)
+    // mips are stored smallest first so mip0 sits at end of allocation
+    let tail_bound = (mip0_padded as u64).saturating_mul(2).saturating_add(65536);
+    let tail_off = if d.has_mips && d.alloc_sz > mip0_padded as u64 && d.alloc_sz <= tail_bound {
+        Some(d.byte_off + (d.alloc_sz - mip0_padded as u64))
     } else {
-        d.byte_off
+        None
     };
-
-    let raw_tex = ttpf_read_virtual(path, &ix, mip0_off, mip0_padded)?;
+    let raw_tex = match tail_off {
+        Some(off) => {
+            let t = ttpf_read_virtual(path, &ix, off, mip0_padded)?;
+            if t.iter().take(256).all(|&b| b == t[0]) {
+                ttpf_read_virtual(path, &ix, d.byte_off, mip0_padded)?
+            } else {
+                t
+            }
+        }
+        None => ttpf_read_virtual(path, &ix, d.byte_off, mip0_padded)?,
+    };
     let lin = if use_64k {
         deswizzle_64kb_ttpf(&raw_tex, d.w, d.h, is_bc, bpe)
     } else {
