@@ -169,7 +169,7 @@ pub fn stop_wav() {
     }
 }
 }
-use plat::{active_window, dock_child_hwnd, find_binkplay, find_hwnd_for_pid, move_window, play_wav_async, stop_wav};
+use plat::{active_window, dock_child_hwnd, find_binkplay, find_hwnd_for_pid, move_window, stop_wav};
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum AppTab {

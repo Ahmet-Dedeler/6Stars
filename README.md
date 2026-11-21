@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-v1.3.7-FFA81C?style=flat-square" alt="Version" />
+  <img src="https://img.shields.io/badge/Version-v1.3.8-FFA81C?style=flat-square" alt="Version" />
   <img src="https://img.shields.io/badge/Rust-1.85%2B-orange?style=flat-square&logo=rust" alt="Rust" />
   <img src="https://img.shields.io/badge/Shaders-RDNA2%20GFX10.3%20%E2%86%92%20HLSL%20%2F%20SPIR--V-FF4FA3?style=flat-square" alt="Shaders" />
   <img src="https://img.shields.io/badge/Textures-100%25%20DXGI%20%2B%20RDNA2%204KB%2F64KB-48D2FF?style=flat-square" alt="Textures" />
@@ -21,7 +21,7 @@
 </p>
 
 <p align="center">
-  <strong>Latest Release: <a href="https://github.com/rpatty-dev/PercyStar/releases/latest">Download PercyStar v1.3.7 (Win64 + In-App Auto-Updater)</a></strong> · <strong><a href="https://github.com/rpatty-dev/PercyStar/releases/download/v1.0.3/PercyStar_macOS.zip">macOS Universal Build</a></strong><br />
+  <strong>Latest Release: <a href="https://github.com/rpatty-dev/PercyStar/releases/latest">Download PercyStar v1.3.8 (Win64 + In-App Auto-Updater)</a></strong> · <strong><a href="https://github.com/rpatty-dev/PercyStar/releases/download/v1.0.3/PercyStar_macOS.zip">macOS Universal Build</a></strong><br />
   <strong>Live Research &amp; Breakthroughs Dashboard: <a href="https://percystar-breakthroughs.vercel.app">percystar-breakthroughs.vercel.app</a></strong> · <strong><a href="https://mapnavmeshsite.vercel.app">Interactive NavMesh World Map</a></strong><br />
   <sub>Windows users on v1.0.3+ can click the golden <b>★ Update Available</b> pill inside PercyStar for 1-click self-update.</sub>
 </p>
@@ -62,8 +62,12 @@
 
 ---
 
-## Features & Format Breakthroughs (v1.3.7)
+## Features & Format Breakthroughs (v1.3.8)
 
+- **Format 99 `float3` Meshlet Positions & Signed UVs (`src/model3d/vertex_stream.rs`)**
+  - Bounded vertex-stream decoder supporting raw `float3` (format `99`) alongside packed format `66` (cables, water, compact headers without quantization), signed format-`40` / float format-`66` UVs, and atomic rejection of corrupt/non-finite streams.
+- **4 GiB+ TTPF Logical Texture Addressing (`src/tex.rs`)**
+  - Reads full `40-bit` TTPF logical size and `21-bit` page addresses so `>4 GiB` map/vehicle texture descriptors resolve without wrapping.
 - **3D World Map & Hillshaded Terrain (`src/worldmap.rs`)**
   - Interactive **World Map** tab with `2048×2048` `MHIU` elevation map, clickable `NavMesh` sector overlay, `3D Terrain` (`256×256` mesh with baked `512×512` sun-angle hillshaded texture + daylight skybox + `WASD/Q/E` fly camera), and async background-loaded **3D City Blocks (Brickell SLOD)**.
 - **3D Cutout Transparency, Glass & Decal Blending (`src/model3d.rs`, `src/tex.rs`)**
@@ -188,6 +192,7 @@ Requires **Rust** (`x86_64-pc-windows-gnu` with MinGW `windres`/`dlltool`, or `m
   - `@Ahmet-Dedeler` ([Percy6Stars](https://github.com/Ahmet-Dedeler/Percy6Stars)) — macOS build & 3D viewer PRs (#6, #7), `RADTools.exe` installer fix, mip0/mip1 placement insight, cutout/glass/decal blending, shadow-proxy hiding, and Videos/OBJ/PS09 UX improvements.
   - `@GamingChelsea` (PR #10) — AWC decode diagnostics, 512 KB superblock stream splitting, and waveform audio player foundation (upgraded with zero-copy ring buffers, smooth drag scrubbing, stream filter, Loop/Auto-Next, WAV export, and keyboard shortcuts).
   - `@kotelkonrad` (Issue #11) — suggested arrow-key / WASD asset browsing navigation.
+  - `@techfoundrynz` (PRs #12, #13) — 40-bit/21-bit `>4 GiB` TTPF texture addressing and format 99 `float3` meshlet vertex-stream decoder.
   - `@Xyzstk` — `SGD5` & `DXBC`/`FSSM` RDNA2 shader PR (#8).
 
 ```powershell
