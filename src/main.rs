@@ -1,5 +1,7 @@
 ﻿mod anim;
 mod awc;
+mod boot;
+mod dat;
 mod dxbc;
 mod psin;
 mod rsc9;
@@ -1300,8 +1302,10 @@ impl Rpf9App {
                         self.preview = psin::parse_psin(&data);
                     } else if e.kind == "ANIM" {
                         self.preview = anim::parse_anim_dict(&data);
+                    } else if e.kind == "DAT" {
+                        self.preview = dat::parse_dat(&data);
                     } else if e.kind == "RSC9" {
-                        self.preview = rsc9::parse_qqqq_table(&data);
+                        self.preview = rsc9::parse_rsc9(&data);
                     } else if e.kind == "RBF0" {
                         self.preview = decode_rbf0(&data).unwrap_or_else(|| format_hex(&data[..data.len().min(2048)]));
                     } else if e.kind == "GFX" {
@@ -2671,6 +2675,7 @@ fn load_disk_cache() -> HashMap<String, Vec<RpfEntry>> {
             "BK2" => "BK2",
             "AWC" => "AWC",
             "XML" => "XML",
+            "DAT" => "DAT",
             "PSIN" => "PSIN",
             "ANIM" => "ANIM",
             "RSC9" => "RSC9",
@@ -2856,6 +2861,7 @@ fn kind_color(kind: &str) -> Color32 {
         "XML" => Color32::from_rgb(72, 210, 255),
         "AWC" => Color32::from_rgb(90, 235, 165),
         "BK2" => Color32::from_rgb(252, 175, 23),
+        "DAT" => Color32::from_rgb(135, 240, 165),
         "PSIN" => Color32::from_rgb(210, 120, 255),
         "ANIM" => Color32::from_rgb(100, 225, 195),
         "RSC9" => Color32::from_rgb(120, 185, 255),
@@ -2980,7 +2986,7 @@ fn read_entry_bytes(e: &RpfEntry) -> std::io::Result<Vec<u8>> {
         f.seek(SeekFrom::Start(e.offset))?;
         let mut raw = vec![0u8; e.comp_size as usize];
         f.read_exact(&mut raw)?;
-        if matches!(e.kind, "XML" | "PSIN" | "ANIM" | "RSC9" | "RBF0" | "GFX" | "GXT" | "ZLIB") {
+        if matches!(e.kind, "XML" | "DAT" | "PSIN" | "ANIM" | "RSC9" | "RBF0" | "GFX" | "GXT" | "ZLIB") {
             let mut out = Vec::new();
             ZlibDecoder::new(&raw[..]).read_to_end(&mut out)?;
             Ok(out)
@@ -3092,7 +3098,17 @@ fn probe_rage9_page(
         && (1..=64).contains(&probe_out[bmap_off + 9]);
     let (mname, is_veh, vlen) = if fits_single_chunk {
         if !has_rage9_meshlets(&probe_out[..olen]) {
-            return None;
+            return Some(RpfEntry {
+                source_rpf: path.to_path_buf(),
+                rpf_name: rname.to_string(),
+                name: format!("rsc9_{:08x}_{}B.rsc9", off + p as u64, olen),
+                kind: "RSC9",
+                offset: off + p as u64,
+                comp_size: probe_dec.total_in(),
+                raw_size: olen as u64,
+                tracks: 0,
+                chunks: Vec::new(),
+            });
         }
         let (mname, _) = extract_rage9_model_name(&probe_out[..olen])?;
         (mname.clone(), is_vehicle_virtual(&probe_out[..olen], &mname), olen)
@@ -3377,6 +3393,14 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
                                 ("GXT", format!("{z_idx:04}_{slug}.gxt"))
                             } else if stitch_head.starts_with(b"PSIN") {
                                 ("PSIN", format!("{z_idx:04}_resource.psin"))
+                            } else if let Some(ver) = dat::probe_dat(&stitch_head) {
+                                ("DAT", format!("{z_idx:04}_aud_dat{ver}.rel"))
+                            } else if stitch_head.starts_with(b"AMB_STREAM_") {
+                                ("XML", format!("{z_idx:04}_audio_packlist.txt"))
+                            } else if stitch_head.starts_with(b"driverSettings_") {
+                                ("XML", format!("{z_idx:04}_audio_driver_settings.txt"))
+                            } else if stitch_head.starts_with(b"BaseCommon:") {
+                                ("XML", format!("{z_idx:04}_audio_mounts.txt"))
                             } else if rsc9::is_qqqq_table(&stitch_head) {
                                 ("RSC9", format!("{z_idx:04}_rsc9_table.bin"))
                             } else {
