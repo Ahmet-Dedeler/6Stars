@@ -382,7 +382,9 @@ mod backend {
 /// macOS: `afplay` can't seek or report position, so each play/resume/seek writes the
 /// remaining samples to a temporary WAV and plays that; position is tracked by the clock.
 /// Volume changes restart playback at the current position, debounced while dragging.
-#[cfg(target_os = "macos")]
+/// macOS and Linux: write the remaining PCM to a temporary WAV and hand it to a command-line
+/// player (`afplay` on macOS; `pw-play`, `paplay` or `aplay` on Linux, whichever is installed).
+#[cfg(unix)]
 mod backend {
     use std::process::{Child, Command, Stdio};
     use std::sync::Arc;
@@ -438,19 +440,47 @@ mod backend {
             }
             let dir = tempfile::Builder::new().prefix("percy6stars-audio-").tempdir().map_err(|e| e.to_string())?;
             let wav = dir.path().join("clip.wav");
-            crate::awc::write_pcm_wav(&wav, self.sample_rate, self.channels, &self.samples[from..]).map_err(|e| e.to_string())?;
-            let child = Command::new("afplay")
-                .arg("-v")
-                .arg(format!("{:.3}", self.volume.clamp(0.0, 1.0)))
-                .arg(&wav)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .map_err(|e| format!("afplay: {e}"))?;
+            let child = self.write_and_play(&wav, from)?;
             self.child = Some(child);
             self._dir = Some(dir);
             self.started_at = Instant::now();
             Ok(())
+        }
+
+        #[cfg(target_os = "macos")]
+        fn write_and_play(&self, wav: &std::path::Path, from: usize) -> Result<Child, String> {
+            crate::awc::write_pcm_wav(wav, self.sample_rate, self.channels, &self.samples[from..]).map_err(|e| e.to_string())?;
+            Command::new("afplay")
+                .arg("-v")
+                .arg(format!("{:.3}", self.volume.clamp(0.0, 1.0)))
+                .arg(wav)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|e| format!("afplay: {e}"))
+        }
+
+        /// Linux players disagree on volume flags (`aplay` has none), so the volume is baked into
+        /// the WAV and the first installed player is used.
+        #[cfg(not(target_os = "macos"))]
+        fn write_and_play(&self, wav: &std::path::Path, from: usize) -> Result<Child, String> {
+            let pcm = super::scale_pcm(&self.samples[from..], self.volume);
+            crate::awc::write_pcm_wav(wav, self.sample_rate, self.channels, &pcm).map_err(|e| e.to_string())?;
+            for (player, args) in super::LINUX_PLAYERS {
+                let spawned = Command::new(player)
+                    .args(*args)
+                    .arg(wav)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn();
+                match spawned {
+                    Ok(child) => return Ok(child),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(format!("{player}: {e}")),
+                }
+            }
+            Err("No audio player found. Install pipewire-bin (pw-play), pulseaudio-utils (paplay) or alsa-utils (aplay).".into())
         }
 
         pub fn set_volume(&mut self, volume: f32) {
@@ -497,8 +527,22 @@ mod backend {
     }
 }
 
+/// Command-line players tried in order on Linux (PipeWire, PulseAudio, then plain ALSA).
+#[cfg(all(unix, not(target_os = "macos")))]
+const LINUX_PLAYERS: &[(&str, &[&str])] = &[("pw-play", &[]), ("paplay", &[]), ("aplay", &["-q"])];
+
+/// Applies a 0..=1 volume to 16-bit PCM for players without a volume flag.
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn scale_pcm(samples: &[i16], volume: f32) -> Vec<i16> {
+    let v = volume.clamp(0.0, 1.0);
+    if v >= 0.999 {
+        return samples.to_vec();
+    }
+    samples.iter().map(|&s| (s as f32 * v).round() as i16).collect()
+}
+
 /// Other platforms: no audio output yet, the cursor just follows the clock.
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, unix)))]
 mod backend {
     use std::time::Instant;
 
@@ -825,6 +869,33 @@ mod tests {
         assert_eq!(player.decoding_idx, None);
         assert_eq!(player.pending_start_frame, 0);
         assert!(player.error.is_none());
+    }
+
+    #[test]
+    fn scale_pcm_applies_volume() {
+        let pcm = [i16::MAX, -1000, 0, i16::MIN];
+        assert_eq!(scale_pcm(&pcm, 1.0), pcm.to_vec());
+        assert_eq!(scale_pcm(&pcm, 0.0), vec![0; 4]);
+        assert_eq!(scale_pcm(&pcm, 0.5), vec![16384, -500, 0, -16384]);
+        assert_eq!(scale_pcm(&pcm, 7.0), pcm.to_vec());
+    }
+
+    /// Silent (all-zero samples, volume 0) check that a Linux player starts, pauses and resumes.
+    /// Opens an audio stream, so it's opt-in: `cargo test linux_player -- --ignored`.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    #[ignore]
+    fn linux_player_plays_silently() {
+        let samples = Arc::new(vec![0i16; 48_000 * 2]);
+        let mut h = backend::WaveOutHandle::play_from(samples, 48_000, 2, 0, 0.0).expect("spawn player");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let (cur, done) = h.current_frame();
+        assert!(cur > 0 && !done);
+        h.pause();
+        let (paused_at, _) = h.current_frame();
+        h.resume();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(h.current_frame().0 > paused_at);
     }
 }
 
