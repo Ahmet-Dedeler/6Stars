@@ -507,6 +507,11 @@ pub fn export_texture_png(tex: &DecodedTexture, path: &Path) -> Result<(), Strin
 
 /// Extract ALL textures from a pgDictionary<grcTexture> inside virtual `v` + physical `p`.
 pub fn extract_txd_textures(v: &[u8], p: &[u8], dict_off: usize) -> Vec<DecodedTexture> {
+    extract_txd_textures_by_ptr(v, p, dict_off).into_iter().map(|(_, tex)| tex).collect()
+}
+
+/// Keep each virtual texture pointer so drawable shaders can bind the correct entry.
+pub fn extract_txd_textures_by_ptr(v: &[u8], p: &[u8], dict_off: usize) -> Vec<(usize, DecodedTexture)> {
     if dict_off + 0x3a > v.len() { return Vec::new(); }
     let Some(tarr) = vptr(ru64(v, dict_off + 0x30)) else { return Vec::new() };
     let tcnt = ru16(v, dict_off + 0x38) as usize;
@@ -540,7 +545,7 @@ pub fn extract_txd_textures(v: &[u8], p: &[u8], dict_off: usize) -> Vec<DecodedT
                 }
             }
         }
-        raw_list.push((poff, name, w, h, dxgi, swiz, mips));
+        raw_list.push((poff, tp, name, w, h, dxgi, swiz, mips));
     }
 
     let mut sorted_poffs: Vec<usize> = raw_list.iter().map(|t| t.0).collect();
@@ -552,7 +557,7 @@ pub fn extract_txd_textures(v: &[u8], p: &[u8], dict_off: usize) -> Vec<DecodedT
     }
 
     let mut out = Vec::new();
-    for (poff, name, w, h, dxgi, swiz, mips) in raw_list {
+    for (poff, tp, name, w, h, dxgi, swiz, mips) in raw_list {
         let Some((fmt_name, is_bc, bpe)) = dxgi_info(dxgi) else { continue };
         let alloc_end = next_map.get(&poff).copied().unwrap_or(p.len());
         let alloc_sz = alloc_end.saturating_sub(poff);
@@ -576,7 +581,7 @@ pub fn extract_txd_textures(v: &[u8], p: &[u8], dict_off: usize) -> Vec<DecodedT
             deswizzle_4kb_d(&p[mip0_off..slice_end], w, h, is_bc, bpe)
         };
         if let Some(pixels) = decode_linear_to_rgba(&lin, w, h, dxgi) {
-            out.push(DecodedTexture {
+            out.push((tp, DecodedTexture {
                 name,
                 w,
                 h,
@@ -585,7 +590,7 @@ pub fn extract_txd_textures(v: &[u8], p: &[u8], dict_off: usize) -> Vec<DecodedT
                 fmt_name,
                 pixels,
                 raw_dds_payload: lin,
-            });
+            }));
         }
     }
     out
@@ -936,29 +941,18 @@ pub struct TtpfHashHit {
     pub dxgi: u8,
 }
 
-impl TtpfHashHit {
-    #[inline]
-    pub fn is_srgb(&self) -> bool {
-        matches!(self.dxgi, 29 | 72 | 75 | 78 | 91 | 99)
-    }
-
-    #[inline]
-    pub fn is_normal_format(&self) -> bool {
-        matches!(self.dxgi, 80 | 81 | 83 | 84)
-    }
-}
-
 /// Texture hash -> location, built once per game dump root (keyed by that root).
 type TtpfHashIndex = std::sync::Arc<HashMap<u64, TtpfHashHit>>;
 static TTPF_HASH_INDEX: std::sync::OnceLock<std::sync::Mutex<HashMap<std::path::PathBuf, TtpfHashIndex>>> =
     std::sync::OnceLock::new();
 
-/// Decoded external textures by hash (`None` = known undecodable); cleared past 512 entries.
-type TtpfTexCache = HashMap<u64, Option<std::sync::Arc<Texture2D>>>;
+/// Cache by archive and descriptor, since different dumps can contain the same hashes.
+type TtpfTexCache = HashMap<(std::path::PathBuf, usize), Option<std::sync::Arc<Texture2D>>>;
 static TTPF_TEX_CACHE: std::sync::OnceLock<std::sync::Mutex<TtpfTexCache>> = std::sync::OnceLock::new();
 
 fn collect_ttpf_files(dir: &Path, depth: usize, out: &mut Vec<std::path::PathBuf>) {
-    if depth > 4 {
+    // pack/<name>/data/ttdb/<category> is five levels below the dump root.
+    if depth > 5 {
         return;
     }
     let Ok(rd) = std::fs::read_dir(dir) else { return };
@@ -981,6 +975,14 @@ fn collect_ttpf_files(dir: &Path, depth: usize, out: &mut Vec<std::path::PathBuf
 }
 
 fn find_dump_root_for_ttpf(rpf_path: &Path) -> Option<std::path::PathBuf> {
+    // Pack drawables can reference both their own TTDB and the base game's TTDB.
+    for ancestor in rpf_path.ancestors().skip(1).take(4) {
+        if ancestor.file_name().is_some_and(|name| name == "pack") {
+            if let Some(root) = ancestor.parent().filter(|p| p.join("data/ttdb").is_dir()) {
+                return Some(root.to_path_buf());
+            }
+        }
+    }
     let mut cur = rpf_path.parent()?;
     for _ in 0..4 {
         if cur.join("data").join("ttdb").is_dir() || cur.join("textures_loose.ttpf").is_file() {
@@ -1014,9 +1016,8 @@ pub fn ttpf_hash_index_for_rpf(rpf_path: &Path) -> Option<std::sync::Arc<HashMap
 
     let mut ttpf_files = Vec::new();
     collect_ttpf_files(&root, 0, &mut ttpf_files);
-    if ttpf_files.is_empty() {
-        return None;
-    }
+    // Prefer the shared archives on duplicate hashes and make selection reproducible.
+    ttpf_files.sort_unstable_by(|a, b| a.components().count().cmp(&b.components().count()).then_with(|| a.cmp(b)));
 
     let mut index: HashMap<u64, TtpfHashHit> = HashMap::with_capacity(360_000);
     for tp in ttpf_files {
@@ -1044,6 +1045,7 @@ pub fn ttpf_hash_index_for_rpf(rpf_path: &Path) -> Option<std::sync::Arc<HashMap
         }
         for i in 0..tex_count {
             let h64 = ru64(&hashes, i * 8);
+            if h64 == 0 { continue; }
             let u0 = ru32(&recs, i * 16);
             let u1 = ru32(&recs, i * 16 + 4);
             let w = ((u0 & 0x3FFF) + 1) as usize;
@@ -1059,14 +1061,18 @@ pub fn ttpf_hash_index_for_rpf(rpf_path: &Path) -> Option<std::sync::Arc<HashMap
         }
     }
 
+    if index.is_empty() {
+        return None;
+    }
     let arc = std::sync::Arc::new(index);
     map.lock().unwrap().insert(root, arc.clone());
     Some(arc)
 }
 
-pub fn decode_ttpf_texture_cached(hit: &TtpfHashHit, hash64: u64) -> Option<std::sync::Arc<Texture2D>> {
+pub fn decode_ttpf_texture_cached(hit: &TtpfHashHit) -> Option<std::sync::Arc<Texture2D>> {
     let cache = TTPF_TEX_CACHE.get_or_init(Default::default);
-    if let Some(entry) = cache.lock().unwrap().get(&hash64) {
+    let key = (hit.path.clone(), hit.tex_idx);
+    if let Some(entry) = cache.lock().unwrap().get(&key) {
         return entry.clone();
     }
     let decoded = decode_ttpf_texture(&hit.path, hit.tex_idx)
@@ -1076,7 +1082,7 @@ pub fn decode_ttpf_texture_cached(hit: &TtpfHashHit, hash64: u64) -> Option<std:
     if g.len() > 512 {
         g.clear();
     }
-    g.insert(hash64, decoded.clone());
+    g.insert(key, decoded.clone());
     decoded
 }
 

@@ -13,9 +13,10 @@
 - **BK2 video on macOS:** Play, pause, scrub, mute and loop `.bk2` files inside the preview panel. Requires [Bink Player.app](https://github.com/Ahmet-Dedeler/bink-player-mac) with embed support. You can also pop the video out into its own window.
 - **AWC audio previews:** Play and seek through individual streams without exporting them first. The decoder also reads multichannel banks and files with extra stream-table headers that upstream can miss.
 - **Better 3D previews:** Drawables in a model dictionary appear separately instead of stacked on top of each other. Fixed rotated meshes and false model entries, added streamed `.ttpf` textures and vehicle paint previews, and added a **Highest detail only** toggle for character and clothing models.
+- **More accurate model colors:** The viewer finds shared textures across packs, binds them to the right materials, and reads both packed and floating-point UVs. If it can't find a usable color texture, it shows that part in gray.
 - **Easier browsing:** Sort the Explorer and Model Viewer by name or size. Small text tables show their strings instead of hex, and binary blobs no longer show up as XML just because they start with `<`.
 
-The latest color fixes (shared textures across packs, per-material texture binding and UV decoding) are in my local build, not on this branch yet. The download links here are for upstream releases and don't include the fork changes.
+The download links here are for upstream releases and don't include the fork changes.
 
 <p align="center">
   <img src="https://img.shields.io/badge/Version-v1.3.0-FFA81C?style=flat-square" alt="Version" />

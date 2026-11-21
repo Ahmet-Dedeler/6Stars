@@ -717,38 +717,6 @@ pub fn model_detail_score(file: &mut File, offset: u64) -> Option<usize> {
     (bytes > 0).then_some(bytes)
 }
 
-fn try_extract_embedded_texture(v: &[u8], p: &[u8]) -> (Option<Texture2D>, String) {
-    let mut bases = vec![0usize];
-    if v.len() >= 0x20 {
-        if let Some(fo) = vptr(ru64(v, 0x18)) {
-            bases.push(fo);
-        }
-    }
-    for base in bases {
-        if base + 0x18 > v.len() { continue; }
-        let Some(sg) = vptr(ru64(v, base + 0x10)) else { continue };
-        if sg + 0x10 > v.len() { continue; }
-        let Some(txd) = vptr(ru64(v, sg + 0x08)) else { continue };
-        // Use our verified Xbox Scarlett SW_4KB_D + reverse-mip + pure-Rust BC7/BC3/BC1 decoder!
-        let decoded = crate::tex::extract_txd_textures(v, p, txd);
-        if !decoded.is_empty() {
-            // Prefer diffuse/albedo texture over normal/spec/blank if multiple embedded
-            let best = decoded
-                .iter()
-                .find(|t| {
-                    let lo = t.name.to_ascii_lowercase();
-                    !lo.contains("_n") && !lo.contains("_nm") && !lo.contains("_s") && !lo.contains("blank") && t.w >= 32
-                })
-                .unwrap_or(&decoded[0]);
-            return (
-                Some(crate::tex::to_model_tex(best)),
-                format!("Embedded {} ({}x{} {}, {}/{})", best.name, best.w, best.h, best.fmt_name, 1, decoded.len()),
-            );
-        }
-    }
-    (None, "External .#td (Material Shading)".into())
-}
-
 /// Maps each LOD0 `(vb_poff, mb_poff)` of the drawable at `base` to its `grmModel::m_ShaderIndex` entry (`mp + 0x20`).
 fn drawable_lod0_shader_map(v: &[u8], base: usize) -> HashMap<(usize, usize), u16> {
     let mut out = HashMap::new();
@@ -779,24 +747,107 @@ fn drawable_lod0_shader_map(v: &[u8], base: usize) -> HashMap<(usize, usize), u1
     out
 }
 
-/// Resolves external `.ttpf` diffuse textures and vehicle-paint shader flags for each shader
-/// referenced by LOD0 geometries of the drawable at `base`.
+enum MaterialTexture<'a> {
+    Embedded(&'a Arc<Texture2D>),
+    Streamed(u64, &'a crate::tex::TtpfHashHit),
+}
+
+#[derive(Default)]
+struct StreamedMaterialCache(HashMap<u64, Option<Arc<Texture2D>>>);
+
+impl StreamedMaterialCache {
+    fn decode(&mut self, hash: u64, hit: &crate::tex::TtpfHashHit) -> Option<Arc<Texture2D>> {
+        if let Some(cached) = self.0.get(&hash) {
+            return cached.clone();
+        }
+        if self.0.len() >= 384 {
+            return None;
+        }
+        let tex = crate::tex::decode_ttpf_texture_cached(hit);
+        self.0.insert(hash, tex.clone());
+        tex
+    }
+}
+
+fn resolve_shader_material(
+    v: &[u8],
+    shader: usize,
+    embedded: &HashMap<usize, (u8, Arc<Texture2D>)>,
+    ttpf_idx: Option<&HashMap<u64, crate::tex::TtpfHashHit>>,
+    is_vehicle: bool,
+    streamed: &mut StreamedMaterialCache,
+) -> GeomMaterial {
+    const DIFFUSE_TEX: u32 = 0xc8e8_c282; // joaat("diffuseTex")
+    const DIFFUSE_TEX2: u32 = 0x0df4_7048; // joaat("diffuseTex2")
+    const TINT_PALETTE_TEX: u32 = 0x2c8d_7182; // joaat("tintPaletteTex")
+    const ALT0_TEX: u32 = 0x3463_94ea; // vehicle body/livery/detail slot 0
+    const EMISSIVE_TEX: u32 = 0x8e0d_63ee; // joaat("emissiveTex")
+
+    let mut mat = GeomMaterial::default();
+    if shader + 0x28 > v.len() || &v[shader + 4..shader + 8] != b"atem" { return mat; }
+    let Some(params) = vptr(ru64(v, shader + 0x20)) else { return mat };
+    let Some(slots) = vptr(ru64(v, shader + 0x10)) else { return mat };
+    if params + 8 > v.len() { return mat; }
+
+    let mut has_tint = false;
+    let mut candidates = [None, None, None, None];
+    for k in 0..v[params + 1] as usize {
+        let ent = params + 8 + k * 8;
+        if ent + 8 > v.len() { break; }
+        let rank = match ru32(v, ent) {
+            DIFFUSE_TEX => 0,
+            ALT0_TEX => 1,
+            DIFFUSE_TEX2 => 2,
+            EMISSIVE_TEX => 3,
+            TINT_PALETTE_TEX => {
+                has_tint = true;
+                continue;
+            }
+            _ => continue, // An sRGB format alone does not make a map an albedo.
+        };
+        let code = ru32(v, ent + 4) as usize;
+        if code % 4 != 0 || slots + code * 2 + 8 > v.len() { continue; }
+        let Some(tp) = vptr(ru64(v, slots + code * 2)) else { continue };
+        let (candidate, dxgi) = if let Some((format, tex)) = embedded.get(&tp) {
+            (MaterialTexture::Embedded(tex), *format)
+        } else {
+            if tp + 0x38 > v.len() || ru64(v, tp + 0x10) != 0x980 { continue; }
+            let Some(reference) = vptr(ru64(v, tp + 0x30)) else { continue };
+            if reference + 16 > v.len() { continue; }
+            let hash = ru64(v, reference + 8);
+            let Some(hit) = ttpf_idx.and_then(|index| index.get(&hash)) else { continue };
+            let min_size = if rank == 0 { 4 } else { 16 };
+            if hit.w < min_size || hit.h < min_size { continue; }
+            (MaterialTexture::Streamed(hash, hit), hit.dxgi)
+        };
+        if !matches!(dxgi, 65 | 80 | 81 | 83 | 84) {
+            candidates[rank] = Some(candidate);
+        }
+    }
+
+    let paint_shader = is_vehicle && has_tint;
+    let candidate_count = if paint_shader { 2 } else { candidates.len() };
+    let has_color_binding = candidates[..candidate_count].iter().any(Option::is_some);
+    mat.texture = candidates.into_iter().take(candidate_count).flatten().find_map(|candidate| {
+        match candidate {
+            MaterialTexture::Embedded(tex) => Some(tex.clone()),
+            MaterialTexture::Streamed(hash, hit) => streamed.decode(hash, hit),
+        }
+    });
+    mat.is_vehicle_paint = paint_shader && !has_color_binding;
+    mat
+}
+
+/// Bind each geometry to its shader's own texture, whether embedded or streamed.
 fn resolve_drawable_materials(
     v: &[u8],
+    p: &[u8],
     base: usize,
     geoms: &[GeomRef],
     ttpf_idx: Option<&HashMap<u64, crate::tex::TtpfHashHit>>,
     is_vehicle: bool,
-    seen_hashes: &mut HashSet<u64>,
-    decode_budget: &mut usize,
+    streamed: &mut StreamedMaterialCache,
 ) -> Vec<GeomMaterial> {
-    const DIFFUSE_TEX: u32 = 0xc8e8_c282; // joaat("diffuseTex")
-    const TINT_PALETTE_TEX: u32 = 0x2c8d_7182; // joaat("tintPaletteTex")
-    const ALT0_TEX: u32 = 0x3463_94ea; // vehicle body/livery/detail slot 0
-    const EMISSIVE_TEX: u32 = 0x8e0d_63ee; // joaat("emissiveTex")
-    const DIRT_DIFFUSE_TEX: u32 = 0x7485_dafb; // joaat("dirtDiffuseTex")
-    const SHARED_LUT_PARAM: u32 = 0x19df_25d7; // shared 128x256 vehicle lookup texture
-
     let mut mats = vec![GeomMaterial::default(); geoms.len()];
     if base + 0x18 > v.len() { return mats; }
     let Some(sg) = vptr(ru64(v, base + 0x10)) else { return mats };
@@ -804,95 +855,22 @@ fn resolve_drawable_materials(
     let Some(sp) = vptr(ru64(v, sg + 0x10)) else { return mats };
     let scnt = ru16(v, sg + 0x18) as usize;
     if scnt == 0 || scnt > 512 || sp + scnt * 8 > v.len() { return mats; }
-    // Verify RAGE9 "atem" (meta) shader table tag
-    let Some(s0) = vptr(ru64(v, sp)) else { return mats };
-    if s0 + 8 > v.len() || (ru64(v, s0) >> 32) != 0x6d65_7461 { return mats; }
-
+    let embedded: HashMap<_, _> = vptr(ru64(v, sg + 8))
+        .into_iter()
+        .flat_map(|txd| crate::tex::extract_txd_textures_by_ptr(v, p, txd))
+        .map(|(ptr, tex)| (ptr, (tex.dxgi, Arc::new(Texture2D { w: tex.w, h: tex.h, pixels: tex.pixels }))))
+        .collect();
     let smap = drawable_lod0_shader_map(v, base);
     let mut shader_cache: HashMap<u16, GeomMaterial> = HashMap::new();
 
     for (gi, &(vb_poff, _, mb_poff, _)) in geoms.iter().enumerate() {
-        let sidx = smap.get(&(vb_poff, mb_poff)).copied().unwrap_or(gi as u16);
-        if let Some(cached) = shader_cache.get(&sidx) {
-            mats[gi] = cached.clone();
-            continue;
-        }
-        let mut mat = GeomMaterial::default();
-        if (sidx as usize) < scnt {
-            if let Some(saddr) = vptr(ru64(v, sp + (sidx as usize) * 8)) {
-                if saddr + 0x28 <= v.len() {
-                    if let (Some(p2), Some(p4)) = (vptr(ru64(v, saddr + 0x10)), vptr(ru64(v, saddr + 0x20))) {
-                        if p4 + 8 <= v.len() {
-                            let tcnt = (v[p4 + 1] as usize).min(48);
-                            let mut has_tint = false;
-                            let mut diffuse_cand: Option<(u64, crate::tex::TtpfHashHit)> = None;
-                            let mut alt0_cand: Option<(u64, crate::tex::TtpfHashHit)> = None;
-                            let mut emissive_cand: Option<(u64, crate::tex::TtpfHashHit)> = None;
-                            let mut fallback_srgb: Option<(u64, crate::tex::TtpfHashHit)> = None;
-
-                            for k in 0..tcnt {
-                                let ent = p4 + 8 + k * 8;
-                                if ent + 8 > v.len() { break; }
-                                let param_hash = ru32(v, ent);
-                                let slot = (ru32(v, ent + 4) / 4) as usize;
-                                if param_hash == TINT_PALETTE_TEX {
-                                    has_tint = true;
-                                }
-                                let Some(idx_map) = ttpf_idx else { continue };
-                                if p2 + slot * 8 + 8 > v.len() { continue; }
-                                let Some(tp) = vptr(ru64(v, p2 + slot * 8)) else { continue };
-                                if tp + 0x40 > v.len() || ru64(v, tp + 0x10) != 0x980 { continue; }
-                                let Some(ref_off) = vptr(ru64(v, tp + 0x30)) else { continue };
-                                if ref_off + 16 > v.len() { continue; }
-                                let h64 = ru64(v, ref_off + 8);
-                                let Some(hit) = idx_map.get(&h64) else { continue };
-                                if hit.is_normal_format() || hit.dxgi == 65 { continue; }
-
-                                if param_hash == DIFFUSE_TEX && hit.w >= 4 && hit.h >= 4 {
-                                    diffuse_cand = Some((h64, hit.clone()));
-                                } else if param_hash == ALT0_TEX && hit.w >= 16 && hit.h >= 16 {
-                                    alt0_cand = Some((h64, hit.clone()));
-                                } else if param_hash == EMISSIVE_TEX && hit.w >= 16 && hit.h >= 16 {
-                                    emissive_cand = Some((h64, hit.clone()));
-                                } else if hit.is_srgb()
-                                    && hit.w >= 16
-                                    && hit.h >= 16
-                                    && param_hash != DIRT_DIFFUSE_TEX
-                                    && param_hash != SHARED_LUT_PARAM
-                                    && fallback_srgb.is_none()
-                                {
-                                    fallback_srgb = Some((h64, hit.clone()));
-                                }
-                            }
-
-                            let chosen = if let Some(c) = diffuse_cand {
-                                Some(c)
-                            } else if has_tint && is_vehicle {
-                                alt0_cand
-                            } else {
-                                alt0_cand.or(emissive_cand).or(fallback_srgb)
-                            };
-
-                            let had_tex_ref = chosen.is_some();
-                            if let Some((h64, hit)) = chosen {
-                                let is_new = seen_hashes.insert(h64);
-                                if !is_new || *decode_budget > 0 {
-                                    if let Some(tex) = crate::tex::decode_ttpf_texture_cached(&hit, h64) {
-                                        mat.texture = Some(tex);
-                                        if is_new && *decode_budget > 0 {
-                                            *decode_budget -= 1;
-                                        }
-                                    }
-                                }
-                            }
-                            mat.is_vehicle_paint = is_vehicle && has_tint && !had_tex_ref;
-                        }
-                    }
-                }
-            }
-        }
-        shader_cache.insert(sidx, mat.clone());
-        mats[gi] = mat;
+        let Some(sidx) = smap.get(&(vb_poff, mb_poff)).copied().or_else(|| (scnt == 1).then_some(0)) else { continue };
+        if sidx as usize >= scnt { continue; }
+        mats[gi] = shader_cache.entry(sidx).or_insert_with(|| {
+            vptr(ru64(v, sp + sidx as usize * 8))
+                .map(|shader| resolve_shader_material(v, shader, &embedded, ttpf_idx, is_vehicle, streamed))
+                .unwrap_or_default()
+        }).clone();
     }
     mats
 }
@@ -945,21 +923,21 @@ struct MeshBuild {
     meshlets: usize,
 }
 
-/// Decodes one meshlet geometry from the physical buffer and appends it to `b`.
-fn append_meshlet_geom(p: &[u8], (vb_off, vb_size, mb_off, _mb_size): GeomRef, geom_id: u16, b: &mut MeshBuild) {
+/// Decodes one meshlet geometry and returns whether it has usable UV0 data.
+fn append_meshlet_geom(p: &[u8], (vb_off, vb_size, mb_off, _mb_size): GeomRef, geom_id: u16, b: &mut MeshBuild) -> bool {
     if mb_off + 0x10 > p.len() || vb_off + 0x80 > p.len() {
-        return;
+        return false;
     }
     let num_meshlets = (ru32(p, mb_off) & 0xFFFF) as usize;
     let tot_tris = ru32(p, mb_off + 4) as usize;
     let tot_vrefs = ru32(p, mb_off + 8) as usize;
     if num_meshlets == 0 || tot_tris == 0 || tot_vrefs == 0 {
-        return;
+        return false;
     }
     let tri_base = mb_off + 0x0c + num_meshlets * 16;
     let remap_base = tri_base + tot_tris * 4;
     if remap_base + tot_vrefs * 2 > p.len() {
-        return;
+        return false;
     }
 
     let mut hdrs = [0u32; 8];
@@ -970,7 +948,7 @@ fn append_meshlet_geom(p: &[u8], (vb_off, vb_size, mb_off, _mb_size): GeomRef, g
     }
     let stream0_off = ((hdrs[0] >> 8) << 1) as usize;
     let mut stream0_end = vb_size;
-    let mut uv_stream_off: Option<usize> = None;
+    let mut uv_stream = None;
     for &h in &hdrs[1..] {
         if h == 0 { continue; }
         let so = ((h >> 8) << 1) as usize;
@@ -978,16 +956,22 @@ fn append_meshlet_geom(p: &[u8], (vb_off, vb_size, mb_off, _mb_size): GeomRef, g
         if so > stream0_off && so < stream0_end {
             stream0_end = so;
         }
-        if st == 0x28 && uv_stream_off.is_none() {
-            uv_stream_off = Some(so);
+        if so > stream0_off && uv_stream.is_none() {
+            // The first descriptor is packed position. Later 0x42 streams are float2 UVs;
+            // 0x28 stores signed fixed-point UVs, including coordinates below zero.
+            match st {
+                0x28 => uv_stream = Some((so, 4)),
+                0x42 => uv_stream = Some((so, 8)),
+                _ => {}
+            }
         }
     }
     if vb_off + stream0_off >= p.len() {
-        return;
+        return false;
     }
     let max_vb_verts = ((stream0_end.saturating_sub(stream0_off)) / 8).min((p.len() - (vb_off + stream0_off)) / 8);
     if max_vb_verts == 0 {
-        return;
+        return false;
     }
 
     let ox = rf32(p, vb_off + 0x60);
@@ -1035,9 +1019,16 @@ fn append_meshlet_geom(p: &[u8], (vb_off, vb_size, mb_off, _mb_size): GeomRef, g
 
     let added_tris = b.tris.len() - start_tri;
     if added_tris == 0 {
-        return;
+        return false;
     }
     let v_cnt = (max_v_used + 1).min(max_vb_verts);
+    let uv_stream = uv_stream.filter(|&(off, stride)| {
+        let end = hdrs.iter().map(|h| ((h >> 8) << 1) as usize)
+            .filter(|&next| next > off)
+            .fold(vb_size.min(p.len() - vb_off), usize::min);
+        off + v_cnt * stride <= end
+    });
+    let mut has_uvs = uv_stream.is_some();
     let vbase = vb_off + stream0_off;
     b.verts.reserve(v_cnt);
     b.uvs.reserve(v_cnt);
@@ -1053,15 +1044,22 @@ fn append_meshlet_geom(p: &[u8], (vb_off, vb_size, mb_off, _mb_size): GeomRef, g
             pos[axis] = slots[slot];
         }
         b.verts.push(pos);
-        let uv = uv_stream_off
-            .map(|uvo| vb_off + uvo + i * 4)
-            .filter(|&u_pos| u_pos + 4 <= p.len())
-            .map(|u_pos| [ru16(p, u_pos) as f32 / 8192.0, ru16(p, u_pos + 2) as f32 / 8192.0])
-            .unwrap_or([0.0, 0.0]);
-        b.uvs.push(uv);
+        let uv = uv_stream
+            .map(|(off, stride)| {
+                let uv = vb_off + off + i * stride;
+                if stride == 4 {
+                    [ru16(p, uv) as i16 as f32 / 8192.0, ru16(p, uv + 2) as i16 as f32 / 8192.0]
+                } else {
+                    [rf32(p, uv), rf32(p, uv + 4)]
+                }
+            })
+            .filter(|uv| uv.iter().all(|x| x.is_finite()));
+        has_uvs &= uv.is_some();
+        b.uvs.push(uv.unwrap_or([0.0, 0.0]));
     }
     b.tri_geom.resize(b.tri_geom.len() + added_tris, geom_id);
     b.meshlets += num_meshlets;
+    has_uvs
 }
 
 /// Lays dictionary parts out on a square-ish XY grid so independent drawables sit side
@@ -1153,34 +1151,25 @@ pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name
         return Err("No RAGE9 meshlet geometries found in resource".into());
     }
 
-    let (texture, mut tex_status) = try_extract_embedded_texture(&v, &p);
-    let ttpf_idx = if texture.is_none() {
-        crate::tex::ttpf_hash_index_for_rpf(rpf_path)
-    } else {
-        None
-    };
-
+    let ttpf_idx = crate::tex::ttpf_hash_index_for_rpf(rpf_path);
     let is_vehicle = is_vehicle_virtual(&v, &model_name);
     let mut b = MeshBuild::default();
     let mut parts = Vec::with_capacity(groups.len());
     let mut part_verts = Vec::with_capacity(groups.len());
     let mut geom_materials: Vec<GeomMaterial> = Vec::with_capacity(geom_count);
-    let mut seen_hashes: HashSet<u64> = HashSet::new();
-    let mut decode_budget = 384usize;
+    let mut streamed = StreamedMaterialCache::default();
     let mut gi_idx = 0u16;
     for (name, base_opt, geoms) in &groups {
-        let mats = if texture.is_none() {
-            if let Some(base) = *base_opt {
-                resolve_drawable_materials(&v, base, geoms, ttpf_idx.as_deref(), is_vehicle, &mut seen_hashes, &mut decode_budget)
-            } else {
-                vec![GeomMaterial::default(); geoms.len()]
-            }
+        let mats = if let Some(base) = *base_opt {
+            resolve_drawable_materials(&v, &p, base, geoms, ttpf_idx.as_deref(), is_vehicle, &mut streamed)
         } else {
             vec![GeomMaterial::default(); geoms.len()]
         };
         let (t0, v0) = (b.tris.len(), b.verts.len());
-        for (&g, mat) in geoms.iter().zip(mats) {
-            append_meshlet_geom(&p, g, gi_idx, &mut b);
+        for (&g, mut mat) in geoms.iter().zip(mats) {
+            if !append_meshlet_geom(&p, g, gi_idx, &mut b) {
+                mat.texture = None;
+            }
             geom_materials.push(mat);
             gi_idx = gi_idx.wrapping_add(1);
         }
@@ -1196,15 +1185,13 @@ pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name
 
     let resolved_tex_geoms = geom_materials.iter().filter(|m| m.texture.is_some()).count();
     let paint_geoms = geom_materials.iter().filter(|m| m.is_vehicle_paint).count();
-    if texture.is_none() {
-        if resolved_tex_geoms > 0 && paint_geoms > 0 {
-            tex_status = format!("TTPF: {resolved_tex_geoms}/{geom_count} mats + Car Paint");
-        } else if resolved_tex_geoms > 0 {
-            tex_status = format!("TTPF: {resolved_tex_geoms}/{geom_count} mats");
-        } else if paint_geoms > 0 {
-            tex_status = format!("Car Paint ({paint_geoms}/{geom_count} geoms)");
-        }
-    }
+    let tex_status = match (resolved_tex_geoms, paint_geoms) {
+        (0, 0) if ttpf_idx.is_none() => "No .ttpf archives found; neutral preview".into(),
+        (0, 0) => "No usable color textures; neutral preview".into(),
+        (0, paint) => format!("Preview paint: {paint}/{geom_count} geoms"),
+        (tex, 0) => format!("Textures: {tex}/{geom_count} geoms"),
+        (tex, paint) => format!("Textures: {tex}/{geom_count} geoms + preview paint ({paint})"),
+    };
 
     let mut mesh = Mesh3D::from_parts(
         model_name,
@@ -1213,7 +1200,7 @@ pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name
         b.tris,
         b.tri_geom,
         Vec::new(),
-        texture,
+        None,
         tex_status,
         geom_count,
         b.meshlets,
@@ -1319,11 +1306,11 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
         let do_wire = matches!(mesh.shade_mode, ShadeMode::Wireframe | ShadeMode::SolidWire);
         let has_uvs = mesh.uvs.len() == mesh.verts.len() && !mesh.uvs.is_empty();
 
-        const MAT_PALETTE: [[f32; 3]; 12] = [
-            [0.82, 0.84, 0.88], [0.24, 0.26, 0.30], [0.18, 0.24, 0.32], [0.72, 0.75, 0.80],
-            [0.34, 0.36, 0.40], [0.86, 0.24, 0.24], [0.48, 0.50, 0.56], [0.28, 0.24, 0.22],
-            [0.78, 0.72, 0.62], [0.38, 0.44, 0.52], [0.64, 0.66, 0.70], [0.20, 0.21, 0.24],
+        const NAV_PALETTE: [[f32; 3]; 5] = [
+            [0.82, 0.84, 0.88], [0.24, 0.26, 0.30], [0.18, 0.24, 0.32],
+            [0.72, 0.75, 0.80], [0.34, 0.36, 0.40],
         ];
+        let color_nav_surfaces = do_textured && mesh.lod_label == "NavMesh";
         let l1 = [0.42f32, 0.65f32, 0.63f32];
         let l2 = [-0.60f32, 0.25f32, -0.45f32];
 
@@ -1379,8 +1366,10 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                     && gmat.map(|m| m.is_vehicle_paint).unwrap_or(false);
                 let base_albedo = if is_paint {
                     mesh.paint_color
-                } else if do_textured && active_tex.is_none() {
-                    MAT_PALETTE[g % MAT_PALETTE.len()]
+                } else if color_nav_surfaces {
+                    NAV_PALETTE.get(g).copied().unwrap_or([0.68; 3])
+                } else if do_textured {
+                    [0.68; 3]
                 } else {
                     [0.86, 0.88, 0.92]
                 };
@@ -1621,7 +1610,12 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
                 mesh.dirty = true;
             }
         }
-        ui.label(RichText::new(&mesh.tex_status).size(11.0).color(Color32::from_rgb(130, 145, 168)));
+        let status = ui.label(RichText::new(&mesh.tex_status).size(11.0).color(Color32::from_rgb(130, 145, 168)));
+        if !mesh.geom_materials.is_empty() {
+            status.on_hover_text("Textured/Mat uses available color textures and optional preview paint. \
+                Unresolved geometry uses a gray fallback. Some game shaders, tints and texture \
+                variants are not reproduced.");
+        }
     });
     ui.add_space(4.0);
 
@@ -1733,6 +1727,46 @@ mod tests {
 mod dictionary_decode_tests {
     use super::*;
 
+    fn render_sample(mut mesh: Mesh3D, tag: &str) {
+        let Ok(dir) = std::env::var("PERCYSTAR_RENDER_DIR") else { return };
+        fs::create_dir_all(&dir).unwrap();
+        rasterize_mesh(&mut mesh, 800, 600);
+        let rgba: Vec<_> = mesh.color_buf.iter().flat_map(|c| c.to_srgba_unmultiplied()).collect();
+        image::save_buffer(Path::new(&dir).join(format!("{tag}.png")), &rgba, 800, 600, image::ColorType::Rgba8)
+            .expect("save render");
+    }
+
+    #[test]
+    fn model_materials_find_shared_textures_from_pack_archives() {
+        let Ok(levels) = std::env::var("PERCYSTAR_LEVELS_RPF") else { return };
+        let Some(root) = Path::new(&levels).parent() else { return };
+        let rpf = root.join("pack/shared_minigame000/shared_minigame000.rpf");
+        if !rpf.exists() {
+            return;
+        }
+        let mesh = decode_rage9_model_from_rpf(&rpf, 362_385_424, "pack model").unwrap();
+        assert_eq!(mesh.name, "a_bfyb01_lgs_lvl1_bits.#dr");
+        assert_eq!(mesh.geom_materials.iter().filter(|mat| mat.texture.is_some()).count(), 6, "{}", mesh.tex_status);
+        assert!(mesh.uvs.iter().any(|uv| uv[0] < 0.0), "UV0 includes signed fixed-point coordinates");
+        eprintln!("[pack model] {}", mesh.tex_status);
+        render_sample(mesh, "pack_model");
+    }
+
+    #[test]
+    fn unused_embedded_thumbnail_does_not_replace_streamed_materials() {
+        let Ok(rpf) = std::env::var("PERCYSTAR_LEVELS_RPF") else { return };
+        if !Path::new(&rpf).exists() {
+            return;
+        }
+        // The embedded 4x4 texture is not bound to these shaders.
+        let mesh = decode_rage9_model_from_rpf(Path::new(&rpf), 74_960_211_984, "siren").unwrap();
+        assert_eq!(mesh.name, "cmn_siren_int_rear_r_bar_01_x4_hi.#ft");
+        assert!(mesh.texture.is_none(), "don't paint the whole asset with the embedded texture");
+        assert!(mesh.geom_materials.iter().filter_map(|m| m.texture.as_ref()).any(|t| t.w > 4), "{}", mesh.tex_status);
+        eprintln!("[siren] {}", mesh.tex_status);
+        render_sample(mesh, "siren");
+    }
+
     /// Regression for bk_02_road_str_slod.#dr (levels.rpf, Xbox build): a drawable dictionary
     /// of 8 Brickell SLOD blocks that used to render stacked at the origin, with towers on
     /// their side because the +0x6C position axis mode was ignored. Runs only when
@@ -1746,6 +1780,7 @@ mod dictionary_decode_tests {
         let m = decode_rage9_model_from_rpf(Path::new(&rpf), 8_679_358_480, "x").expect("decode dictionary");
         assert_eq!(m.parts.len(), 8, "expected 8 drawables");
         assert_eq!(m.geom_count, 317);
+        assert!(m.uvs.iter().flatten().any(|uv| (uv * 8192.0).fract() != 0.0), "expected float2 UV streams alongside fixed-point streams");
         let tower = m.parts.iter().find(|p| p.name == "bk_04_slod.#dr").expect("bk_04_slod part");
         let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
         for t in &m.tris[tower.tris.clone()] {
@@ -1773,13 +1808,11 @@ mod dictionary_decode_tests {
             ("cheetah2", 74_051_276_816u64),
             ("cheetah2_hi", 74_053_521_424u64),
             ("brickell_slod", 8_679_358_480u64),
+            ("fern", 71_430_041_616u64),
+            ("dress", 67_927_576_592u64),
         ];
-        let out_dir = std::env::var("PERCYSTAR_RENDER_DIR").ok();
-        if let Some(ref d) = out_dir {
-            let _ = fs::create_dir_all(d);
-        }
         for (tag, off) in cases {
-            let mut m = decode_rage9_model_from_rpf(Path::new(&rpf), off, tag).expect("decode model");
+            let m = decode_rage9_model_from_rpf(Path::new(&rpf), off, tag).expect("decode model");
             let tex_mats = m.geom_materials.iter().filter(|gm| gm.texture.is_some()).count();
             let paint_mats = m.geom_materials.iter().filter(|gm| gm.is_vehicle_paint).count();
             eprintln!("[{tag}] status='{}' geoms={} tex_mats={} paint_mats={}", m.tex_status, m.geom_count, tex_mats, paint_mats);
@@ -1789,15 +1822,7 @@ mod dictionary_decode_tests {
             } else {
                 assert!(tex_mats > 0, "{tag} should resolve external TTPF textures");
             }
-            if let Some(ref d) = out_dir {
-                rasterize_mesh(&mut m, 800, 600);
-                let mut rgba = Vec::with_capacity(800 * 600 * 4);
-                for c in &m.color_buf {
-                    rgba.extend_from_slice(&c.to_srgba_unmultiplied());
-                }
-                image::save_buffer(Path::new(d).join(format!("{tag}.png")), &rgba, 800, 600, image::ColorType::Rgba8)
-                    .expect("save render");
-            }
+            render_sample(m, tag);
         }
     }
 }
