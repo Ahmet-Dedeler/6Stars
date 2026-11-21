@@ -134,7 +134,7 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
     let Ok(event_loop) = EventLoop::builder().build() else {
         return;
     };
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(24);
     if let Some(lp) = cfg.levels_rpf.clone() {
         let start = cfg.start_pos;
         std::thread::spawn(move || {
@@ -185,7 +185,7 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
             }
             let groups = Arc::new(arch_groups);
             let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let n_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).clamp(2, 8);
+            let n_workers = (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8) / 2).clamp(2, 4);
             std::thread::scope(|s| {
                 for _ in 0..n_workers {
                     let groups = Arc::clone(&groups);
@@ -209,6 +209,7 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
                         if tx.send(WorldStreamMsg::ArchetypeDone).is_err() {
                             break;
                         }
+                        std::thread::sleep(std::time::Duration::from_millis(2));
                     });
                 }
             });
@@ -548,6 +549,7 @@ struct GpuState {
     stream_done: usize,
     stream_total: usize,
     sgd5_count: usize,
+    frame_idx: u64,
     start_instant: Instant,
     has_hw_rt: bool,
     map_min: [f32; 2],
@@ -661,7 +663,7 @@ impl GpuState {
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::AutoVsync,
+            present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -956,6 +958,7 @@ impl GpuState {
             stream_done: 0,
             stream_total: 0,
             sgd5_count: 0,
+            frame_idx: 0,
             start_instant: Instant::now(),
             has_hw_rt,
             map_min: [-13000.0, -9000.0],
@@ -1218,7 +1221,7 @@ impl ApplicationHandler for GpuWorldApp {
                 self.last_frame = now;
 
                 if let Some(g) = &mut self.gpu {
-                    for _ in 0..24 {
+                    for _ in 0..4 {
                         let Ok(msg) = self.stream_rx.try_recv() else { break };
                         match msg {
                             WorldStreamMsg::Batch(batch) => g.add_batch(&batch),
@@ -1320,8 +1323,9 @@ impl ApplicationHandler for GpuWorldApp {
                 let Ok(frame) = g.surface.get_current_texture() else { return };
                 let view_tex = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
                 let mut enc = g.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world_enc") });
+                g.frame_idx = g.frame_idx.wrapping_add(1);
 
-                {
+                if g.frame_idx % 2 == 1 {
                     let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("shadow_pass"),
                         color_attachments: &[],
@@ -1336,7 +1340,10 @@ impl ApplicationHandler for GpuWorldApp {
                     rp.set_pipeline(&g.shadow_pipeline);
                     rp.set_bind_group(0, &g.uniform_bg, &[]);
                     for b in &g.batches {
-                        if b.bound_radius < 5000.0 && (b.bound_center - light_target).length_squared() > (2200.0 + b.bound_radius).powi(2) {
+                        if b.bound_radius < 3.0 {
+                            continue;
+                        }
+                        if b.bound_radius < 5000.0 && (b.bound_center - light_target).length_squared() > (1200.0 + b.bound_radius).powi(2) {
                             continue;
                         }
                         rp.set_bind_group(1, &b.tex_bind_group, &[]);
@@ -1373,14 +1380,21 @@ impl ApplicationHandler for GpuWorldApp {
                     rp.draw(0..6, 0..1);
 
                     rp.set_pipeline(&g.main_pipeline);
+                    let mut drawn = 0usize;
                     for b in &g.batches {
                         if b.bound_radius < 5000.0 {
                             let to_b = b.bound_center - self.cam_pos;
-                            if to_b.dot(fwd) < -(b.bound_radius + 150.0) {
+                            if to_b.dot(fwd) < -(b.bound_radius + 120.0) {
                                 continue;
                             }
-                            if to_b.length_squared() > (7500.0 + b.bound_radius).powi(2) {
+                            let d2 = to_b.length_squared();
+                            let max_d = if b.bound_radius > 35.0 { 6500.0 } else if b.bound_radius < 2.0 { 450.0 } else { 3200.0 };
+                            if d2 > (max_d + b.bound_radius).powi(2) {
                                 continue;
+                            }
+                            drawn += 1;
+                            if drawn > 1400 {
+                                break;
                             }
                         }
                         rp.set_bind_group(1, &b.tex_bind_group, &[]);
