@@ -125,7 +125,9 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
                 }));
             }
             // 2. build/load cached 0DRPz map placements + model index and stream all levels nearest-first
+            eprintln!("[world-gpu] loading/building world index from {}", lp.display());
             let ix = crate::mapdata::build_or_load_world_index(&lp);
+            eprintln!("[world-gpu] index ready: {} maps, {} models, {} entities", ix.map_count, ix.models.len(), ix.entities.len());
             let _ = tx.send(WorldStreamMsg::MapCount(ix.map_count));
             let mut arch_groups: Vec<(u32, u64, f32, Vec<(Vec3, Quat, Vec3, [f32; 4])>)> = Vec::new();
             let mut grouped: HashMap<u32, (f32, Vec<(Vec3, Quat, Vec3, [f32; 4])>)> = HashMap::new();
@@ -149,6 +151,7 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
                     arch_groups.push((h, moff, d2, insts));
                 }
             }
+            eprintln!("[world-gpu] matched {} unique drawable archetypes to stream", arch_groups.len());
             arch_groups.sort_by(|a, b| a.2.total_cmp(&b.2));
             for (h, moff, _, insts) in arch_groups {
                 if let Ok(mesh) = crate::model3d::decode_rage9_model_from_rpf(&lp, moff, &format!("arch_{h:08x}")) {

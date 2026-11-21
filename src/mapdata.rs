@@ -172,7 +172,7 @@ fn load_world_index(path: &Path, rpf_len: u64) -> Option<WorldIndex> {
 }
 
 pub fn build_or_load_world_index(levels_rpf: &Path) -> WorldIndex {
-    let Ok(mut f) = File::open(levels_rpf) else { return WorldIndex::default() };
+    let Ok(f) = File::open(levels_rpf) else { return WorldIndex::default() };
     let sz = f.metadata().map(|m| m.len()).unwrap_or(0);
     if let Some(cp) = cache_path() {
         if let Some(ix) = load_world_index(&cp, sz) {
@@ -180,63 +180,100 @@ pub fn build_or_load_world_index(levels_rpf: &Path) -> WorldIndex {
         }
     }
 
-    let mut ix = WorldIndex::default();
-    let chunk_sz = 64 * 1024 * 1024usize;
-    let mut buf = vec![0u8; chunk_sz];
-    let mut off = 0u64;
-    let mut dec = Decompress::new(true);
-    let mut out = vec![0u8; 32768];
-    let mut f_res = File::open(levels_rpf).unwrap();
+    let chunk_sz = 64 * 1024 * 1024u64;
+    let next_off = std::sync::atomic::AtomicU64::new(0);
+    let done_bytes = std::sync::atomic::AtomicU64::new(0);
+    let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).clamp(2, 12);
 
-    while off < sz {
-        let _ = f.seek(SeekFrom::Start(off));
-        let mut read_n = 0usize;
-        while read_n < chunk_sz {
-            match f.read(&mut buf[read_n..]) {
-                Ok(0) => break,
-                Ok(n) => read_n += n,
-                Err(_) => break,
-            }
-        }
-        if read_n < 64 {
-            break;
-        }
-        let mut pos = 0usize;
-        while pos + 0x20 <= read_n {
-            let p = pos + 0x10;
-            if is_zlib(&buf[p..]) {
-                dec.reset(true);
-                let _ = dec.decompress(&buf[p..(p + 32768).min(read_n)], &mut out, FlushDecompress::None);
-                let olen = dec.total_out() as usize;
-                if olen >= 0x80 {
-                    let vft = ru64(&out, 0);
-                    let bmap = ru64(&out, 8);
-                    if vft == 0 && (0x5000_0000..0x5800_0000).contains(&bmap) {
-                        let abs_off = off + p as u64;
-                        if out.get(0x10..0x15) == Some(b"0DRPz") {
-                            if let Ok((sys, _, _)) = read_virtual_from_file(&mut f_res, abs_off) {
-                                if let Some(ents) = parse_0drpz_map_entities(&sys) {
-                                    ix.map_count += 1;
-                                    ix.entities.extend(ents);
-                                }
-                            }
-                        } else if has_rage9_meshlets(&out[..olen]) {
-                            if let Some((nm, ext)) = extract_rage9_model_name(&out[..olen]) {
-                                let stem = nm.strip_suffix(ext).unwrap_or(&nm);
-                                ix.models.entry(joaat(stem)).or_insert(abs_off);
-                            }
+    let mut ix = std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(n_threads);
+        for tid in 0..n_threads {
+            let next_off = &next_off;
+            let done_bytes = &done_bytes;
+            handles.push(s.spawn(move || {
+                let mut local = WorldIndex::default();
+                let Ok(mut f_scan) = File::open(levels_rpf) else { return local };
+                let Ok(mut f_res) = File::open(levels_rpf) else { return local };
+                let mut buf = vec![0u8; chunk_sz as usize];
+                let mut dec = Decompress::new(true);
+                let mut head = [0u8; 64];
+                let mut out = vec![0u8; 32768];
+                loop {
+                    let off = next_off.fetch_add(chunk_sz, std::sync::atomic::Ordering::Relaxed);
+                    if off >= sz {
+                        break;
+                    }
+                    if f_scan.seek(SeekFrom::Start(off)).is_err() {
+                        break;
+                    }
+                    let want = (sz - off).min(chunk_sz) as usize;
+                    let mut read_n = 0usize;
+                    while read_n < want {
+                        match f_scan.read(&mut buf[read_n..want]) {
+                            Ok(0) => break,
+                            Ok(n) => read_n += n,
+                            Err(_) => break,
                         }
                     }
+                    let mut pos = 0usize;
+                    while pos + 0x20 <= read_n {
+                        let p = pos + 0x10;
+                        if is_zlib(&buf[p..]) {
+                            dec.reset(true);
+                            let _ = dec.decompress(&buf[p..(p + 256).min(read_n)], &mut head, FlushDecompress::None);
+                            if dec.total_out() >= 0x20 {
+                                let vft = ru64(&head, 0);
+                                let bmap = ru64(&head, 8);
+                                if vft == 0 && (0x5000_0000..0x5800_0000).contains(&bmap) {
+                                    let abs_off = off + p as u64;
+                                    if head.get(0x10..0x15) == Some(b"0DRPz") {
+                                        if let Ok((sys, _, _)) = read_virtual_from_file(&mut f_res, abs_off) {
+                                            if let Some(ents) = parse_0drpz_map_entities(&sys) {
+                                                local.map_count += 1;
+                                                local.entities.extend(ents);
+                                            }
+                                        }
+                                    } else {
+                                        dec.reset(true);
+                                        let _ = dec.decompress(&buf[p..(p + 32768).min(read_n)], &mut out, FlushDecompress::None);
+                                        let olen = dec.total_out() as usize;
+                                        if olen >= 0x80 && has_rage9_meshlets(&out[..olen]) {
+                                            if let Some((nm, ext)) = extract_rage9_model_name(&out[..olen]) {
+                                                let stem = nm.strip_suffix(ext).unwrap_or(&nm);
+                                                local.models.entry(joaat(stem)).or_insert(abs_off);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        pos += 0x1000;
+                    }
+                    let done = done_bytes.fetch_add(read_n as u64, std::sync::atomic::Ordering::Relaxed) + read_n as u64;
+                    if tid == 0 {
+                        eprintln!("[world-index] {:.1} / {:.1} GB...", done as f64 / 1e9, sz as f64 / 1e9);
+                    }
+                }
+                local
+            }));
+        }
+        let mut merged = WorldIndex::default();
+        for h in handles {
+            if let Ok(local) = h.join() {
+                merged.map_count += local.map_count;
+                merged.entities.extend(local.entities);
+                for (k, v) in local.models {
+                    merged.models.entry(k).or_insert(v);
                 }
             }
-            pos += 0x1000;
         }
-        off += read_n as u64;
-    }
+        merged
+    });
 
     if let Some(cp) = cache_path() {
         save_world_index(&cp, sz, &ix);
     }
+    let _ = &mut ix;
     ix
 }
 
