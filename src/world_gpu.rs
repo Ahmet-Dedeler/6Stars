@@ -3,6 +3,7 @@ use crate::worldmap::WorldMapData;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Quat, Vec3};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::time::Instant;
@@ -13,9 +14,6 @@ use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
-
-#[cfg(windows)]
-use winit::platform::windows::EventLoopBuilderExtWindows;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -74,36 +72,47 @@ pub struct WorldLaunchConfig {
     pub start_pos: [f32; 3],
 }
 
-pub fn launch_world_gpu_window(cfg: WorldLaunchConfig) {
-    std::thread::spawn(move || {
-        #[cfg(windows)]
-        let mut builder = {
-            let mut b = EventLoop::builder();
-            b.with_any_thread(true);
-            b
-        };
-        #[cfg(not(windows))]
-        let mut builder = EventLoop::builder();
+pub fn launch_world_gpu_process(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--gpu-world");
+    if let Some(c) = common_rpf {
+        cmd.arg("--common").arg(c);
+    }
+    if let Some(l) = levels_rpf {
+        cmd.arg("--levels").arg(l);
+    }
+    cmd.spawn().map_err(|e| format!("Failed to launch 3D GPU World: {e}"))?;
+    Ok(())
+}
 
-        let Ok(event_loop) = builder.build() else {
-            return;
-        };
-        let (tx, rx) = mpsc::channel();
-        if cfg.batches.is_empty() {
-            if let Some(lp) = cfg.levels_rpf.clone() {
-                std::thread::spawn(move || {
-                    if let Ok(mesh) = crate::model3d::decode_rage9_model_from_rpf(&lp, 8_679_358_480, "brickell_slod") {
-                        let _ = tx.send(WorldBatchInput {
-                            mesh,
-                            instances: vec![(Vec3::ZERO, Quat::IDENTITY, Vec3::ONE, [1.0; 4])],
-                        });
-                    }
+pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
+    let terrain = common_rpf
+        .and_then(|p| crate::worldmap::load_mhiu_from_rpf(p).ok())
+        .map(Arc::new);
+    let cfg = WorldLaunchConfig {
+        terrain,
+        batches: Vec::new(),
+        levels_rpf: levels_rpf.map(Path::to_path_buf),
+        map_count: 0,
+        start_pos: [-2351.0, -5533.0, 140.0],
+    };
+    let Ok(event_loop) = EventLoop::builder().build() else {
+        return;
+    };
+    let (tx, rx) = mpsc::channel();
+    if let Some(lp) = cfg.levels_rpf.clone() {
+        std::thread::spawn(move || {
+            if let Ok(mesh) = crate::model3d::decode_rage9_model_from_rpf(&lp, 8_679_358_480, "brickell_slod") {
+                let _ = tx.send(WorldBatchInput {
+                    mesh,
+                    instances: vec![(Vec3::ZERO, Quat::IDENTITY, Vec3::ONE, [1.0; 4])],
                 });
             }
-        }
-        let mut app = GpuWorldApp::new(cfg, rx);
-        let _ = event_loop.run_app(&mut app);
-    });
+        });
+    }
+    let mut app = GpuWorldApp::new(cfg, rx);
+    let _ = event_loop.run_app(&mut app);
 }
 
 const WORLD_WGSL: &str = r#"

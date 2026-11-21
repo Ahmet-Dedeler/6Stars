@@ -4727,6 +4727,24 @@ fn main() -> eframe::Result<()> {
         let _ = fs::remove_file(cur.with_extension("exe.old"));
     }
     let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 2 && args[1] == "--gpu-world" {
+        let mut common_p: Option<PathBuf> = None;
+        let mut levels_p: Option<PathBuf> = None;
+        let mut idx = 2usize;
+        while idx + 1 < args.len() {
+            if args[idx] == "--common" {
+                common_p = Some(PathBuf::from(&args[idx + 1]));
+                idx += 2;
+            } else if args[idx] == "--levels" {
+                levels_p = Some(PathBuf::from(&args[idx + 1]));
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+        }
+        world_gpu::run_gpu_world_cli(common_p.as_deref(), levels_p.as_deref());
+        return Ok(());
+    }
     if args.len() >= 3 && args[1] == "--probe-maps" {
         mapdata::probe_maps_cli(&PathBuf::from(&args[2]));
         return Ok(());

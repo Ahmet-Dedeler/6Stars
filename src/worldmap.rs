@@ -331,22 +331,10 @@ pub fn render_world_map_ui(
             }
         }
         if ui.button("Launch 3D GPU World (wgpu)").on_hover_text("Open DX12/Vulkan GPU 3D World with PBR, Sun/Time-of-Day (F6), Minimap & Raytracing (R)").clicked() {
-            let mut batches = Vec::new();
-            if let Some(ref m) = wm.terrain_mesh {
-                if m.name.contains("brickell") {
-                    batches.push(crate::world_gpu::WorldBatchInput {
-                        mesh: m.clone(),
-                        instances: vec![(glam::Vec3::ZERO, glam::Quat::IDENTITY, glam::Vec3::ONE, [1.0; 4])],
-                    });
-                }
+            match crate::world_gpu::launch_world_gpu_process(common_rpf, levels_rpf) {
+                Ok(()) => wm.status = "Launched 3D GPU World window (streaming MHIU + Brickell SLOD)".into(),
+                Err(e) => wm.status = e,
             }
-            crate::world_gpu::launch_world_gpu_window(crate::world_gpu::WorldLaunchConfig {
-                terrain: wm.data.clone().map(Arc::new),
-                batches,
-                levels_rpf: levels_rpf.map(|p| p.to_path_buf()),
-                map_count: 0,
-                start_pos: [-2351.0, -5533.0, 120.0],
-            });
         }
         ui.label(egui::RichText::new(&wm.status).size(11.5).color(Color32::from_rgb(175, 195, 220)));
     });
