@@ -1,7 +1,7 @@
 {
   "title": "RAGE 9 Research & PercyStar Breakthroughs",
   "author": "@rpatty",
-  "lastUpdated": "2026-11-21 08:42 UTC",
+  "lastUpdated": "2026-11-21 08:46 UTC",
   "percystarVersion": "1.3.0",
   "links": {
     "github": "https://github.com/rpatty-dev/PercyStar",
@@ -21,11 +21,24 @@
   ],
   "breakthroughs": [
     {
+      "id": "rpf9-header-toc-proof",
+      "timestamp": "2026-11-21 08:46 UTC",
+      "category": "Archive Format",
+      "badge": "9FPR HEADER CRACKED",
+      "latest": true,
+      "title": "RPF9 (9FPR) 64-Byte Header Layout & Static-Key TOC Cipher Proven",
+      "summary": "Mapped the 64-byte 9FPR header across all 22 archives (data_offset at +0x04, toc_size at +0x08, names_len at +0x0C, entry_count at +0x24) and proved the encrypted TOC (7.998 bits/byte) uses a static key + fixed IV because +0x40..+0x60 (32 bytes) is byte-for-byte identical across four distinct archives.",
+      "details": [
+        "9FPR Header: +0x00 '9FPR', +0x04 u32 data_offset (exact payload start, e.g. 0x340 in story000_bvh4.rpf), +0x08 u32 toc_size, +0x0C u32 names_len, +0x18 0x47a00, +0x1C 0x150, +0x24 u32 entry_count (4 in story000_bvh4, 418 in common.rpf).",
+        "Cross-archive proof: story000_bvh4.rpf, core_licenses_data.rpf, appdata0.rpf, and nested core_licenses_data[0x1000] all share the exact 32-byte ciphertext 5f08daabecbdd40258c3516807024c24fb9f756755ef4be458785bfed8aa6989 at +0x40..+0x60 despite distinct +0x10 archive hashes.",
+        "PercyStar now parses 9FPR entry_count and skips directly to data_offset (+0x04) when scanning unencrypted streams."
+      ]
+    },
+    {
       "id": "dat26-joaat-resolved",
       "timestamp": "2026-11-21 08:42 UTC",
       "category": "Audio Metadata",
       "badge": "CRACKED · 2,600+ HASHES",
-      "latest": true,
       "title": "RAGE 9 Audio DAT26 (.rel) Hash Table Cracked — 2,600+ Sound/DSP Names Resolved",
       "summary": "Cracked the RAGE 9 DAT26 (ver=26) binary audio metadata container layout in audio_meta (u32 ver=26, u32 data_sz, followed by 8-byte (joaat32_hash, data_offset) index records) and resolved 2,600 of 4,543 entries in z_0003..z_0009 directly to plaintext sound/DSP/vehicle effect names via JOAAT32.",
       "details": [

@@ -2693,8 +2693,16 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
     let mut hdr = [0u8; 64];
     let n = f.read(&mut hdr)?;
     let magic = String::from_utf8_lossy(&hdr[..n.min(4)]).into_owned();
-    let hdr_hex: String = hdr[4..n.min(16)].iter().map(|b| format!("{b:02x}")).collect();
-    let hdr_info = format!("{magic}  ·  {sz} B  ·  {hdr_hex}");
+    let (data_off, hdr_info) = if n >= 40 && &hdr[..4] == b"9FPR" {
+        let doff = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
+        let nlen = u32::from_le_bytes([hdr[12], hdr[13], hdr[14], hdr[15]]);
+        let ecnt = u32::from_le_bytes([hdr[36], hdr[37], hdr[38], hdr[39]]);
+        let start = if doff >= 0x40 && (doff as u64) < sz { doff } else { 0x40 };
+        (start, format!("{magic}  ·  {sz} B  ·  {ecnt} entries  ·  data@0x{start:x}  ·  names={nlen}B"))
+    } else {
+        let hdr_hex: String = hdr[4..n.min(16)].iter().map(|b| format!("{b:02x}")).collect();
+        (0x40usize, format!("{magic}  ·  {sz} B  ·  {hdr_hex}"))
+    };
     if let Some(st) = progress_state {
         st.lock().unwrap().header_info = hdr_info.clone();
     }
@@ -2816,7 +2824,7 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
     }
 
     if let Some(data) = whole {
-        let mut i = 0x40usize;
+        let mut i = data_off.min(data.len());
         let mut stitch_chunks: Vec<(u64, u64)> = Vec::new();
         let mut stitch_raw = 0u64;
         let mut stitch_head: Vec<u8> = Vec::new();
