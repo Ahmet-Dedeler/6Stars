@@ -8,6 +8,21 @@
   A maintained fork of <a href="https://github.com/rpatty-dev/PercyStar">rpatty-dev/PercyStar</a>, the Rust RPF9 and TTPF archive explorer. I use it on macOS, so most of my changes are around in-app playback and model browsing.
 </p>
 
+## Build from Source
+
+Clone `main` for the latest version of this fork.
+
+```sh
+git clone --branch main https://github.com/Ahmet-Dedeler/PercyStar.git
+cd PercyStar
+```
+
+**macOS:** Install Rust via `rustup`, Python 3, and the Xcode Command Line Tools. Run `bash scripts/build_macos.sh` and open `dist/PercyStar.app`. The script fetches and verifies the pinned decoder and frame bridge. Video playback works offline on Apple Silicon with macOS 12 or later. The app also builds for Intel, but the included decoder is ARM-only.
+
+**Windows x64:** Install Rust and the Visual Studio C++ Build Tools. Run `cargo build --release --locked` and open `target\release\PercyStar.exe`. For `.bk2` previews, use [the RAD player setup script](scripts/setup_deps.ps1).
+
+To update, run `git pull --ff-only` and rebuild. On macOS, the script won't overwrite an existing app, so use a new output path, for example `PERCYSTAR_APP_PATH=dist/PercyStar-next.app bash scripts/build_macos.sh`. On Windows, skip the in-app updater. It points to upstream.
+
 ## What This Fork Adds
 
 - **BK2 video on Apple Silicon:** Select a `.bk2` to play it right in the preview panel. You can pause, scrub, mute and loop. The Mac build includes the decoder, so there's no second app to install.
@@ -16,10 +31,7 @@
 - **More accurate model colors:** The viewer finds shared textures across packs, binds them to the right materials, and reads both packed and floating-point UVs. If it can't find a usable color texture, it shows that part in gray.
 - **Easier browsing:** Sort the Explorer and Model Viewer by name or size. Small text tables show their strings instead of hex, and binary blobs no longer show up as XML just because they start with `<`.
 
-The download links here are for upstream releases and don't include the fork changes.
-
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-v1.3.0-FFA81C?style=flat-square" alt="Version" />
   <img src="https://img.shields.io/badge/Rust-1.85%2B-orange?style=flat-square&logo=rust" alt="Rust" />
   <img src="https://img.shields.io/badge/Shaders-RDNA2%20GFX10.3%20%E2%86%92%20HLSL%20%2F%20SPIR--V-FF4FA3?style=flat-square" alt="Shaders" />
   <img src="https://img.shields.io/badge/Textures-DXGI%20%2B%20RDNA2%204KB%2F64KB-48D2FF?style=flat-square" alt="Textures" />
@@ -31,13 +43,11 @@ The download links here are for upstream releases and don't include the fork cha
 </p>
 
 <p align="center">
-  <strong>Upstream Releases: <a href="https://github.com/rpatty-dev/PercyStar/releases/latest">Windows (Win64 + In-App Auto-Updater)</a></strong> · <strong><a href="https://github.com/rpatty-dev/PercyStar/releases/download/v1.0.3/PercyStar_macOS.zip">macOS Universal Build</a></strong><br />
-  <strong>Live Research &amp; Breakthroughs Dashboard: <a href="https://percystar-breakthroughs.vercel.app">percystar-breakthroughs.vercel.app</a></strong> · <strong><a href="https://mapnavmeshsite.vercel.app">Interactive NavMesh World Map</a></strong><br />
-  <sub>Windows users on v1.0.3+ can click the golden <b>★ Update Available</b> pill inside PercyStar for 1-click self-update.</sub>
+  <strong>Live Research &amp; Breakthroughs Dashboard: <a href="https://percystar-breakthroughs.vercel.app">percystar-breakthroughs.vercel.app</a></strong> · <strong><a href="https://mapnavmeshsite.vercel.app">Interactive NavMesh World Map</a></strong>
 </p>
 
 <p align="center">
-  <img src="assets/demo_overview.webp" alt="PercyStar 30fps Showcase — Neon Sunset UI, Search, Vehicles Filter & In-App Updater" width="920" />
+  <img src="assets/demo_overview.webp" alt="PercyStar demo: Neon Sunset UI, search, and vehicle filters" width="920" />
 </p>
 
 ---
@@ -64,7 +74,7 @@ The download links here are for upstream releases and don't include the fork cha
 </p>
 
 <details>
-<summary>Static High-Res Screenshot (Neon Sunset v1.0.3)</summary>
+<summary>Static High-Res Screenshot (Neon Sunset)</summary>
 <p align="center">
   <img src="assets/preview.png" alt="PercyStar 3D Meshlet Viewer — Neon Sunset Theme" width="900" />
 </p>
@@ -72,7 +82,7 @@ The download links here are for upstream releases and don't include the fork cha
 
 ---
 
-## Features & Format Breakthroughs (v1.2.0)
+## Features & Format Breakthroughs
 
 - **Native Xbox Series X `PS\x00\x09` AMD RDNA2 (GFX10.3) Shader Disassembler & HLSL / SPIR-V Lifter (`Shaders (RDNA2)` Tab)**
   - Parses the complete `PS\x00\x09` PSO cache (`25,471` Graphics PSOs, `2,693` Compute PSOs, `54,576` metadata blobs, `21,522` compiled AMD GFX10.3 shaders), including `0x41` `USER_DATA` root-signature bindings (`SRV`/`CBV`/`UAV`/`Sampler`), `COMPUTE_PGM_RSRC1/2`, and `[numthreads(x,y,z)]`.
@@ -117,7 +127,7 @@ PercyStar/
 ├── assets/
 │   ├── logo.png            # App & window icon
 │   ├── logo.ico            # Windows executable icon
-│   ├── demo_overview.webp  # 30fps Neon Sunset UI, search & updater showcase
+│   ├── demo_overview.webp  # 30fps Neon Sunset UI and search demo
 │   ├── demo_3d.webp        # 30fps 3D meshlet viewer shading modes showcase
 │   ├── demo_inspector.webp # 30fps XML / PSIN / ADAT Opus audio showcase
 │   ├── preview.png         # High-res Neon Sunset screenshot
@@ -147,19 +157,6 @@ PercyStar/
 ## What's Still Missing
 
 The Xbox dump scan found 754,364 entries, including 797 videos. That's a count of recognized entries, not a full inventory of every file in every archive. The [format audit](docs/format-coverage.md) lists what rendered, what fell back to raw bytes, and what the scan doesn't cover.
-
-## Building from Source
-
-On macOS, run `bash scripts/build_macos.sh` with Rust, Python 3 and the Xcode Command Line Tools. It builds `dist/PercyStar.app` (set `PERCYSTAR_APP_PATH` to keep a previous build). The build fetches and verifies the pinned RAD player and frame-bridge source. Playback works offline on Apple Silicon with macOS 12 or later. The main app also builds for Intel, but the included video decoder is ARM-only.
-
-On Windows, use **Rust** (`x86_64-pc-windows-gnu` with MinGW `windres`/`dlltool`, or `msvc`). Cargo fetches all pinned dependencies from `Cargo.lock`:
-
-```powershell
-cargo test --release
-cargo build --release
-```
-
-Compiled standalone binary: `target/release/PercyStar.exe`.
 
 ---
 
