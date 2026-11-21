@@ -5,7 +5,7 @@
 <h1 align="center">PercyStar (Maintained Fork)</h1>
 
 <p align="center">
-  A maintained fork of <a href="https://github.com/rpatty-dev/PercyStar">rpatty-dev/PercyStar</a>, the Rust RPF9 and TTPF archive explorer. I use it on macOS, so most of my changes are around in-app playback and model browsing.
+  A maintained fork of <a href="https://github.com/rpatty-dev/PercyStar">rpatty-dev/PercyStar</a>, the Rust RPF9 and TTPF archive explorer.
 </p>
 
 <p align="center">
@@ -181,7 +181,7 @@ PercyStar/
 
 ## What's Still Missing
 
-The Xbox dump scan found 754,364 entries, including 797 videos. That's a count of recognized entries, not a full inventory of every file in every archive. The [format audit](docs/format-coverage.md) lists what rendered, what fell back to raw bytes, and what the scan doesn't cover.
+The Xbox dump scan recognized 754,364 entries, including 797 videos. The [format audit](docs/format-coverage.md) lists what rendered, what fell back to raw bytes, and what the scan doesn't cover.
 
 ---
 
