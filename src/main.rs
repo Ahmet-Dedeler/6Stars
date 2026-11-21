@@ -1317,7 +1317,7 @@ impl Rpf9App {
     fn rebuild_view(&mut self, key: (u64, String, Category, String, bool)) {
         let st = self.state.lock().unwrap();
         if self.hay_ver != st.ver {
-            self.hay = st.entries.iter().map(|e| format!("{}|{}|{}", e.name, e.rpf_name, e.kind).to_lowercase()).collect();
+            self.hay = st.entries.iter().map(|e| format!("{}|{}|{}|{}", e.name, e.rpf_name, e.kind, kind_search_words(e.kind)).to_lowercase()).collect();
             self.cached_rpf_names = st.rpf_names.clone();
             self.hay_ver = st.ver;
             let mut c = [0usize; 11];
@@ -2441,6 +2441,23 @@ fn draw_percystar_spinner(ui: &mut egui::Ui, size: f32) {
     }
     p.add(egui::Shape::convex_polygon(pts, Color32::from_rgb(252, 175, 23), Stroke::NONE));
     ui.ctx().request_repaint();
+}
+
+/// Plain words for each entry type, added to the search text so "video" or "sound" finds
+/// clips whose file names don't say so (standalone files keep their original names).
+fn kind_search_words(kind: &str) -> &'static str {
+    match kind {
+        "BK2" => "video movie bink",
+        "AWC" => "audio sound",
+        "TXD" | "TTPF" => "texture image",
+        "MODEL" => "model mesh",
+        "VEH" => "vehicle model mesh",
+        "NAVM" => "navmesh",
+        "GXT" => "text strings",
+        "RBF0" | "GFX" => "ui",
+        "XML" => "config",
+        _ => "",
+    }
 }
 
 fn kind_color(kind: &str) -> Color32 {
