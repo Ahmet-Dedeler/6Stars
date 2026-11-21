@@ -10,13 +10,31 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same PR or branch cancels the run it replaces.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # CI only checks that tests pass and packaging works; it never ships a binary. Skipping
+  # fat LTO and single-unit codegen here cuts most of the build time. Shipped builds come
+  # from scripts/build_windows.ps1 / build_macos.sh locally with the full Cargo.toml profile.
+  CARGO_PROFILE_RELEASE_LTO: "false"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+
 jobs:
   windows:
     runs-on: windows-2022
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-      - name: Run release tests
+      # Caches ~/.cargo and compiled dependencies; only main writes the cache, PRs reuse it.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Tests and the package build share one release dependency build.
+      - name: Run tests
         run: cargo test --locked --release --target x86_64-pc-windows-msvc
       - name: Build and verify the local Windows package
         shell: pwsh
