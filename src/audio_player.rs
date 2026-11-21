@@ -741,18 +741,7 @@ pub fn render_awc_audio_view(
         });
     });
     if let Some(ref bctx) = player.bank_ctx {
-        if !bctx.used_by.is_empty() {
-            ui.add_space(2.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(format!("Pack: {} | Used by:", bctx.pack_name)).size(11.0).color(Color32::from_rgb(175, 160, 200)));
-                for item in bctx.used_by.iter().take(6) {
-                    if ui.small_button(RichText::new(item).size(11.0).color(Color32::from_rgb(155, 225, 195))).clicked() {
-                        ctx.copy_text(item.clone());
-                        player.requested_search = Some(item.replace('.', "_"));
-                    }
-                }
-            });
-        }
+        let _ = bctx;
     }
     ui.add_space(4.0);
     ui.separator();
