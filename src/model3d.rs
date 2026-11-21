@@ -117,6 +117,8 @@ pub struct Mesh3D {
     color_buf: Vec<Color32>,
     z_buf: Vec<f32>,
     proj_buf: Vec<[f32; 3]>,
+    /// Per-vertex perspective scale (proportional to 1/w), used for perspective-correct UVs.
+    persp_buf: Vec<f32>,
     blend_order: Vec<(usize, f32, bool)>,
     tex: Option<TextureHandle>,
     pub dirty: bool,
@@ -215,6 +217,7 @@ impl Mesh3D {
             color_buf: Vec::new(),
             z_buf: Vec::new(),
             proj_buf: Vec::new(),
+            persp_buf: Vec::new(),
             blend_order: Vec::new(),
             tex: None,
             dirty: true,
@@ -1477,7 +1480,8 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
     let persp_k = 1.0 / (mesh.radius * 4.5);
 
     mesh.proj_buf.resize(mesh.verts.len(), [0.0; 3]);
-    for (dst, v) in mesh.proj_buf.iter_mut().zip(&mesh.verts) {
+    mesh.persp_buf.resize(mesh.verts.len(), 1.0);
+    for ((dst, pw), v) in mesh.proj_buf.iter_mut().zip(mesh.persp_buf.iter_mut()).zip(&mesh.verts) {
         let x = v[0] - ctr[0];
         let y = v[1] - ctr[1];
         let z = v[2] - ctr[2];
@@ -1487,6 +1491,7 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
         let z2 = z * cp + y1 * sp;
         let persp = 1.0 / (1.0 - (y2 * persp_k).clamp(-0.65, 0.65));
         *dst = [cx + x1 * scale * persp, cy_s - z2 * scale * persp, y2];
+        *pw = persp;
     }
 
     let wf = w as f32;
@@ -1644,6 +1649,10 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                     let uv0 = mesh.uvs[i0];
                     let uv1 = mesh.uvs[i1];
                     let uv2 = mesh.uvs[i2];
+                    // Perspective-correct UVs: weight each corner by its 1/w (persp) so the
+                    // texture stays pinned to the surface. Plain screen-space barycentrics
+                    // (affine mapping) make the image slide along the quad diagonal as you orbit.
+                    let (q0, q1, q2) = (mesh.persp_buf[i0], mesh.persp_buf[i1], mesh.persp_buf[i2]);
                     for y in iy0..=iy1 {
                         let row_start = y * w + ix0;
                         let z_row = &mut mesh.z_buf[row_start..row_start + span_len];
@@ -1654,9 +1663,11 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                                 let (b0, b1, b2) = (w0 * inv_abs, w1 * inv_abs, w2 * inv_abs);
                                 let z = b0 * p0[2] + b1 * p1[2] + b2 * p2[2];
                                 if z + depth_bias > z_row[x] {
+                                    let (c0, c1, c2) = (b0 * q0, b1 * q1, b2 * q2);
+                                    let inv_q = 1.0 / (c0 + c1 + c2);
                                     let tc = tex.sample(
-                                        b0 * uv0[0] + b1 * uv1[0] + b2 * uv2[0],
-                                        b0 * uv0[1] + b1 * uv1[1] + b2 * uv2[1],
+                                        (c0 * uv0[0] + c1 * uv1[0] + c2 * uv2[0]) * inv_q,
+                                        (c0 * uv0[1] + c1 * uv1[1] + c2 * uv2[1]) * inv_q,
                                     );
                                     let alpha = match pass {
                                         MaterialPass::Opaque => 255,
@@ -1982,6 +1993,42 @@ mod tests {
         assert!(p[2][0] > 100.0, "+X must be screen-right (no mirror)");
         assert!(p[3][1] < p[4][1], "positive pitch views from above");
         assert!(p[4][2] > p[3][2], "-Y side is closer to camera");
+    }
+
+    #[test]
+    fn textures_stay_pinned_while_orbiting() {
+        // A quad facing the camera, u = (x + 1) / 2, plus one unreferenced probe vertex on
+        // the surface off the diagonal. Turned sideways, the texel under the probe must
+        // still be u = 0.5; affine (screen-space) UVs drift ~0.06 here, past the band.
+        let verts = vec![
+            [-1.0, 0.0, -1.0], [1.0, 0.0, -1.0], [1.0, 0.0, 1.0], [-1.0, 0.0, 1.0],
+            [0.0, 0.0, -0.5],
+        ];
+        let uvs = verts.iter().map(|v: &[f32; 3]| [(v[0] + 1.0) * 0.5, 0.5]).collect();
+        let mut m = Mesh3D::from_parts(
+            "orbit".into(), verts, uvs, vec![[0, 1, 2], [2, 3, 0]],
+            vec![0, 0], vec![], None, String::new(), 1, 0, String::new(),
+        );
+        m.geom_materials = vec![GeomMaterial {
+            texture: Some(Arc::new(Texture2D {
+                // green band for u in [0.47, 0.53), red before it, blue after (lighting scales
+                // the channels, so test which channel wins rather than exact values)
+                w: 256, h: 1, pixels: (0..256).map(|i| match i {
+                    0..120 => Color32::RED,
+                    120..136 => Color32::GREEN,
+                    _ => Color32::BLUE,
+                }).collect(),
+            })),
+            ..Default::default()
+        }];
+        m.pitch = 0.0;
+        for yaw in [-1.2f32, -0.9, 0.9, 1.2] {
+            m.yaw = yaw;
+            rasterize_mesh(&mut m, 400, 400);
+            let [px, py, _] = m.proj_buf[4];
+            let c = m.color_buf[py as usize * 400 + px as usize];
+            assert!(c.g() > c.r() && c.g() > c.b(), "yaw {yaw}: {c:?} under the probe, expected the green u = 0.5 band");
+        }
     }
 
     #[test]
