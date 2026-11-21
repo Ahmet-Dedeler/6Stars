@@ -25,9 +25,28 @@ pub struct Texture2D {
 pub struct GeomMaterial {
     pub texture: Option<Arc<Texture2D>>,
     pub is_vehicle_paint: bool,
-    alpha_test: bool,
+    pass: MaterialPass,
     auxiliary_pass: bool,
 }
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum MaterialPass {
+    #[default]
+    Opaque,
+    Cutout,
+    Alpha,
+    Decal,
+    Glass { texture_alpha: bool },
+}
+
+impl GeomMaterial {
+    fn blends(&self, has_uvs: bool) -> bool {
+        matches!(self.pass, MaterialPass::Glass { .. })
+            || (has_uvs && self.texture.is_some() && matches!(self.pass, MaterialPass::Alpha | MaterialPass::Decal))
+    }
+}
+
+const GLASS_PREVIEW_ALPHA: u8 = 64;
 
 const DEFAULT_PAINT_COLOR: [f32; 3] = [0.78, 0.11, 0.14];
 
@@ -92,6 +111,7 @@ pub struct Mesh3D {
     color_buf: Vec<Color32>,
     z_buf: Vec<f32>,
     proj_buf: Vec<[f32; 3]>,
+    blend_order: Vec<(usize, f32, bool)>,
     tex: Option<TextureHandle>,
     pub dirty: bool,
     last_dragging: bool,
@@ -187,6 +207,7 @@ impl Mesh3D {
             color_buf: Vec::new(),
             z_buf: Vec::new(),
             proj_buf: Vec::new(),
+            blend_order: Vec::new(),
             tex: None,
             dirty: true,
             last_dragging: false,
@@ -790,11 +811,17 @@ fn resolve_shader_material(
     const TINT_PALETTE_TEX: u32 = 0x2c8d_7182; // joaat("tintPaletteTex")
     const ALT0_TEX: u32 = 0x3463_94ea; // vehicle body/livery/detail slot 0
     const EMISSIVE_TEX: u32 = 0x8e0d_63ee; // joaat("emissiveTex")
+    const GLASS_SHADER: u32 = 0xe3ba_3129;
 
     let mut mat = GeomMaterial::default();
     if shader + 0x28 > v.len() || &v[shader + 4..shader + 8] != b"atem" { return mat; }
-    // Render bucket 3 is used by masked meshes such as fence wire and leaves.
-    mat.alpha_test = v.get(shader + 0x3c) == Some(&(1 << 3));
+    mat.pass = match v.get(shader + 0x3c) {
+        Some(2) if ru32(v, shader) == GLASS_SHADER => MaterialPass::Glass { texture_alpha: false },
+        Some(2) => MaterialPass::Alpha,
+        Some(4) => MaterialPass::Decal,
+        Some(8) => MaterialPass::Cutout,
+        _ => MaterialPass::Opaque,
+    };
     let Some(params) = vptr(ru64(v, shader + 0x20)) else { return mat };
     let Some(slots) = vptr(ru64(v, shader + 0x10)) else { return mat };
     if params + 8 > v.len() { return mat; }
@@ -830,7 +857,8 @@ fn resolve_shader_material(
             if hit.w < min_size || hit.h < min_size { continue; }
             (MaterialTexture::Streamed(hash, hit), hit.dxgi)
         };
-        if !matches!(dxgi, 65 | 80 | 81 | 83 | 84) || (dxgi == 65 && mat.alpha_test && rank == 0) {
+        let uses_opacity = !matches!(mat.pass, MaterialPass::Opaque);
+        if !matches!(dxgi, 65 | 80 | 81 | 83 | 84) || (dxgi == 65 && uses_opacity && rank == 0) {
             candidates[rank] = Some(candidate);
         }
     }
@@ -844,7 +872,17 @@ fn resolve_shader_material(
             MaterialTexture::Streamed(hash, hit) => streamed.decode(hash, hit),
         }
     });
-    mat.is_vehicle_paint = paint_shader && !has_color_binding;
+    if matches!(mat.pass, MaterialPass::Glass { .. }) {
+        // Some glass uses a constant placeholder or has no decodable color map.
+        // The game shader still draws it; use a translucent tint in the preview.
+        if mat.texture.as_ref().is_some_and(|t| t.w <= 4 && t.h <= 4 && t.pixels.iter().all(|p| p.a() == 0)) {
+            mat.texture = None;
+        }
+        mat.pass = MaterialPass::Glass {
+            texture_alpha: mat.texture.as_ref().is_some_and(|t| t.pixels.iter().any(|p| p.a() < 255)),
+        };
+    }
+    mat.is_vehicle_paint = paint_shader && !has_color_binding && mat.pass == MaterialPass::Opaque;
     mat
 }
 
@@ -1272,6 +1310,13 @@ fn draw_line_z(
     }
 }
 
+#[inline]
+fn blend_preview_pixel(dst: &mut Color32, src: Color32, alpha: u8) {
+    let a = alpha as u16;
+    let mix = |s: u8, d: u8| ((s as u16 * a + d as u16 * (255 - a) + 127) / 255) as u8;
+    *dst = Color32::from_rgb(mix(src.r(), dst.r()), mix(src.g(), dst.g()), mix(src.b(), dst.b()));
+}
+
 fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
     let npix = w * h;
     if mesh.fb_w != w || mesh.fb_h != h {
@@ -1336,11 +1381,32 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
             // A missing cutout mask should not cover other textured geometry with
             // a solid panel. Keep the clay fallback when nothing can be textured.
             let has_preview_texture = do_textured && has_uvs
-                && mesh.geom_materials.iter().any(|m| m.alpha_test && m.texture.is_none())
+                && mesh.geom_materials.iter().any(|m| m.pass == MaterialPass::Cutout && m.texture.is_none())
                 && mesh.tri_geom.get(vis.clone()).is_some_and(|ids| {
                     ids.iter().any(|&g| mesh.geom_materials.get(g as usize).is_some_and(|m| m.texture.is_some()))
                 });
-            for (ti, t) in mesh.tris.iter().enumerate().skip(vis.start).take(vis.len()) {
+
+            let use_blending = do_textured && mesh.texture.is_none()
+                && mesh.geom_materials.iter().any(|m| m.blends(has_uvs));
+            let blend_material = |ti| {
+                if !use_blending { return None; }
+                let g = mesh.tri_geom.get(ti).copied().unwrap_or(0) as usize;
+                mesh.geom_materials.get(g).filter(|m| m.blends(has_uvs) && !m.auxiliary_pass)
+            };
+            mesh.blend_order.clear();
+            if use_blending {
+                for ti in vis.clone() {
+                    if let Some(mat) = blend_material(ti) {
+                        let [a, b, c] = mesh.tris[ti].map(|i| mesh.proj_buf[i as usize][2]);
+                        mesh.blend_order.push((ti, a + b + c, mat.pass == MaterialPass::Decal));
+                    }
+                }
+                // Decals go over opaque surfaces, then glass/alpha draws far to near.
+                mesh.blend_order.sort_unstable_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.total_cmp(&b.1)));
+            }
+            let solid_tris = vis.filter(|&ti| blend_material(ti).is_none());
+            for ti in solid_tris.chain(mesh.blend_order.iter().map(|&(ti, _, _)| ti)) {
+                let t = mesh.tris[ti];
                 let g = mesh.tri_geom.get(ti).copied().unwrap_or(0) as usize;
                 let gmat = mesh.geom_materials.get(g);
                 let active_tex: Option<&Texture2D> = if do_textured && has_uvs {
@@ -1349,10 +1415,20 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                     None
                 };
                 if do_textured && gmat.is_some_and(|m| m.auxiliary_pass
-                    || (m.alpha_test && active_tex.is_none() && has_preview_texture))
+                    || (m.pass == MaterialPass::Cutout && active_tex.is_none() && has_preview_texture))
                 {
                     continue;
                 }
+                let blend = blend_material(ti).is_some();
+                let pass = if do_textured && mesh.texture.is_some() {
+                    MaterialPass::Cutout
+                } else if do_textured {
+                    gmat.map_or(MaterialPass::Opaque, |m| m.pass)
+                } else {
+                    MaterialPass::Opaque
+                };
+                let glass = matches!(pass, MaterialPass::Glass { .. });
+                let depth_bias = if blend && pass == MaterialPass::Decal { mesh.radius * 0.0001 } else { 0.0 };
                 let i0 = t[0] as usize;
                 let i1 = t[1] as usize;
                 let i2 = t[2] as usize;
@@ -1396,6 +1472,8 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                     mesh.paint_color
                 } else if color_nav_surfaces {
                     NAV_PALETTE.get(g).copied().unwrap_or([0.68; 3])
+                } else if glass {
+                    [0.62, 0.71, 0.78]
                 } else if do_textured {
                     [0.68; 3]
                 } else {
@@ -1433,7 +1511,6 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                 let span_len = ix1 - ix0 + 1;
 
                 if let Some(tex) = active_tex {
-                    let alpha_test = mesh.texture.is_some() || gmat.is_some_and(|m| m.alpha_test);
                     let uv0 = mesh.uvs[i0];
                     let uv1 = mesh.uvs[i1];
                     let uv2 = mesh.uvs[i2];
@@ -1446,24 +1523,35 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                             if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
                                 let (b0, b1, b2) = (w0 * inv_abs, w1 * inv_abs, w2 * inv_abs);
                                 let z = b0 * p0[2] + b1 * p1[2] + b2 * p2[2];
-                                if z > z_row[x] {
+                                if z + depth_bias > z_row[x] {
                                     let tc = tex.sample(
                                         b0 * uv0[0] + b1 * uv1[0] + b2 * uv2[0],
                                         b0 * uv0[1] + b1 * uv1[1] + b2 * uv2[1],
                                     );
-                                    // Holes must leave both color and depth untouched.
-                                    if !alpha_test || tc.a() >= 128 {
-                                        let [r, g, b, _] = if alpha_test && tc.a() != 255 {
+                                    let alpha = match pass {
+                                        MaterialPass::Opaque => 255,
+                                        MaterialPass::Cutout => if tc.a() >= 128 { 255 } else { 0 },
+                                        MaterialPass::Glass { texture_alpha: false } => GLASS_PREVIEW_ALPHA,
+                                        _ => tc.a(),
+                                    };
+                                    // Holes leave both color and depth untouched.
+                                    if alpha != 0 {
+                                        let [r, g, b, _] = if pass != MaterialPass::Opaque && tc.a() != 255 {
                                             tc.to_srgba_unmultiplied()
                                         } else {
                                             tc.to_array()
                                         };
-                                        z_row[x] = z;
-                                        c_row[x] = Color32::from_rgb(
+                                        let src = Color32::from_rgb(
                                             ((r as f32 * shade_r).min(255.0)) as u8,
                                             ((g as f32 * shade_g).min(255.0)) as u8,
                                             ((b as f32 * shade_b).min(255.0)) as u8,
                                         );
+                                        if blend {
+                                            blend_preview_pixel(&mut c_row[x], src, alpha);
+                                        } else {
+                                            z_row[x] = z;
+                                            c_row[x] = src;
+                                        }
                                     }
                                 }
                             }
@@ -1487,8 +1575,12 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                         if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
                             let z = (w0 * p0[2] + w1 * p1[2] + w2 * p2[2]) * inv_abs;
                             if z > z_row[x] {
-                                z_row[x] = z;
-                                c_row[x] = flat_col;
+                                if glass {
+                                    blend_preview_pixel(&mut c_row[x], flat_col, GLASS_PREVIEW_ALPHA);
+                                } else {
+                                    z_row[x] = z;
+                                    c_row[x] = flat_col;
+                                }
                             }
                         }
                         w0 += e12_dx;
@@ -1651,7 +1743,7 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
         if !mesh.geom_materials.is_empty() {
             status.on_hover_text("Textured/Mat uses available color textures, opacity masks and optional preview paint. \
                 Untextured solid surfaces use a gray fallback. Use Clay Solid to see auxiliary geometry and \
-                cutouts whose opacity mask could not be loaded.");
+                cutouts whose opacity mask could not be loaded. Glass transparency is approximate.");
         }
     });
     ui.add_space(4.0);
@@ -1762,7 +1854,7 @@ mod tests {
         m.geom_materials = vec![
             GeomMaterial {
                 texture: Some(Arc::new(Texture2D { w: 1, h: 1, pixels: vec![Color32::TRANSPARENT] })),
-                alpha_test: true,
+                pass: MaterialPass::Cutout,
                 ..Default::default()
             },
             GeomMaterial {
@@ -1777,6 +1869,44 @@ mod tests {
         Arc::get_mut(m.geom_materials[0].texture.as_mut().unwrap()).unwrap().pixels[0] = Color32::RED;
         rasterize_mesh(&mut m, 100, 100);
         assert!(m.color_buf[center].r() > 0 && m.z_buf[center] > 0.0, "the wire still writes depth");
+    }
+
+    #[test]
+    fn blended_layers_respect_depth_and_decal_order() {
+        // Submit the near glass first, the far glass last, and a decal in the
+        // exact plane of the opaque surface.
+        let verts = [-0.2, 0.0, 0.0, -0.1, 0.2].into_iter()
+            .flat_map(|y| [[-1.0, y, -1.0], [1.0, y, -1.0], [0.0, y, 1.0]])
+            .collect();
+        let mut m = Mesh3D::from_parts(
+            "layers".into(), verts, vec![[0.0; 2]; 15], (0..5).map(|i| [i * 3, i * 3 + 1, i * 3 + 2]).collect(),
+            (0..5).collect(), vec![], None, String::new(), 5, 0, String::new(),
+        );
+        m.yaw = 0.0;
+        m.pitch = 0.0;
+        let glass = MaterialPass::Glass { texture_alpha: true };
+        m.geom_materials = [
+            ([255, 0, 0, 128], glass), ([0, 0, 255, 255], MaterialPass::Opaque),
+            ([0, 255, 0, 128], MaterialPass::Decal), ([0, 255, 0, 128], glass),
+            ([255, 255, 255, 255], glass),
+        ].into_iter().map(|([r, g, b, a], pass)| GeomMaterial {
+            texture: Some(Arc::new(Texture2D { w: 1, h: 1, pixels: vec![Color32::from_rgba_unmultiplied(r, g, b, a)] })),
+            pass,
+            ..Default::default()
+        }).collect();
+        let center = 50 * 100 + 50;
+        rasterize_mesh(&mut m, 100, 100);
+        let composited = m.color_buf[center];
+        assert_eq!(m.z_buf[center], 0.0, "only the opaque layer writes depth");
+        assert!(composited.r() > composited.g() && composited.b() > 0, "near red is over green, with blue still visible");
+        m.geom_materials[4].texture = None;
+        m.geom_materials[4].pass = MaterialPass::Opaque;
+        rasterize_mesh(&mut m, 100, 100);
+        assert_eq!(m.color_buf[center], composited, "the hidden layer must not affect the pixel");
+        m.geom_materials[2].texture = None;
+        m.geom_materials[2].auxiliary_pass = true;
+        rasterize_mesh(&mut m, 100, 100);
+        assert!(m.color_buf[center].g() < composited.g(), "a coplanar decal blends over its base");
     }
 
     #[test]
@@ -1795,6 +1925,31 @@ mod tests {
 #[cfg(test)]
 mod dictionary_decode_tests {
     use super::*;
+
+    #[test]
+    fn glass_props_blend_without_filling_the_depth_buffer() {
+        let Ok(rpf) = std::env::var("PERCYSTAR_LEVELS_RPF") else { return };
+        let path = Path::new(&rpf);
+        if !path.exists() { return; }
+        for (tag, off, texture_alpha) in [
+            ("glass_door", 68_851_257_360, true),
+            ("glass_table", 69_061_394_448, false),
+            ("wine_glass", 67_766_120_464, false),
+        ] {
+            let mut m = decode_rage9_model_from_rpf(path, off, tag).unwrap();
+            assert!(m.geom_materials.iter().any(|g| g.pass == MaterialPass::Glass { texture_alpha }), "{tag}");
+            rasterize_mesh(&mut m, 800, 600);
+            let blended = m.color_buf.chunks_exact(800).zip(m.z_buf.chunks_exact(800))
+                .map(|(row, depths)| row.iter().zip(depths).filter(|&(c, z)| !z.is_finite() && *c != row[0]).count())
+                .sum::<usize>();
+            assert!(blended > 1_000, "{tag} should show glass without any opaque surface at {blended} pixels");
+            render_sample(m, tag);
+        }
+        let m = decode_rage9_model_from_rpf(path, 70_451_695_632, "floodlight").unwrap();
+        assert!(m.geom_materials.iter().any(|g| g.pass == MaterialPass::Decal
+            && g.texture.as_ref().is_some_and(|t| t.pixels.iter().any(|p| p.a() == 0))));
+        render_sample(m, "floodlight");
+    }
 
     #[test]
     fn chainlink_preview_excludes_shadow_meshes_and_keeps_wire_holes() {
