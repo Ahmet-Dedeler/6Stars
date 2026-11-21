@@ -8,7 +8,7 @@ fn rd32(d: &[u8], o: usize) -> u32 {
     u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
 }
 
-// inspect pe64 executable for bringup: sections, gdk/scarlett imports, and key anchors
+// inspect pe64 executable for bringup: sections, console/gdk imports, and key anchors
 pub fn inspect_pe64_for_bringup(data: &[u8]) -> String {
     if data.len() < 0x100 || &data[0..2] != b"MZ" {
         return String::from("Not a valid MZ/PE binary");
@@ -77,7 +77,7 @@ pub fn inspect_pe64_for_bringup(data: &[u8]) -> String {
             let _ = writeln!(out, "\n--- Imported DLLs ({}) ---", dlls.len());
             for dll in &dlls {
                 let tag = if dll.to_ascii_lowercase().contains("xbox")
-                    || dll.to_ascii_lowercase().contains("scarlett")
+                    || dll.to_ascii_lowercase().contains("console")
                     || dll.to_ascii_lowercase().contains("gdk")
                     || dll.to_ascii_lowercase().contains("xgame")
                     || dll.to_ascii_lowercase().contains("d3d12")
@@ -129,7 +129,7 @@ fn xml_val<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
 pub fn summarize_gdk_manifest(game_cfg: &str, layout_xml: Option<&str>) -> String {
     let mut out = String::with_capacity(1024);
     let _ = writeln!(out, "=== Xbox GDK Boot & Package Manifest ===");
-    for tag in ["TitleId", "MSAAppId", "StoreId", "SMTEnabled", "XboxLockhartTitleMemory", "XboxAnacondaTitleMemory", "SizeMB"] {
+    for tag in ["TitleId", "MSAAppId", "StoreId", "SMTEnabled", "SizeMB"] {
         if let Some(v) = xml_val(game_cfg, tag) {
             let _ = writeln!(out, "  {tag}: {v}");
         }
@@ -153,12 +153,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_gdk_manifest_summary() {
-        let cfg = r#"<Game><TitleId>7952987A</TitleId><Executable Name="game_scarlett_master.exe" /><SizeMB>2048</SizeMB></Game>"#;
+    fn inspects_gdk_manifest_summary() {
+        let cfg = r#"<Game><TitleId>1234ABCD</TitleId><Executable Name="game_console_master.exe" /><SizeMB>2048</SizeMB></Game>"#;
         let lay = r#"<Package><Chunk Id="1000"><FileGroup Include="common.rpf" /></Chunk></Package>"#;
         let s = summarize_gdk_manifest(cfg, Some(lay));
-        assert!(s.contains("TitleId: 7952987A"));
-        assert!(s.contains("Executable: game_scarlett_master.exe"));
+        assert!(s.contains("TitleId: 1234ABCD"));
+        assert!(s.contains("Executable: game_console_master.exe"));
         assert!(s.contains("Layout Chunks: 1 | RPF Mount Refs: 1"));
     }
 

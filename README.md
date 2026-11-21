@@ -72,6 +72,9 @@
   - Detects and decodes `0DRPz`-backed `crClipDictionary` resources (`anim.rpf`), extracting clip counts, hash tables, flags, and animation block pointers.
 - **`0x71717171` Pointer-Tagged `RSC9` Table Decoder (`src/rsc9.rs`) & Smart `RBF0` Naming**
   - Decodes `0x71717171` pointer-relocated `RSC9` hash/data dictionaries (e.g. `30,683`-entry `script.rpf` table) and auto-names `RBF0` / XML config streams by root struct slug.
+- **CLI Bring-Up & Format Examples 😉**
+  - `PercyStar.exe --inspect-exe <example_binary.exe>` — inspects PE64 sections, GDK/console imports, `9FPR` / `scrProgram` anchors, and `MicrosoftGame.Config` layout 😉
+  - `PercyStar.exe --extract-sgd5 <shaders.rpf> <out_dir>` — extracts `SGD5` DXBC/FSSM RDNA2 shaders 😉
 
 - **Native Xbox Series X `PS\x00\x09` AMD RDNA2 (GFX10.3) Shader Disassembler & HLSL / SPIR-V Lifter (`Shaders (RDNA2)` Tab)**
   - Parses the complete `PS\x00\x09` PSO cache (`25,471` Graphics PSOs, `2,693` Compute PSOs, `54,576` metadata blobs, `21,522` compiled AMD GFX10.3 shaders), including `0x41` `USER_DATA` root-signature bindings (`SRV`/`CBV`/`UAV`/`Sampler`), `COMPUTE_PGM_RSRC1/2`, and `[numthreads(x,y,z)]`.
@@ -81,7 +84,7 @@
   - Full-screen 3D workspace built for instant 60 FPS browsing across **144,000+ RAGE 9 3D models**.
   - **10 Strict RAGE 9 Categories** with live counts: **All Models**, **Vehicles**, **Air & Sea**, **Weapons**, **Characters**, **Clothing**, **Animals** (`cr[mbfraci]_` taxonomy), **Props & Items**, **World / Map**, and **NavMesh 3D**.
   - **Hide LODs/Bounds** toggle (filters `_lod`/`_slod`/`batchlod`/`bipedbounds`/`collision_`), `◀ Prev` / `Next ▶` / `Random` buttons, `Up`/`Down` arrow-key browsing, **5 Camera Presets** (`3/4`, `Front`, `Side`, `Back`, `Top`), and **1-Click Catalog CSV Import** + `.OBJ` loader.
-- **100% Xbox Series X (Scarlett / RDNA2) Texture Engine (`.#td` & `.ttpf`)**
+- **100% Console RDNA2 Texture Engine (`.#td` & `.ttpf`)**
   - **100.00% TTPF Format Identification (357,115 / 357,115 textures):** Solved ETPF descriptor `u1` bits 3..9 (`(u1 >> 3) & 0x7F` = exact Microsoft `DXGI_FORMAT` enum) — zero unknown texture formats.
   - **All 20+ DXGI Formats Decoded Natively in Pure Rust:** `BC1`–`BC7`, `BC6H_UF16`/`SF16` HDR, `R16G16B16A16_FLOAT`/`UNORM`, `R16_FLOAT`/`UNORM`, `R16G16_FLOAT`, `R32_FLOAT`, `R10G10B10A2_UNORM`, `R8G8B8A8`, `B8G8R8A8`, `R8_UNORM`, `A8_UNORM` (`texture2ddecoder` + IEEE-754 half-float Reinhard tonemapping).
   - **Verified RDNA2 4KB (`SW_4KB_D`) & 64KB Deswizzle for All 5 Bit Depths (8 / 16 / 32 / 64 / 128bpp):** Plus reverse-mip `mip0` tail addressing, instant `O(log N)` RDS5 chunk seeking, exact RDS5 chunk codec decoding (`0=RAW`, `1..7=HW BCPack BC1..BC7`, `8=ZLIB`), interactive zoom viewer, multi-texture strip, and **Export PNG / Export DDS (DX10)**.
@@ -135,9 +138,16 @@ PercyStar/
 │   └── breakthroughs.json  # Live-synced research & breakthroughs timeline feed
 ├── src/
 │   ├── main.rs             # PercyStar egui app, Model Viewer, RDNA2 Shader Lifter, RPF9/TTPF scanner & CLI
-│   ├── rdna2.rs            # Xbox Scarlett PS\x00\x09 parser, AMD GFX10.3 disassembler, HLSL SM 6.6 & SPIR-V 1.5 lifter
+│   ├── rdna2.rs            # Console RDNA2 PS\x00\x09 parser, AMD GFX10.3 disassembler, HLSL SM 6.6 & SPIR-V 1.5 lifter
+│   ├── sgd5.rs             # SGD5 shader-group container & DXBC/FSSM extractor
+│   ├── dxbc.rs             # DXBC / NOBC / FSSM RDNA2 shader disassembler
+│   ├── psin.rs             # PSIN binary PSO schema, enum & instance decoder
+│   ├── anim.rs             # crClipDictionary (0DRPz) animation header decoder
+│   ├── dat.rs              # RAGE 9 audio metadata (DAT25/26/41/61) decoder
+│   ├── rsc9.rs             # RSC9 0x71717171 table & phBound AABB inspector
+│   ├── boot.rs             # PE64 bring-up & manifest inspector (--inspect-exe) 😉
 │   ├── model3d.rs          # RAGE 9 meshlet decoder, UV/TXD parser & Z-buffer renderer
-│   ├── tex.rs              # Xbox Scarlett RDNA2 4KB/64KB textures, TTPF, RBF0, GFx, 0DRPz & CNavMesh
+│   ├── tex.rs              # Console RDNA2 4KB/64KB textures, TTPF, RBF0, GFx, 0DRPz & CNavMesh
 │   └── awc.rs              # Pure-Rust ADAT (.awc) Opus -> .wav decoder
 ├── app.rc / build.rs       # Win32 icon resource
 ├── Cargo.toml / Cargo.lock # All Rust crate dependencies pinned cleanly
