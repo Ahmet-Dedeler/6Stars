@@ -715,7 +715,8 @@ impl Rpf9App {
         spawn_update_check(Arc::clone(&app.update), cc.egui_ctx.clone());
         clean_stale_temp_dirs();
         // reopen the last folder, unless we were launched to open a folder or archive
-        let opens_archive = open_paths.iter().any(|p| p.is_dir() || (p.is_file() && loose_media_entry(p).is_none() && is_archive_file(p)));
+        let opens_archive = open_paths.iter().any(|p| p.is_dir()
+            || (p.is_file() && file_viewer(p).is_none() && loose_media_entry(p).is_none() && is_archive_file(p)));
         if let Some(last) = load_last_folder().filter(|_| !opens_archive) {
             if last.is_dir() {
                 app.start_folder_scan(last);
@@ -731,27 +732,38 @@ impl Rpf9App {
     }
 
     /// Opens what the user handed us from Finder, Explorer, a drop on the window or the
-    /// command line: a folder, an archive, or standalone .bk2/.awc files.
+    /// command line: folders, archives, media, or standalone models and shaders.
     /// Standalone media is added to the current list and selected instead of replacing it,
     /// so dropping one clip doesn't throw away a scanned game folder.
     fn open_paths(&mut self, paths: Vec<PathBuf>) {
         let mut loose = Vec::new();
         let mut archive = None;
+        let mut viewer_file = None;
         let mut unsupported = Vec::new();
         for p in paths {
             if p.is_dir() {
                 archive = Some(p);
-            } else if let Some(e) = loose_media_entry(&p) {
-                loose.push(e);
-            } else if p.is_file() && is_archive_file(&p) {
-                archive = Some(p);
-            } else {
-                unsupported.push(p.file_name().unwrap_or_default().to_string_lossy().into_owned());
+                continue;
             }
+            if p.is_file() {
+                if let Some(tab) = file_viewer(&p) {
+                    viewer_file = Some((tab, p));
+                    continue;
+                }
+                if let Some(e) = loose_media_entry(&p) {
+                    loose.push(e);
+                    continue;
+                }
+                if is_archive_file(&p) {
+                    archive = Some(p);
+                    continue;
+                }
+            }
+            unsupported.push(p.file_name().unwrap_or_default().to_string_lossy().into_owned());
         }
         if !unsupported.is_empty() {
             // don't throw away a loaded folder for a stray .png
-            self.state.lock().unwrap().status = format!("Can't open {}: not an .rpf, .ttpf, .bk2 or .awc", unsupported.join(", "));
+            self.state.lock().unwrap().status = format!("Can't open {}: expected a folder or an .rpf, .ttpf, .bk2, .awc, .obj, or .ps09 file", unsupported.join(", "));
         }
         if let Some(p) = archive {
             self.tab = AppTab::Explorer;
@@ -761,10 +773,9 @@ impl Rpf9App {
                 self.start_single_scan(p);
             }
         }
-        if loose.is_empty() {
-            return;
-        }
-        let first = {
+        let first = if loose.is_empty() {
+            None
+        } else {
             let mut st = self.state.lock().unwrap();
             let mut first = None;
             for e in loose {
@@ -784,13 +795,32 @@ impl Rpf9App {
             st.ver += 1;
             first
         };
-        self.tab = AppTab::Explorer;
-        self.category = Category::All;
-        self.filter.clear();
-        self.selected_rpf = LOOSE_LABEL.into();
-        if let Some(i) = first {
+        if let Some((tab, path)) = viewer_file {
+            if tab == AppTab::ModelViewer {
+                self.open_obj_path(&path);
+            } else {
+                self.reset_selection();
+                self.tab = AppTab::Shaders;
+                self.load_ps09_path(&path);
+            }
+        } else if let Some(i) = first {
+            self.tab = AppTab::Explorer;
+            self.category = Category::All;
+            self.filter.clear();
+            self.selected_rpf = LOOSE_LABEL.into();
             self.select_entry(i);
         }
+    }
+
+    fn open_obj_path(&mut self, path: &Path) {
+        let Some(mesh) = parse_obj(path) else {
+            self.state.lock().unwrap().status = format!("Could not read an OBJ model from {}", path.display());
+            return;
+        };
+        self.reset_selection();
+        self.tab = AppTab::ModelViewer;
+        self.mesh3d = Some(mesh);
+        self.show_3d = true;
     }
 
     fn stop_bink_player(&mut self) {
@@ -1638,12 +1668,7 @@ impl Rpf9App {
                     }
                     if ui.button("Open .OBJ").clicked() {
                         if let Some(p) = rfd::FileDialog::new().add_filter("OBJ 3D Model", &["obj"]).pick_file() {
-                            if let Some(m) = parse_obj(&p) {
-                                self.textures.clear();
-                                self.tex_handle = None;
-                                self.mesh3d = Some(m);
-                                self.show_3d = true;
-                            }
+                            self.open_obj_path(&p);
                         }
                     }
                 });
@@ -1913,7 +1938,9 @@ impl Rpf9App {
                     cache.header.compute_pso_count,
                 );
                 self.sh_cache = Some(cache);
-                self.sh_selected = Some(0);
+                self.sh_selected = self.sh_cache.as_ref().filter(|c| !c.shaders.is_empty()).map(|_| 0);
+                self.sh_stage_filter = None;
+                self.sh_search.clear();
                 self.sh_cached_text = (None, String::new());
                 self.sh_status = st_msg;
             }
@@ -2395,6 +2422,17 @@ fn is_archive_file(p: &Path) -> bool {
     }
     let mut m = [0u8; 4];
     File::open(p).and_then(|mut f| f.read_exact(&mut m)).is_ok() && (m.starts_with(b"RPF") || m[1..] == *b"FPR")
+}
+
+fn file_viewer(path: &Path) -> Option<AppTab> {
+    let ext = path.extension()?.to_str()?;
+    if ext.eq_ignore_ascii_case("obj") {
+        Some(AppTab::ModelViewer)
+    } else if ext.eq_ignore_ascii_case("ps09") {
+        Some(AppTab::Shaders)
+    } else {
+        None
+    }
 }
 
 /// Deletes video/audio scratch folders left by a crash or forced quit (they can hold full
@@ -3117,7 +3155,7 @@ impl eframe::App for Rpf9App {
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "Drop to open  ·  .rpf  .ttpf  .bk2  .awc  or a folder",
+                "Drop to open  ·  .rpf  .ttpf  .bk2  .awc  .obj  .ps09  or a folder",
                 egui::FontId::proportional(22.0),
                 Color32::from_rgb(255, 168, 28),
             );
@@ -3197,11 +3235,12 @@ impl eframe::App for Rpf9App {
                         self.start_folder_scan(folder);
                     }
                 }
-                if ui.button("Open File...").on_hover_text("An .rpf/.ttpf archive, or standalone .bk2 videos and .awc sound banks. You can also drop files on the window.").clicked() {
+                if ui.button("Open File...").on_hover_text("Open an archive, video, sound bank, OBJ model, or PS09 shader cache. You can also drop files on the window.").clicked() {
                     if let Some(ps) = rfd::FileDialog::new()
-                        .add_filter("Archives and media", &["rpf", "ttpf", "bk2", "awc"])
+                        .add_filter("All supported files", &["rpf", "ttpf", "bk2", "awc", "obj", "ps09"])
                         .add_filter("RPF / TTPF archives", &["rpf", "ttpf"])
                         .add_filter("Bink 2 video / AWC audio", &["bk2", "awc"])
+                        .add_filter("OBJ models / PS09 shaders", &["obj", "ps09"])
                         .pick_files()
                     {
                         self.open_paths(ps);
@@ -3209,13 +3248,7 @@ impl eframe::App for Rpf9App {
                 }
                 if ui.button("Open .OBJ").clicked() {
                     if let Some(p) = rfd::FileDialog::new().add_filter("OBJ 3D Model", &["obj"]).pick_file() {
-                        if let Some(m) = parse_obj(&p) {
-                            self.stop_bink_player();
-                            self.textures.clear();
-                            self.tex_handle = None;
-                            self.mesh3d = Some(m);
-                            self.show_3d = true;
-                        }
+                        self.open_obj_path(&p);
                     }
                 }
                 if ui.button("Import Catalog").clicked() {

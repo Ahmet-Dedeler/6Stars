@@ -100,6 +100,12 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
       <key>UTTypeConformsTo</key><array><string>public.audio</string><string>public.data</string></array>
       <key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array><string>awc</string></array></dict>
     </dict>
+    <dict>
+      <key>UTTypeIdentifier</key><string>io.github.ahmet-dedeler.6stars.ps09</string>
+      <key>UTTypeDescription</key><string>RAGE Shader Cache</string>
+      <key>UTTypeConformsTo</key><array><string>public.data</string></array>
+      <key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array><string>ps09</string></array></dict>
+    </dict>
   </array>
   <key>CFBundleDocumentTypes</key>
   <array>
@@ -123,6 +129,18 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
       <key>LSHandlerRank</key><string>Alternate</string>
       <key>CFBundleTypeExtensions</key><array><string>awc</string></array>
       <key>LSItemContentTypes</key><array><string>io.github.ahmet-dedeler.6stars.awc</string></array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key><string>Wavefront OBJ</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>LSItemContentTypes</key><array><string>public.geometry-definition-format</string></array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key><string>RAGE Shader Cache</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>LSItemContentTypes</key><array><string>io.github.ahmet-dedeler.6stars.ps09</string></array>
     </dict>
   </array>
 </dict>
