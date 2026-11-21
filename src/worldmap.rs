@@ -343,6 +343,7 @@ pub fn render_world_map_ui(
             crate::world_gpu::launch_world_gpu_window(crate::world_gpu::WorldLaunchConfig {
                 terrain: wm.data.clone().map(Arc::new),
                 batches,
+                levels_rpf: levels_rpf.map(|p| p.to_path_buf()),
                 map_count: 0,
                 start_pos: [-2351.0, -5533.0, 120.0],
             });

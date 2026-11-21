@@ -2,6 +2,8 @@ use crate::model3d::{Mesh3D, Texture2D};
 use crate::worldmap::WorldMapData;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Quat, Vec3};
+use std::collections::HashMap;
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::time::Instant;
 use wgpu::util::DeviceExt;
@@ -55,7 +57,7 @@ struct FrameUniforms {
     sun_dir: [f32; 4],
     sky_zenith: [f32; 4],
     sky_horizon: [f32; 4],
-    flags: [f32; 4], // x=rt_on, y=time_hours, z=map_min_x, w=map_span
+    flags: [f32; 4], // x=rt_on, y=time_hours, z=map_min_x, w=map_span_x
     map_y: [f32; 4], // x=map_min_y, y=map_span_y, z=viewport_w, w=viewport_h
 }
 
@@ -67,6 +69,7 @@ pub struct WorldBatchInput {
 pub struct WorldLaunchConfig {
     pub terrain: Option<Arc<WorldMapData>>,
     pub batches: Vec<WorldBatchInput>,
+    pub levels_rpf: Option<std::path::PathBuf>,
     pub map_count: usize,
     pub start_pos: [f32; 3],
 }
@@ -85,7 +88,20 @@ pub fn launch_world_gpu_window(cfg: WorldLaunchConfig) {
         let Ok(event_loop) = builder.build() else {
             return;
         };
-        let mut app = GpuWorldApp::new(cfg);
+        let (tx, rx) = mpsc::channel();
+        if cfg.batches.is_empty() {
+            if let Some(lp) = cfg.levels_rpf.clone() {
+                std::thread::spawn(move || {
+                    if let Ok(mesh) = crate::model3d::decode_rage9_model_from_rpf(&lp, 8_679_358_480, "brickell_slod") {
+                        let _ = tx.send(WorldBatchInput {
+                            mesh,
+                            instances: vec![(Vec3::ZERO, Quat::IDENTITY, Vec3::ONE, [1.0; 4])],
+                        });
+                    }
+                });
+            }
+        }
+        let mut app = GpuWorldApp::new(cfg, rx);
         let _ = event_loop.run_app(&mut app);
     });
 }
@@ -199,7 +215,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let ndv = max(dot(n, v), 0.0);
 
     var sh = sample_shadow(in.shadow_coord, ndl);
-    // rt toggle adds multi-bounce sky gi + fresnel reflection + contact shadow contrast
     let rt_on = u.flags.x > 0.5;
     if (rt_on) {
         sh = smoothstep(0.08, 0.92, sh);
@@ -221,23 +236,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(aces_tonemap(col), 1.0);
 }
 
-struct SkyOut {
-    @builtin(position) pos: vec4<f32>,
-    @location(0) dir: vec3<f32>,
-};
-
 @vertex
-fn vs_sky(@builtin(vertex_index) vid: u32) -> SkyOut {
+fn vs_sky(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32> {
     var pts = array<vec2<f32>, 3>(
         vec2<f32>(-1.0, -1.0),
         vec2<f32>(3.0, -1.0),
         vec2<f32>(-1.0, 3.0)
     );
-    let p = pts[vid];
-    var out: SkyOut;
-    out.pos = vec4<f32>(p, 0.9999, 1.0);
-    out.dir = vec3<f32>(p.x, p.y, 1.0);
-    return out;
+    return vec4<f32>(pts[vid], 0.9999, 1.0);
 }
 
 @fragment
@@ -308,6 +314,8 @@ struct GpuState {
     uniform_buf: wgpu::Buffer,
     uniform_bg: wgpu::BindGroup,
     tex_bgl: wgpu::BindGroupLayout,
+    tex_samp: wgpu::Sampler,
+    white_bg: wgpu::BindGroup,
     shadow_pipeline: wgpu::RenderPipeline,
     main_pipeline: wgpu::RenderPipeline,
     sky_pipeline: wgpu::RenderPipeline,
@@ -374,34 +382,22 @@ fn upload_texture(
     })
 }
 
-fn mesh_to_gpu_verts_indices(mesh: &Mesh3D) -> (Vec<GpuVertex>, Vec<u32>) {
-    let mut verts: Vec<GpuVertex> = mesh
-        .verts
-        .iter()
-        .enumerate()
-        .map(|(i, &p)| GpuVertex {
-            pos: p,
-            normal: [0.0, 0.0, 1.0],
-            uv: mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]),
-        })
-        .collect();
-    let mut accum = vec![Vec3::ZERO; verts.len()];
-    let mut indices = Vec::with_capacity(mesh.tris.len() * 3);
+fn compute_smooth_normals(mesh: &Mesh3D) -> Vec<[f32; 3]> {
+    let mut accum = vec![Vec3::ZERO; mesh.verts.len()];
     for (ti, &[a, b, c]) in mesh.tris.iter().enumerate() {
         let n = mesh.normals.get(ti).copied().unwrap_or([0.0, 0.0, 1.0]);
         let nv = Vec3::from_array(n);
         if (a as usize) < accum.len() { accum[a as usize] += nv; }
         if (b as usize) < accum.len() { accum[b as usize] += nv; }
         if (c as usize) < accum.len() { accum[c as usize] += nv; }
-        indices.push(a);
-        indices.push(b);
-        indices.push(c);
     }
-    for (v, n) in verts.iter_mut().zip(accum) {
-        let nn = n.normalize_or_zero();
-        v.normal = if nn.length_squared() > 0.01 { nn.to_array() } else { [0.0, 0.0, 1.0] };
-    }
-    (verts, indices)
+    accum
+        .into_iter()
+        .map(|n| {
+            let nn = n.normalize_or_zero();
+            if nn.length_squared() > 0.01 { nn.to_array() } else { [0.0, 0.0, 1.0] }
+        })
+        .collect()
 }
 
 impl GpuState {
@@ -640,65 +636,9 @@ impl GpuState {
 
         let white_tex = Texture2D { w: 1, h: 1, pixels: vec![eframe::egui::Color32::from_rgb(190, 195, 205)] };
         let white_bg = upload_texture(&device, &queue, &tex_bgl, &tex_samp, &white_tex);
+        let minimap_bg = upload_texture(&device, &queue, &tex_bgl, &tex_samp, &white_tex);
 
-        let mut batches = Vec::new();
-        let mut tri_count = 0usize;
-        let mut instance_count = 0usize;
-        let mut model_count = 0usize;
-        let mut map_min = [-13000.0f32, -9000.0f32];
-        let mut map_span = [20000.0f32, 20000.0f32];
-        let mut minimap_bg = None;
-
-        if let Some(ref terrain) = cfg.terrain {
-            map_min = [terrain.bmin[0], terrain.bmin[1]];
-            map_span = [terrain.bmax[0] - terrain.bmin[0], terrain.bmax[1] - terrain.bmin[1]];
-            let tmesh = terrain.build_terrain_mesh(4);
-            let (gv, gi) = mesh_to_gpu_verts_indices(&tmesh);
-            if !gv.is_empty() && !gi.is_empty() {
-                let tbg = tmesh.texture.as_ref().map(|t| upload_texture(&device, &queue, &tex_bgl, &tex_samp, t));
-                minimap_bg = tbg.as_ref().map(|_| upload_texture(&device, &queue, &tex_bgl, &tex_samp, tmesh.texture.as_ref().unwrap()));
-                let inst = GpuInstance::from_mat4(Mat4::IDENTITY, [1.0; 4]);
-                let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("t_vb"), contents: bytemuck::cast_slice(&gv), usage: wgpu::BufferUsages::VERTEX });
-                let ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("t_ib"), contents: bytemuck::cast_slice(&gi), usage: wgpu::BufferUsages::INDEX });
-                let inst_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("t_inst"), contents: bytemuck::bytes_of(&inst), usage: wgpu::BufferUsages::VERTEX });
-                tri_count += tmesh.tris.len();
-                instance_count += 1;
-                batches.push(GpuMeshBatch {
-                    vb, ib, inst_buf,
-                    index_count: gi.len() as u32,
-                    inst_count: 1,
-                    tex_bind_group: tbg.unwrap_or_else(|| upload_texture(&device, &queue, &tex_bgl, &tex_samp, &white_tex)),
-                });
-            }
-        }
-
-        for b in &cfg.batches {
-            let (gv, gi) = mesh_to_gpu_verts_indices(&b.mesh);
-            if gv.is_empty() || gi.is_empty() || b.instances.is_empty() {
-                continue;
-            }
-            let insts: Vec<GpuInstance> = b.instances.iter().map(|&(pos, rot, scale, col)| {
-                GpuInstance::from_mat4(Mat4::from_scale_rotation_translation(scale, rot, pos), col)
-            }).collect();
-            let tbg = b.mesh.texture.as_ref()
-                .or_else(|| b.mesh.geom_materials.iter().find_map(|m| m.texture.as_deref()))
-                .map(|t| upload_texture(&device, &queue, &tex_bgl, &tex_samp, t))
-                .unwrap_or_else(|| upload_texture(&device, &queue, &tex_bgl, &tex_samp, &white_tex));
-            let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("m_vb"), contents: bytemuck::cast_slice(&gv), usage: wgpu::BufferUsages::VERTEX });
-            let ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("m_ib"), contents: bytemuck::cast_slice(&gi), usage: wgpu::BufferUsages::INDEX });
-            let inst_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("m_inst"), contents: bytemuck::cast_slice(&insts), usage: wgpu::BufferUsages::VERTEX });
-            tri_count += b.mesh.tris.len() * insts.len();
-            instance_count += insts.len();
-            model_count += 1;
-            batches.push(GpuMeshBatch {
-                vb, ib, inst_buf,
-                index_count: gi.len() as u32,
-                inst_count: insts.len() as u32,
-                tex_bind_group: tbg,
-            });
-        }
-
-        Self {
+        let mut st = Self {
             window,
             surface,
             device,
@@ -709,20 +649,113 @@ impl GpuState {
             uniform_buf,
             uniform_bg,
             tex_bgl,
+            tex_samp,
+            white_bg,
             shadow_pipeline,
             main_pipeline,
             sky_pipeline,
             minimap_pipeline,
-            minimap_bg: minimap_bg.unwrap_or(white_bg),
-            batches,
-            tri_count,
-            instance_count,
-            model_count,
+            minimap_bg,
+            batches: Vec::new(),
+            tri_count: 0,
+            instance_count: 0,
+            model_count: 0,
             map_count: cfg.map_count,
             has_hw_rt,
-            map_min,
-            map_span,
+            map_min: [-13000.0, -9000.0],
+            map_span: [20000.0, 20000.0],
+        };
+
+        if let Some(ref terrain) = cfg.terrain {
+            st.map_min = [terrain.bmin[0], terrain.bmin[1]];
+            st.map_span = [terrain.bmax[0] - terrain.bmin[0], terrain.bmax[1] - terrain.bmin[1]];
+            let tmesh = terrain.build_terrain_mesh(4);
+            if let Some(ref t) = tmesh.texture {
+                st.minimap_bg = upload_texture(&st.device, &st.queue, &st.tex_bgl, &st.tex_samp, t);
+            }
+            st.add_batch(&WorldBatchInput {
+                mesh: tmesh,
+                instances: vec![(Vec3::ZERO, Quat::IDENTITY, Vec3::ONE, [1.0; 4])],
+            });
+            st.model_count = st.model_count.saturating_sub(1);
         }
+
+        for b in &cfg.batches {
+            st.add_batch(b);
+        }
+        st
+    }
+
+    // splits mesh3d by tri_geom material so every ttpf texture and paint group renders cleanly
+    fn add_batch(&mut self, b: &WorldBatchInput) {
+        if b.mesh.verts.is_empty() || b.mesh.tris.is_empty() || b.instances.is_empty() {
+            return;
+        }
+        let normals = compute_smooth_normals(&b.mesh);
+        let insts: Vec<GpuInstance> = b
+            .instances
+            .iter()
+            .map(|&(pos, rot, scale, col)| GpuInstance::from_mat4(Mat4::from_scale_rotation_translation(scale, rot, pos), col))
+            .collect();
+        let inst_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("m_inst"),
+            contents: bytemuck::cast_slice(&insts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        let mut by_geom: HashMap<u16, Vec<u32>> = HashMap::new();
+        for (ti, &[i0, i1, i2]) in b.mesh.tris.iter().enumerate() {
+            let g = if b.mesh.texture.is_some() { 0 } else { b.mesh.tri_geom.get(ti).copied().unwrap_or(0) };
+            let v = by_geom.entry(g).or_default();
+            v.push(i0);
+            v.push(i1);
+            v.push(i2);
+        }
+
+        let gv: Vec<GpuVertex> = b
+            .mesh
+            .verts
+            .iter()
+            .enumerate()
+            .map(|(i, &pos)| GpuVertex {
+                pos,
+                normal: normals[i],
+                uv: b.mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]),
+            })
+            .collect();
+        let vb = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("m_vb"),
+            contents: bytemuck::cast_slice(&gv),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        for (g, indices) in by_geom {
+            let ib = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("m_ib"),
+                contents: bytemuck::cast_slice(&indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+            let tex_bg = b
+                .mesh
+                .texture
+                .as_ref()
+                .or_else(|| b.mesh.geom_materials.get(g as usize).and_then(|m| m.texture.as_deref()))
+                .map(|t| upload_texture(&self.device, &self.queue, &self.tex_bgl, &self.tex_samp, t))
+                .unwrap_or_else(|| self.white_bg.clone());
+
+            self.batches.push(GpuMeshBatch {
+                vb: vb.clone(),
+                ib,
+                inst_buf: inst_buf.clone(),
+                index_count: indices.len() as u32,
+                inst_count: insts.len() as u32,
+                tex_bind_group: tex_bg,
+            });
+        }
+
+        self.tri_count += b.mesh.tris.len() * insts.len();
+        self.instance_count += insts.len();
+        self.model_count += 1;
     }
 
     fn resize(&mut self, w: u32, h: u32) {
@@ -738,14 +771,18 @@ impl GpuState {
 
 struct GpuWorldApp {
     cfg: Option<WorldLaunchConfig>,
+    terrain_ref: Option<Arc<WorldMapData>>,
+    stream_rx: Receiver<WorldBatchInput>,
     gpu: Option<GpuState>,
     cam_pos: Vec3,
+    vel_z: f32,
     yaw: f32,
     pitch: f32,
     time_h: f32,
     auto_sun: bool,
     rt_on: bool,
-    keys: [bool; 7], // W A S D Q E Shift
+    walk_mode: bool,
+    keys: [bool; 8], // W A S D Q E Shift Space
     dragging: bool,
     last_cursor: Option<PhysicalPosition<f64>>,
     last_frame: Instant,
@@ -753,22 +790,36 @@ struct GpuWorldApp {
 }
 
 impl GpuWorldApp {
-    fn new(cfg: WorldLaunchConfig) -> Self {
+    fn new(cfg: WorldLaunchConfig, stream_rx: Receiver<WorldBatchInput>) -> Self {
         Self {
             cam_pos: Vec3::from_array(cfg.start_pos),
+            terrain_ref: cfg.terrain.clone(),
             cfg: Some(cfg),
+            stream_rx,
             gpu: None,
+            vel_z: 0.0,
             yaw: 0.4,
             pitch: -0.18,
             time_h: 10.50,
             auto_sun: false,
             rt_on: true,
-            keys: [false; 7],
+            walk_mode: false,
+            keys: [false; 8],
             dragging: false,
             last_cursor: None,
             last_frame: Instant::now(),
             last_title: Instant::now(),
         }
+    }
+
+    fn sample_terrain_z(&self, x: f32, y: f32) -> f32 {
+        let Some(ref t) = self.terrain_ref else { return 0.0 };
+        let u = ((x - t.bmin[0]) / (t.bmax[0] - t.bmin[0]).max(1.0)).clamp(0.0, 1.0);
+        let v = ((y - t.bmin[1]) / (t.bmax[1] - t.bmin[1]).max(1.0)).clamp(0.0, 1.0);
+        let ix = ((u * (t.w.saturating_sub(1)) as f32) as usize).min(t.w - 1);
+        let iy = ((v * (t.h.saturating_sub(1)) as f32) as usize).min(t.h - 1);
+        let h = t.heights[iy * t.w + ix] as f32 / 255.0;
+        t.bmin[2] + h * (t.bmax[2] - t.bmin[2])
     }
 }
 
@@ -787,6 +838,7 @@ impl ApplicationHandler for GpuWorldApp {
         let cfg = self.cfg.take().unwrap_or(WorldLaunchConfig {
             terrain: None,
             batches: Vec::new(),
+            levels_rpf: None,
             map_count: 0,
             start_pos: [0.0, 0.0, 120.0],
         });
@@ -829,8 +881,13 @@ impl ApplicationHandler for GpuWorldApp {
                         KeyCode::KeyQ => self.keys[4] = down,
                         KeyCode::KeyE => self.keys[5] = down,
                         KeyCode::ShiftLeft | KeyCode::ShiftRight => self.keys[6] = down,
+                        KeyCode::Space => self.keys[7] = down,
                         KeyCode::F6 if down => self.auto_sun = !self.auto_sun,
                         KeyCode::KeyR if down => self.rt_on = !self.rt_on,
+                        KeyCode::KeyG if down => {
+                            self.walk_mode = !self.walk_mode;
+                            self.vel_z = 0.0;
+                        }
                         KeyCode::BracketRight if down => self.time_h = (self.time_h + 0.5) % 24.0,
                         KeyCode::BracketLeft if down => self.time_h = (self.time_h + 23.5) % 24.0,
                         _ => {}
@@ -842,18 +899,42 @@ impl ApplicationHandler for GpuWorldApp {
                 let dt = (now - self.last_frame).as_secs_f32().min(0.1);
                 self.last_frame = now;
 
+                if let Some(g) = &mut self.gpu {
+                    while let Ok(batch) = self.stream_rx.try_recv() {
+                        g.add_batch(&batch);
+                    }
+                }
+
                 if self.auto_sun {
                     self.time_h = (self.time_h + dt * 0.35) % 24.0;
                 }
                 let fwd = Vec3::new(self.yaw.cos() * self.pitch.cos(), self.yaw.sin() * self.pitch.cos(), self.pitch.sin()).normalize();
+                let fwd_flat = Vec3::new(self.yaw.cos(), self.yaw.sin(), 0.0).normalize();
                 let right = fwd.cross(Vec3::Z).normalize_or(Vec3::Y);
-                let speed = if self.keys[6] { 650.0 } else { 140.0 } * dt;
-                if self.keys[0] { self.cam_pos += fwd * speed; }
-                if self.keys[2] { self.cam_pos -= fwd * speed; }
+                let move_fwd = if self.walk_mode { fwd_flat } else { fwd };
+                let speed = if self.walk_mode {
+                    if self.keys[6] { 45.0 } else { 14.0 }
+                } else if self.keys[6] {
+                    650.0
+                } else {
+                    140.0
+                } * dt;
+                if self.keys[0] { self.cam_pos += move_fwd * speed; }
+                if self.keys[2] { self.cam_pos -= move_fwd * speed; }
                 if self.keys[3] { self.cam_pos += right * speed; }
                 if self.keys[1] { self.cam_pos -= right * speed; }
-                if self.keys[5] { self.cam_pos.z += speed; }
-                if self.keys[4] { self.cam_pos.z -= speed; }
+                if self.walk_mode {
+                    let ground_z = self.sample_terrain_z(self.cam_pos.x, self.cam_pos.y) + 1.8;
+                    self.vel_z -= 18.0 * dt;
+                    self.cam_pos.z += self.vel_z * dt;
+                    if self.cam_pos.z <= ground_z {
+                        self.cam_pos.z = ground_z;
+                        self.vel_z = if self.keys[7] { 8.5 } else { 0.0 };
+                    }
+                } else {
+                    if self.keys[5] { self.cam_pos.z += speed; }
+                    if self.keys[4] { self.cam_pos.z -= speed; }
+                }
 
                 let Some(g) = &mut self.gpu else { return };
                 let az = (self.time_h / 24.0) * std::f32::consts::TAU - 1.2;
@@ -863,10 +944,10 @@ impl ApplicationHandler for GpuWorldApp {
                 if now - self.last_title >= std::time::Duration::from_millis(120) {
                     self.last_title = now;
                     let rt_lbl = if !self.rt_on { "OFF" } else if g.has_hw_rt { "HW-RT" } else { "SS-RT/GI" };
+                    let mode_lbl = if self.walk_mode { "WALK(G)" } else { "FLY(G)" };
                     g.window.set_title(&format!(
-                        "PercyStar 3D World | pos {:.0} {:.0} {:.0} | Sun {} az {:.1} el {:+.1} (F6) | Time {:.2}h | {} maps | {} models | {} instances | {:.2} M tris | RT: {}",
-                        self.cam_pos.x, self.cam_pos.y, self.cam_pos.z,
-                        if self.auto_sun { "auto" } else { "manual" },
+                        "PercyStar 3D World | pos {:.0} {:.0} {:.0} | {} | Sun az {:.1} el {:+.1} (F6) | Time {:.2}h | {} maps | {} models | {} instances | {:.2} M tris | RT: {}",
+                        self.cam_pos.x, self.cam_pos.y, self.cam_pos.z, mode_lbl,
                         az.to_degrees().rem_euclid(360.0), el.to_degrees(),
                         self.time_h, g.map_count, g.model_count, g.instance_count,
                         g.tri_count as f64 / 1e6, rt_lbl
