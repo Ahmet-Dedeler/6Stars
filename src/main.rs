@@ -670,6 +670,7 @@ struct Rpf9App {
     mv_cat: ModelCat,
     mv_filter: String,
     mv_hide_lods: bool,
+    mv_drawer_open: bool,
     mv_entries: Vec<(usize, ModelCat, String)>,
     mv_counts: [usize; 10],
     mv_video_count: usize,
@@ -795,6 +796,7 @@ impl Rpf9App {
             mv_cat: ModelCat::All,
             mv_filter: String::new(),
             mv_hide_lods: true,
+            mv_drawer_open: true,
             mv_entries: Vec::new(),
             mv_counts: [0; 10],
             mv_video_count: 0,
@@ -1607,12 +1609,13 @@ impl Rpf9App {
         let mut to_select: Option<usize> = None;
         let mut browse_videos = false;
 
-        egui::SidePanel::left("mv_sidebar")
-            .default_width(360.0)
-            .frame(egui::Frame::new().fill(Color32::from_rgb(20, 13, 31)).inner_margin(10.0))
-            .show(ctx, |ui| {
+        if self.mv_drawer_open {
+            egui::SidePanel::left("mv_sidebar")
+                .default_width(360.0)
+                .frame(egui::Frame::new().fill(Color32::from_rgb(20, 13, 31)).inner_margin(10.0))
+                .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("MODEL VIEWER").size(12.0).strong().color(Color32::from_rgb(255, 168, 28)));
+                    ui.label(RichText::new("MODELS").size(12.0).strong().color(Color32::from_rgb(255, 168, 28)));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             RichText::new(format!("{} shown · {} total", self.mv_view.len(), self.mv_counts[0]))
@@ -1621,9 +1624,50 @@ impl Rpf9App {
                         );
                     });
                 });
-                ui.add_space(6.0);
+                ui.add_space(5.0);
 
-                // Quick catalog & OBJ loaders
+                ui.horizontal(|ui| {
+                    let sr = ui.add(
+                        egui::TextEdit::singleline(&mut self.mv_filter)
+                            .desired_width(ui.available_width() - 28.0)
+                            .hint_text("Search models (Ctrl+F) · words AND · -exclude"),
+                    );
+                    if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
+                        sr.request_focus();
+                    }
+                    if sr.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        self.mv_filter.clear();
+                    }
+                    if ui.button("✕").on_hover_text("Clear filter").clicked() {
+                        self.mv_filter.clear();
+                    }
+                });
+
+                ui.add_space(5.0);
+                ui.horizontal_wrapped(|ui| {
+                    for (cat, label) in MODEL_CATS {
+                        let cnt = self.mv_counts[model_cat_idx(cat)];
+                        let active = self.mv_cat == cat;
+                        let (_, col) = model_cat_tag(cat);
+                        let txt = RichText::new(format!("{label} {cnt}"))
+                            .size(11.0)
+                            .strong()
+                            .color(if active { Color32::WHITE } else { col });
+                        let btn = egui::Button::new(txt)
+                            .fill(if active { Color32::from_rgb(28, 122, 198) } else { Color32::from_rgb(32, 20, 48) });
+                        if ui.add(btn).clicked() {
+                            self.mv_cat = cat;
+                        }
+                    }
+                    let videos = RichText::new(format!("Videos {}", self.mv_video_count))
+                        .size(11.0)
+                        .strong()
+                        .color(kind_color("BK2"));
+                    browse_videos = ui.add(egui::Button::new(videos).fill(Color32::from_rgb(32, 20, 48)))
+                        .on_hover_text("Browse all .bk2 clips in Explorer").clicked();
+                });
+
+                ui.add_space(4.0);
                 let curated_p = self.find_local_catalog("models_vehicles_weapons_peds.csv");
                 let master_p = self.find_local_catalog("models_catalog_master.csv");
                 ui.horizontal_wrapped(|ui| {
@@ -1634,7 +1678,7 @@ impl Rpf9App {
                         }
                     }
                     if let Some(mp) = master_p {
-                        if ui.button("Master (144k)").on_hover_text("Load all 144,655 discovered GTA VI 3D models").clicked() {
+                        if ui.button("Master (144k)").on_hover_text("Load all 144,655 discovered 3D models").clicked() {
                             self.import_catalog_csv(&mp);
                             self.refresh_mv_view();
                         }
@@ -1652,93 +1696,24 @@ impl Rpf9App {
                     }
                 });
 
-                ui.add_space(6.0);
-                ui.label(RichText::new("CATEGORIES").size(10.5).color(Color32::from_rgb(120, 128, 148)));
-                ui.add_space(3.0);
-
-                // 2-column category chip grid
-                egui::Grid::new("mv_cat_grid").num_columns(2).spacing([6.0, 4.0]).show(ui, |ui| {
-                    for (idx, &(cat, label)) in MODEL_CATS.iter().enumerate() {
-                        let cnt = self.mv_counts[model_cat_idx(cat)];
-                        let active = self.mv_cat == cat;
-                        let (_, col) = model_cat_tag(cat);
-                        let txt = RichText::new(format!("{label} ({cnt})"))
-                            .size(11.5)
-                            .strong()
-                            .color(if active { Color32::BLACK } else { col });
-                        let btn = egui::Button::new(txt)
-                            .min_size(egui::vec2(162.0, 22.0))
-                            .fill(if active { Color32::from_rgb(255, 168, 28) } else { Color32::from_rgb(32, 20, 48) });
-                        if ui.add(btn).clicked() {
-                            self.mv_cat = cat;
-                        }
-                        if idx % 2 == 1 {
-                            ui.end_row();
-                        }
-                    }
-                    let videos = RichText::new(format!("Videos ({})", self.mv_video_count))
-                        .size(11.5)
-                        .strong()
-                        .color(kind_color("BK2"));
-                    let button = egui::Button::new(videos)
-                        .min_size(egui::vec2(162.0, 22.0))
-                        .fill(Color32::from_rgb(32, 20, 48));
-                    browse_videos = ui.add(button).on_hover_text("Browse all .bk2 clips in Explorer").clicked();
-                    ui.end_row();
-                });
-
-                ui.add_space(8.0);
-                let sr = ui.add(
-                    egui::TextEdit::singleline(&mut self.mv_filter)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("Search models (Ctrl+F) · words AND · -exclude"),
-                );
-                if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
-                    sr.request_focus();
-                }
-                if sr.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    self.mv_filter.clear();
-                }
-
                 ui.add_space(5.0);
                 self.refresh_mv_view();
                 let cur_pos = self.selected.and_then(|sel| {
                     self.mv_view.iter().position(|&mi| self.mv_entries[mi].0 == sel)
                 });
                 ui.horizontal(|ui| {
-                    let lod_btn = egui::Button::new(
-                        RichText::new(if self.mv_hide_lods { "Hide LODs/Bounds: ON" } else { "Hide LODs/Bounds: OFF" })
-                            .size(11.0)
-                            .color(if self.mv_hide_lods { Color32::BLACK } else { Color32::from_rgb(185, 180, 205) }),
-                    )
-                    .fill(if self.mv_hide_lods { Color32::from_rgb(95, 235, 145) } else { Color32::from_rgb(36, 24, 54) });
-                    if ui.add(lod_btn).clicked() {
-                        self.mv_hide_lods = !self.mv_hide_lods;
-                    }
+                    ui.checkbox(&mut self.mv_hide_lods, "hide LOD copies");
                     sort_combo(ui, "mv_sort_combo", &mut self.sort_mode);
                     let has_any = !self.mv_view.is_empty();
-                    if ui.add_enabled(has_any, egui::Button::new("◀ Prev")).clicked() {
-                        let next_i = match cur_pos {
-                            Some(0) | None => self.mv_view.len() - 1,
-                            Some(p) => p - 1,
-                        };
-                        to_select = Some(self.mv_entries[self.mv_view[next_i]].0);
-                    }
-                    if ui.add_enabled(has_any, egui::Button::new("Next ▶")).clicked() {
-                        let next_i = match cur_pos {
-                            Some(p) if p + 1 < self.mv_view.len() => p + 1,
-                            _ => 0,
-                        };
-                        to_select = Some(self.mv_entries[self.mv_view[next_i]].0);
-                    }
                     if ui.add_enabled(has_any, egui::Button::new("Random")).clicked() {
                         let r = self.next_rand() % self.mv_view.len();
                         to_select = Some(self.mv_entries[self.mv_view[r]].0);
                     }
                 });
+                ui.label(RichText::new("Up/Down arrow keys step through the list").size(10.5).color(Color32::from_rgb(130, 134, 150)));
 
                 // Arrow key / W-S navigation when search box is not focused
-                if !sr.has_focus() && !ctx.wants_keyboard_input() && !self.mv_view.is_empty() {
+                if !ctx.wants_keyboard_input() && !self.mv_view.is_empty() {
                     if ui.input(|i| i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::S)) {
                         let next_i = match cur_pos {
                             Some(p) if p + 1 < self.mv_view.len() => p + 1,
@@ -1795,6 +1770,7 @@ impl Rpf9App {
                     self.state.lock().unwrap().status = msg;
                 }
             });
+        }
 
         if browse_videos {
             self.browse_videos();
@@ -1810,6 +1786,36 @@ impl Rpf9App {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(Color32::from_rgb(13, 9, 21)).inner_margin(12.0))
             .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let dr_btn = egui::Button::new(RichText::new("☰ Models").strong().color(Color32::WHITE))
+                        .fill(if self.mv_drawer_open { Color32::from_rgb(28, 122, 198) } else { Color32::from_rgb(36, 24, 54) });
+                    if ui.add(dr_btn).clicked() {
+                        self.mv_drawer_open = !self.mv_drawer_open;
+                    }
+                    let has_any = !self.mv_view.is_empty();
+                    let cur_pos = self.selected.and_then(|sel| self.mv_view.iter().position(|&mi| self.mv_entries[mi].0 == sel));
+                    if ui.add_enabled(has_any, egui::Button::new("◀")).clicked() {
+                        let next_i = match cur_pos { Some(0) | None => self.mv_view.len() - 1, Some(p) => p - 1 };
+                        self.select_entry(self.mv_entries[self.mv_view[next_i]].0);
+                        self.show_3d = true;
+                    }
+                    if ui.add_enabled(has_any, egui::Button::new("▶")).clicked() {
+                        let next_i = match cur_pos { Some(p) if p + 1 < self.mv_view.len() => p + 1, _ => 0 };
+                        self.select_entry(self.mv_entries[self.mv_view[next_i]].0);
+                        self.show_3d = true;
+                    }
+                    let sel_label = self.selected.and_then(|s| self.state.lock().unwrap().entries.get(s).map(|e| format!("{}@{}", e.rpf_name, e.offset)))
+                        .unwrap_or_else(|| "none".into());
+                    ui.label(RichText::new(format!("Model: {sel_label}")).size(12.0).color(Color32::from_rgb(185, 190, 210)));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Open .OBJ").clicked() {
+                            if let Some(p) = rfd::FileDialog::new().add_filter("OBJ 3D Model", &["obj"]).pick_file() {
+                                self.open_obj_path(&p);
+                            }
+                        }
+                    });
+                });
+                ui.separator();
                 if media_loading {
                     ui.centered_and_justified(|ui| {
                         ui.vertical_centered(|ui| {

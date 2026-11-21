@@ -81,23 +81,6 @@ pub enum WorldStreamMsg {
     Sgd5Count(usize),
 }
 
-fn count_sgd5_shaders_in_rpf(shaders_rpf: &Path) -> usize {
-    use std::io::Read;
-    let Ok(mut f) = std::fs::File::open(shaders_rpf) else { return 0 };
-    let mut buf = vec![0u8; 8 * 1024 * 1024];
-    let mut total = 0usize;
-    loop {
-        let Ok(n) = f.read(&mut buf) else { break };
-        if n < 16 { break; }
-        for w in buf[..n].windows(4) {
-            if w == b"SGD5" {
-                total += 1;
-            }
-        }
-    }
-    total
-}
-
 pub fn launch_world_gpu_process(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let mut cmd = std::process::Command::new(exe);
@@ -113,6 +96,15 @@ pub fn launch_world_gpu_process(common_rpf: Option<&Path>, levels_rpf: Option<&P
 }
 
 pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
+    #[cfg(windows)]
+    unsafe {
+        extern "system" {
+            fn GetCurrentProcess() -> isize;
+            fn SetPriorityClass(hProcess: isize, dwPriorityClass: u32) -> i32;
+        }
+        // below_normal keeps windows audio and desktop apps stutter-free during streaming
+        SetPriorityClass(GetCurrentProcess(), 0x0000_4000);
+    }
     let fallback_dir = crate::load_last_folder();
     let resolved_common = common_rpf.map(Path::to_path_buf).or_else(|| {
         fallback_dir.as_ref().map(|d| d.join("common.rpf")).filter(|p| p.exists())
@@ -129,7 +121,7 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
         batches: Vec::new(),
         levels_rpf: resolved_levels,
         map_count: 0,
-        start_pos: [-2351.0, -5533.0, 140.0],
+        start_pos: [-127.276, -1855.924, 24.0],
     };
     let Ok(event_loop) = EventLoop::builder().build() else {
         return;
@@ -152,20 +144,51 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
             let _ = tx.send(WorldStreamMsg::MapCount(ix.map_count));
             let mut arch_groups: Vec<(u32, u64, f32, Vec<(Vec3, Quat, Vec3, [f32; 4])>)> = Vec::new();
             let mut grouped: HashMap<u32, (f32, Vec<(Vec3, Quat, Vec3, [f32; 4])>)> = HashMap::new();
+            let mut box_insts: Vec<(Vec3, Quat, Vec3, [f32; 4])> = Vec::new();
             for e in &ix.entities {
-                if !ix.models.contains_key(&e.archetype_hash) {
-                    continue;
-                }
                 let dx = e.pos[0] - start[0];
                 let dy = e.pos[1] - start[1];
                 let d2 = dx * dx + dy * dy;
                 let q = Quat::from_xyzw(e.rot[0], e.rot[1], e.rot[2], e.rot[3]).normalize();
+                if !ix.models.contains_key(&e.archetype_hash) {
+                    if d2 <= 2200.0 * 2200.0 && box_insts.len() < 12_000 {
+                        let h = e.archetype_hash;
+                        let r = 0.45 + ((h & 0xFF) as f32 / 255.0) * 0.45;
+                        let g = 0.45 + (((h >> 8) & 0xFF) as f32 / 255.0) * 0.45;
+                        let b = 0.50 + (((h >> 16) & 0xFF) as f32 / 255.0) * 0.45;
+                        box_insts.push((Vec3::from_array(e.pos), q, Vec3::new(14.0 * e.scale_xy, 14.0 * e.scale_xy, 18.0 * e.scale_z), [r, g, b, 1.0]));
+                    }
+                    continue;
+                }
                 let sc = Vec3::new(e.scale_xy, e.scale_xy, e.scale_z);
                 let entry = grouped.entry(e.archetype_hash).or_insert_with(|| (d2, Vec::new()));
                 if d2 < entry.0 {
                     entry.0 = d2;
                 }
                 entry.1.push((Vec3::from_array(e.pos), q, sc, [1.0; 4]));
+            }
+            if !box_insts.is_empty() {
+                let bmesh = Mesh3D::from_parts(
+                    "__placeholder_boxes__".into(),
+                    vec![
+                        [-0.5, -0.5, 0.0], [0.5, -0.5, 0.0], [0.5, 0.5, 0.0], [-0.5, 0.5, 0.0],
+                        [-0.5, -0.5, 1.0], [0.5, -0.5, 1.0], [0.5, 0.5, 1.0], [-0.5, 0.5, 1.0],
+                    ],
+                    vec![[0.0, 0.0]; 8],
+                    vec![
+                        [0, 1, 2], [0, 2, 3], [4, 6, 5], [4, 7, 6],
+                        [0, 4, 5], [0, 5, 1], [1, 5, 6], [1, 6, 2],
+                        [2, 6, 7], [2, 7, 3], [3, 7, 4], [3, 4, 0],
+                    ],
+                    vec![0; 12],
+                    Vec::new(),
+                    None,
+                    String::new(),
+                    1,
+                    0,
+                    "BOX".into(),
+                );
+                let _ = tx.send(WorldStreamMsg::Batch(WorldBatchInput { mesh: bmesh, instances: box_insts }));
             }
             for (h, (d2, insts)) in grouped {
                 if let Some(&moff) = ix.models.get(&h) {
@@ -174,18 +197,11 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
             }
             eprintln!("[world-gpu] matched {} unique drawable archetypes to stream", arch_groups.len());
             arch_groups.sort_by(|a, b| a.2.total_cmp(&b.2));
-            let _ = tx.send(WorldStreamMsg::TotalArchetypes(arch_groups.len()));
-            if let Some(sp) = lp.parent().map(|d| d.join("shaders.rpf")).filter(|p| p.exists()) {
-                let tx_s = tx.clone();
-                std::thread::spawn(move || {
-                    let n = count_sgd5_shaders_in_rpf(&sp);
-                    eprintln!("[world-gpu] indexed {} SGD5 shader packs from {}", n, sp.display());
-                    let _ = tx_s.send(WorldStreamMsg::Sgd5Count(n));
-                });
-            }
+            let stream_cap = arch_groups.len().min(800);
+            let _ = tx.send(WorldStreamMsg::TotalArchetypes(stream_cap));
             let groups = Arc::new(arch_groups);
             let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let n_workers = (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8) / 2).clamp(2, 4);
+            let n_workers = 3usize;
             std::thread::scope(|s| {
                 for _ in 0..n_workers {
                     let groups = Arc::clone(&groups);
@@ -194,7 +210,7 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
                     let lp = lp.clone();
                     s.spawn(move || loop {
                         let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if i >= groups.len() {
+                        if i >= stream_cap {
                             break;
                         }
                         let (h, moff, _, ref insts) = groups[i];
@@ -209,7 +225,7 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
                         if tx.send(WorldStreamMsg::ArchetypeDone).is_err() {
                             break;
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        std::thread::sleep(std::time::Duration::from_millis(5));
                     });
                 }
             });
@@ -365,9 +381,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let lit = direct + kd * albedo * amb_d + env * fr_v + amb_d * rt_bounce;
 
     let dist = length(u.cam_pos.xyz - in.world_pos);
-    let fog = 1.0 - exp(-dist * 0.000028);
+    let fog = 1.0 - exp(-dist * 0.000028 * max(u.hud.w, 0.0));
     let fog_col = mix(u.sky_horizon.rgb, u.sky_zenith.rgb, 0.25);
-    let col = mix(lit, fog_col, clamp(fog, 0.0, 0.55));
+    let col = mix(lit, fog_col, clamp(fog, 0.0, 0.65)) * max(u.sky_zenith.w, 0.2);
     return vec4<f32>(aces_tonemap(col), 1.0);
 }
 
@@ -518,6 +534,8 @@ struct GpuMeshBatch {
     tex_bind_group: wgpu::BindGroup,
     bound_center: Vec3,
     bound_radius: f32,
+    is_box: bool,
+    is_terrain: bool,
 }
 
 struct GpuState {
@@ -541,6 +559,7 @@ struct GpuState {
     minimap_pipeline: wgpu::RenderPipeline,
     progress_pipeline: wgpu::RenderPipeline,
     minimap_bg: wgpu::BindGroup,
+    egui_renderer: egui_wgpu::Renderer,
     batches: Vec<GpuMeshBatch>,
     tri_count: usize,
     instance_count: usize,
@@ -549,6 +568,7 @@ struct GpuState {
     stream_done: usize,
     stream_total: usize,
     sgd5_count: usize,
+    tex_bytes: usize,
     frame_idx: u64,
     start_instant: Instant,
     has_hw_rt: bool,
@@ -576,16 +596,36 @@ fn upload_texture(
     bgl: &wgpu::BindGroupLayout,
     samp: &wgpu::Sampler,
     tex: &Texture2D,
-) -> wgpu::BindGroup {
-    let mut raw = Vec::with_capacity(tex.w * tex.h * 4);
-    for c in &tex.pixels {
-        raw.extend_from_slice(&c.to_array());
-    }
+    max_dim: usize,
+) -> (wgpu::BindGroup, usize) {
+    let w0 = tex.w.max(1);
+    let h0 = tex.h.max(1);
+    let scale = (w0.max(h0) + max_dim - 1) / max_dim.max(1);
+    let (w, h, raw) = if scale > 1 && tex.pixels.len() >= w0 * h0 {
+        let nw = (w0 / scale).max(1);
+        let nh = (h0 / scale).max(1);
+        let mut buf = Vec::with_capacity(nw * nh * 4);
+        for y in 0..nh {
+            let sy = (y * scale).min(h0 - 1);
+            for x in 0..nw {
+                let sx = (x * scale).min(w0 - 1);
+                buf.extend_from_slice(&tex.pixels[sy * w0 + sx].to_array());
+            }
+        }
+        (nw, nh, buf)
+    } else {
+        let mut buf = Vec::with_capacity(tex.pixels.len() * 4);
+        for c in &tex.pixels {
+            buf.extend_from_slice(&c.to_array());
+        }
+        (w0, h0, buf)
+    };
+    let bytes = raw.len();
     let gpu_tex = device.create_texture_with_data(
         queue,
         &wgpu::TextureDescriptor {
             label: Some("albedo"),
-            size: wgpu::Extent3d { width: tex.w.max(1) as u32, height: tex.h.max(1) as u32, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -597,14 +637,15 @@ fn upload_texture(
         &raw,
     );
     let view = gpu_tex.create_view(&wgpu::TextureViewDescriptor::default());
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("tex_bg"),
         layout: bgl,
         entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(samp) },
         ],
-    })
+    });
+    (bg, bytes)
 }
 
 fn compute_smooth_normals(mesh: &Mesh3D) -> Vec<[f32; 3]> {
@@ -926,8 +967,9 @@ impl GpuState {
         });
 
         let white_tex = Texture2D { w: 1, h: 1, pixels: vec![eframe::egui::Color32::from_rgb(190, 195, 205)] };
-        let white_bg = upload_texture(&device, &queue, &tex_bgl, &tex_samp, &white_tex);
-        let minimap_bg = upload_texture(&device, &queue, &tex_bgl, &tex_samp, &white_tex);
+        let (white_bg, _) = upload_texture(&device, &queue, &tex_bgl, &tex_samp, &white_tex, 256);
+        let (minimap_bg, _) = upload_texture(&device, &queue, &tex_bgl, &tex_samp, &white_tex, 256);
+        let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
 
         let mut st = Self {
             window,
@@ -950,6 +992,7 @@ impl GpuState {
             minimap_pipeline,
             progress_pipeline,
             minimap_bg,
+            egui_renderer,
             batches: Vec::new(),
             tri_count: 0,
             instance_count: 0,
@@ -958,6 +1001,7 @@ impl GpuState {
             stream_done: 0,
             stream_total: 0,
             sgd5_count: 0,
+            tex_bytes: 0,
             frame_idx: 0,
             start_instant: Instant::now(),
             has_hw_rt,
@@ -968,15 +1012,12 @@ impl GpuState {
         if let Some(ref terrain) = cfg.terrain {
             st.map_min = [terrain.bmin[0], terrain.bmin[1]];
             st.map_span = [terrain.bmax[0] - terrain.bmin[0], terrain.bmax[1] - terrain.bmin[1]];
-            let tmesh = terrain.build_world_terrain_mesh(2);
+            let tmesh = terrain.build_terrain_mesh(8);
             if let Some(ref t) = tmesh.texture {
-                st.minimap_bg = upload_texture(&st.device, &st.queue, &st.tex_bgl, &st.tex_samp, t);
+                let (mbg, bytes) = upload_texture(&st.device, &st.queue, &st.tex_bgl, &st.tex_samp, t, 1024);
+                st.minimap_bg = mbg;
+                st.tex_bytes += bytes;
             }
-            st.add_batch(&WorldBatchInput {
-                mesh: tmesh,
-                instances: vec![(Vec3::ZERO, Quat::IDENTITY, Vec3::ONE, [1.0; 4])],
-            });
-            st.model_count = st.model_count.saturating_sub(1);
         }
 
         for b in &cfg.batches {
@@ -1054,13 +1095,20 @@ impl GpuState {
                 contents: bytemuck::cast_slice(&indices),
                 usage: wgpu::BufferUsages::INDEX,
             });
-            let tex_bg = b
-                .mesh
-                .texture
-                .as_ref()
-                .or_else(|| b.mesh.geom_materials.get(g as usize).and_then(|m| m.texture.as_deref()))
-                .map(|t| upload_texture(&self.device, &self.queue, &self.tex_bgl, &self.tex_samp, t))
-                .unwrap_or_else(|| self.white_bg.clone());
+            let tex_bg = if self.tex_bytes < 512 * 1024 * 1024 {
+                b.mesh
+                    .texture
+                    .as_ref()
+                    .or_else(|| b.mesh.geom_materials.get(g as usize).and_then(|m| m.texture.as_deref()))
+                    .map(|t| {
+                        let (bg, bytes) = upload_texture(&self.device, &self.queue, &self.tex_bgl, &self.tex_samp, t, 256);
+                        self.tex_bytes += bytes;
+                        bg
+                    })
+                    .unwrap_or_else(|| self.white_bg.clone())
+            } else {
+                self.white_bg.clone()
+            };
 
             self.batches.push(GpuMeshBatch {
                 vb: vb.clone(),
@@ -1071,6 +1119,8 @@ impl GpuState {
                 tex_bind_group: tex_bg,
                 bound_center,
                 bound_radius,
+                is_box: b.mesh.name == "__placeholder_boxes__",
+                is_terrain: b.mesh.name == "mhiu_world_terrain",
             });
         }
 
@@ -1095,6 +1145,9 @@ struct GpuWorldApp {
     terrain_ref: Option<Arc<WorldMapData>>,
     stream_rx: Receiver<WorldStreamMsg>,
     gpu: Option<GpuState>,
+    egui_ctx: eframe::egui::Context,
+    egui_events: Vec<eframe::egui::Event>,
+    pointer_pos: eframe::egui::Pos2,
     cam_pos: Vec3,
     vel_z: f32,
     yaw: f32,
@@ -1103,6 +1156,11 @@ struct GpuWorldApp {
     auto_sun: bool,
     rt_on: bool,
     walk_mode: bool,
+    menu_open: bool,
+    show_models: bool,
+    show_boxes: bool,
+    fog_density: f32,
+    exposure: f32,
     keys: [bool; 8], // W A S D Q E Shift Space
     dragging: bool,
     last_cursor: Option<PhysicalPosition<f64>>,
@@ -1118,13 +1176,21 @@ impl GpuWorldApp {
             cfg: Some(cfg),
             stream_rx,
             gpu: None,
+            egui_ctx: eframe::egui::Context::default(),
+            egui_events: Vec::new(),
+            pointer_pos: eframe::egui::Pos2::ZERO,
             vel_z: 0.0,
-            yaw: 0.4,
-            pitch: -0.18,
-            time_h: 10.50,
+            yaw: 0.65,
+            pitch: -0.08,
+            time_h: 13.50,
             auto_sun: false,
             rt_on: true,
             walk_mode: false,
+            menu_open: true,
+            show_models: true,
+            show_boxes: true,
+            fog_density: 0.85,
+            exposure: 1.0,
             keys: [false; 8],
             dragging: false,
             last_cursor: None,
@@ -1174,13 +1240,34 @@ impl ApplicationHandler for GpuWorldApp {
                     g.resize(sz.width, sz.height);
                 }
             }
-            WindowEvent::MouseInput { state, button: MouseButton::Left | MouseButton::Right, .. } => {
-                self.dragging = state == ElementState::Pressed;
-                if !self.dragging {
-                    self.last_cursor = None;
+            WindowEvent::MouseInput { state, button, .. } => {
+                let pressed = state == ElementState::Pressed;
+                let egui_btn = match button {
+                    MouseButton::Left => Some(eframe::egui::PointerButton::Primary),
+                    MouseButton::Right => Some(eframe::egui::PointerButton::Secondary),
+                    MouseButton::Middle => Some(eframe::egui::PointerButton::Middle),
+                    _ => None,
+                };
+                if let Some(eb) = egui_btn {
+                    self.egui_events.push(eframe::egui::Event::PointerButton {
+                        pos: self.pointer_pos,
+                        button: eb,
+                        pressed,
+                        modifiers: Default::default(),
+                    });
+                }
+                let over_ui = self.menu_open && self.egui_ctx.wants_pointer_input();
+                if matches!(button, MouseButton::Left | MouseButton::Right) && (!pressed || !over_ui) {
+                    self.dragging = pressed;
+                    if !self.dragging {
+                        self.last_cursor = None;
+                    }
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
+                let scale = self.gpu.as_ref().map(|g| g.window.scale_factor() as f32).unwrap_or(1.0);
+                self.pointer_pos = eframe::egui::pos2(position.x as f32 / scale, position.y as f32 / scale);
+                self.egui_events.push(eframe::egui::Event::PointerMoved(self.pointer_pos));
                 if self.dragging {
                     if let Some(prev) = self.last_cursor {
                         let dx = (position.x - prev.x) as f32;
@@ -1190,6 +1277,17 @@ impl ApplicationHandler for GpuWorldApp {
                     }
                     self.last_cursor = Some(position);
                 }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let (dx, dy) = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(x, y) => (x * 24.0, y * 24.0),
+                    winit::event::MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32),
+                };
+                self.egui_events.push(eframe::egui::Event::MouseWheel {
+                    unit: eframe::egui::MouseWheelUnit::Point,
+                    delta: eframe::egui::vec2(dx, dy),
+                    modifiers: Default::default(),
+                });
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let down = event.state == ElementState::Pressed;
@@ -1203,6 +1301,8 @@ impl ApplicationHandler for GpuWorldApp {
                         KeyCode::KeyE => self.keys[5] = down,
                         KeyCode::ShiftLeft | KeyCode::ShiftRight => self.keys[6] = down,
                         KeyCode::Space => self.keys[7] = down,
+                        KeyCode::Home | KeyCode::F1 if down => self.menu_open = !self.menu_open,
+                        KeyCode::KeyB if down => self.show_boxes = !self.show_boxes,
                         KeyCode::F6 if down => self.auto_sun = !self.auto_sun,
                         KeyCode::KeyR if down => self.rt_on = !self.rt_on,
                         KeyCode::KeyG if down => {
@@ -1221,7 +1321,7 @@ impl ApplicationHandler for GpuWorldApp {
                 self.last_frame = now;
 
                 if let Some(g) = &mut self.gpu {
-                    for _ in 0..4 {
+                    for _ in 0..2 {
                         let Ok(msg) = self.stream_rx.try_recv() else { break };
                         match msg {
                             WorldStreamMsg::Batch(batch) => g.add_batch(&batch),
@@ -1302,7 +1402,7 @@ impl ApplicationHandler for GpuWorldApp {
                 let light_vp = light_proj * light_view;
 
                 let day_fac = (sun_dir.z * 2.5).clamp(0.0, 1.0);
-                let sky_zenith = [0.06 + day_fac * 0.20, 0.09 + day_fac * 0.42, 0.16 + day_fac * 0.72, 1.0];
+                let sky_zenith = [0.06 + day_fac * 0.20, 0.09 + day_fac * 0.42, 0.16 + day_fac * 0.72, self.exposure];
                 let sky_horizon = [0.14 + day_fac * 0.54, 0.16 + day_fac * 0.62, 0.24 + day_fac * 0.68, 1.0];
                 let load_prog = if g.stream_total > 0 { (g.stream_done as f32 / g.stream_total as f32).clamp(0.0, 1.0) } else { 0.02 };
                 let load_active = if g.stream_total == 0 || g.stream_done < g.stream_total { 1.0 } else { 0.0 };
@@ -1316,7 +1416,7 @@ impl ApplicationHandler for GpuWorldApp {
                     sky_horizon,
                     flags: [if self.rt_on { 1.0 } else { 0.0 }, self.time_h, g.map_min[0], g.map_span[0]],
                     map_y: [g.map_min[1], g.map_span[1], g.config.width as f32, g.config.height as f32],
-                    hud: [load_prog, load_active, g.start_instant.elapsed().as_secs_f32(), g.sgd5_count as f32],
+                    hud: [load_prog, load_active, g.start_instant.elapsed().as_secs_f32(), self.fog_density],
                 };
                 g.queue.write_buffer(&g.uniform_buf, 0, bytemuck::bytes_of(&uni));
 
@@ -1382,7 +1482,13 @@ impl ApplicationHandler for GpuWorldApp {
                     rp.set_pipeline(&g.main_pipeline);
                     let mut drawn = 0usize;
                     for b in &g.batches {
-                        if b.bound_radius < 5000.0 {
+                        if b.is_box && !self.show_boxes {
+                            continue;
+                        }
+                        if !b.is_box && !b.is_terrain && !self.show_models {
+                            continue;
+                        }
+                        if !b.is_terrain && b.bound_radius < 5000.0 {
                             let to_b = b.bound_center - self.cam_pos;
                             if to_b.dot(fwd) < -(b.bound_radius + 120.0) {
                                 continue;
@@ -1410,6 +1516,80 @@ impl ApplicationHandler for GpuWorldApp {
 
                     rp.set_pipeline(&g.progress_pipeline);
                     rp.draw(0..6, 0..1);
+                }
+
+                if self.menu_open {
+                    let scale = g.window.scale_factor() as f32;
+                    let screen_desc = egui_wgpu::ScreenDescriptor {
+                        size_in_pixels: [g.config.width, g.config.height],
+                        pixels_per_point: scale,
+                    };
+                    let raw_in = eframe::egui::RawInput {
+                        screen_rect: Some(eframe::egui::Rect::from_min_size(
+                            eframe::egui::Pos2::ZERO,
+                            eframe::egui::vec2(g.config.width as f32 / scale, g.config.height as f32 / scale),
+                        )),
+                        events: std::mem::take(&mut self.egui_events),
+                        ..Default::default()
+                    };
+                    let full_out = self.egui_ctx.run(raw_in, |ctx| {
+                        eframe::egui::Window::new("World & ReShade (Home / F1)")
+                            .default_pos([g.config.width as f32 / scale - 360.0, g.config.height as f32 / scale - 360.0])
+                            .default_width(340.0)
+                            .resizable(false)
+                            .show(ctx, |ui| {
+                                ui.label(format!(
+                                    "{} maps | {}/{} models | {} instances | {:.2} M tris | {} MB VRAM tex",
+                                    g.map_count, g.model_count, g.stream_total, g.instance_count,
+                                    g.tri_count as f64 / 1e6, g.tex_bytes / (1024 * 1024)
+                                ));
+                                ui.separator();
+                                ui.add(eframe::egui::Slider::new(&mut self.time_h, 0.0..=24.0).text("Time of Day (h)"));
+                                ui.add(eframe::egui::Slider::new(&mut self.fog_density, 0.0..=2.0).text("Fog Density"));
+                                ui.add(eframe::egui::Slider::new(&mut self.exposure, 0.3..=2.2).text("Exposure"));
+                                ui.horizontal(|ui| {
+                                    ui.checkbox(&mut self.auto_sun, "Auto Sun (F6)");
+                                    ui.checkbox(&mut self.rt_on, "RT Shadows (R)");
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.checkbox(&mut self.show_models, "Real Models");
+                                    ui.checkbox(&mut self.show_boxes, "Boxes (B)");
+                                    ui.checkbox(&mut self.walk_mode, "Walk (G)");
+                                });
+                                ui.horizontal(|ui| {
+                                    if ui.button("Go to Densest Area").clicked() {
+                                        self.cam_pos = Vec3::new(-127.276, -1855.924, 24.0);
+                                        self.yaw = 0.65;
+                                        self.pitch = -0.08;
+                                    }
+                                    ui.label(format!("Pos: {:.0}, {:.0}, {:.0}", self.cam_pos.x, self.cam_pos.y, self.cam_pos.z));
+                                });
+                            });
+                    });
+                    for (id, delta) in &full_out.textures_delta.set {
+                        g.egui_renderer.update_texture(&g.device, &g.queue, *id, delta);
+                    }
+                    let tris = self.egui_ctx.tessellate(full_out.shapes, scale);
+                    g.egui_renderer.update_buffers(&g.device, &g.queue, &mut enc, &tris, &screen_desc);
+                    {
+                        let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("egui_pass"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &view_tex,
+                                resolve_target: None,
+                                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                        }).forget_lifetime();
+                        g.egui_renderer.render(&mut rp, &tris, &screen_desc);
+                    }
+                    for id in &full_out.textures_delta.free {
+                        g.egui_renderer.free_texture(id);
+                    }
+                } else {
+                    self.egui_events.clear();
                 }
 
                 g.queue.submit(Some(enc.finish()));
