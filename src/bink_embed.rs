@@ -12,11 +12,9 @@
 
 use eframe::egui::{self, Color32, ColorImage, RichText, TextureHandle, TextureOptions};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc};
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -40,7 +38,7 @@ pub struct EmbedStatus {
     pub muted: bool,
 }
 
-fn helper_dir() -> Option<PathBuf> {
+pub fn helper_dir() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let macos = exe.parent()?;
     let contents = macos.parent()?;
@@ -50,60 +48,6 @@ fn helper_dir() -> Option<PathBuf> {
     let helpers = contents.join("Helpers");
     (helpers.join("BinkMacArmPlayer").is_file() && helpers.join("libBinkHUD.dylib").is_file())
         .then_some(helpers)
-}
-
-pub struct PendingClip {
-    helper_dir: PathBuf,
-    title: String,
-    rx: mpsc::Receiver<io::Result<TempDir>>,
-    cancel: Arc<AtomicBool>,
-}
-
-impl PendingClip {
-    pub fn prepare(path: PathBuf, offset: u64, size: u64, title: String) -> Result<Self, String> {
-        let helper_dir = helper_dir().ok_or("Video decoder isn't in this build. Open the packaged PercyStar.app.")?;
-        let (tx, rx) = mpsc::channel();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = cancel.clone();
-        std::thread::Builder::new().name("bk2-prepare".into()).spawn(move || {
-            let _ = tx.send(copy_clip(&path, offset, size, &worker_cancel));
-        }).map_err(|err| format!("Start video preview: {err}"))?;
-        Ok(Self { helper_dir, title, rx, cancel })
-    }
-
-    pub fn poll(&self, volume: f32, looping: bool) -> Option<Result<BinkEmbed, String>> {
-        Some(match self.rx.try_recv() {
-            Ok(Ok(dir)) => BinkEmbed::spawn_in(&self.helper_dir, dir, &self.title, volume, looping),
-            Ok(Err(err)) => Err(format!("Read video: {err}")),
-            Err(mpsc::TryRecvError::Empty) => return None,
-            Err(mpsc::TryRecvError::Disconnected) => Err("Video preparation stopped".into()),
-        })
-    }
-}
-
-impl Drop for PendingClip {
-    fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
-    }
-}
-
-fn copy_clip(path: &Path, offset: u64, size: u64, cancel: &AtomicBool) -> io::Result<TempDir> {
-    let mut archive = File::open(path)?;
-    archive.seek(SeekFrom::Start(offset))?;
-    let dir = tempfile::Builder::new().prefix("percystar-video-").tempdir()?;
-    let mut clip = File::create(dir.path().join("clip.bk2"))?;
-    let mut buf = vec![0; size.min(1024 * 1024) as usize];
-    let mut remaining = size;
-    while remaining > 0 {
-        if cancel.load(Ordering::Relaxed) {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "preview cancelled"));
-        }
-        let count = remaining.min(buf.len() as u64) as usize;
-        archive.read_exact(&mut buf[..count])?;
-        clip.write_all(&buf[..count])?;
-        remaining -= count as u64;
-    }
-    Ok(dir)
 }
 
 pub struct BinkEmbed {
@@ -121,7 +65,7 @@ pub struct BinkEmbed {
 }
 
 impl BinkEmbed {
-    fn spawn_in(helpers: &Path, dir: TempDir, title: &str, volume: f32, looping: bool) -> Result<Self, String> {
+    pub fn spawn_in(helpers: &Path, dir: TempDir, title: String, volume: f32, looping: bool) -> Result<Self, String> {
         let shm_path = dir.path().join("frames");
         let shm = OpenOptions::new().read(true).write(true).create_new(true).open(&shm_path)
             .and_then(|f| { f.set_len(HDR)?; Ok(f) }).map_err(|e| format!("Create video frame file: {e}"))?;
@@ -136,7 +80,7 @@ impl BinkEmbed {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| format!("Start video decoder (requires Apple Silicon): {e}"))?;
-        Ok(Self { child, shm, _dir: dir, title: title.to_string(), last_seq: 0, cmd_seq: 0, tex: None, frame_bytes: Vec::new(), status: EmbedStatus::default(), scrub: None, exited: false })
+        Ok(Self { child, shm, _dir: dir, title, last_seq: 0, cmd_seq: 0, tex: None, frame_bytes: Vec::new(), status: EmbedStatus::default(), scrub: None, exited: false })
     }
 
     fn send(&mut self, cmd: u32, arg: f64) {
@@ -288,16 +232,8 @@ fn fmt_time(s: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn video_preview_copies_only_the_archive_entry() {
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        file.write_all(b"prefixKB2nvideoNEXT").unwrap();
-        let cancel = AtomicBool::new(false);
-        let dir = copy_clip(file.path(), 6, 9, &cancel).unwrap();
-        assert_eq!(std::fs::read(dir.path().join("clip.bk2")).unwrap(), b"KB2nvideo");
-        assert_eq!(copy_clip(file.path(), 6, 100, &cancel).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
-    }
+    use crate::video_clip::copy_clip;
+    use std::sync::atomic::AtomicBool;
 
     /// Silent end-to-end check against the packaged helper:
     /// PERCYSTAR_BINK_APP=<app> PERCYSTAR_BK2=<clip> cargo test --release bink_embed -- --ignored --nocapture
@@ -309,7 +245,7 @@ mod tests {
         let src = Path::new(&src);
         let clip = copy_clip(src, 0, src.metadata().unwrap().len(), &AtomicBool::new(false)).unwrap();
         let ctx = egui::Context::default();
-        let mut be = BinkEmbed::spawn_in(&helpers, clip, "test", 0.0, true).unwrap();
+        let mut be = BinkEmbed::spawn_in(&helpers, clip, "test".into(), 0.0, true).unwrap();
         let wait = |be: &mut BinkEmbed, ms: u64| {
             let t = std::time::Instant::now();
             let mut frames = 0;

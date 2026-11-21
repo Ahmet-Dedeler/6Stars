@@ -2605,10 +2605,12 @@ dependencies = [
  "eframe",
  "flate2",
  "image",
+ "raw-window-handle",
  "rfd",
  "rusty-opus",
  "tempfile",
  "texture2ddecoder",
+ "windows",
 ]
 
 [[package]]

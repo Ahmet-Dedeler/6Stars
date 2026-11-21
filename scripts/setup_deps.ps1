@@ -1,27 +1,36 @@
-# installs optional bink2 playback depndency binkplay exe beside percystar exe
-$ErrorActionPreference = "Stop"
-$dir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$root = Split-Path -Parent $dir
-$outDir = if (Test-Path "$root\target\release\PercyStar.exe") { "$root\target\release" } else { $root }
+param([string]$Destination = (Join-Path $PSScriptRoot '..\target\release'))
 
-$radDefault = "C:\Program Files (x86)\RADVideo\binkplay.exe"
-if (Test-Path $radDefault) {
-    Copy-Item $radDefault "$outDir\binkplay.exe" -Force
-    Write-Host "Copied binkplay.exe from RADVideo to $outDir"
-    exit 0
+$ErrorActionPreference = 'Stop'
+$archiveHash = 'c5b9128db8fe7c5bef85bff711da5ff4fed313a8e4ae49d9933a324fe34313aa'
+$playerHash = 'a5e30be7409ba2ad6dede57de7a44df14fce94d3e2660e71ff4d2240c45fa78f'
+$sevenZip = Get-Command 7z.exe, 7zz.exe -CommandType Application -ErrorAction SilentlyContinue |
+    Select-Object -First 1 -ExpandProperty Source
+if (!$sevenZip) {
+    $sevenZip = Join-Path $env:ProgramFiles '7-Zip\7z.exe'
+}
+if (!(Test-Path -LiteralPath $sevenZip -PathType Leaf)) {
+    throw '7-Zip is required at build time to extract the RAD player.'
 }
 
-$tmpZip = Join-Path $env:TEMP "RADTools.7z"
-$tmpExt = Join-Path $env:TEMP "radtools_ext"
-Write-Host "Downloading official RAD Video Tools..."
-Invoke-WebRequest -Uri "https://www.radgametools.com/down/Bink/RADTools.7z" -OutFile $tmpZip
-if (Get-Command 7z -ErrorAction SilentlyContinue) {
-    7z x $tmpZip "-pRAD" "-o$tmpExt" -y | Out-Null
-    $bp = Get-ChildItem $tmpExt -Recurse -Filter "binkplay.exe" | Select-Object -First 1
-    if ($bp) {
-        Copy-Item $bp.FullName "$outDir\binkplay.exe" -Force
-        Write-Host "Installed binkplay.exe to $outDir"
+$temp = New-Item -ItemType Directory -Path (Join-Path ([IO.Path]::GetTempPath()) ([Guid]::NewGuid().ToString()))
+try {
+    $archive = Join-Path $temp.FullName 'RADTools.7z'
+    $installer = Join-Path $temp.FullName 'radtools.exe'
+    $player = Join-Path $temp.FullName 'binkplay.exe'
+    Invoke-WebRequest -UseBasicParsing -Uri 'https://www.radgametools.com/down/Bink/RADTools.7z' -OutFile $archive
+    if ((Get-FileHash -LiteralPath $archive).Hash -ne $archiveHash) {
+        throw 'The RAD download has changed. Update the pinned checksums before building.'
     }
-} else {
-    Write-Host "Downloaded $tmpZip password RAD extract binkplay.exe beside PercyStar.exe"
+    # The outer 7z contains an NSIS installer. Extract the player without running it.
+    & $sevenZip x $archive '-pRAD' "-o$($temp.FullName)" 'radtools.exe' | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Could not extract radtools.exe.' }
+    & $sevenZip x $installer "-o$($temp.FullName)" 'binkplay.exe' | Out-Null
+    if ($LASTEXITCODE -ne 0 -or (Get-FileHash -LiteralPath $player).Hash -ne $playerHash) {
+        throw 'Could not verify the extracted binkplay.exe.'
+    }
+    New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+    Copy-Item -LiteralPath $player -Destination (Join-Path $Destination 'binkplay.exe')
+    Write-Host "Added the RAD player to $Destination"
+} finally {
+    Remove-Item -LiteralPath $temp.FullName -Recurse -Force
 }

@@ -29,7 +29,7 @@
 
 ## What This Fork Adds
 
-- **BK2 video on Apple Silicon:** Select a `.bk2` to play it right in the preview panel. You can pause, scrub, mute and loop. The Mac build includes the decoder, so there's no second app to install.
+- **BK2 video on Apple Silicon and Windows x64:** Select a `.bk2` to play it in the preview panel. Both build scripts include the decoder, so there's no second app to install. On Windows, click the video and press Space to pause, or use its slider to seek.
 - **AWC audio previews:** Play and seek through individual streams without exporting them first. The decoder also reads multichannel banks and files with extra stream-table headers that upstream can miss.
 - **Better 3D previews:** Drawables in a model dictionary appear separately instead of stacked on top of each other. Fixed rotated meshes and false model entries, added streamed `.ttpf` textures and vehicle paint previews, and added a **Highest detail only** toggle for character and clothing models.
 - **More accurate model colors:** The viewer finds shared textures across packs, binds them to the right materials, and reads both packed and floating-point UVs. If it can't find a usable color texture, it shows that part in gray.
@@ -56,18 +56,18 @@ The script fetches and verifies the pinned decoder and frame bridge, so video pl
 <details>
 <summary><b>Windows x64</b></summary>
 
-1. Install Rust and the Visual Studio C++ Build Tools.
-2. Run `cargo build --release --locked`.
-3. Open `target\release\PercyStar.exe`.
+1. Install Rust, the Visual Studio C++ Build Tools, and 7-Zip.
+2. Run `.\scripts\build_windows.ps1` in PowerShell.
+3. Open `dist\PercyStar-Win64\PercyStar.exe`.
 
-For `.bk2` previews, run [the RAD player setup script](scripts/setup_deps.ps1). Skip the in-app updater, it points to upstream.
+The build fetches and verifies RAD's decoder and puts it next to PercyStar without running the RAD installer. Keep the two files together. A plain `cargo build` builds the app without bundling the player.
 
 </details>
 
 <details>
 <summary><b>Updating</b></summary>
 
-Run `git pull --ff-only` and rebuild. On macOS the build script won't overwrite an existing app, so pick a new output path:
+Run `git pull --ff-only` and rebuild. Set `-Destination` on Windows or `PERCYSTAR_APP_PATH` on macOS to keep your previous build:
 
 ```sh
 PERCYSTAR_APP_PATH=dist/PercyStar-next.app bash scripts/build_macos.sh
@@ -134,7 +134,7 @@ PERCYSTAR_APP_PATH=dist/PercyStar-next.app bash scripts/build_macos.sh
 - **Whole-Folder & Single-Archive Scanning (`.rpf` & `.ttpf`)**
   - Multi-threaded live scanning cached to `%LOCALAPPDATA%\PercyStar\scan_cache_v8.tsv`.
 - **In-app Bink 2 playback**
-  - The Apple Silicon build includes the decoder and frame bridge. On Windows, the existing D3D11 dock uses RAD's `binkplay.exe` ([setup script](scripts/setup_deps.ps1)).
+  - The Apple Silicon build includes the decoder and frame bridge. Windows docks RAD's native player for pause and seeking. The Windows loop toggle applies when you next open a video.
 - **CLI Batch Exporters (Models, Textures & RDNA2 Shaders)**
   ```powershell
   PercyStar.exe --extract-vehicles "<path-to-levels.rpf>" "<output-dir>"
@@ -161,7 +161,8 @@ PercyStar/
 ├── promo/                  # HyperFrames source for the promo video
 ├── scripts/
 │   ├── build_macos.sh      # Universal macOS (.app / .zip) build helper
-│   ├── setup_deps.ps1      # Optional RAD Video Tools (binkplay.exe) setup
+│   ├── build_windows.ps1  # Builds the Windows app with its video helper
+│   ├── setup_deps.ps1      # Fetches and extracts the pinned Windows player
 │   ├── awc_extract.py      # Standalone CLI ADAT (.awc) Opus -> .wav helper
 │   └── rpf9_carve.py       # Standalone CLI RPF9 carver
 ├── docs/
@@ -190,7 +191,7 @@ The Xbox dump scan recognized 754,364 entries, including 797 videos. The [format
 PercyStar is an independent archive viewer for **unencrypted, user-supplied files**. The Rust archive decoders are separate from video playback, which uses RAD's player.
 
 - **Zero Circumvention / Zero Keys:** Contains **no** decryption routines, encryption keys, hashes, DRM bypasses, or access-control workarounds. Encrypted data is skipped untouched.
-- **No Game Files:** The source repo contains no RAD binaries or game assets. The Mac build downloads the player from RAD for local use; the decoder remains under RAD's terms. Users supply their own archives.
+- **No Game Files:** The source repo contains no RAD binaries or game assets. The Mac and Windows builds download their player from RAD for local use; the decoder remains under RAD's terms. Users supply their own archives.
 - **Independent Trademark Disclaimer:** PercyStar is an independent open-source project and is not affiliated with, endorsed by, or sponsored by any game studio or publisher.
 
 **Copyright (c) 2026 rpatty-dev — All Rights Reserved.**  

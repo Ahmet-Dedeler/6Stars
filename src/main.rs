@@ -1,10 +1,13 @@
 mod audio_player;
 mod awc;
+#[cfg(not(target_os = "macos"))]
+mod bink_dock;
 #[cfg(target_os = "macos")]
 mod bink_embed;
 mod model3d;
 mod rdna2;
 mod tex;
+mod video_clip;
 #[cfg(test)]
 mod audit_tests;
 use model3d::{
@@ -27,137 +30,62 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::Command;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-const REPO_RELEASES_URL: &str = "https://github.com/rpatty-dev/PercyStar/releases";
+const REPO_RELEASES_URL: &str = "https://github.com/Ahmet-Dedeler/PercyStar/releases";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 // threshold in levels rpf where vehicle fragtypes begin
 const VEH_ZONE_OFF: u64 = 0x10b2_0000_00;
 
-// win32 docking + PlaySound; non-windows builds use the stubs in the other `plat` below
 #[cfg(windows)]
 mod plat {
-use std::path::{Path, PathBuf};
+use std::os::windows::ffi::OsStrExt;
+use std::path::Path;
 
 #[link(name = "winmm")]
 extern "system" {
     fn PlaySoundW(pszSound: *const u16, hmod: isize, fdwSound: u32) -> i32;
 }
 
-#[link(name = "user32")]
-extern "system" {
-    fn EnumWindows(lpEnumFunc: unsafe extern "system" fn(isize, isize) -> i32, lParam: isize) -> i32;
-    fn GetWindowThreadProcessId(hWnd: isize, lpdwProcessId: *mut u32) -> u32;
-    fn IsWindowVisible(hWnd: isize) -> i32;
-    fn SetParent(hWndChild: isize, hWndNewParent: isize) -> isize;
-    fn MoveWindow(hWnd: isize, X: i32, Y: i32, nWidth: i32, nHeight: i32, bRepaint: i32) -> i32;
-    fn GetActiveWindow() -> isize;
-    fn GetWindowLongW(hWnd: isize, nIndex: i32) -> i32;
-    fn SetWindowLongW(hWnd: isize, nIndex: i32, dwNewLong: i32) -> i32;
-}
-
-struct EnumCtx {
-    pid: u32,
-    hwnd: isize,
-}
-
-unsafe extern "system" fn enum_cb(hwnd: isize, lparam: isize) -> i32 {
-    let ctx = &mut *(lparam as *mut EnumCtx);
-    let mut wpid = 0u32;
-    GetWindowThreadProcessId(hwnd, &mut wpid);
-    if wpid == ctx.pid && IsWindowVisible(hwnd) != 0 {
-        ctx.hwnd = hwnd;
-        return 0;
-    }
-    1
-}
-
-pub fn find_hwnd_for_pid(pid: u32) -> Option<isize> {
-    let mut ctx = EnumCtx { pid, hwnd: 0 };
-    unsafe { EnumWindows(enum_cb, &mut ctx as *mut _ as isize); }
-    (ctx.hwnd != 0).then_some(ctx.hwnd)
-}
-
-// strips popup frame so binkplay docks cleanly insid egui panel
-pub fn dock_child_hwnd(child_hwnd: isize, parent_hwnd: isize, x: i32, y: i32, w: i32, h: i32) {
-    const GWL_STYLE: i32 = -16;
-    const WS_CHILD: i32 = 0x4000_0000;
-    const WS_POPUP: i32 = -0x8000_0000_i32;
-    const WS_CAPTION: i32 = 0x00C0_0000;
-    const WS_THICKFRAME: i32 = 0x0004_0000;
-    unsafe {
-        let style = GetWindowLongW(child_hwnd, GWL_STYLE);
-        SetWindowLongW(child_hwnd, GWL_STYLE, (style & !WS_POPUP & !WS_CAPTION & !WS_THICKFRAME) | WS_CHILD);
-        SetParent(child_hwnd, parent_hwnd);
-        MoveWindow(child_hwnd, x, y, w.max(64), h.max(64), 1);
-    }
-}
-
-pub fn find_binkplay() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("binkplay.exe")))
-        .filter(|p| p.exists())
-        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files (x86)\RADVideo\binkplay.exe"))
-}
-
-/// Extra player args after the clip path: borderless D3D11 window that gets docked into the preview panel.
-pub fn binkplay_args() -> &'static [&'static str] { &["/NoBorder", "/DrawD3D11", "/L", "/W640", "/H360"] }
-
-pub fn play_wav_async(path: &Path) {
-    let mut wide: Vec<u16> = path.to_string_lossy().encode_utf16().collect();
+pub fn play_wav_async(path: &Path) -> bool {
+    const SND_FILENAME: u32 = 0x0002_0000;
+    const SND_ASYNC: u32 = 1;
+    const SND_NODEFAULT: u32 = 2;
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
     wide.push(0);
-    unsafe { PlaySoundW(wide.as_ptr(), 0, 0x00020000 | 0x0001); }
+    unsafe { PlaySoundW(wide.as_ptr(), 0, SND_FILENAME | SND_ASYNC | SND_NODEFAULT) != 0 }
 }
 
 pub fn stop_wav() {
     unsafe { PlaySoundW(std::ptr::null(), 0, 0); }
 }
 
-pub fn active_window() -> isize {
-    unsafe { GetActiveWindow() }
-}
-
-pub fn move_window(hwnd: isize, x: i32, y: i32, w: i32, h: i32) {
-    unsafe { MoveWindow(hwnd, x, y, w, h, 1); }
-}
 }
 
 // macOS/Linux: no HWND docking, WAV via afplay/aplay
 #[cfg(not(windows))]
 mod plat {
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::Mutex;
 
 static WAV_PROC: Mutex<Option<Child>> = Mutex::new(None);
 
-pub fn find_hwnd_for_pid(_pid: u32) -> Option<isize> { None }
-pub fn dock_child_hwnd(_c: isize, _p: isize, _x: i32, _y: i32, _w: i32, _h: i32) {}
-pub fn active_window() -> isize { 0 }
-pub fn move_window(_hwnd: isize, _x: i32, _y: i32, _w: i32, _h: i32) {}
-
-pub fn find_binkplay() -> PathBuf {
-    std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("binkplay")))
-        .filter(|p| p.is_file())
-        .unwrap_or_else(|| PathBuf::from("binkplay"))
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn binkplay_args() -> &'static [&'static str] { &[] }
-
-pub fn play_wav_async(path: &Path) {
+pub fn play_wav_async(path: &Path) -> bool {
     stop_wav();
     let player = if cfg!(target_os = "macos") { "afplay" } else { "aplay" };
     if let Ok(c) = Command::new(player).arg(path).spawn() {
         *WAV_PROC.lock().unwrap() = Some(c);
+        true
+    } else {
+        false
     }
 }
 
@@ -168,9 +96,7 @@ pub fn stop_wav() {
     }
 }
 }
-use plat::{active_window, dock_child_hwnd, find_binkplay, find_hwnd_for_pid, move_window, play_wav_async, stop_wav};
-#[cfg(not(target_os = "macos"))]
-use plat::binkplay_args;
+use plat::{play_wav_async, stop_wav};
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum AppTab {
@@ -495,9 +421,7 @@ struct MediaState {
     loading: bool,
     status: String,
     awc_streams: Vec<(u32, PathBuf)>,
-    bink_child_pid: Option<u32>,
-    bink_hwnd: Option<isize>,
-    bink_clip: Option<PathBuf>,
+    awc_dir: Option<tempfile::TempDir>,
     loaded_mesh: Option<Mesh3D>,
     loaded_textures: Option<Vec<DecodedTexture>>,
 }
@@ -648,21 +572,17 @@ struct Rpf9App {
     filter: String,
     logo_tex: Option<TextureHandle>,
     watch_gen: Arc<Mutex<u64>>,
-    bink_proc: Option<Child>,
+    #[cfg(not(target_os = "macos"))]
+    bink_dock: Option<bink_dock::BinkDock>,
     // in-panel player for the selected AWC's decoded streams
     audio: Option<audio_player::AudioPlayer>,
     #[cfg(target_os = "macos")]
     bink_embed: Option<bink_embed::BinkEmbed>,
-    #[cfg(target_os = "macos")]
-    bink_pending: Option<bink_embed::PendingClip>,
-    #[cfg(target_os = "macos")]
+    bink_pending: Option<(PathBuf, String, video_clip::PendingClip)>,
     bink_volume: f32,
-    #[cfg(target_os = "macos")]
-    bink_loop: bool,
-    parent_hwnd: isize,
-    last_dock_rect: [i32; 4],
     #[cfg(not(target_os = "macos"))]
-    clip_seq: u64,
+    bink_muted: bool,
+    bink_loop: bool,
     mesh3d: Option<Mesh3D>,
     show_3d: bool,
     textures: Vec<DecodedTexture>,
@@ -730,20 +650,16 @@ impl Rpf9App {
             filter: String::new(),
             logo_tex,
             watch_gen: Arc::new(Mutex::new(0)),
-            bink_proc: None,
+            #[cfg(not(target_os = "macos"))]
+            bink_dock: None,
             audio: None,
             #[cfg(target_os = "macos")]
             bink_embed: None,
-            #[cfg(target_os = "macos")]
             bink_pending: None,
-            #[cfg(target_os = "macos")]
             bink_volume: 0.8,
-            #[cfg(target_os = "macos")]
-            bink_loop: true,
-            parent_hwnd: 0,
-            last_dock_rect: [0; 4],
             #[cfg(not(target_os = "macos"))]
-            clip_seq: 0,
+            bink_muted: false,
+            bink_loop: true,
             mesh3d: None,
             show_3d: false,
             textures: Vec::new(),
@@ -795,34 +711,29 @@ impl Rpf9App {
 
     fn stop_bink_player(&mut self) {
         #[cfg(target_os = "macos")]
-        {
-            self.bink_embed = None;
-            if self.bink_pending.take().is_some() {
-                let mut m = self.media.lock().unwrap();
-                m.loading = false;
-                m.status.clear();
-            }
-        }
-        if let Some(mut c) = self.bink_proc.take() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-        let mut m = self.media.lock().unwrap();
-        m.bink_child_pid = None;
-        m.bink_hwnd = None;
-        m.bink_clip = None;
-    }
-
-    #[cfg(target_os = "macos")]
-    fn poll_bink_player(&mut self, ctx: &egui::Context) {
-        let Some(pending) = &self.bink_pending else { return };
-        if let Some(result) = pending.poll(self.bink_volume, self.bink_loop) {
-            self.bink_pending = None;
+        { self.bink_embed = None; }
+        #[cfg(not(target_os = "macos"))]
+        { self.bink_dock = None; }
+        if self.bink_pending.take().is_some() {
             let mut m = self.media.lock().unwrap();
             m.loading = false;
-            match result {
+            m.status.clear();
+        }
+    }
+
+    fn poll_bink_player(&mut self, ctx: &egui::Context) {
+        let Some((_, _, pending)) = &self.bink_pending else { return };
+        if let Some(result) = pending.poll() {
+            let (decoder, title, _) = self.bink_pending.take().unwrap();
+            let mut m = self.media.lock().unwrap();
+            m.loading = false;
+            #[cfg(target_os = "macos")]
+            let (target, spawn) = (&mut self.bink_embed, bink_embed::BinkEmbed::spawn_in);
+            #[cfg(not(target_os = "macos"))]
+            let (target, spawn) = (&mut self.bink_dock, bink_dock::BinkDock::spawn);
+            match result.and_then(|dir| spawn(&decoder, dir, title, self.bink_volume, self.bink_loop)) {
                 Ok(player) => {
-                    self.bink_embed = Some(player);
+                    *target = Some(player);
                     m.status.clear();
                 }
                 Err(err) => m.status = err,
@@ -835,7 +746,6 @@ impl Rpf9App {
     fn reset_selection(&mut self) {
         self.selected = None;
         self.preview.clear();
-        self.last_dock_rect = [0; 4];
         self.mesh3d = None;
         self.show_3d = false;
         self.textures.clear();
@@ -845,12 +755,7 @@ impl Rpf9App {
         stop_wav();
         self.audio = None;
         self.stop_bink_player();
-        let mut m = self.media.lock().unwrap();
-        m.awc_streams.clear();
-        m.status.clear();
-        m.loading = false;
-        m.loaded_mesh = None;
-        m.loaded_textures = None;
+        self.media = Arc::new(Mutex::new(MediaState::default()));
     }
 
     fn import_catalog_csv(&mut self, csv_path: &Path) {
@@ -1259,59 +1164,23 @@ impl Rpf9App {
             return;
         }
 
-        #[cfg(target_os = "macos")]
         if e.kind == "BK2" {
             let mut m = self.media.lock().unwrap();
-            match bink_embed::PendingClip::prepare(e.source_rpf, e.offset, e.comp_size, e.name) {
+            #[cfg(target_os = "macos")]
+            let decoder = bink_embed::helper_dir();
+            #[cfg(not(target_os = "macos"))]
+            let decoder = bink_dock::player_path();
+            let Some(decoder) = decoder else {
+                m.status = "No video decoder in this build. Open the packaged PercyStar build.".into();
+                return;
+            };
+            match video_clip::PendingClip::prepare(e.source_rpf, e.offset, e.comp_size) {
                 Ok(pending) => {
-                    self.bink_pending = Some(pending);
+                    self.bink_pending = Some((decoder, e.name, pending));
                     m.loading = true;
                     m.status = "Preparing video preview...".into();
                 }
-                Err(err) => m.status = err,
-            }
-            return;
-        }
-        #[cfg(not(target_os = "macos"))]
-        if e.kind == "BK2" {
-            let tmp = std::env::temp_dir().join("rpf9_preview_bk2");
-            let _ = fs::create_dir_all(&tmp);
-            if let Ok(rd) = fs::read_dir(&tmp) {
-                for old in rd.flatten() {
-                    let _ = fs::remove_file(old.path());
-                }
-            }
-            // bump seq name so windows file locks never block switching vids
-            self.clip_seq += 1;
-            let bk2_p = tmp.join(format!("clip_{}.bk2", self.clip_seq));
-            match read_entry_bytes(&e) {
-                Ok(bytes) => {
-                    if let Err(err) = fs::write(&bk2_p, &bytes) {
-                        self.media.lock().unwrap().status = format!("Write error: {err}");
-                        return;
-                    }
-                }
-                Err(err) => {
-                    self.media.lock().unwrap().status = format!("Read error: {err}");
-                    return;
-                }
-            }
-            match Command::new(find_binkplay())
-                .arg(&bk2_p)
-                .args(binkplay_args())
-                .spawn()
-            {
-                Ok(child) => {
-                    let pid = child.id();
-                    self.bink_proc = Some(child);
-                    let mut m = self.media.lock().unwrap();
-                    m.bink_child_pid = Some(pid);
-                    m.bink_clip = Some(bk2_p);
-                    m.status = format!("Playing {} (Bink player)", e.name);
-                }
-                Err(err) => {
-                    self.media.lock().unwrap().status = format!("Bink player not found ({err}).");
-                }
+                Err(err) => m.status = format!("Start video preview: {err}"),
             }
             return;
         }
@@ -2384,16 +2253,22 @@ fn collect_rpfs(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 fn decode_awc_for_player(e: &RpfEntry, media: &Arc<Mutex<MediaState>>) {
-    let tmp = std::env::temp_dir().join("rpf9_preview_awc");
-    let _ = fs::remove_dir_all(&tmp);
-    let wavs = match read_entry_bytes(e) {
-        Ok(bytes) => awc::decode_awc_bytes_to_wavs(&bytes, &tmp, "stream"),
-        Err(_) => Vec::new(),
-    };
+    let result = (|| -> std::io::Result<_> {
+        let tmp = tempfile::Builder::new().prefix("percystar-audio-").tempdir()?;
+        let bytes = read_entry_bytes(e)?;
+        let wavs = awc::decode_awc_bytes_to_wavs(&bytes, tmp.path(), "stream");
+        Ok((tmp, wavs))
+    })();
     let mut m = media.lock().unwrap();
     m.loading = false;
-    m.status = format!("Decoded {} playable .wav stream(s) natively", wavs.len());
-    m.awc_streams = wavs;
+    match result {
+        Ok((tmp, wavs)) => {
+            m.status = format!("Decoded {} playable .wav stream(s) natively", wavs.len());
+            m.awc_streams = wavs;
+            m.awc_dir = Some(tmp);
+        }
+        Err(err) => m.status = format!("Read audio: {err}"),
+    }
 }
 
 fn setup_style(ctx: &egui::Context) {
@@ -2993,7 +2868,6 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
 
 impl eframe::App for Rpf9App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        #[cfg(target_os = "macos")]
         self.poll_bink_player(ctx);
         let (media_loading, media_status, awc_streams) = {
             let mut m = self.media.lock().unwrap();
@@ -3229,56 +3103,24 @@ impl eframe::App for Rpf9App {
         });
 
         egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::from_rgb(14, 10, 22)).inner_margin(12.0)).show(ctx, |ui| {
-            if self.parent_hwnd == 0 {
-                let h = active_window();
-                if h != 0 { self.parent_hwnd = h; }
-            }
-            let (bink_pid, bink_hwnd_opt, bink_clip_opt) = {
-                let m = self.media.lock().unwrap();
-                (m.bink_child_pid, m.bink_hwnd, m.bink_clip.clone())
-            };
-
-            #[allow(unused_mut)]
-            let mut embedded = false;
             #[cfg(target_os = "macos")]
             if let Some(be) = self.bink_embed.as_mut() {
-                embedded = true;
                 be.ui(ui, &mut self.bink_volume, &mut self.bink_loop);
+                return;
             }
-            if embedded {
-            } else if let Some(pid) = bink_pid {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(&media_status).strong().color(Color32::from_rgb(252, 175, 23)));
-                    if ui.button("Stop").clicked() {
+            #[cfg(not(target_os = "macos"))]
+            if let Some(player) = self.bink_dock.as_mut() {
+                match player.ui(ui, _frame, &mut self.bink_volume, &mut self.bink_muted, &mut self.bink_loop) {
+                    Ok(false) => {}
+                    Ok(true) => self.stop_bink_player(),
+                    Err(err) => {
                         self.stop_bink_player();
-                    }
-                    if ui.button("Pop-out").clicked() {
-                        if let Some(cp) = bink_clip_opt {
-                            self.stop_bink_player();
-                            let _ = Command::new(find_binkplay()).arg(&cp).spawn();
-                        }
-                    }
-                });
-                ui.add_space(6.0);
-                let rect = ui.available_rect_before_wrap();
-                let ppp = ctx.pixels_per_point();
-                let (rx, ry, rw, rh) = ((rect.min.x * ppp) as i32, (rect.min.y * ppp) as i32, (rect.width() * ppp) as i32, (rect.height() * ppp) as i32);
-                if let Some(bh) = bink_hwnd_opt {
-                    let cur = [rx, ry, rw, rh];
-                    if cur != self.last_dock_rect {
-                        self.last_dock_rect = cur;
-                        move_window(bh, rx, ry, rw.max(64), rh.max(64));
-                    }
-                } else if self.parent_hwnd != 0 {
-                    if let Some(bh) = find_hwnd_for_pid(pid) {
-                        dock_child_hwnd(bh, self.parent_hwnd, rx, ry, rw, rh);
-                        self.media.lock().unwrap().bink_hwnd = Some(bh);
-                        self.last_dock_rect = [rx, ry, rw, rh];
-                    } else {
-                        ctx.request_repaint();
+                        self.media.lock().unwrap().status = err;
                     }
                 }
-            } else if media_loading {
+                return;
+            }
+            if media_loading {
                 ui.horizontal(|ui| {
                     draw_percystar_spinner(ui, 24.0);
                     ui.label(RichText::new(&media_status).color(Color32::from_rgb(252, 175, 23)));

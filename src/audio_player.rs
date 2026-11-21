@@ -54,13 +54,14 @@ pub struct AudioPlayer {
     pos: f64,
     started: Option<Instant>,
     scrub: Option<f64>,
-    tmp_seq: u64,
+    seek_dir: Option<tempfile::TempDir>,
+    error: Option<&'static str>,
 }
 
 impl AudioPlayer {
     pub fn new(streams: &[(u32, PathBuf)]) -> Self {
         let streams = streams.iter().map(|(i, p)| (*i, p.clone(), WavInfo::read(p))).collect();
-        Self { streams, sel: 0, pos: 0.0, started: None, scrub: None, tmp_seq: 0 }
+        Self { streams, sel: 0, pos: 0.0, started: None, scrub: None, seek_dir: None, error: None }
     }
 
     /// Same stream list as the one this player was built for.
@@ -81,6 +82,8 @@ impl AudioPlayer {
 
     fn play_from(&mut self, at: f64) {
         stop_wav();
+        self.started = None;
+        self.error = None;
         let Some((_, path, Some(info))) = self.streams.get(self.sel).cloned() else { return };
         let at = at.clamp(0.0, info.duration());
         let file = if at < 0.05 {
@@ -105,16 +108,26 @@ impl AudioPlayer {
             out.extend_from_slice(b"data");
             out.extend_from_slice(&(data.len() as u32).to_le_bytes());
             out.extend_from_slice(data);
-            self.tmp_seq += 1;
-            let p = std::env::temp_dir().join(format!("percystar_seek_{}_{}.wav", std::process::id(), self.tmp_seq % 2));
+            if self.seek_dir.is_none() {
+                self.seek_dir = tempfile::tempdir().ok();
+            }
+            let Some(dir) = &self.seek_dir else {
+                self.error = Some("Could not create a temporary file for seeking.");
+                return;
+            };
+            let p = dir.path().join("seek.wav");
             if fs::write(&p, out).is_err() {
+                self.error = Some("Could not write the audio seek preview.");
                 return;
             }
             p
         };
-        play_wav_async(&file);
         self.pos = at;
-        self.started = Some(Instant::now());
+        if play_wav_async(&file) {
+            self.started = Some(Instant::now());
+        } else {
+            self.error = Some("Could not start audio playback.");
+        }
     }
 
     fn pause(&mut self) {
@@ -126,6 +139,7 @@ impl AudioPlayer {
     pub fn stop(&mut self) {
         self.started = None;
         self.pos = 0.0;
+        self.error = None;
         stop_wav();
     }
 
@@ -140,6 +154,9 @@ impl AudioPlayer {
             }
         }
         ui.label(RichText::new(status).strong().color(Color32::WHITE));
+        if let Some(err) = self.error {
+            ui.colored_label(Color32::LIGHT_RED, err);
+        }
         ui.add_space(6.0);
 
         // transport for the selected stream
