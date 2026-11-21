@@ -95,9 +95,10 @@ impl FssmShader {
 pub fn extract_fssm(data: &[u8]) -> Result<FssmShader, String> {
     let payload = find_dxil_payload(data)?;
 
+    // probe common nobc zlib offsets first before scanning 0x60..0xc0
     let scan_end = payload.len().min(0xC0).saturating_sub(2);
-    for offset in 0x60..=scan_end {
-        if !is_zlib_header(&payload[offset..offset + 2]) {
+    for offset in [0x64usize, 0xA0].into_iter().chain(0x60..=scan_end) {
+        if offset > scan_end || !is_zlib_header(&payload[offset..offset + 2]) {
             continue;
         }
 
@@ -317,7 +318,7 @@ fn format_fssm_disasm(fssm: &FssmShader, source: &str) -> String {
     let _ = writeln!(
         output,
         "; =============================================================================\n\
-         ; PercyStar AMD RDNA2 (GFX10.3 / Xbox Scarlett) Disassembly\n\
+         ; PercyStar AMD RDNA2 (GFX10.3) Disassembly\n\
          ; Source: {source}\n\
          ; FSSM: {} bytes | Code: 0x{:X} + {} bytes | {} insns\n\
          ; =============================================================================\n",
@@ -389,7 +390,7 @@ pub fn inspect(data: &[u8]) -> String {
             if content.windows(4).any(|window| window == b"NOBC") {
                 let _ = writeln!(
                     output,
-                    "    GTA wrapped shader: DXIL payload uses NOBC (no LLVM bitcode)"
+                    "    NOBC wrapped shader: DXIL payload uses NOBC (no LLVM bitcode)"
                 );
             }
         }

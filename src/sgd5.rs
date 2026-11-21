@@ -35,7 +35,6 @@ pub struct Sgd5File {
     pub data: Vec<u8>,
     pub shaders: Vec<Sgd5Shader>,
     pub effect_count: u32,
-    pub trailer_offset: usize,
 }
 
 #[derive(Debug)]
@@ -237,11 +236,19 @@ fn parse_sgd5_data(path: &Path, data: Vec<u8>) -> Result<Sgd5File, Sgd5Error> {
         data,
         shaders,
         effect_count,
-        trailer_offset: offset + 4,
     })
 }
 
 fn find_sgd5_starts(data: &[u8]) -> Vec<usize> {
+    // fast 4kb page check avoids scanning 100mb byte by byte
+    let aligned: Vec<usize> = (0..data.len().saturating_sub(3))
+        .step_by(0x1000)
+        .filter(|&o| &data[o..o + 4] == MAGIC)
+        .collect();
+    if !aligned.is_empty() {
+        return aligned;
+    }
+
     let mut starts = Vec::new();
     let mut offset = 0usize;
     while let Some(found) = data[offset..]
@@ -252,17 +259,7 @@ fn find_sgd5_starts(data: &[u8]) -> Vec<usize> {
         starts.push(found);
         offset = found + 1;
     }
-
-    let aligned: Vec<_> = starts
-        .iter()
-        .copied()
-        .filter(|offset| *offset == 0 || offset % 0x1000 == 0)
-        .collect();
-    if aligned.is_empty() {
-        starts
-    } else {
-        aligned
-    }
+    starts
 }
 
 fn parse_sgd5_streams(path: &Path, mut data: Vec<u8>) -> Result<Vec<Sgd5File>, Sgd5Error> {
