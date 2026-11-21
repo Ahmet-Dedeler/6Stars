@@ -4612,8 +4612,9 @@ impl eframe::App for Rpf9App {
                     ui.label(RichText::new(&t.name).strong().color(Color32::from_rgb(255, 168, 28)));
                     ui.label(RichText::new(format!("{}x{} · {} · mips={}", t.w, t.h, t.fmt_name, t.mips)).color(Color32::from_rgb(170, 210, 235)));
                     if let Some((fw, fh)) = t.full_size {
-                        ui.label(RichText::new(format!("Reduced resolution ({}x{} of {fw}x{fh})", t.w, t.h)).color(Color32::from_rgb(255, 200, 90)))
-                            .on_hover_text("The full-size mip is BCPack-compressed (Xbox hardware codec), so a smaller mip stored as plain data is shown instead.");
+                        let what = t.reduced_note.as_deref().unwrap_or("Reduced resolution");
+                        ui.label(RichText::new(format!("{what} ({}x{} of {fw}x{fh})", t.w, t.h)).color(Color32::from_rgb(255, 200, 90)))
+                            .on_hover_text("The full-size mip uses a BCPack variant Percy6Stars can't decode yet (only BCPack BC1 is supported), so the largest smaller mip that decodes is shown instead.");
                     }
                     ui.add(egui::Slider::new(&mut self.tex_zoom, 0.25..=4.0).text("Zoom").fixed_decimals(2));
                     if ui.button("Export PNG").clicked() {
@@ -5172,7 +5173,7 @@ mod tests {
             eprintln!("tex {id} {}x{} f{:02x} mips={} alloc={:#x}", d.w, d.h, d.fmt_byte, d.has_mips, d.alloc_sz);
             for (k, (sc, dx, t64, off, px)) in res.iter().take(4).enumerate() {
                 eprintln!("   score {sc:.1} dxgi {dx} t64 {t64} off {off:#x}");
-                let t = tex::DecodedTexture { name: String::new(), w: d.w, h: d.h, mips: 1, dxgi: *dx, fmt_name: "", pixels: px.clone(), raw_dds_payload: vec![], full_size: None };
+                let t = tex::DecodedTexture { name: String::new(), w: d.w, h: d.h, mips: 1, dxgi: *dx, fmt_name: "", pixels: px.clone(), raw_dds_payload: vec![], full_size: None, reduced_note: None };
                 let _ = export_texture_png(&t, &Path::new(&out).join(format!("{id}_{k}.png")));
             }
         }
@@ -5309,7 +5310,7 @@ fn export_models_cli(rpf_path: &PathBuf, out_dir: &PathBuf, filter: &str, vehicl
 fn dump_textures_cli(src_path: &PathBuf, out_dir: &PathBuf, limit: usize) {
     let _ = fs::create_dir_all(out_dir);
     let is_ttpf = src_path.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("ttpf")).unwrap_or(false);
-    let (mut ok, mut bcpk, mut fail) = (0usize, 0usize, 0usize);
+    let (mut ok, mut bcpk, mut fail, mut reduced) = (0usize, 0usize, 0usize, 0usize);
     if is_ttpf {
         let ix = match tex::ttpf_index(src_path) {
             Ok(i) => i,
@@ -5322,6 +5323,7 @@ fn dump_textures_cli(src_path: &PathBuf, out_dir: &PathBuf, limit: usize) {
                 Ok(tx) => {
                     if export_texture_png(&tx, &out_dir.join(format!("{}.png", tx.name))).is_ok() {
                         ok += 1;
+                        reduced += tx.full_size.is_some() as usize;
                     }
                 }
                 Err(e) if e.contains("BCPack") => bcpk += 1,
@@ -5355,7 +5357,7 @@ fn dump_textures_cli(src_path: &PathBuf, out_dir: &PathBuf, limit: usize) {
             }
         }
     }
-    eprintln!("DONE: Exported {ok} PNGs (bcpack={bcpk}, fail={fail}) to {}", out_dir.display());
+    eprintln!("DONE: Exported {ok} PNGs (reduced={reduced}, bcpack={bcpk}, fail={fail}) to {}", out_dir.display());
 }
 
 fn load_ps09_from_path(path: &Path) -> Result<Ps09Cache, String> {

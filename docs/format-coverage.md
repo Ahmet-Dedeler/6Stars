@@ -4,7 +4,7 @@ What Percy6Stars can show for each kind of entry its scanner recognizes. Coverag
 
 | Entries | What Percy6Stars can show |
 | --- | --- |
-| TTPF textures | Preview and PNG/DDS export. Some textures keep their full-size mip in BCPack, which Percy6Stars can't decode; for about a third of those a smaller mip is stored as zlib or raw data, and the preview shows that one, labelled "Reduced resolution". See [BCPack and the lower-mip fallback](#bcpack-and-the-lower-mip-fallback). |
+| TTPF textures | Preview and PNG/DDS export, including BCPack BC1. Textures whose full-size mip uses another BCPack variant (BC3 to BC7) show the largest smaller mip that decodes, labelled e.g. "Top mips are BCPack BC7; showing mip 2". See [BCPack and the lower-mip fallback](#bcpack-and-the-lower-mip-fallback). |
 | Models and vehicles | Mesh previews. Every sampled model and vehicle produced geometry; this doesn't guarantee full materials, rigging or animation. |
 | AWC audio | Every sampled bank yielded at least one playable stream. |
 | NavMesh | Every sampled tile opened as triangles. |
@@ -21,9 +21,11 @@ The shader tab inspects supported RDNA2 PSO caches separately. The archive scan 
 
 ## BCPack and the lower-mip fallback
 
-A `.ttpf` texture stores its whole mip chain, smallest mip first. The store compresses each chunk with zlib, stores it raw, or uses BCPack, a hardware texture codec with no public decoder. When the full-size mip falls in a BCPack chunk, Percy6Stars decodes the largest smaller mip that sits outside BCPack. The texture preview shows it as "Reduced resolution (WxH of FULLWxFULLH)", and the Model Viewer uses it for materials, so those models show texture colors instead of gray.
+A `.ttpf` texture stores its whole mip chain, smallest mip first. The store compresses each chunk with zlib, stores it raw, or uses BCPack, the Xbox Series hardware texture codec (a rANS entropy layer over BCn blocks). The chunk table says which BCn variant a BCPack chunk holds.
 
-In the measured scan, about a third of BCPack-blocked textures could be recovered this way, most at 1/2 to 1/8 of full width (mip 1 to mip 3). Blocked UI textures couldn't be recovered. Chunks flagged as BCPack that are exactly their uncompressed size are read as raw data.
+**BC1** chunks are decoded with [bcpack-rs](https://github.com/Ahmet-Dedeler/bcpack-rs). Its entropy layer uses the exact model tables from Microsoft's [silicon-rans](https://github.com/microsoft/silicon-rans) Verilog; its block layer uses two small tables fitted from data, so a few blocks can come out with slightly off colours. A chunk the decoder rejects is treated like any other undecodable BCPack chunk. BC1 is by far the most common variant: on six measured stores, 2,517 of the 2,616 textures whose full-size mip touches BCPack were BC1, and all of them now decode at full size (before, 1,594 showed a smaller mip and 923 showed nothing).
+
+For the other variants (BC3 to BC7), Percy6Stars decodes the largest smaller mip whose chunks are all decodable (raw, zlib or BCPack BC1). The texture preview says which variant blocked it and which mip it shows, e.g. "Top mips are BCPack BC7; showing mip 2 (512x512 of 2048x2048)", and the Model Viewer uses that mip for materials, so those models show texture colors instead of gray. On the same stores, 91 of the remaining 99 were recovered this way. Chunks flagged as BCPack that are exactly their uncompressed size are read as raw data.
 
 The mip layout follows AMD Gfx10 (4 KiB blocks for tile modes 1 to 3, 64 KiB for mode 0, small mips packed into a tail block). On a sample of unblocked textures, mip 1 matched a 2x2 downsample of mip 0 every time, and mip 0 matched the main decoder byte for byte in almost every case. In the rest, the main decoder's guess for where mip 0 starts is wrong, so it shows the tail block instead of the image.
 

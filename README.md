@@ -48,7 +48,8 @@ If this is your first PR, a typo fix is a good place to start. The [contributing
 - **BK2 video on Apple Silicon and Windows x64:** Open **Videos** from the Model Viewer or **Videos (.bk2)** in Explorer, then select a clip to play it. Both build scripts include the decoder, so there's no second app to install. On Windows, click the video and press Space to pause, or use its slider to seek.
 - **AWC audio previews:** Play and seek through individual streams without exporting them first. The decoder also reads multichannel banks and files with extra stream-table headers that upstream can miss.
 - **Better 3D previews:** Drawables in a model dictionary appear separately instead of stacked on top of each other. Fixed rotated meshes and false model entries, added streamed `.ttpf` textures and vehicle paint previews, and added a **Highest detail only** toggle for character and clothing models.
-- **More accurate model colors:** The viewer finds shared textures across packs, binds them to the right materials, and reads both packed and floating-point UVs. If it can't find a usable color texture, it shows that part in gray. When a texture's full-size mip is BCPack (which isn't decoded yet), it falls back to the largest smaller mip stored plainly. That recovers about a third of blocked textures, labeled **Reduced resolution**.
+- **More accurate model colors:** The viewer finds shared textures across packs, binds them to the right materials, and reads both packed and floating-point UVs. If it can't find a usable color texture, it shows that part in gray.
+- **BCPack BC1 textures:** `.ttpf` textures compressed with the Xbox Series BCPack codec in its BC1 variant now preview, export and show on models at full size, decoded with [bcpack-rs](https://github.com/Ahmet-Dedeler/bcpack-rs) (MIT OR Apache-2.0), which uses the exact rANS tables from Microsoft's [silicon-rans](https://github.com/microsoft/silicon-rans) (MIT). Other BCPack variants (BC3 to BC7) aren't decoded yet: for those the preview falls back to the largest smaller mip that decodes and says so, e.g. "Top mips are BCPack BC7; showing mip 2".
 - **Open files directly:** Use **Open File...**, drag files into Percy6Stars, or choose Percy6Stars in **Open With**. This works for `.rpf`, `.ttpf`, `.bk2`, `.awc`, `.obj`, and `.ps09`. Models and shader caches open in their own tabs. Standalone videos and sound banks are added to the current list.
 - **Texture gallery:** In **Textures**, or with a `.ttpf` open, switch the file list from **List** to **Grid** to browse every texture as a thumbnail. Thumbnails load in the background as you scroll, arrow keys move through the grid, and the slider sets their size. Idea and tile patterns from [paryzius/ttpf-viewer](https://github.com/paryzius/ttpf-viewer) (MIT).
 - **Sharper `.ttpf` decoding:** Small icons and some short mip chains that used to come out scrambled or black now decode cleanly, using ttpf-viewer's tile patterns where they fit better than ours. Character parts (eyes, heads, clothing, animals) now pick up their own textures, and eyes show their iris instead of a gray ball.
@@ -149,7 +150,7 @@ The demos are recorded from the real app, offscreen, by [`src/demo_capture.rs`](
 - **RDNA2 texture engine (`.#td` and `.ttpf`)**
   - Reads the ETPF descriptor's format bits (`(u1 >> 3) & 0x7F` = the `DXGI_FORMAT` enum).
   - Decodes 20+ DXGI formats in pure Rust: `BC1`–`BC7`, `BC6H_UF16`/`SF16` HDR, `R16G16B16A16_FLOAT`/`UNORM`, `R16_FLOAT`/`UNORM`, `R16G16_FLOAT`, `R32_FLOAT`, `R10G10B10A2_UNORM`, `R8G8B8A8`, `B8G8R8A8`, `R8_UNORM`, `A8_UNORM` (`texture2ddecoder` + half-float Reinhard tonemapping).
-  - RDNA2 4 KB (`SW_4KB_D`) and 64 KB deswizzle at 8 / 16 / 32 / 64 / 128 bpp. Raw and zlib-backed textures preview and export as PNG or DDS. BCPack payloads are recognized but not decoded.
+  - RDNA2 4 KB (`SW_4KB_D`) and 64 KB deswizzle at 8 / 16 / 32 / 64 / 128 bpp. Raw, zlib and BCPack BC1 textures preview and export as PNG or DDS. Other BCPack variants are recognized and fall back to a smaller mip.
 - **RAGE9 meshlet decoder (`.#dr`, `.#ft`, `.#dd`, `.obj`)**
   - Click-to-view decoding of unencrypted virtual (`0x50xxxxxx`) and physical (`0x60xxxxxx`) meshlet resources inside `.rpf` archives, with `+0xA8` drawable name resolution and non-zero page headers.
   - Extraction follows `Lod0 -> grmModel -> grmGeometry`: 24/24/16-bit quantized vertices, 7-bit meshlet triangles with a `u16` remap table, UV0 (`type 0x28`), embedded `SW_4KB_D` BC7/BC3/BC1 textures, external `.png`/`.bmp` textures, and `.OBJ` export (`v` + `vt` + `f v/vt`).
@@ -214,6 +215,7 @@ Percy6Stars/
 ├── app.rc / build.rs         # Win32 icon resource
 ├── Cargo.toml / Cargo.lock
 ├── CONTRIBUTING.md / CODE_OF_CONDUCT.md
+├── THIRD_PARTY_NOTICES.md    # Licenses of bundled third-party code (bcpack-rs, silicon-rans tables)
 └── LICENSE / LICENSE-MIT       # Upstream terms and MIT for marked modules
 ```
 
@@ -221,7 +223,7 @@ Percy6Stars/
 
 ## What's Still Missing
 
-BCPack textures, rigging and animation, and full material graphs. The [format coverage notes](docs/format-coverage.md) list what each entry kind can preview, what falls back to raw bytes, and what the scanner skips.
+BCPack BC3 to BC7 textures (BC1 decodes), rigging and animation, and full material graphs. The [format coverage notes](docs/format-coverage.md) list what each entry kind can preview, what falls back to raw bytes, and what the scanner skips.
 
 ---
 
@@ -240,4 +242,4 @@ Rights holders with a concern can [open an issue](https://github.com/Ahmet-Dedel
 
 ## License
 
-Licensed under the [PercyStar Non-Commercial Attribution & Copyleft License v1.2](LICENSE) from [PercyStar](https://github.com/rpatty-dev/PercyStar) by @rpatty-dev. Free to use, fork and modify, not for commercial use. Two modules are also [MIT](LICENSE-MIT): `mac_open.rs` and `video_clip.rs`. `ttpf_tile.rs` is ported from [paryzius/ttpf-viewer](https://github.com/paryzius/ttpf-viewer) and stays under its MIT license, with the copyright notice in the file.
+Licensed under the [PercyStar Non-Commercial Attribution & Copyleft License v1.2](LICENSE) from [PercyStar](https://github.com/rpatty-dev/PercyStar) by @rpatty-dev. Free to use, fork and modify, not for commercial use. Two modules are also [MIT](LICENSE-MIT): `mac_open.rs` and `video_clip.rs`. `ttpf_tile.rs` is ported from [paryzius/ttpf-viewer](https://github.com/paryzius/ttpf-viewer) and stays under its MIT license, with the copyright notice in the file. The BCPack decoder is the [bcpack-rs](https://github.com/Ahmet-Dedeler/bcpack-rs) crate (MIT OR Apache-2.0), which contains model tables from Microsoft's [silicon-rans](https://github.com/microsoft/silicon-rans) (MIT); see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

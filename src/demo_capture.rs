@@ -315,6 +315,7 @@ fn load_texture(path: &Path, stem: &str) -> DecodedTexture {
         pixels: img.pixels().map(|p| Color32::from_rgb(p[0], p[1], p[2])).collect(),
         raw_dds_payload: Vec::new(),
         full_size: None,
+        reduced_note: None,
     }
 }
 

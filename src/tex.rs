@@ -50,6 +50,8 @@ pub struct DecodedTexture {
     /// Full mip-0 size when only a smaller mip could be decoded (TTPF lower-mip fallback).
     /// `w`/`h`/`pixels` then describe the reduced mip.
     pub full_size: Option<(usize, usize)>,
+    /// Why a reduced mip is shown, e.g. "Top mips are BCPack BC7; showing mip 2".
+    pub reduced_note: Option<String>,
 }
 
 pub fn dxgi_info(dxgi: u8) -> Option<(&'static str, bool, usize)> {
@@ -605,6 +607,7 @@ fn extract_txd_textures_impl(v: &[u8], p: &[u8], dict_off: usize, thumbnail: boo
                 pixels,
                 raw_dds_payload: lin,
                 full_size: None,
+                reduced_note: None,
             }));
             if thumbnail { break; }
         }
@@ -930,7 +933,28 @@ const CHUNK_CACHE_BYTES: usize = 384 << 20;
 const MAX_TTPF_CHUNK_BYTES: u64 = 64 << 20;
 static TTPF_CHUNKS: std::sync::Mutex<Option<ChunkCache>> = std::sync::Mutex::new(None);
 
-/// One chunk's bytes: inflated if zlib, as stored if raw, Err(codec) if BCPack.
+/// BCPack codecs (1..=7 = BC1..BC7) that `ttpf_chunk` decodes. Only BC1 so far.
+const BCPACK_DECODED: u8 = 1 << 1;
+
+fn bcpack_codec_name(codec: u8) -> &'static str {
+    match codec {
+        1 => "BC1", 2 => "BC2", 3 => "BC3", 4 => "BC4", 5 => "BC5", 6 => "BC6H", 7 => "BC7", _ => "HW",
+    }
+}
+
+/// A BCPack BC1 chunk as plain BC1 blocks (one per 8 bytes of the chunk's virtual length),
+/// decoded with bcpack-rs (github.com/Ahmet-Dedeler/bcpack-rs). The rANS layer uses the
+/// exact tables from Microsoft's MIT-licensed silicon-rans; the block layer uses two small
+/// tables fitted from data, so a few blocks may come out with slightly off colours.
+fn bcpack_bc1_chunk(stored: &[u8], virt_len: u64) -> Result<Vec<u8>, String> {
+    static TABLES: std::sync::OnceLock<(bcpack::bc1::Window, bcpack::bc1::QuadTable)> = std::sync::OnceLock::new();
+    let (window, quads) = TABLES.get_or_init(|| (bcpack::bc1::Window::default_table(), bcpack::bc1::QuadTable::default_table()));
+    // Stored bytes include the chunk's zero padding, which the decoder accepts.
+    let out = bcpack::bc1::decode(stored, (virt_len / 8) as usize, window, quads).map_err(|e| e.to_string())?;
+    Ok(out.blocks)
+}
+
+/// One chunk's bytes: inflated if zlib, as stored if raw, decoded if BCPack BC1, else Err.
 fn ttpf_chunk(path: &Path, file: &mut File, signature: ArchiveSignature, (cs, ce, vl, codec): (u64, u64, u64, u8)) -> Result<std::sync::Arc<Vec<u8>>, String> {
     let key = (path.to_path_buf(), signature, cs);
     if let Some(c) = TTPF_CHUNKS.lock().unwrap().as_ref().and_then(|c| c.map.get(&key)) {
@@ -948,11 +972,11 @@ fn ttpf_chunk(path: &Path, file: &mut File, signature: ArchiveSignature, (cs, ce
         out
     } else if ch.len() as u64 == vl {
         ch
+    } else if BCPACK_DECODED & 1 << codec != 0 {
+        bcpack_bc1_chunk(&ch, vl).map_err(|e| format!("Texture uses Xbox Series BCPack (BC1), but this chunk didn't decode: {e}"))?
     } else {
-        let mode = match codec {
-            1 => "BC1", 2 => "BC2", 3 => "BC3", 4 => "BC4", 5 => "BC5", 6 => "BC6H", 7 => "BC7", _ => "HW",
-        };
-        return Err(format!("Texture uses Xbox Series X hardware BCPack ({mode}) — ASIC-only compression (not decodable on PC)"));
+        let mode = bcpack_codec_name(codec);
+        return Err(format!("Texture uses Xbox Series BCPack ({mode}); only BCPack BC1 is decoded so far"));
     };
     if archive_signature(file)? != signature {
         return Err("TTPF archive changed while it was being read".into());
@@ -1146,11 +1170,21 @@ impl TtpfMipLayout {
 }
 
 impl TtpfIndex {
-    /// True if any byte of the virtual range [off, off + len) lies in a BCPack chunk.
-    fn range_hits_bcpack(&self, off: u64, len: u64) -> bool {
+    /// BCPack codecs (bit n = BCn, n in 1..=7) of the chunks under [off, off + len).
+    fn bcpack_codecs(&self, off: u64, len: u64) -> u8 {
         let end = off + len;
         let first = self.chunks.partition_point(|c| c.2 + c.3 <= off);
-        self.chunks[first..].iter().take_while(|c| c.2 < end).any(|c| (1..=7).contains(&c.4))
+        self.chunks[first..].iter().take_while(|c| c.2 < end).filter(|c| (1..=7).contains(&c.4)).fold(0, |m, c| m | 1 << c.4)
+    }
+
+    /// True if any byte of the virtual range [off, off + len) lies in a BCPack chunk.
+    fn range_hits_bcpack(&self, off: u64, len: u64) -> bool {
+        self.bcpack_codecs(off, len) != 0
+    }
+
+    /// True if the range touches a BCPack codec we can't decode yet (anything but BC1).
+    fn range_hits_undecodable_bcpack(&self, off: u64, len: u64) -> bool {
+        self.bcpack_codecs(off, len) & !BCPACK_DECODED != 0
     }
 }
 
@@ -1173,7 +1207,7 @@ struct TtpfLowerMip {
     pixels: Vec<Color32>,
 }
 
-/// Decode the largest mip below mip 0 that is stored outside BCPack chunks.
+/// Decode the largest mip below mip 0 whose chunks are all decodable (raw, zlib or BCPack BC1).
 fn ttpf_decode_lower_mip(path: &Path, ix: &TtpfIndex, d: &TtpfTexMeta, max_pixels: usize) -> Option<TtpfLowerMip> {
     let (_, is_bc, bpe) = dxgi_info(d.dxgi)?;
     // BCPack only wraps BCn data, and the mip-chain layout is only verified for BCn.
@@ -1187,7 +1221,7 @@ fn ttpf_decode_lower_mip(path: &Path, ix: &TtpfIndex, d: &TtpfTexMeta, max_pixel
         let (bw, bh) = (s.ew * 4, s.eh * 4);
         if bw * bh > max_pixels { continue; }
         let (a, b) = layout.span(m);
-        if ix.range_hits_bcpack(d.byte_off + a, b - a) {
+        if ix.range_hits_undecodable_bcpack(d.byte_off + a, b - a) {
             continue;
         }
         let Ok(raw) = ttpf_read_virtual(path, ix, d.byte_off + a, (b - a) as usize) else { continue };
@@ -1224,8 +1258,9 @@ fn ttpf_mip0_range(d: &TtpfTexMeta, is_bc: bool, bpe: usize) -> (u64, usize, boo
 
 /// Decode a single texture by descriptor index from a `.ttpf` archive.
 ///
-/// When mip 0 is BCPack-compressed this falls back to the largest smaller mip stored as raw
-/// or zlib data: `full_size` is then set and `w`/`h`/`pixels` describe the reduced mip.
+/// BCPack BC1 chunks are decoded. When mip 0 still can't be read (BCPack BC3-BC7) this falls
+/// back to the largest smaller mip that can: `full_size` and `reduced_note` are then set and
+/// `w`/`h`/`pixels` describe the reduced mip.
 pub fn decode_ttpf_texture(path: &Path, tex_idx: usize) -> Result<DecodedTexture, String> {
     decode_ttpf_with_budget(path, tex_idx, usize::MAX)
 }
@@ -1252,6 +1287,13 @@ fn decode_ttpf_with_budget(path: &Path, tex_idx: usize, max_pixels: usize) -> Re
             let Some(low) = ttpf_decode_lower_mip(path, &ix, d, max_pixels) else {
                 return Err(format!("{err}; no usable smaller mip"));
             };
+            let reduced_note = err.contains("BCPack").then(|| {
+                let (off, len, _) = ttpf_mip0_range(d, is_bc, bpe);
+                let m = ix.bcpack_codecs(off, len as u64) & !BCPACK_DECODED;
+                let names: Vec<&str> = (1..=7).filter(|c| m & 1 << c != 0).map(bcpack_codec_name).collect();
+                let names = if names.is_empty() { "BCPack".to_string() } else { format!("BCPack {}", names.join("/")) };
+                format!("Top mips are {names}; showing mip {}", low.mip)
+            });
             return Ok(DecodedTexture {
                 name: format!("tex_{:05}_{}x{}_{fmt_name}_mip{}", d.idx, d.w, d.h, low.mip),
                 w: low.w,
@@ -1262,6 +1304,7 @@ fn decode_ttpf_with_budget(path: &Path, tex_idx: usize, max_pixels: usize) -> Re
                 pixels: low.pixels,
                 raw_dds_payload: low.lin,
                 full_size: Some((d.w, d.h)),
+                reduced_note,
             });
         }
         Err(err) => return Err(err),
@@ -1276,6 +1319,7 @@ fn decode_ttpf_with_budget(path: &Path, tex_idx: usize, max_pixels: usize) -> Re
         pixels,
         raw_dds_payload: lin,
         full_size: None,
+        reduced_note: None,
     })
 }
 
@@ -2127,6 +2171,7 @@ pub fn decode_mhiu_heightmap(data: &[u8]) -> Option<DecodedTexture> {
         pixels,
         raw_dds_payload: Vec::new(),
         full_size: None,
+        reduced_note: None,
     })
 }
 
@@ -2327,7 +2372,8 @@ mod mhiu_tests {
         println!("AUDIT decoded {total}, ambiguous {multi}, changed vs v1.4.1 baseline {changed}, winners {wins:?}");
     }
 
-    /// Counts BCPack-blocked textures and how many the lower-mip fallback recovers.
+    /// Counts BCPack textures: read in full (BCPack BC1, or chunks flagged BCPack but stored
+    /// at full size) or recovered by the lower-mip fallback.
     ///
     ///   PERCYSTAR_DUMP=<dump root> cargo test --release ttpf_lower_mip_fallback -- --ignored --nocapture
     ///
@@ -2350,7 +2396,7 @@ mod mhiu_tests {
                 .collect()
         };
         assert!(!stores.is_empty(), "no ttpf stores under {}", root.display());
-        let (mut all_blocked, mut all_recovered, mut all_textures, mut flagged_but_stored) = (0usize, 0usize, 0usize, 0usize);
+        let (mut all_blocked, mut all_recovered, mut all_textures, mut read_in_full) = (0usize, 0usize, 0usize, 0usize);
         for path in &stores {
             let ix = ttpf_index(path).expect("index");
             let (mut blocked, mut recovered) = (0usize, 0usize);
@@ -2365,10 +2411,10 @@ mod mhiu_tests {
                 blocked += 1;
                 if let Ok(t) = decode_ttpf_texture(path, d.idx) {
                     let Some((fw, fh)) = t.full_size else {
-                        // A few chunks carry a BCPack codec but are exactly their virtual size;
-                        // the reader takes those as stored data, so mip 0 isn't blocked.
+                        // BCPack BC1 decodes, and a few chunks carry a BCPack codec but are
+                        // exactly their virtual size (read as stored data): mip 0 isn't blocked.
                         blocked -= 1;
-                        flagged_but_stored += 1;
+                        read_in_full += 1;
                         continue;
                     };
                     assert_eq!((fw, fh), (d.w, d.h));
@@ -2390,7 +2436,7 @@ mod mhiu_tests {
             println!("{rel}: {} textures, blocked {blocked}, recovered {recovered} [{}] {example}", ix.descs.len(), mips.join(" "));
         }
         println!(
-            "TOTAL: {} stores, {all_textures} textures, blocked {all_blocked}, recovered {all_recovered} ({:.1}%); {flagged_but_stored} BCPack-flagged but stored",
+            "TOTAL: {} stores, {all_textures} textures, blocked {all_blocked}, recovered {all_recovered} ({:.1}%); {read_in_full} BCPack textures read in full",
             stores.len(),
             100.0 * all_recovered as f64 / all_blocked.max(1) as f64
         );
@@ -2409,6 +2455,81 @@ mod mhiu_tests {
                 let _ = std::fs::create_dir_all(&out);
                 export_texture_png(&t, &Path::new(&out).join(format!("{}.png", t.name))).expect("png");
             }
+        }
+    }
+
+    /// BCPack BC1 chunks decode to one 8-byte block per 8 bytes of virtual length, with the
+    /// store's zero padding after the stream; a stream that isn't BCPack is rejected.
+    #[test]
+    fn bcpack_bc1_chunk_decodes_synthetic_stream() {
+        let blocks = 512;
+        let (mut stream, _) = bcpack::encode::synthetic_bc1(7, blocks, 100);
+        stream.resize(stream.len().next_multiple_of(256), 0);
+        let out = bcpack_bc1_chunk(&stream, blocks as u64 * 8).expect("synthetic BC1 stream");
+        assert_eq!(out.len(), blocks * 8);
+        assert!(bcpack_bc1_chunk(&[0xA5; 4096], blocks as u64 * 8).is_err());
+    }
+
+    /// Per-store BCPack coverage: for every texture whose full-size mip touches a BCPack
+    /// chunk, whether it decodes at full size, at a smaller mip, or not at all, split by
+    /// the BCPack codec of that mip.
+    ///
+    ///   PERCYSTAR_DUMP=<dump root> cargo test --release ttpf_bcpack_coverage -- --ignored --nocapture
+    ///
+    /// `PERCYSTAR_TTPF_STORES=<rel>,<rel>` picks the stores (default: vehicles, weapons, peds_0_3).
+    #[test]
+    #[ignore]
+    fn ttpf_bcpack_coverage() {
+        let Some(root) = dump_root() else { return };
+        let rels = std::env::var("PERCYSTAR_TTPF_STORES").unwrap_or_else(|_| {
+            "data/ttdb/vehicles/ttdb_vehicles.ttpf,data/ttdb/weapons/ttdb_weapons.ttpf,data/ttdb/peds/ttdb_peds_0_3.ttpf".into()
+        });
+        let name = |m: u8| (1..=7).filter(|c| m & 1 << c != 0).map(|c| ["", "BC1", "BC2", "BC3", "BC4", "BC5", "BC6H", "BC7"][c]).collect::<Vec<_>>().join("+");
+        // codec mask -> (full, reduced, failed)
+        let mut total: std::collections::BTreeMap<String, [usize; 3]> = Default::default();
+        let mut written = 0;
+        for rel in rels.split(',').filter(|r| !r.is_empty()) {
+            let path = root.join(rel);
+            let ix = ttpf_index(&path).expect("index");
+            let mut per: std::collections::BTreeMap<String, [usize; 3]> = Default::default();
+            for d in &ix.descs {
+                let Some((_, is_bc, bpe)) = dxgi_info(d.dxgi) else { continue };
+                let (off, len, _) = ttpf_mip0_range(d, is_bc, bpe);
+                let m = ix.bcpack_codecs(off, len as u64);
+                if m == 0 {
+                    continue;
+                }
+                let t = decode_ttpf_texture(&path, d.idx);
+                let slot = match &t {
+                    Ok(t) if t.full_size.is_none() => 0,
+                    Ok(_) => 1,
+                    Err(_) => 2,
+                };
+                // `PERCY_OUT=<dir>`: write a few BC1 textures with no plain smaller mip either,
+                // which only show up at all because BCPack BC1 decodes.
+                if let (Ok(t), Ok(out)) = (&t, std::env::var("PERCY_OUT")) {
+                    let lower_all_bcpack = ttpf_bc_layout(d, bpe).is_some_and(|l| {
+                        (1..l.mips.len()).all(|m| { let (a, b) = l.span(m); ix.range_hits_bcpack(d.byte_off + a, b - a) })
+                    });
+                    if slot == 0 && m == 1 << 1 && lower_all_bcpack && d.w * d.h >= 256 * 256 && written < 3 {
+                        let _ = std::fs::create_dir_all(&out);
+                        let stem = path.file_stem().unwrap().to_string_lossy();
+                        export_texture_png(t, &Path::new(&out).join(format!("{stem}_{}.png", t.name))).expect("png");
+                        written += 1;
+                    }
+                }
+                per.entry(name(m)).or_default()[slot] += 1;
+            }
+            println!("{rel}: {} textures", ix.descs.len());
+            for (k, v) in &per {
+                println!("    {k:10} full {:5}  reduced {:5}  failed {:5}", v[0], v[1], v[2]);
+                let t = total.entry(k.clone()).or_default();
+                (0..3).for_each(|i| t[i] += v[i]);
+            }
+        }
+        println!("TOTAL (textures whose mip 0 touches BCPack):");
+        for (k, v) in &total {
+            println!("    {k:10} full {:5}  reduced {:5}  failed {:5}", v[0], v[1], v[2]);
         }
     }
 
