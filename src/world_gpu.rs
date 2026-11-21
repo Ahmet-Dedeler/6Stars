@@ -197,7 +197,7 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
             }
             eprintln!("[world-gpu] matched {} unique drawable archetypes to stream", arch_groups.len());
             arch_groups.sort_by(|a, b| a.2.total_cmp(&b.2));
-            let stream_cap = arch_groups.len().min(800);
+            let stream_cap = arch_groups.len().min(3000);
             let _ = tx.send(WorldStreamMsg::TotalArchetypes(stream_cap));
             let groups = Arc::new(arch_groups);
             let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1101,7 +1101,7 @@ impl GpuState {
                     .as_ref()
                     .or_else(|| b.mesh.geom_materials.get(g as usize).and_then(|m| m.texture.as_deref()))
                     .map(|t| {
-                        let (bg, bytes) = upload_texture(&self.device, &self.queue, &self.tex_bgl, &self.tex_samp, t, 256);
+                        let (bg, bytes) = upload_texture(&self.device, &self.queue, &self.tex_bgl, &self.tex_samp, t, 128);
                         self.tex_bytes += bytes;
                         bg
                     })
@@ -1188,8 +1188,8 @@ impl GpuWorldApp {
             walk_mode: false,
             menu_open: true,
             show_models: true,
-            show_boxes: true,
-            fog_density: 0.85,
+            show_boxes: false,
+            fog_density: 0.70,
             exposure: 1.0,
             keys: [false; 8],
             dragging: false,
@@ -1533,38 +1533,66 @@ impl ApplicationHandler for GpuWorldApp {
                         ..Default::default()
                     };
                     let full_out = self.egui_ctx.run(raw_in, |ctx| {
-                        eframe::egui::Window::new("World & ReShade (Home / F1)")
-                            .default_pos([g.config.width as f32 / scale - 360.0, g.config.height as f32 / scale - 360.0])
-                            .default_width(340.0)
-                            .resizable(false)
-                            .show(ctx, |ui| {
-                                ui.label(format!(
-                                    "{} maps | {}/{} models | {} instances | {:.2} M tris | {} MB VRAM tex",
+                        let mut vis = eframe::egui::Visuals::dark();
+                        vis.window_fill = eframe::egui::Color32::from_rgba_premultiplied(20, 13, 31, 238);
+                        vis.panel_fill = eframe::egui::Color32::from_rgb(20, 13, 31);
+                        vis.window_stroke = eframe::egui::Stroke::new(1.2, eframe::egui::Color32::from_rgb(255, 72, 165));
+                        vis.widgets.inactive.bg_fill = eframe::egui::Color32::from_rgb(36, 22, 54);
+                        vis.widgets.hovered.bg_fill = eframe::egui::Color32::from_rgb(56, 32, 82);
+                        vis.widgets.active.bg_fill = eframe::egui::Color32::from_rgb(255, 168, 28);
+                        vis.selection.bg_fill = eframe::egui::Color32::from_rgb(255, 168, 28);
+                        ctx.set_visuals(vis);
+
+                        eframe::egui::Window::new(
+                            eframe::egui::RichText::new("PERCYSTAR · WORLD & RESHADE (Home / F1)")
+                                .strong()
+                                .color(eframe::egui::Color32::from_rgb(255, 168, 28)),
+                        )
+                        .default_pos([g.config.width as f32 / scale - 370.0, 18.0])
+                        .default_width(350.0)
+                        .resizable(false)
+                        .show(ctx, |ui| {
+                            ui.label(
+                                eframe::egui::RichText::new(format!(
+                                    "{} maps · {}/{} models · {} inst · {:.2}M tris · {} MB VRAM",
                                     g.map_count, g.model_count, g.stream_total, g.instance_count,
                                     g.tri_count as f64 / 1e6, g.tex_bytes / (1024 * 1024)
-                                ));
-                                ui.separator();
-                                ui.add(eframe::egui::Slider::new(&mut self.time_h, 0.0..=24.0).text("Time of Day (h)"));
-                                ui.add(eframe::egui::Slider::new(&mut self.fog_density, 0.0..=2.0).text("Fog Density"));
-                                ui.add(eframe::egui::Slider::new(&mut self.exposure, 0.3..=2.2).text("Exposure"));
-                                ui.horizontal(|ui| {
-                                    ui.checkbox(&mut self.auto_sun, "Auto Sun (F6)");
-                                    ui.checkbox(&mut self.rt_on, "RT Shadows (R)");
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.checkbox(&mut self.show_models, "Real Models");
-                                    ui.checkbox(&mut self.show_boxes, "Boxes (B)");
-                                    ui.checkbox(&mut self.walk_mode, "Walk (G)");
-                                });
-                                ui.horizontal(|ui| {
-                                    if ui.button("Go to Densest Area").clicked() {
-                                        self.cam_pos = Vec3::new(-127.276, -1855.924, 24.0);
-                                        self.yaw = 0.65;
-                                        self.pitch = -0.08;
-                                    }
-                                    ui.label(format!("Pos: {:.0}, {:.0}, {:.0}", self.cam_pos.x, self.cam_pos.y, self.cam_pos.z));
-                                });
+                                ))
+                                .size(11.0)
+                                .color(eframe::egui::Color32::from_rgb(95, 215, 255)),
+                            );
+                            ui.separator();
+                            ui.add(eframe::egui::Slider::new(&mut self.time_h, 0.0..=24.0).text("Time of Day (h)"));
+                            ui.add(eframe::egui::Slider::new(&mut self.fog_density, 0.0..=2.0).text("Fog Density"));
+                            ui.add(eframe::egui::Slider::new(&mut self.exposure, 0.3..=2.2).text("Exposure"));
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut self.auto_sun, "Auto Sun (F6)");
+                                ui.checkbox(&mut self.rt_on, "RT Shadows (R)");
                             });
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut self.show_models, "Real Models");
+                                ui.checkbox(&mut self.show_boxes, "Boxes (B)");
+                                ui.checkbox(&mut self.walk_mode, "Walk (G)");
+                            });
+                            ui.horizontal(|ui| {
+                                let btn = eframe::egui::Button::new(
+                                    eframe::egui::RichText::new("Go to Downtown Brickell")
+                                        .strong()
+                                        .color(eframe::egui::Color32::BLACK),
+                                )
+                                .fill(eframe::egui::Color32::from_rgb(255, 168, 28));
+                                if ui.add(btn).clicked() {
+                                    self.cam_pos = Vec3::new(-127.276, -1855.924, 24.0);
+                                    self.yaw = 0.65;
+                                    self.pitch = -0.08;
+                                }
+                                ui.label(
+                                    eframe::egui::RichText::new(format!("Pos: {:.0}, {:.0}, {:.0}", self.cam_pos.x, self.cam_pos.y, self.cam_pos.z))
+                                        .size(11.0)
+                                        .color(eframe::egui::Color32::from_rgb(200, 190, 220)),
+                                );
+                            });
+                        });
                     });
                     for (id, delta) in &full_out.textures_delta.set {
                         g.egui_renderer.update_texture(&g.device, &g.queue, *id, delta);
