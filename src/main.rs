@@ -7,6 +7,8 @@ mod bink_embed;
 mod model3d;
 mod rdna2;
 mod tex;
+#[cfg(target_os = "macos")]
+mod mac_open;
 mod video_clip;
 #[cfg(test)]
 mod audit_tests;
@@ -628,7 +630,7 @@ struct Rpf9App {
 }
 
 impl Rpf9App {
-    fn new(cc: &eframe::CreationContext<'_>, logo_rgba: Option<(Vec<u8>, u32, u32)>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, logo_rgba: Option<(Vec<u8>, u32, u32)>, open_paths: Vec<PathBuf>) -> Self {
         setup_style(&cc.egui_ctx);
         let logo_tex = logo_rgba.map(|(raw, w, h)| {
             let ci = ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &raw);
@@ -640,7 +642,7 @@ impl Rpf9App {
             selected_rpf: "All RPFs".into(),
             state: Arc::new(Mutex::new(ScanState {
                 header_info: "No archive or folder loaded".into(),
-                status: "Open an .rpf/.ttpf or select a game folder".into(),
+                status: "Open a game folder or archive, or drop .bk2/.awc files here".into(),
                 ..Default::default()
             })),
             media: Arc::new(Mutex::new(MediaState::default())),
@@ -706,7 +708,69 @@ impl Rpf9App {
                 app.start_folder_scan(last);
             }
         }
+        #[cfg(target_os = "macos")]
+        mac_open::set_context(&cc.egui_ctx);
+        // paths from the command line (Windows "Open with", a file dropped on the .exe)
+        if !open_paths.is_empty() {
+            app.open_paths(open_paths);
+        }
         app
+    }
+
+    /// Opens what the user handed us from Finder, Explorer, a drop on the window or the
+    /// command line: a folder, an archive, or standalone .bk2/.awc files.
+    /// Standalone media is added to the current list and selected instead of replacing it,
+    /// so dropping one clip doesn't throw away a scanned game folder.
+    fn open_paths(&mut self, paths: Vec<PathBuf>) {
+        let mut loose = Vec::new();
+        let mut archive = None;
+        for p in paths {
+            if p.is_dir() {
+                archive = Some(p);
+            } else if let Some(e) = loose_media_entry(&p) {
+                loose.push(e);
+            } else if p.is_file() {
+                archive = Some(p);
+            }
+        }
+        if let Some(p) = archive {
+            self.tab = AppTab::Explorer;
+            if p.is_dir() {
+                self.start_folder_scan(p);
+            } else {
+                self.start_single_scan(p);
+            }
+        }
+        if loose.is_empty() {
+            return;
+        }
+        let first = {
+            let mut st = self.state.lock().unwrap();
+            let mut first = None;
+            for e in loose {
+                let idx = match st.entries.iter().position(|x| x.source_rpf == e.source_rpf && x.offset == 0) {
+                    Some(i) => i,
+                    None => {
+                        st.entries.push(e);
+                        st.entries.len() - 1
+                    }
+                };
+                first.get_or_insert(idx);
+            }
+            if !st.rpf_names.iter().any(|n| n == LOOSE_LABEL) {
+                st.rpf_names.push(LOOSE_LABEL.into());
+                st.rpf_names.sort();
+            }
+            st.ver += 1;
+            first
+        };
+        self.tab = AppTab::Explorer;
+        self.category = Category::All;
+        self.filter.clear();
+        self.selected_rpf = LOOSE_LABEL.into();
+        if let Some(i) = first {
+            self.select_entry(i);
+        }
     }
 
     fn stop_bink_player(&mut self) {
@@ -854,7 +918,7 @@ impl Rpf9App {
                 Ok((hdr, mut entries)) => {
                     let mut st = state.lock().unwrap();
                     st.header_info = hdr;
-                    st.rpf_names = vec![path.file_name().unwrap_or_default().to_string_lossy().into_owned()];
+                    st.rpf_names = vec![archive_label(&path)];
                     let n = entries.len();
                     st.entries.append(&mut entries);
                     st.ver += 1;
@@ -959,7 +1023,7 @@ impl Rpf9App {
                                     st.entries.extend(cached_entries.iter().cloned());
                                     st.ver += 1;
                                     st.file_sig.insert(p.clone(), sig);
-                                    let rname = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                                    let rname = archive_label(p);
                                     if !st.rpf_names.contains(&rname) {
                                         st.rpf_names.push(rname);
                                     }
@@ -1000,7 +1064,7 @@ impl Rpf9App {
                                 };
                                 if idx >= total { return; }
                                 let (p, sig, key) = &changed[idx];
-                                let rname = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                                let rname = archive_label(p);
                                 state.lock().unwrap().status = format!("Scanning [{}/{}] {}...", idx + 1, total, rname);
                                 if let Ok((_, new_entries)) = scan_single_rpf(p, None) {
                                     {
@@ -2140,7 +2204,9 @@ fn save_ui_state(app: &Rpf9App) {
     let Some(dir) = app_data_dir() else { return };
     let _ = fs::create_dir_all(&dir);
     let cat = CATS.iter().position(|c| *c == app.category).unwrap_or(0);
-    let _ = fs::write(dir.join("ui_state.txt"), format!("{cat}\n{}\n{}\n{}", app.vehicles_only as u8, app.selected_rpf, app.filter));
+    // loose files dropped in this session are gone on the next launch
+    let rpf = if app.selected_rpf == LOOSE_LABEL { "All RPFs" } else { app.selected_rpf.as_str() };
+    let _ = fs::write(dir.join("ui_state.txt"), format!("{cat}\n{}\n{}\n{}", app.vehicles_only as u8, rpf, app.filter));
 }
 
 fn load_ui_state(app: &mut Rpf9App) {
@@ -2245,11 +2311,56 @@ fn collect_rpfs(dir: &Path, out: &mut Vec<PathBuf>) {
             let p = entry.path();
             if ft.is_dir() {
                 collect_rpfs(&p, out);
-            } else if ft.is_file() && p.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("rpf") || s.eq_ignore_ascii_case("ttpf")).unwrap_or(false) {
+            } else if ft.is_file() && (is_loose_media_ext(&p) || p.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("rpf") || s.eq_ignore_ascii_case("ttpf")).unwrap_or(false)) {
                 out.push(p);
             }
         }
     }
+}
+
+/// Dropdown label shared by every standalone .bk2/.awc, so a folder of loose clips adds one
+/// row to the archive dropdown instead of one per file.
+const LOOSE_LABEL: &str = "Loose media files";
+
+fn is_loose_media_ext(p: &Path) -> bool {
+    p.extension().and_then(|s| s.to_str()).is_some_and(|s| s.eq_ignore_ascii_case("bk2") || s.eq_ignore_ascii_case("awc"))
+}
+
+/// Archive dropdown label for a scanned path.
+fn archive_label(p: &Path) -> String {
+    if is_loose_media_ext(p) {
+        LOOSE_LABEL.into()
+    } else {
+        p.file_name().unwrap_or_default().to_string_lossy().into_owned()
+    }
+}
+
+/// A standalone Bink 2 video or AWC sound bank (not inside an archive) as a single entry,
+/// named after the file. Detected by magic bytes, so the extension doesn't matter.
+fn loose_media_entry(path: &Path) -> Option<RpfEntry> {
+    let mut f = File::open(path).ok()?;
+    let size = f.metadata().ok()?.len();
+    let mut h = [0u8; 44];
+    f.read_exact(&mut h).ok()?;
+    let u32_at = |o: usize| u32::from_le_bytes([h[o], h[o + 1], h[o + 2], h[o + 3]]);
+    let (kind, tracks) = if &h[..4] == b"ADAT" {
+        ("AWC", u32_at(8))
+    } else if &h[..3] == b"KB2" && h[3].is_ascii_lowercase() {
+        ("BK2", u32_at(40))
+    } else {
+        return None;
+    };
+    Some(RpfEntry {
+        source_rpf: path.to_path_buf(),
+        rpf_name: LOOSE_LABEL.into(),
+        name: path.file_name()?.to_string_lossy().into_owned(),
+        kind,
+        offset: 0,
+        comp_size: size,
+        raw_size: size,
+        tracks,
+        chunks: Vec::new(),
+    })
 }
 
 fn decode_awc_for_player(e: &RpfEntry, media: &Arc<Mutex<MediaState>>) {
@@ -2665,6 +2776,12 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
         return Ok((info, entries));
     }
 
+    // standalone .bk2/.awc: one entry, no need to read the whole file
+    if let Some(e) = loose_media_entry(path) {
+        let info = format!("{}  ·  {}  ·  {}", e.kind, format_size(e.raw_size), e.name);
+        return Ok((info, vec![e]));
+    }
+
     let mut f = File::open(path)?;
     let sz = f.metadata()?.len();
     let rname = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
@@ -2868,6 +2985,26 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
 
 impl eframe::App for Rpf9App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // files dropped on the window, or opened from Finder (double-click, Open With, Dock)
+        #[allow(unused_mut)]
+        let mut incoming: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        #[cfg(target_os = "macos")]
+        incoming.extend(mac_open::take());
+        if !incoming.is_empty() {
+            self.open_paths(incoming);
+        }
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop_overlay")));
+            let rect = ctx.screen_rect();
+            painter.rect_filled(rect, 0.0, Color32::from_black_alpha(180));
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Drop to open  ·  .rpf  .ttpf  .bk2  .awc  or a folder",
+                egui::FontId::proportional(22.0),
+                Color32::from_rgb(255, 168, 28),
+            );
+        }
         self.poll_bink_player(ctx);
         let (media_loading, media_status, awc_streams) = {
             let mut m = self.media.lock().unwrap();
@@ -2943,9 +3080,14 @@ impl eframe::App for Rpf9App {
                         self.start_folder_scan(folder);
                     }
                 }
-                if ui.button("Open Archive").clicked() {
-                    if let Some(p) = rfd::FileDialog::new().add_filter("RPF / TTPF Archives", &["rpf", "ttpf"]).pick_file() {
-                        self.start_single_scan(p);
+                if ui.button("Open File...").on_hover_text("An .rpf/.ttpf archive, or standalone .bk2 videos and .awc sound banks. You can also drop files on the window.").clicked() {
+                    if let Some(ps) = rfd::FileDialog::new()
+                        .add_filter("Archives and media", &["rpf", "ttpf", "bk2", "awc"])
+                        .add_filter("RPF / TTPF archives", &["rpf", "ttpf"])
+                        .add_filter("Bink 2 video / AWC audio", &["bk2", "awc"])
+                        .pick_files()
+                    {
+                        self.open_paths(ps);
                     }
                 }
                 if ui.button("Open .OBJ").clicked() {
@@ -3817,5 +3959,10 @@ fn main() -> eframe::Result<()> {
     }
     let opts = eframe::NativeOptions { viewport: vb, ..Default::default() };
     let title = format!("PercyStar v{APP_VERSION}");
-    eframe::run_native(&title, opts, Box::new(move |cc| Ok(Box::new(Rpf9App::new(cc, logo_rgba)))))
+    // files or folders passed on the command line ("Open with", drop on the .exe); skips
+    // flags like macOS's old -psn_ launch argument
+    let open_paths: Vec<PathBuf> = args.iter().skip(1).filter(|a| !a.starts_with('-')).map(PathBuf::from).filter(|p| p.exists()).collect();
+    #[cfg(target_os = "macos")]
+    mac_open::install();
+    eframe::run_native(&title, opts, Box::new(move |cc| Ok(Box::new(Rpf9App::new(cc, logo_rgba, open_paths)))))
 }

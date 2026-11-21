@@ -52,6 +52,60 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key><string>${MACOSX_DEPLOYMENT_TARGET}</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+  <!-- Lets Finder open these with PercyStar (double-click, Open With, drop on the Dock icon).
+       Archives default to PercyStar; .bk2/.awc are Alternate so an installed Bink Player or
+       audio tool keeps the default. -->
+  <key>UTImportedTypeDeclarations</key>
+  <array>
+    <dict>
+      <key>UTTypeIdentifier</key><string>dev.rpatty.percystar.rpf</string>
+      <key>UTTypeDescription</key><string>RAGE Package File</string>
+      <key>UTTypeConformsTo</key><array><string>public.data</string></array>
+      <key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array><string>rpf</string></array></dict>
+    </dict>
+    <dict>
+      <key>UTTypeIdentifier</key><string>dev.rpatty.percystar.ttpf</string>
+      <key>UTTypeDescription</key><string>RAGE Texture Pack</string>
+      <key>UTTypeConformsTo</key><array><string>public.data</string></array>
+      <key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array><string>ttpf</string></array></dict>
+    </dict>
+    <dict>
+      <key>UTTypeIdentifier</key><string>com.radgametools.bink2</string>
+      <key>UTTypeDescription</key><string>Bink 2 Video</string>
+      <key>UTTypeConformsTo</key><array><string>public.movie</string><string>public.data</string></array>
+      <key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array><string>bk2</string></array></dict>
+    </dict>
+    <dict>
+      <key>UTTypeIdentifier</key><string>dev.rpatty.percystar.awc</string>
+      <key>UTTypeDescription</key><string>RAGE Audio Wave Container</string>
+      <key>UTTypeConformsTo</key><array><string>public.audio</string><string>public.data</string></array>
+      <key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array><string>awc</string></array></dict>
+    </dict>
+  </array>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key><string>RAGE Archive</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Default</string>
+      <key>CFBundleTypeExtensions</key><array><string>rpf</string><string>ttpf</string></array>
+      <key>LSItemContentTypes</key><array><string>dev.rpatty.percystar.rpf</string><string>dev.rpatty.percystar.ttpf</string></array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key><string>Bink 2 Video</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>CFBundleTypeExtensions</key><array><string>bk2</string></array>
+      <key>LSItemContentTypes</key><array><string>com.radgametools.bink2</string></array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key><string>RAGE Audio</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>CFBundleTypeExtensions</key><array><string>awc</string></array>
+      <key>LSItemContentTypes</key><array><string>dev.rpatty.percystar.awc</string></array>
+    </dict>
+  </array>
 </dict>
 </plist>
 PLIST
