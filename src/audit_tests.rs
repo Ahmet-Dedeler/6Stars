@@ -1,4 +1,4 @@
-//! Opt-in format coverage audit over a real game dump.
+//! Opt-in format coverage audit over a scan of your own archives.
 //!
 //! Samples entries of every kind from the 6Stars scan cache and runs the same decoder the
 //! UI uses on selection, reporting how many succeed per kind plus example failures.

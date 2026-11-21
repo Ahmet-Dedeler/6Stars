@@ -533,7 +533,7 @@ pub fn extract_rage9_model_name(v: &[u8]) -> Option<(String, &'static str)> {
         }
         i += 1;
     }
-    // Fallback: RAGE9 gtaDrawable name pointer at +0xa8 (catches 3,000+ models without .#dr suffix!)
+    // Fallback: RAGE9 drawable name pointer at +0xa8 (catches 3,000+ models without .#dr suffix!)
     if v.len() >= 0xb0 {
         if let Some(no) = vptr(ru64(v, 0xa8)) {
             if no < v.len() {
@@ -678,7 +678,7 @@ fn resolve_meshlet_buffer(v: &[u8], link_ptr: u64) -> Option<(usize, usize)> {
 /// One meshlet geometry: (vertex buffer phys offset, vertex buffer bytes, meshlet buffer phys offset, meshlet buffer bytes).
 type GeomRef = (usize, usize, usize, usize);
 
-/// LOD0 (high detail) meshlet geometries of the gtaDrawable at `base`.
+/// LOD0 (high detail) meshlet geometries of the drawable at `base`.
 fn drawable_lod0_geoms(v: &[u8], base: usize) -> Vec<GeomRef> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -930,7 +930,7 @@ fn resolve_drawable_materials(
 }
 
 /// One drawable inside a decoded resource. Plain drawables have a single part;
-/// drawable dictionaries (pgDictionary<gtaDrawable>) have one per entry.
+/// drawable dictionaries (pgDictionary<drawable>) have one per entry.
 #[derive(Clone)]
 pub struct MeshPart {
     pub name: String,
@@ -942,7 +942,7 @@ pub struct MeshPart {
 /// Detects a RAGE9 drawable dictionary root and returns `(name, drawable_offset)` per entry.
 ///
 /// Layout (pgDictionary): +0x20 hash array {ptr, u16 count}, +0x30 drawable ptr array
-/// {ptr, u16 count}. Each entry is an independent gtaDrawable modelled around its own
+/// {ptr, u16 count}. Each entry is an independent drawable modelled around its own
 /// origin, so entries must NOT be merged into one mesh (that stacks them on top of each
 /// other). Map placement lives in ymap entities, which this resource does not carry.
 fn drawable_dictionary_entries(v: &[u8]) -> Vec<(String, usize)> {
@@ -2017,7 +2017,7 @@ mod dictionary_decode_tests {
     /// Regression for bk_02_road_str_slod.#dr (levels.rpf, Xbox build): a drawable dictionary
     /// of 8 Brickell SLOD blocks that used to render stacked at the origin, with towers on
     /// their side because the +0x6C position axis mode was ignored. Runs only when
-    /// PERCYSTAR_LEVELS_RPF points at levels.rpf from the Xbox v1.0.2.1 dump.
+    /// PERCYSTAR_LEVELS_RPF points at a levels.rpf you supply.
     #[test]
     fn brickell_slod_dictionary_splits_and_stands_upright() {
         let Ok(rpf) = std::env::var("PERCYSTAR_LEVELS_RPF") else { return };
