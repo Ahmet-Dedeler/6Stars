@@ -126,9 +126,10 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
     let Ok(event_loop) = EventLoop::builder().build() else {
         return;
     };
-    let (tx, rx) = mpsc::sync_channel(24);
+    let (tx, rx) = mpsc::sync_channel(16);
+    let cam_track = Arc::new(std::sync::Mutex::new((Vec3::from_array(cfg.start_pos), 1u64)));
+    let cam_track_bg = Arc::clone(&cam_track);
     if let Some(lp) = cfg.levels_rpf.clone() {
-        let start = cfg.start_pos;
         std::thread::spawn(move || {
             // 1. fast-load brickell slod city blocks immediately
             if let Ok(mesh) = crate::model3d::decode_rage9_model_from_rpf(&lp, 8_679_358_480, "brickell_slod") {
@@ -137,35 +138,31 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
                     instances: vec![(Vec3::ZERO, Quat::IDENTITY, Vec3::ONE, [1.0; 4])],
                 }));
             }
-            // 2. build/load cached 0DRPz map placements + model index and stream all levels nearest-first
+            // 2. build/load cached 0DRPz map placements + model index
             eprintln!("[world-gpu] loading/building world index from {}", lp.display());
             let ix = crate::mapdata::build_or_load_world_index(&lp);
             eprintln!("[world-gpu] index ready: {} maps, {} models, {} entities", ix.map_count, ix.models.len(), ix.entities.len());
             let _ = tx.send(WorldStreamMsg::MapCount(ix.map_count));
-            let mut arch_groups: Vec<(u32, u64, f32, Vec<(Vec3, Quat, Vec3, [f32; 4])>)> = Vec::new();
-            let mut grouped: HashMap<u32, (f32, Vec<(Vec3, Quat, Vec3, [f32; 4])>)> = HashMap::new();
+
+            let mut grouped: HashMap<u32, (Vec3, Vec<(Vec3, Quat, Vec3, [f32; 4])>)> = HashMap::new();
             let mut box_insts: Vec<(Vec3, Quat, Vec3, [f32; 4])> = Vec::new();
+            let start = cam_track_bg.lock().unwrap().0;
             for e in &ix.entities {
-                let dx = e.pos[0] - start[0];
-                let dy = e.pos[1] - start[1];
-                let d2 = dx * dx + dy * dy;
+                let p = Vec3::from_array(e.pos);
                 let q = Quat::from_xyzw(e.rot[0], e.rot[1], e.rot[2], e.rot[3]).normalize();
                 if !ix.models.contains_key(&e.archetype_hash) {
-                    if d2 <= 2200.0 * 2200.0 && box_insts.len() < 12_000 {
+                    if p.distance_squared(start) <= 2200.0 * 2200.0 && box_insts.len() < 12_000 {
                         let h = e.archetype_hash;
                         let r = 0.45 + ((h & 0xFF) as f32 / 255.0) * 0.45;
                         let g = 0.45 + (((h >> 8) & 0xFF) as f32 / 255.0) * 0.45;
                         let b = 0.50 + (((h >> 16) & 0xFF) as f32 / 255.0) * 0.45;
-                        box_insts.push((Vec3::from_array(e.pos), q, Vec3::new(14.0 * e.scale_xy, 14.0 * e.scale_xy, 18.0 * e.scale_z), [r, g, b, 1.0]));
+                        box_insts.push((p, q, Vec3::new(14.0 * e.scale_xy, 14.0 * e.scale_xy, 18.0 * e.scale_z), [r, g, b, 1.0]));
                     }
                     continue;
                 }
                 let sc = Vec3::new(e.scale_xy, e.scale_xy, e.scale_z);
-                let entry = grouped.entry(e.archetype_hash).or_insert_with(|| (d2, Vec::new()));
-                if d2 < entry.0 {
-                    entry.0 = d2;
-                }
-                entry.1.push((Vec3::from_array(e.pos), q, sc, [1.0; 4]));
+                let entry = grouped.entry(e.archetype_hash).or_insert_with(|| (p, Vec::new()));
+                entry.1.push((p, q, sc, [1.0; 4]));
             }
             if !box_insts.is_empty() {
                 let bmesh = Mesh3D::from_parts(
@@ -190,48 +187,85 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
                 );
                 let _ = tx.send(WorldStreamMsg::Batch(WorldBatchInput { mesh: bmesh, instances: box_insts }));
             }
-            for (h, (d2, insts)) in grouped {
-                if let Some(&moff) = ix.models.get(&h) {
-                    arch_groups.push((h, moff, d2, insts));
+
+            let all_groups: Vec<(u32, u64, Vec3, Vec<(Vec3, Quat, Vec3, [f32; 4])>)> = grouped
+                .into_iter()
+                .filter_map(|(h, (rep, insts))| ix.models.get(&h).map(|&moff| (h, moff, rep, insts)))
+                .collect();
+            eprintln!("[world-gpu] {} unique drawable archetypes indexed for live camera streaming", all_groups.len());
+
+            let mut loaded = std::collections::HashSet::<u32>::new();
+            let mut last_gen = 0u64;
+            let mut total_sent = 0usize;
+            loop {
+                let (cam_p, cur_gen) = *cam_track_bg.lock().unwrap();
+                if cur_gen == last_gen {
+                    std::thread::sleep(std::time::Duration::from_millis(80));
+                    continue;
                 }
-            }
-            eprintln!("[world-gpu] matched {} unique drawable archetypes to stream", arch_groups.len());
-            arch_groups.sort_by(|a, b| a.2.total_cmp(&b.2));
-            let stream_cap = arch_groups.len().min(3000);
-            let _ = tx.send(WorldStreamMsg::TotalArchetypes(stream_cap));
-            let groups = Arc::new(arch_groups);
-            let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let n_workers = 3usize;
-            std::thread::scope(|s| {
-                for _ in 0..n_workers {
-                    let groups = Arc::clone(&groups);
-                    let cursor = Arc::clone(&cursor);
-                    let tx = tx.clone();
-                    let lp = lp.clone();
-                    s.spawn(move || loop {
-                        let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if i >= stream_cap {
-                            break;
-                        }
-                        let (h, moff, _, ref insts) = groups[i];
-                        if let Ok(mesh) = crate::model3d::decode_rage9_model_from_rpf(&lp, moff, &format!("arch_{h:08x}")) {
-                            let lo = mesh.name.to_ascii_lowercase();
-                            if !(lo.ends_with("_shadow") || lo.ends_with("_pxy") || lo.ends_with("_lit_proxy")) {
-                                if tx.send(WorldStreamMsg::Batch(WorldBatchInput { mesh, instances: insts.clone() })).is_err() {
-                                    break;
+                last_gen = cur_gen;
+                let mut nearby: Vec<(usize, f32)> = all_groups
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (h, _, _, _))| !loaded.contains(h))
+                    .filter_map(|(idx, (_, _, _, insts))| {
+                        let d2 = insts.iter().map(|i| i.0.distance_squared(cam_p)).fold(f32::MAX, f32::min);
+                        (d2 <= 3200.0 * 3200.0).then_some((idx, d2))
+                    })
+                    .collect();
+                if nearby.is_empty() {
+                    continue;
+                }
+                nearby.sort_by(|a, b| a.1.total_cmp(&b.1));
+                let take_n = nearby.len().min(if total_sent == 0 { 1200 } else { 500 });
+                let batch_list: Vec<(u32, u64, Vec<(Vec3, Quat, Vec3, [f32; 4])>)> = nearby
+                    .into_iter()
+                    .take(take_n)
+                    .map(|(idx, _)| {
+                        let (h, moff, _, ref insts) = all_groups[idx];
+                        loaded.insert(h);
+                        (h, moff, insts.clone())
+                    })
+                    .collect();
+                total_sent += batch_list.len();
+                let _ = tx.send(WorldStreamMsg::TotalArchetypes(total_sent));
+                let groups = Arc::new(batch_list);
+                let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                std::thread::scope(|s| {
+                    for _ in 0..3 {
+                        let groups = Arc::clone(&groups);
+                        let cursor = Arc::clone(&cursor);
+                        let tx = tx.clone();
+                        let lp = lp.clone();
+                        let cam_track_bg = Arc::clone(&cam_track_bg);
+                        s.spawn(move || loop {
+                            if cam_track_bg.lock().unwrap().1 != last_gen {
+                                break;
+                            }
+                            let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if i >= groups.len() {
+                                break;
+                            }
+                            let (h, moff, ref insts) = groups[i];
+                            if let Ok(mesh) = crate::model3d::decode_rage9_model_from_rpf(&lp, moff, &format!("arch_{h:08x}")) {
+                                let lo = mesh.name.to_ascii_lowercase();
+                                if !(lo.ends_with("_shadow") || lo.ends_with("_pxy") || lo.ends_with("_lit_proxy")) {
+                                    if tx.send(WorldStreamMsg::Batch(WorldBatchInput { mesh, instances: insts.clone() })).is_err() {
+                                        break;
+                                    }
                                 }
                             }
-                        }
-                        if tx.send(WorldStreamMsg::ArchetypeDone).is_err() {
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                    });
-                }
-            });
+                            if tx.send(WorldStreamMsg::ArchetypeDone).is_err() {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        });
+                    }
+                });
+            }
         });
     }
-    let mut app = GpuWorldApp::new(cfg, rx);
+    let mut app = GpuWorldApp::new(cfg, rx, cam_track);
     let _ = event_loop.run_app(&mut app);
 }
 
@@ -1144,6 +1178,8 @@ struct GpuWorldApp {
     cfg: Option<WorldLaunchConfig>,
     terrain_ref: Option<Arc<WorldMapData>>,
     stream_rx: Receiver<WorldStreamMsg>,
+    cam_track: Arc<std::sync::Mutex<(Vec3, u64)>>,
+    last_stream_cam: Vec3,
     gpu: Option<GpuState>,
     egui_ctx: eframe::egui::Context,
     egui_events: Vec<eframe::egui::Event>,
@@ -1169,12 +1205,14 @@ struct GpuWorldApp {
 }
 
 impl GpuWorldApp {
-    fn new(cfg: WorldLaunchConfig, stream_rx: Receiver<WorldStreamMsg>) -> Self {
+    fn new(cfg: WorldLaunchConfig, stream_rx: Receiver<WorldStreamMsg>, cam_track: Arc<std::sync::Mutex<(Vec3, u64)>>) -> Self {
         Self {
             cam_pos: Vec3::from_array(cfg.start_pos),
+            last_stream_cam: Vec3::from_array(cfg.start_pos),
             terrain_ref: cfg.terrain.clone(),
             cfg: Some(cfg),
             stream_rx,
+            cam_track,
             gpu: None,
             egui_ctx: eframe::egui::Context::default(),
             egui_events: Vec::new(),
@@ -1362,6 +1400,14 @@ impl ApplicationHandler for GpuWorldApp {
                 } else {
                     if self.keys[5] { self.cam_pos.z += speed; }
                     if self.keys[4] { self.cam_pos.z -= speed; }
+                }
+
+                if self.cam_pos.distance_squared(self.last_stream_cam) > 180.0 * 180.0 {
+                    self.last_stream_cam = self.cam_pos;
+                    if let Ok(mut ct) = self.cam_track.lock() {
+                        ct.0 = self.cam_pos;
+                        ct.1 += 1;
+                    }
                 }
 
                 let Some(g) = &mut self.gpu else { return };

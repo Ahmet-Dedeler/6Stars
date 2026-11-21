@@ -15,6 +15,7 @@ const KNOWN_NAMES: &[&str] = &[
     "x", "y", "z", "w", "r", "g", "b", "a",
     "CMapData", "CMapTypes", "CEntityDef", "CBaseArchetypeDef", "CMloArchetypeDef",
     "CMloRoomDef", "CMloPortalDef", "CMloEntitySet", "CMloInstanceDef", "fwEntityDef",
+    "rage__fwPropInstanceListDef",
     "entities", "archetypeName", "position", "rotation", "scaleXY", "scaleZ",
     "rooms", "portals", "entitySets", "attachedObjects", "flags", "lodDist", "childLodDist",
     "parentIndex", "numChildren", "roomIndex", "entitySet",
