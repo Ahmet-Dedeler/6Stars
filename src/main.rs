@@ -128,12 +128,14 @@ enum ModelCat {
     Animals,
     Props,
     World,
+    /// No naming rule matched. Kept out of World / Map so that category only holds known map assets.
+    Other,
     NavMesh,
 }
 
-const MODEL_CATS: [(ModelCat, &str); 10] = [
+const MODEL_CATS: [(ModelCat, &str); 11] = [
     (ModelCat::All, "All Models"),
-    (ModelCat::Vehicles, "Vehicles"),
+    (ModelCat::Vehicles, "Vehicles & Parts"),
     (ModelCat::AircraftBoats, "Air & Sea"),
     (ModelCat::Weapons, "Weapons"),
     (ModelCat::Characters, "Characters"),
@@ -141,6 +143,7 @@ const MODEL_CATS: [(ModelCat, &str); 10] = [
     (ModelCat::Animals, "Animals"),
     (ModelCat::Props, "Props & Items"),
     (ModelCat::World, "World / Map"),
+    (ModelCat::Other, "Uncategorized"),
     (ModelCat::NavMesh, "NavMesh 3D"),
 ];
 
@@ -155,7 +158,8 @@ fn model_cat_idx(c: ModelCat) -> usize {
         ModelCat::Animals => 6,
         ModelCat::Props => 7,
         ModelCat::World => 8,
-        ModelCat::NavMesh => 9,
+        ModelCat::Other => 9,
+        ModelCat::NavMesh => 10,
     }
 }
 
@@ -169,6 +173,7 @@ fn model_cat_tag(c: ModelCat) -> (&'static str, Color32) {
         ModelCat::Animals => ("ANM", Color32::from_rgb(95, 235, 145)),
         ModelCat::Props => ("PRP", Color32::from_rgb(130, 185, 255)),
         ModelCat::World => ("WLD", Color32::from_rgb(160, 170, 190)),
+        ModelCat::Other => ("???", Color32::from_rgb(140, 140, 150)),
         ModelCat::NavMesh => ("NAV", Color32::from_rgb(125, 235, 110)),
         ModelCat::All => ("MDL", Color32::from_rgb(180, 185, 200)),
     }
@@ -350,7 +355,7 @@ fn classify_model_cat(kind: &str, name: &str) -> ModelCat {
         return ModelCat::Props;
     }
 
-    ModelCat::World
+    ModelCat::Other
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -610,7 +615,7 @@ struct Rpf9App {
     mv_detail_index: Option<DetailIndex>,
     mv_detail_job: Option<mpsc::Receiver<DetailIndex>>,
     mv_entries: Vec<(usize, ModelCat, String)>,
-    mv_counts: [usize; 10],
+    mv_counts: [usize; 11],
     mv_ver: u64,
     mv_view: Vec<usize>,
     mv_view_key: Option<(u64, ModelCat, String, bool, bool)>,
@@ -685,7 +690,7 @@ impl Rpf9App {
             mv_detail_index: None,
             mv_detail_job: None,
             mv_entries: Vec::new(),
-            mv_counts: [0; 10],
+            mv_counts: [0; 11],
             mv_ver: u64::MAX,
             mv_view: Vec::new(),
             mv_view_key: None,
@@ -1409,7 +1414,7 @@ impl Rpf9App {
         if self.mv_ver != ver {
             let st = self.state.lock().unwrap();
             let mut entries = Vec::new();
-            let mut counts = [0usize; 10];
+            let mut counts = [0usize; 11];
             for (idx, e) in st.entries.iter().enumerate() {
                 if !matches!(e.kind, "MODEL" | "VEH" | "NAVM") {
                     continue;
@@ -1559,7 +1564,7 @@ impl Rpf9App {
                     ui.label(RichText::new("MODEL VIEWER").size(12.0).strong().color(Color32::from_rgb(255, 168, 28)));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
-                            RichText::new(format!("{} shown · {} total", self.mv_view.len(), self.mv_counts[0]))
+                            RichText::new(format!("{} shown · {} in category", self.mv_view.len(), self.mv_counts[model_cat_idx(self.mv_cat)]))
                                 .size(11.0)
                                 .color(Color32::from_rgb(155, 145, 180)),
                         );
@@ -3458,6 +3463,40 @@ mod tests {
         ];
         let replacements = lower_detail_variants(HashMap::from([(PathBuf::from(path), groups)]));
         assert_eq!(replacements, HashMap::from([(0, 1), (2, 1), (3, 4), (5, 4)]));
+    }
+
+    #[test]
+    fn loose_media_files_become_single_entries() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let mut bk2 = [0u8; 64];
+        bk2[..4].copy_from_slice(b"KB2n");
+        bk2[40..44].copy_from_slice(&1u32.to_le_bytes());
+        let vp = dir.path().join("intro clip.bk2");
+        File::create(&vp).unwrap().write_all(&bk2).unwrap();
+        let v = loose_media_entry(&vp).unwrap();
+        assert_eq!((v.kind, v.name.as_str(), v.offset, v.comp_size, v.tracks), ("BK2", "intro clip.bk2", 0, 64, 1));
+        assert_eq!(v.rpf_name, archive_label(&vp));
+
+        let mut awc = [0u8; 64];
+        awc[..4].copy_from_slice(b"ADAT");
+        awc[8..12].copy_from_slice(&3u32.to_le_bytes());
+        // extension doesn't matter, the magic does
+        let ap = dir.path().join("bank.dat");
+        File::create(&ap).unwrap().write_all(&awc).unwrap();
+        let a = loose_media_entry(&ap).unwrap();
+        assert_eq!((a.kind, a.tracks), ("AWC", 3));
+        assert_eq!(scan_single_rpf(&ap, None).unwrap().1.len(), 1);
+
+        let rp = dir.path().join("x.rpf");
+        File::create(&rp).unwrap().write_all(&[0u8; 64]).unwrap();
+        assert!(loose_media_entry(&rp).is_none());
+        assert_eq!(archive_label(&rp), "x.rpf");
+    }
+
+    #[test]
+    fn unmatched_model_names_are_uncategorized() {
+        assert_eq!(classify_model_cat("MODEL", "zz_mystery_thing.#dr"), ModelCat::Other);
     }
 
     #[test]
