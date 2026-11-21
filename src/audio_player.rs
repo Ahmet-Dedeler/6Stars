@@ -698,6 +698,12 @@ pub fn render_awc_audio_view(
             player.seek_by_secs(-5.0);
         } else if player.active_idx.is_some() && ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
             player.seek_by_secs(5.0);
+        } else if ctx.input(|i| i.key_pressed(egui::Key::N)) {
+            let next = player.active_idx.map_or(0, |idx| (idx + 1).min(player.tracks.len() - 1));
+            player.play_track(next, 0);
+        } else if ctx.input(|i| i.key_pressed(egui::Key::P)) {
+            let prev = player.active_idx.map_or(0, |idx| idx.saturating_sub(1));
+            player.play_track(prev, 0);
         }
     }
 

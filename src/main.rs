@@ -67,6 +67,8 @@ extern "system" {
     fn SetParent(hWndChild: isize, hWndNewParent: isize) -> isize;
     fn MoveWindow(hWnd: isize, X: i32, Y: i32, nWidth: i32, nHeight: i32, bRepaint: i32) -> i32;
     fn GetActiveWindow() -> isize;
+    fn SetFocus(hWnd: isize) -> isize;
+    fn SetForegroundWindow(hWnd: isize) -> i32;
     fn GetWindowLongW(hWnd: isize, nIndex: i32) -> i32;
     fn SetWindowLongW(hWnd: isize, nIndex: i32, dwNewLong: i32) -> i32;
 }
@@ -105,6 +107,8 @@ pub fn dock_child_hwnd(child_hwnd: isize, parent_hwnd: isize, x: i32, y: i32, w:
         SetWindowLongW(child_hwnd, GWL_STYLE, (style & !WS_POPUP & !WS_CAPTION & !WS_THICKFRAME) | WS_CHILD);
         SetParent(child_hwnd, parent_hwnd);
         MoveWindow(child_hwnd, x, y, w.max(64), h.max(64), 1);
+        SetForegroundWindow(parent_hwnd);
+        SetFocus(parent_hwnd);
     }
 }
 
@@ -3851,7 +3855,7 @@ impl eframe::App for Rpf9App {
                 ui.add_space(4.0);
             }
             self.refresh_view();
-            if !ctx.wants_keyboard_input() && !self.view.is_empty() && self.audio_player.tracks.is_empty() {
+            if !ctx.wants_keyboard_input() && !self.view.is_empty() {
                 let cur_pos = self.selected.and_then(|sel| self.view.iter().position(|&i| i == sel));
                 let allow_wasd = !self.show_3d;
                 let step_to: Option<usize> = ctx.input(|i| {
