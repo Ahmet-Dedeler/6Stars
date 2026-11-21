@@ -44,7 +44,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-const REPO_RELEASES_URL: &str = "https://github.com/Ahmet-Dedeler/6Stars/releases";
+const REPO_RELEASES_URL: &str = "https://github.com/Ahmet-Dedeler/Percy6Stars/releases";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -514,11 +514,11 @@ fn spawn_install_update(ver: String, upd: Arc<Mutex<UpdateState>>, ctx: egui::Co
     ctx.request_repaint();
     std::thread::spawn(move || {
         let res: Result<(), String> = (|| {
-            let tmp = std::env::temp_dir().join("6stars_self_update");
+            let tmp = std::env::temp_dir().join("percy6stars_self_update");
             let _ = fs::remove_dir_all(&tmp);
             fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
             let zip_p = tmp.join("update.zip");
-            let dl_url = format!("{REPO_RELEASES_URL}/download/v{ver}/6Stars_v{ver}_Win64.zip");
+            let dl_url = format!("{REPO_RELEASES_URL}/download/v{ver}/Percy6Stars_v{ver}_Win64.zip");
             let dl = silent_cmd("curl.exe")
                 .args(["-fsSL", "-o", zip_p.to_str().ok_or("bad zip path")?, &dl_url])
                 .output()
@@ -545,8 +545,8 @@ fn spawn_install_update(ver: String, upd: Arc<Mutex<UpdateState>>, ctx: egui::Co
                 return Err("Archive extraction failed".into());
             }
 
-            let new_exe = tmp.join("6Stars.exe");
-            let head = fs::read(&new_exe).map_err(|_| "6Stars.exe missing in release zip".to_string())?;
+            let new_exe = tmp.join("Percy6Stars.exe");
+            let head = fs::read(&new_exe).map_err(|_| "Percy6Stars.exe missing in release zip".to_string())?;
             if head.len() < 100_000 || !head.starts_with(b"MZ") {
                 return Err("Downloaded binary looks invalid".into());
             }
@@ -1310,7 +1310,7 @@ impl Rpf9App {
             #[cfg(not(target_os = "macos"))]
             let decoder = bink_dock::player_path();
             let Some(decoder) = decoder else {
-                m.status = "No video decoder in this build. Open the packaged 6Stars build.".into();
+                m.status = "No video decoder in this build. Open the packaged Percy6Stars build.".into();
                 return;
             };
             match video_clip::PendingClip::prepare(e.source_rpf, e.offset, e.comp_size) {
@@ -2266,11 +2266,14 @@ fn app_data_dir() -> Option<PathBuf> {
     } else {
         std::env::var("HOME").ok().map(|d| PathBuf::from(d).join(".local/share"))
     }?;
-    let dir = base.join("6Stars");
-    // the app used to be called PercyStar: carry the old folder over once so the scan cache survives
-    let old = base.join("PercyStar");
-    if !dir.exists() && old.is_dir() {
-        let _ = fs::rename(&old, &dir);
+    let dir = base.join("Percy6Stars");
+    // the app used to be called 6Stars and before that PercyStar: carry the newest old folder
+    // over once so the scan cache survives
+    for old in ["6Stars", "PercyStar"] {
+        let old = base.join(old);
+        if !dir.exists() && old.is_dir() {
+            let _ = fs::rename(&old, &dir);
+        }
     }
     Some(dir)
 }
@@ -2445,8 +2448,8 @@ fn clean_stale_temp_dirs() {
     for e in rd.flatten() {
         let name = e.file_name();
         let name = name.to_string_lossy();
-        // percystar-* are left by builds from before the rename
-        if !["6stars-video-", "6stars-audio-", "percystar-video-", "percystar-audio-"].iter().any(|p| name.starts_with(p)) {
+        // 6stars-* and percystar-* are left by builds from before the renames
+        if !["percy6stars-video-", "percy6stars-audio-", "6stars-video-", "6stars-audio-", "percystar-video-", "percystar-audio-"].iter().any(|p| name.starts_with(p)) {
             continue;
         }
         let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > Duration::from_secs(3600));
@@ -2503,7 +2506,7 @@ fn loose_media_entry(path: &Path) -> Option<RpfEntry> {
 
 fn decode_awc_for_player(e: &RpfEntry, media: &Arc<Mutex<MediaState>>) {
     let result = (|| -> std::io::Result<_> {
-        let tmp = tempfile::Builder::new().prefix("6stars-audio-").tempdir()?;
+        let tmp = tempfile::Builder::new().prefix("percy6stars-audio-").tempdir()?;
         let bytes = read_entry_bytes(e)?;
         let wavs = awc::decode_awc_bytes_to_wavs(&bytes, tmp.path(), "stream");
         Ok((tmp, wavs))
@@ -3536,7 +3539,7 @@ impl eframe::App for Rpf9App {
                     .resizable(false)
                     .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                     .show(ctx, |ui| {
-                        ui.label(RichText::new(format!("6Stars v{new_ver} is ready!")).size(15.0).strong().color(Color32::from_rgb(255, 168, 28)));
+                        ui.label(RichText::new(format!("Percy6Stars v{new_ver} is ready!")).size(15.0).strong().color(Color32::from_rgb(255, 168, 28)));
                         ui.label(RichText::new(format!("Installed: v{APP_VERSION}  ->  Latest: v{new_ver}")).color(Color32::from_rgb(200, 190, 220)));
                         ui.add_space(8.0);
                         if !upd_status.is_empty() {
@@ -4158,7 +4161,7 @@ fn main() -> eframe::Result<()> {
         vb = vb.with_icon(egui::IconData { rgba: raw.clone(), width: w, height: h });
     }
     let opts = eframe::NativeOptions { viewport: vb, ..Default::default() };
-    let title = format!("6Stars v{APP_VERSION}");
+    let title = format!("Percy6Stars v{APP_VERSION}");
     // files or folders passed on the command line ("Open with", drop on the .exe); skips
     // flags like macOS's old -psn_ launch argument
     let open_paths: Vec<PathBuf> = args.iter().skip(1).filter(|a| !a.starts_with('-')).map(PathBuf::from).filter(|p| p.exists()).collect();

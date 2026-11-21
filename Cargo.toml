@@ -4,7 +4,7 @@ version = "1.6.1"
 edition = "2021"
 
 [[bin]]
-name = "6Stars"
+name = "Percy6Stars"
 path = "src/main.rs"
 
 [dependencies]

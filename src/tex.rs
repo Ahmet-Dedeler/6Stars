@@ -1316,7 +1316,7 @@ fn ttpf_mip0_guesses(d: &TtpfTexMeta, is_bc: bool, bpe: usize) -> Vec<Mip0Guess>
         let (a1, b1) = l.span(1);
         Mip0Guess { label, off: d.byte_off + a, len: (b - a) as usize, use_64k: l.use_64k, mip1: Some((d.byte_off + a1, b1 - a1, l.clone())), layout: Some(l) }
     };
-    // Baseline first: what 6Stars decoded before guesses were compared. Tiny textures whose
+    // Baseline first: what Percy6Stars decoded before guesses were compared. Tiny textures whose
     // mip 0 sits inside the shared tail block are read from the tail (reading the block's
     // origin shows an empty mask); everything else uses the original allocation guess.
     if ext.mips[0].tail_origin.is_some() && ext.block_bytes <= d.alloc_sz {
@@ -1662,7 +1662,7 @@ pub fn inspect_gfx(data: &[u8]) -> String {
 }
 
 /// Fast snippet extractor for naming `0DRPz` / standalone text chunks in the archive list
-/// so users can Ctrl+F radio artists, weapons, vehicles, or dialogue directly in 6Stars.
+/// so users can Ctrl+F radio artists, weapons, vehicles, or dialogue directly in Percy6Stars.
 pub fn probe_gxt_snippet(head: &[u8]) -> Option<String> {
     let is_0drpz = head.len() >= 24 && &head[16..21] == b"0DRPz";
     let start = if is_0drpz { 0x60.min(head.len()) } else { 0 };

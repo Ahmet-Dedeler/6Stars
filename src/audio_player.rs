@@ -237,7 +237,7 @@ mod tests {
         b.extend_from_slice(b"data");
         b.extend_from_slice(&(data.len() as u32).to_le_bytes());
         b.extend_from_slice(&data);
-        let p = std::env::temp_dir().join("6stars_wavinfo_test.wav");
+        let p = std::env::temp_dir().join("percy6stars_wavinfo_test.wav");
         fs::write(&p, &b).unwrap();
         let w = WavInfo::read(&p).unwrap();
         let _ = fs::remove_file(&p);

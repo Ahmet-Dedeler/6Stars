@@ -2,7 +2,7 @@
 # Packages just the decoder and MIT-licensed frame bridge for local Mac builds.
 set -euo pipefail
 
-app="${1:?6Stars.app path required}"
+app="${1:?Percy6Stars.app path required}"
 cache="${CARGO_TARGET_DIR:-target}/bink-macos"
 rad_url=https://www.radgametools.com/down/Bink/BinkMacArmPlayer.dmg
 rad_sha=a9496ed44219b2a061cf542bd7c4d565f29d117c8cbe143c85e8901d7b295966

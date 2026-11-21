@@ -132,7 +132,7 @@ impl BinkDock {
             }
         } else if let Some(child) = win::player_window(self.child.id()) {
             let Ok(RawWindowHandle::Win32(parent)) = frame.window_handle().map(|h| h.as_raw()) else {
-                return Err("Could not find the 6Stars window to dock video".into());
+                return Err("Could not find the Percy6Stars window to dock video".into());
             };
             if !win::dock_window(child, parent.hwnd.get()) {
                 return Err("Windows could not dock the Bink player window".into());

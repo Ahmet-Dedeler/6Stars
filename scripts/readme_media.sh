@@ -4,11 +4,11 @@
 #   bash scripts/readme_media.sh
 #
 # 1. generates the sample models/textures (scripts/demo_data.py)
-# 2. records the real 6Stars UI offscreen (src/demo_capture.rs, no window, no sound)
+# 2. records the real Percy6Stars UI offscreen (src/demo_capture.rs, no window, no sound)
 # 3. encodes animated WebPs, a still and a short MP4 into assets/
 set -euo pipefail
 cd "$(dirname "$0")/.."
-WORK="${SIXSTARS_DEMO_WORK:-${TMPDIR:-/tmp}/6stars-readme-media}"
+WORK="${SIXSTARS_DEMO_WORK:-${TMPDIR:-/tmp}/percy6stars-readme-media}"
 mkdir -p "$WORK"
 if [ -z "${SKIP_RECORD:-}" ]; then
 uv run -q scripts/demo_data.py "$WORK/data"

@@ -1,6 +1,6 @@
 //! Opt-in format coverage audit over a scan of your own archives.
 //!
-//! Samples entries of every kind from the 6Stars scan cache and runs the same decoder the
+//! Samples entries of every kind from the Percy6Stars scan cache and runs the same decoder the
 //! UI uses on selection, reporting how many succeed per kind plus example failures.
 //!
 //!   PERCYSTAR_AUDIT=1 cargo test --release format_audit -- --ignored --nocapture
@@ -61,7 +61,7 @@ fn format_audit() {
             by_kind.entry(e.kind).or_default().push(e);
         }
     }
-    let tmp = std::env::temp_dir().join("6stars_audit");
+    let tmp = std::env::temp_dir().join("percy6stars_audit");
     let _ = fs::create_dir_all(&tmp);
     for (kind, list) in &by_kind {
         let step = (list.len() / per_kind).max(1);

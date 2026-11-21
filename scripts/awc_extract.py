@@ -82,7 +82,7 @@ def extract_awc(awc_path: str, out_dir: str) -> list[str]:
         wav_p = os.path.join(out_dir, f"{base}_s{idx:02d}.wav")
         serial = 0x50530001 + idx
         opus_head = struct.pack("<8sBBHIhB", b"OpusHead", 1, 1, 0, 48000, 0, 0)
-        opus_tags = b"OpusTags" + struct.pack("<I", 6) + b"6Stars" + struct.pack("<I", 0)
+        opus_tags = b"OpusTags" + struct.pack("<I", 6) + b"Percy6Stars" + struct.pack("<I", 0)
         ogg = bytearray()
         ogg.extend(ogg_page(serial, 0, 2, 0, [opus_head]))
         ogg.extend(ogg_page(serial, 1, 0, 0, [opus_tags]))
