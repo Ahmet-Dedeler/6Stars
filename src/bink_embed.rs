@@ -1,9 +1,8 @@
 //! In-panel Bink 2 (.bk2) playback on macOS.
 //!
-//! There is no open Bink 2 decoder, so decoding stays in RAD's player, run through Bink Player.app
-//! (github.com/Ahmet-Dedeler/bink-player-mac) in its embed mode: the player window stays
-//! invisible and every decoded frame is copied into a shared file that we map into an egui
-//! texture. Audio plays from the player process. Control goes back through the same file.
+//! The Mac bundle includes a decoder and frame bridge. Only the helper decodes video and
+//! plays audio; PercyStar reads the latest BGRA frame into an egui texture and sends commands
+//! through the same file. No external app or launcher is used.
 //!
 //! Shared file layout (see bink-player `src/embed.inc`):
 //!   0x00 magic 'KBEM', version | 0x08 u64 seq (latest frame in slot seq & 1)
@@ -12,11 +11,14 @@
 //!   0x80 slot 0, slot 1 (stride * height each, BGRA)
 
 use eframe::egui::{self, Color32, ColorImage, RichText, TextureHandle, TextureOptions};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc};
 use std::time::Duration;
+use tempfile::TempDir;
 
 const MAGIC: u32 = 0x4D45_424B;
 const HDR: u64 = 0x80;
@@ -38,57 +40,103 @@ pub struct EmbedStatus {
     pub muted: bool,
 }
 
-/// Bink Player.app binaries if installed and new enough to have embed mode.
-fn player_paths() -> Option<(PathBuf, PathBuf)> {
-    let mut roots = vec![PathBuf::from("/Applications/Bink Player.app")];
-    if let Some(h) = std::env::var_os("HOME") {
-        roots.push(PathBuf::from(h).join("Applications/Bink Player.app"));
+fn helper_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let macos = exe.parent()?;
+    let contents = macos.parent()?;
+    if macos.file_name()? != "MacOS" || contents.file_name()? != "Contents" {
+        return None;
     }
-    roots.into_iter().find_map(|r| {
-        let macos = r.join("Contents/MacOS");
-        let (bin, dylib) = (macos.join("BinkMacArmPlayer"), macos.join("libBinkHUD.dylib"));
-        let has_embed = fs::read(&dylib).ok()?.windows(13).any(|w| w == b"BINKHUD_EMBED");
-        (bin.exists() && has_embed).then_some((bin, dylib))
-    })
+    let helpers = contents.join("Helpers");
+    (helpers.join("BinkMacArmPlayer").is_file() && helpers.join("libBinkHUD.dylib").is_file())
+        .then_some(helpers)
 }
 
-/// True when in-panel playback can be used on this machine.
-pub fn available() -> bool {
-    cfg!(target_os = "macos") && player_paths().is_some()
+pub struct PendingClip {
+    helper_dir: PathBuf,
+    title: String,
+    rx: mpsc::Receiver<io::Result<TempDir>>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl PendingClip {
+    pub fn prepare(path: PathBuf, offset: u64, size: u64, title: String) -> Result<Self, String> {
+        let helper_dir = helper_dir().ok_or("Video decoder isn't in this build. Open the packaged PercyStar.app.")?;
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        std::thread::Builder::new().name("bk2-prepare".into()).spawn(move || {
+            let _ = tx.send(copy_clip(&path, offset, size, &worker_cancel));
+        }).map_err(|err| format!("Start video preview: {err}"))?;
+        Ok(Self { helper_dir, title, rx, cancel })
+    }
+
+    pub fn poll(&self, volume: f32, looping: bool) -> Option<Result<BinkEmbed, String>> {
+        Some(match self.rx.try_recv() {
+            Ok(Ok(dir)) => BinkEmbed::spawn_in(&self.helper_dir, dir, &self.title, volume, looping),
+            Ok(Err(err)) => Err(format!("Read video: {err}")),
+            Err(mpsc::TryRecvError::Empty) => return None,
+            Err(mpsc::TryRecvError::Disconnected) => Err("Video preparation stopped".into()),
+        })
+    }
+}
+
+impl Drop for PendingClip {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+fn copy_clip(path: &Path, offset: u64, size: u64, cancel: &AtomicBool) -> io::Result<TempDir> {
+    let mut archive = File::open(path)?;
+    archive.seek(SeekFrom::Start(offset))?;
+    let dir = tempfile::Builder::new().prefix("percystar-video-").tempdir()?;
+    let mut clip = File::create(dir.path().join("clip.bk2"))?;
+    let mut buf = vec![0; size.min(1024 * 1024) as usize];
+    let mut remaining = size;
+    while remaining > 0 {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "preview cancelled"));
+        }
+        let count = remaining.min(buf.len() as u64) as usize;
+        archive.read_exact(&mut buf[..count])?;
+        clip.write_all(&buf[..count])?;
+        remaining -= count as u64;
+    }
+    Ok(dir)
 }
 
 pub struct BinkEmbed {
     child: Child,
-    shm_path: PathBuf,
     shm: File,
-    pub clip: PathBuf,
+    _dir: TempDir,
     title: String,
     last_seq: u64,
     cmd_seq: u32,
     tex: Option<TextureHandle>,
+    frame_bytes: Vec<u8>,
     pub status: EmbedStatus,
     scrub: Option<f64>,
     exited: bool,
 }
 
 impl BinkEmbed {
-    pub fn spawn(clip: &Path, title: &str, volume: f32, looping: bool) -> Result<Self, String> {
-        let (bin, dylib) = player_paths().ok_or("Bink Player.app with embed support not installed")?;
-        let shm_path = clip.with_extension("embed");
-        fs::write(&shm_path, [0u8; HDR as usize]).map_err(|e| format!("embed file: {e}"))?;
-        let shm = OpenOptions::new().read(true).write(true).open(&shm_path).map_err(|e| e.to_string())?;
-        let child = Command::new(bin)
+    fn spawn_in(helpers: &Path, dir: TempDir, title: &str, volume: f32, looping: bool) -> Result<Self, String> {
+        let shm_path = dir.path().join("frames");
+        let shm = OpenOptions::new().read(true).write(true).create_new(true).open(&shm_path)
+            .and_then(|f| { f.set_len(HDR)?; Ok(f) }).map_err(|e| format!("Create video frame file: {e}"))?;
+        let child = Command::new(helpers.join("BinkMacArmPlayer"))
             .args(["-m", "-l"])
-            .arg(clip)
-            .env("DYLD_INSERT_LIBRARIES", dylib)
+            .arg(dir.path().join("clip.bk2"))
+            .env("DYLD_INSERT_LIBRARIES", helpers.join("libBinkHUD.dylib"))
             .env("BINKHUD_EMBED", &shm_path)
             .env("BINKHUD_VOLUME", format!("{volume:.3}"))
             .env("BINKHUD_LOOP", if looping { "1" } else { "0" })
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| format!("start player: {e}"))?;
-        Ok(Self { child, shm_path, shm, clip: clip.to_path_buf(), title: title.to_string(), last_seq: 0, cmd_seq: 0, tex: None, status: EmbedStatus::default(), scrub: None, exited: false })
+            .map_err(|e| format!("Start video decoder (requires Apple Silicon): {e}"))?;
+        Ok(Self { child, shm, _dir: dir, title: title.to_string(), last_seq: 0, cmd_seq: 0, tex: None, frame_bytes: Vec::new(), status: EmbedStatus::default(), scrub: None, exited: false })
     }
 
     fn send(&mut self, cmd: u32, arg: f64) {
@@ -105,7 +153,7 @@ impl BinkEmbed {
         let mut h = [0u8; 0x58];
         self.shm.read_exact_at(&mut h, 0).ok()?;
         let r32 = |o: usize| u32::from_le_bytes(h[o..o + 4].try_into().unwrap());
-        (r32(0) == MAGIC).then(|| (h, u64::from_le_bytes(h[8..16].try_into().unwrap())))
+        (r32(0) == MAGIC && r32(4) == 1).then(|| (h, u64::from_le_bytes(h[8..16].try_into().unwrap())))
     }
 
     /// Pulls status and, if a new frame was published, uploads it. Returns false once the player is gone.
@@ -126,26 +174,23 @@ impl BinkEmbed {
             paused: r32(0x30) != 0,
             muted: r32(0x34) != 0,
         };
-        if seq == 0 || seq == self.last_seq || w == 0 || hh == 0 || stride < w * 4 {
+        if seq == 0 || seq == self.last_seq || !(1..=8192).contains(&w) || !(1..=8192).contains(&hh)
+            || stride != w * 4
+        {
             return !self.exited;
         }
         let bytes = stride as usize * hh as usize;
-        let mut px = vec![0u8; bytes];
-        if self.shm.read_exact_at(&mut px, HDR + (seq & 1) * bytes as u64).is_err() {
+        self.frame_bytes.resize(bytes, 0);
+        if self.shm.read_exact_at(&mut self.frame_bytes, HDR + (seq & 1) * bytes as u64).is_err() {
             return !self.exited;
         }
         // seqlock: the slot we read is only rewritten two frames later
-        if self.read_header().map_or(true, |(_, s2)| s2 > seq + 1) {
+        if self.read_header().map_or(true, |(_, s2)| s2 != seq) {
             return !self.exited;
         }
         self.last_seq = seq;
-        let mut rgba = Vec::with_capacity(w as usize * hh as usize * 4);
-        for row in px.chunks_exact(stride as usize) {
-            for p in row[..w as usize * 4].chunks_exact(4) {
-                rgba.extend_from_slice(&[p[2], p[1], p[0], 255]);
-            }
-        }
-        let img = ColorImage::from_rgba_unmultiplied([w as usize, hh as usize], &rgba);
+        let pixels = self.frame_bytes.chunks_exact(4).map(|p| Color32::from_rgb(p[2], p[1], p[0])).collect();
+        let img = ColorImage { size: [w as usize, hh as usize], pixels };
         match &mut self.tex {
             Some(t) => t.set(img, TextureOptions::LINEAR),
             None => self.tex = Some(ctx.load_texture("bk2_embed", img, TextureOptions::LINEAR)),
@@ -153,13 +198,12 @@ impl BinkEmbed {
         true
     }
 
-    /// Draws the video and its transport bar. Returns true when the user asked to pop it out.
-    pub fn ui(&mut self, ui: &mut egui::Ui, volume: &mut f32, looping: &mut bool) -> bool {
+    pub fn ui(&mut self, ui: &mut egui::Ui, volume: &mut f32, looping: &mut bool) {
         let ctx = ui.ctx().clone();
-        self.poll(&ctx);
-        ctx.request_repaint_after(Duration::from_millis(12));
+        if self.poll(&ctx) {
+            ctx.request_repaint_after(Duration::from_millis(if self.status.paused { 60 } else { 12 }));
+        }
         let st = self.status;
-        let mut pop_out = false;
 
         ui.horizontal(|ui| {
             ui.label(RichText::new(&self.title).strong().color(Color32::from_rgb(252, 175, 23)));
@@ -167,11 +211,12 @@ impl BinkEmbed {
                 ui.label(RichText::new(format!("{}x{} · {:.2} fps · {} frames", st.width, st.height, st.fps, st.frames)).color(Color32::from_rgb(170, 200, 230)));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Pop out").on_hover_text("Open in Bink Player's own window").clicked() {
-                    pop_out = true;
-                }
+                ui.label(RichText::new("Bink Video by RAD Game Tools").small().weak());
             });
         });
+        if self.exited {
+            ui.label("The video decoder stopped. Select the video again to retry.");
+        }
         ui.add_space(4.0);
 
         const BAR_H: f32 = 34.0;
@@ -224,7 +269,6 @@ impl BinkEmbed {
                 self.send(CMD_LOOP, if *looping { 1.0 } else { 0.0 });
             }
         });
-        pop_out
     }
 }
 
@@ -233,7 +277,6 @@ impl Drop for BinkEmbed {
         self.send(CMD_QUIT, 0.0);
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = fs::remove_file(&self.shm_path);
     }
 }
 
@@ -246,17 +289,27 @@ fn fmt_time(s: f64) -> String {
 mod tests {
     use super::*;
 
-    /// Silent end-to-end check against the installed Bink Player.app:
-    /// PERCYSTAR_BK2=<file.bk2> cargo test --release bink_embed -- --ignored --nocapture
+    #[test]
+    fn video_preview_copies_only_the_archive_entry() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"prefixKB2nvideoNEXT").unwrap();
+        let cancel = AtomicBool::new(false);
+        let dir = copy_clip(file.path(), 6, 9, &cancel).unwrap();
+        assert_eq!(std::fs::read(dir.path().join("clip.bk2")).unwrap(), b"KB2nvideo");
+        assert_eq!(copy_clip(file.path(), 6, 100, &cancel).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// Silent end-to-end check against the packaged helper:
+    /// PERCYSTAR_BINK_APP=<app> PERCYSTAR_BK2=<clip> cargo test --release bink_embed -- --ignored --nocapture
     #[test]
     #[ignore]
     fn bink_embed_plays_pauses_and_seeks() {
         let Ok(src) = std::env::var("PERCYSTAR_BK2") else { return };
-        assert!(available(), "Bink Player.app with embed mode not installed");
-        let clip = std::env::temp_dir().join("percystar_embed_test.bk2");
-        fs::copy(&src, &clip).unwrap();
+        let helpers = PathBuf::from(std::env::var_os("PERCYSTAR_BINK_APP").expect("PERCYSTAR_BINK_APP")).join("Contents/Helpers");
+        let src = Path::new(&src);
+        let clip = copy_clip(src, 0, src.metadata().unwrap().len(), &AtomicBool::new(false)).unwrap();
         let ctx = egui::Context::default();
-        let mut be = BinkEmbed::spawn(&clip, "test", 0.0, true).unwrap();
+        let mut be = BinkEmbed::spawn_in(&helpers, clip, "test", 0.0, true).unwrap();
         let wait = |be: &mut BinkEmbed, ms: u64| {
             let t = std::time::Instant::now();
             let mut frames = 0;
@@ -278,11 +331,10 @@ mod tests {
         let f0 = be.status.frame;
         wait(&mut be, 800);
         assert!(be.status.paused && be.status.frame == f0, "pause should hold the frame");
-        be.send(CMD_SEEK_SECS, 1.0);
+        let target = 1.0f64.min(st.frames as f64 / st.fps * 0.5);
+        be.send(CMD_SEEK_SECS, target);
         wait(&mut be, 800);
-        println!("after seek to 1s: frame {}", be.status.frame);
-        assert!((be.status.frame as f64 - st.fps).abs() <= 3.0, "seek should land near 1s");
-        drop(be);
-        let _ = fs::remove_file(&clip);
+        println!("after seek to {target:.2}s: frame {}", be.status.frame);
+        assert!((be.status.frame as f64 - target * st.fps).abs() <= 3.0, "seek should land near the requested time");
     }
 }

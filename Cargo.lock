@@ -2607,6 +2607,7 @@ dependencies = [
  "image",
  "rfd",
  "rusty-opus",
+ "tempfile",
  "texture2ddecoder",
 ]
 

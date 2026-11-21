@@ -10,7 +10,7 @@
 
 ## What This Fork Adds
 
-- **BK2 video on macOS:** Play, pause, scrub, mute and loop `.bk2` files inside the preview panel. Requires [Bink Player.app](https://github.com/Ahmet-Dedeler/bink-player-mac) with embed support. You can also pop the video out into its own window.
+- **BK2 video on Apple Silicon:** Select a `.bk2` to play it right in the preview panel. You can pause, scrub, mute and loop. The Mac build includes the decoder, so there's no second app to install.
 - **AWC audio previews:** Play and seek through individual streams without exporting them first. The decoder also reads multichannel banks and files with extra stream-table headers that upstream can miss.
 - **Better 3D previews:** Drawables in a model dictionary appear separately instead of stacked on top of each other. Fixed rotated meshes and false model entries, added streamed `.ttpf` textures and vehicle paint previews, and added a **Highest detail only** toggle for character and clothing models.
 - **More accurate model colors:** The viewer finds shared textures across packs, binds them to the right materials, and reads both packed and floating-point UVs. If it can't find a usable color texture, it shows that part in gray.
@@ -22,7 +22,7 @@ The download links here are for upstream releases and don't include the fork cha
   <img src="https://img.shields.io/badge/Version-v1.3.0-FFA81C?style=flat-square" alt="Version" />
   <img src="https://img.shields.io/badge/Rust-1.85%2B-orange?style=flat-square&logo=rust" alt="Rust" />
   <img src="https://img.shields.io/badge/Shaders-RDNA2%20GFX10.3%20%E2%86%92%20HLSL%20%2F%20SPIR--V-FF4FA3?style=flat-square" alt="Shaders" />
-  <img src="https://img.shields.io/badge/Textures-100%25%20DXGI%20%2B%20RDNA2%204KB%2F64KB-48D2FF?style=flat-square" alt="Textures" />
+  <img src="https://img.shields.io/badge/Textures-DXGI%20%2B%20RDNA2%204KB%2F64KB-48D2FF?style=flat-square" alt="Textures" />
   <img src="https://img.shields.io/badge/3D-Model%20Viewer%20(10%20Categories)-FF55AF?style=flat-square" alt="3D" />
   <img src="https://img.shields.io/badge/Audio-Pure%20Rust%20Opus%20(Zero%20FFmpeg)-90EBA5?style=flat-square" alt="Audio" />
   <img src="https://img.shields.io/badge/Platform-Windows%20x64-0078D6?style=flat-square" alt="Windows" />
@@ -82,10 +82,10 @@ The download links here are for upstream releases and don't include the fork cha
   - Full-screen 3D workspace built for instant 60 FPS browsing across **144,000+ RAGE 9 3D models**.
   - **10 Strict RAGE 9 Categories** with live counts: **All Models**, **Vehicles**, **Air & Sea**, **Weapons**, **Characters**, **Clothing**, **Animals** (`cr[mbfraci]_` taxonomy), **Props & Items**, **World / Map**, and **NavMesh 3D**.
   - **Hide LODs/Bounds** toggle (filters `_lod`/`_slod`/`batchlod`/`bipedbounds`/`collision_`), `◀ Prev` / `Next ▶` / `Random` buttons, `Up`/`Down` arrow-key browsing, **5 Camera Presets** (`3/4`, `Front`, `Side`, `Back`, `Top`), and **1-Click Catalog CSV Import** + `.OBJ` loader.
-- **100% Xbox Series X (Scarlett / RDNA2) Texture Engine (`.#td` & `.ttpf`)**
+- **Xbox Series X (Scarlett / RDNA2) Texture Engine (`.#td` & `.ttpf`)**
   - **100.00% TTPF Format Identification (357,115 / 357,115 textures):** Solved ETPF descriptor `u1` bits 3..9 (`(u1 >> 3) & 0x7F` = exact Microsoft `DXGI_FORMAT` enum) — zero unknown texture formats.
   - **All 20+ DXGI Formats Decoded Natively in Pure Rust:** `BC1`–`BC7`, `BC6H_UF16`/`SF16` HDR, `R16G16B16A16_FLOAT`/`UNORM`, `R16_FLOAT`/`UNORM`, `R16G16_FLOAT`, `R32_FLOAT`, `R10G10B10A2_UNORM`, `R8G8B8A8`, `B8G8R8A8`, `R8_UNORM`, `A8_UNORM` (`texture2ddecoder` + IEEE-754 half-float Reinhard tonemapping).
-  - **Verified RDNA2 4KB (`SW_4KB_D`) & 64KB Deswizzle for All 5 Bit Depths (8 / 16 / 32 / 64 / 128bpp):** Plus reverse-mip `mip0` tail addressing, instant `O(log N)` RDS5 chunk seeking, exact RDS5 chunk codec decoding (`0=RAW`, `1..7=HW BCPack BC1..BC7`, `8=ZLIB`), interactive zoom viewer, multi-texture strip, and **Export PNG / Export DDS (DX10)**.
+  - **RDNA2 4KB (`SW_4KB_D`) & 64KB Deswizzle for All 5 Bit Depths (8 / 16 / 32 / 64 / 128bpp):** Raw and zlib-backed textures support preview and PNG/DDS export. The scanner recognizes BCPack chunks but does not decode their payloads.
 - **Expanded RAGE 9 3D Meshlet Decoder (`.#dr`, `.#ft`, `.#dd`, `.obj`)**
   - Direct click-to-view decoding of unencrypted RAGE 9 virtual (`0x50xxxxxx`) + physical (`0x60xxxxxx`) meshlet resources straight out of `.rpf` archives, including `+0xA8` drawable name resolution and non-zero page header support (**38× more models discovered**).
   - Clean **LOD0-only** extraction (`Lod0 -> grmModel -> grmGeometry`), 24/24/16-bit quantized vertices, 7-bit packed meshlet triangles + `u16` remap table, **UV0** (`type 0x28`), upgraded embedded `SW_4KB_D` BC7/BC3/BC1 textures, custom `.png`/`.bmp` texture loading, and full `.OBJ` export (`v` + `vt` + `f v/vt`).
@@ -98,8 +98,8 @@ The download links here are for upstream releases and don't include the fork cha
   - **No Python, no FFmpeg, no external DLLs required** — `ADAT` (`.awc`) Opus streams decode natively via pure-Rust `rusty-opus` (RFC 6716). All crates pinned in [`Cargo.lock`](Cargo.lock).
 - **Whole-Folder & Single-Archive Scanning (`.rpf` & `.ttpf`)**
   - Multi-threaded live scanning cached to `%LOCALAPPDATA%\PercyStar\scan_cache_v8.tsv`.
-- **Docked D3D11 Bink2 Video Player (Optional `binkplay.exe`)**
-  - Docks RAD `binkplay.exe` (`/NoBorder /DrawD3D11 /L`) directly into the inspector pane. Run [`scripts/setup_deps.ps1`](scripts/setup_deps.ps1) if needed.
+- **In-app Bink 2 playback**
+  - The Apple Silicon build includes the decoder and frame bridge. On Windows, the existing D3D11 dock uses RAD's `binkplay.exe` ([setup script](scripts/setup_deps.ps1)).
 - **CLI Batch Exporters (Models, Textures & RDNA2 Shaders)**
   ```powershell
   PercyStar.exe --extract-vehicles "<path-to-levels.rpf>" "<output-dir>"
@@ -144,9 +144,15 @@ PercyStar/
 
 ---
 
+## What's Still Missing
+
+The Xbox dump scan found 754,364 entries, including 797 videos. That's a count of recognized entries, not a full inventory of every file in every archive. The [format audit](docs/format-coverage.md) lists what rendered, what fell back to raw bytes, and what the scan doesn't cover.
+
 ## Building from Source
 
-Requires **Rust** (`x86_64-pc-windows-gnu` with MinGW `windres`/`dlltool`, or `msvc`). Cargo fetches all pinned dependencies from `Cargo.lock`:
+On macOS, run `bash scripts/build_macos.sh` with Rust, Python 3 and the Xcode Command Line Tools. It builds `dist/PercyStar.app` (set `PERCYSTAR_APP_PATH` to keep a previous build). The build fetches and verifies the pinned RAD player and frame-bridge source. Playback works offline on Apple Silicon with macOS 12 or later. The main app also builds for Intel, but the included video decoder is ARM-only.
+
+On Windows, use **Rust** (`x86_64-pc-windows-gnu` with MinGW `windres`/`dlltool`, or `msvc`). Cargo fetches all pinned dependencies from `Cargo.lock`:
 
 ```powershell
 cargo test --release
@@ -159,10 +165,10 @@ Compiled standalone binary: `target/release/PercyStar.exe`.
 
 ## Scope, Clean-Room Research & Legal Notice
 
-PercyStar is an **independent, clean-room binary inspection and parser tool** built from scratch in Rust. It only parses **unencrypted, user-supplied files** (`KB2*` streams, `ADAT` audio, plain `zlib` XML/PSIN containers, and standard uncompressed meshlet vertex/index blocks) for research and interoperability (cf. 17 U.S.C. § 1201(f)):
+PercyStar is an independent archive viewer for **unencrypted, user-supplied files**. The Rust archive decoders are separate from video playback, which uses RAD's player.
 
 - **Zero Circumvention / Zero Keys:** Contains **no** decryption routines, encryption keys, hashes, DRM bypasses, or access-control workarounds. Encrypted data is skipped untouched.
-- **Zero Proprietary Content:** Ships **no** third-party binaries, copyrighted models, textures, audio, shaders, or game assets. Users are solely responsible for supplying archives they legally own or are authorized to inspect.
+- **No Game Files:** The source repo contains no RAD binaries or game assets. The Mac build downloads the player from RAD for local use; the decoder remains under RAD's terms. Users supply their own archives.
 - **Independent Trademark Disclaimer:** PercyStar is an independent open-source project and is not affiliated with, endorsed by, or sponsored by any game studio or publisher.
 
 **Copyright (c) 2026 rpatty-dev — All Rights Reserved.**  
