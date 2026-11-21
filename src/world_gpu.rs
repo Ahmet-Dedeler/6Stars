@@ -364,9 +364,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let lit = direct + kd * albedo * amb_d + env * fr_v + amb_d * rt_bounce;
 
     let dist = length(u.cam_pos.xyz - in.world_pos);
-    let fog = 1.0 - exp(-dist * 0.00011);
+    let fog = 1.0 - exp(-dist * 0.000028);
     let fog_col = mix(u.sky_horizon.rgb, u.sky_zenith.rgb, 0.25);
-    let col = mix(lit, fog_col, clamp(fog, 0.0, 0.88));
+    let col = mix(lit, fog_col, clamp(fog, 0.0, 0.55));
     return vec4<f32>(aces_tonemap(col), 1.0);
 }
 
@@ -965,7 +965,7 @@ impl GpuState {
         if let Some(ref terrain) = cfg.terrain {
             st.map_min = [terrain.bmin[0], terrain.bmin[1]];
             st.map_span = [terrain.bmax[0] - terrain.bmin[0], terrain.bmax[1] - terrain.bmin[1]];
-            let tmesh = terrain.build_world_terrain_mesh(4);
+            let tmesh = terrain.build_world_terrain_mesh(2);
             if let Some(ref t) = tmesh.texture {
                 st.minimap_bg = upload_texture(&st.device, &st.queue, &st.tex_bgl, &st.tex_samp, t);
             }

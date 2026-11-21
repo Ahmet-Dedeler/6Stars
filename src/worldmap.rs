@@ -119,18 +119,22 @@ impl WorldMapData {
 
     // build downsampled 3d terrain mesh (z-up, scaled 1:100 for smooth orbiting)
     pub fn build_world_terrain_mesh(&self, step: usize) -> Mesh3D {
-        let mut m = self.build_terrain_mesh(step);
+        let mut m = self.build_terrain_mesh_with_tex(step, 2048);
         for v in &mut m.verts {
             v[0] *= 100.0;
             v[1] *= 100.0;
-            v[2] *= 25.0;
+            v[2] = v[2] * 25.0 - 1.0;
         }
         m.name = "mhiu_world_terrain".into();
         m
     }
 
     pub fn build_terrain_mesh(&self, step: usize) -> Mesh3D {
-        let step = step.max(4);
+        self.build_terrain_mesh_with_tex(step.max(4), 512)
+    }
+
+    fn build_terrain_mesh_with_tex(&self, step: usize, max_tex: usize) -> Mesh3D {
+        let step = step.max(2);
         let gw = (self.w + step - 1) / step;
         let gh = (self.h + step - 1) / step;
         let mut verts = Vec::with_capacity(gw * gh);
@@ -158,8 +162,8 @@ impl WorldMapData {
             }
         }
         // bake hillshaded elevation texture for crisp 3d terrain
-        let tw = self.w.min(512);
-        let th = self.h.min(512);
+        let tw = self.w.min(max_tex);
+        let th = self.h.min(max_tex);
         let mut tpix = Vec::with_capacity(tw * th);
         for ty in 0..th {
             let py = (ty * self.h / th).min(self.h - 1);

@@ -1,6 +1,7 @@
 ﻿mod anim;
 mod audio_player;
 mod awc;
+mod bink2;
 mod boot;
 mod dat;
 mod dxbc;
@@ -4757,6 +4758,18 @@ fn main() -> eframe::Result<()> {
                 Err(e) => eprintln!("PSIN error: {e}"),
             },
             Err(e) => eprintln!("Read error: {e}"),
+        }
+        return Ok(());
+    }
+    if args.len() >= 4 && args[1] == "--decode-bk2" {
+        let bk2 = PathBuf::from(&args[2]);
+        let out_dir = PathBuf::from(&args[3]);
+        let max_f = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(30);
+        let dll = bk2.parent().map(|d| d.join("bink2w64.dll")).filter(|p| p.exists())
+            .unwrap_or_else(|| PathBuf::from("bink2w64.dll"));
+        match bink2::decode_bk2_to_pngs(&dll, &bk2, &out_dir, max_f) {
+            Ok((info, n)) => println!("Decoded {n} frames ({}x{}) to {}", info.width, info.height, out_dir.display()),
+            Err(e) => eprintln!("BK2 decode error: {e}"),
         }
         return Ok(());
     }
