@@ -1,7 +1,7 @@
 {
   "title": "RAGE 9 Research & PercyStar Breakthroughs",
   "author": "@rpatty",
-  "lastUpdated": "2026-11-21 08:01 UTC",
+  "lastUpdated": "2026-11-21 08:10 UTC",
   "percystarVersion": "1.3.0",
   "links": {
     "github": "https://github.com/rpatty-dev/PercyStar",
@@ -21,11 +21,24 @@
   ],
   "breakthroughs": [
     {
+      "id": "audio-anim-script-sweep",
+      "timestamp": "2026-11-21 08:10 UTC",
+      "category": "Audio / Anim / Scripts",
+      "badge": "3 ARCHIVES INDEXED",
+      "latest": true,
+      "title": "Audio Metadata Catalog (431 Banks), Anim.rpf (83,640 RSCs) & Story000 Script Tables",
+      "summary": "Cataloged 142 audio_meta chunks (17 audio:/config/*.dat paths + 431 bank/slot names), 83,640 RAGE 9 animation dictionaries in anim.rpf (2,525 named), and stitched 45 story000_script.rpf chunks (2.84 MB) revealing 0x71717171-tagged u64 offset tables.",
+      "details": [
+        "Audio Metadata (F:\\Ext6\\audio_meta): 17 config paths (categories.dat, curves.dat, dynamix.dat, effects.dat, game.dat, music.dat, waveslots2.xml) and 431 bank/slot identifiers (AMB_STREAM_*, AMBIENT_SCRIPT_SLOT_*).",
+        "Animations (anim.rpf, 4.41 GB): 83,640 RSC animation resources (81,115 anonymous + 2,525 named clips/dictionaries).",
+        "Scripts (story000_script.rpf, 78.02 MB): 322 zlib chunks, 45 stitched 64 KB chunks (2,844,528 B) with 0x71717171-tagged u64 pointer tables."
+      ]
+    },
+    {
       "id": "gpu-shader-proof",
       "timestamp": "2026-11-21 08:01 UTC",
       "category": "Shaders / GPU",
       "badge": "RTX 2060 SUPER · 500/500 PASS",
-      "latest": true,
       "title": "Lifted RDNA2 → SPIR-V Shaders Validated on Real NVIDIA RTX 2060 SUPER GPU",
       "summary": "Validated 500 lifted PS\\x00\\x09 SPIR-V 1.5 shaders (277 PS, 181 VS, 42 CS) directly on an NVIDIA GeForce RTX 2060 SUPER (Vulkan 1.4, vendor 0x10de, device 0x1f06) with 500/500 vkCreateShaderModule passes and 42/42 vkCreateComputePipelines passes.",
       "details": [
