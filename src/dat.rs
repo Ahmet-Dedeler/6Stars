@@ -172,7 +172,9 @@ pub fn parse_audio_rpf_catalog(audio_rpf: &Path, first_awc_off: u64) -> Option<A
                         if let Some(stripped) = s.strip_prefix("Core.").or_else(|| s.strip_prefix("core.")) {
                             hash_dict.entry(joaat(stripped)).or_insert_with(|| stripped.to_string());
                         }
-                        if s.contains('.') {
+                        // Real pack names are short; cap the dotted-substring expansion, which
+                        // is quadratic in the number of parts.
+                        if s.contains('.') && s.len() <= 256 && s.matches('.').count() < 16 {
                             let parts: Vec<&str> = s.split('.').collect();
                             for a in 0..parts.len() {
                                 for b_idx in (a + 1)..=parts.len() {
@@ -459,16 +461,23 @@ pub fn resolve_awc_names_from_catalog(
         let idx_num = k + 1;
         if let Some(bi) = matched_awc[k] {
             let b = &bs[bi];
-            let pack_slug = b.pack_name.replace('.', "_");
+            // Entry names double as export file names, so keep only filename-safe characters
+            // (catalog strings can contain '/' or ':').
+            let slug = |s: &str| -> String {
+                s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect()
+            };
+            let pack_slug = slug(&b.pack_name);
             let name = if let Some(sl) = b.used_by.first() {
-                let sl_clean = sl.replace('.', "_");
+                let sl_clean = slug(sl);
                 format!("sound_{idx_num:04}_{pack_slug}__{sl_clean}_{sc}st.awc")
             } else {
                 format!("sound_{idx_num:04}_{pack_slug}_{sc}st.awc")
             };
             out[k] = Some(ResolvedAwcMeta {
                 name,
-                exact_size: b.exact_size,
+                // Only trust the catalog size when it fits before the next bank (or EOF);
+                // 0 keeps the scanned length.
+                exact_size: if b.exact_size <= real_gaps[k] { b.exact_size } else { 0 },
                 bank_hash: b.bank_hash,
                 pack_name: b.pack_name.clone(),
                 used_by: b.used_by.clone(),

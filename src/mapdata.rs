@@ -145,9 +145,11 @@ pub fn parse_0drpz_archetype_aliases(sys: &[u8]) -> Vec<(u32, u32)> {
     aliases
 }
 
+/// Adds model offsets the Explorer's folder scan found to the world index. Reads the
+/// current scan cache in our data folder (upstream read `%LOCALAPPDATA%\PercyStar\
+/// scan_cache_v9.tsv`, which is stale for Percy6Stars and absent on macOS).
 fn merge_scan_cache_models(ix: &mut WorldIndex) {
-    let Some(base) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) else { return };
-    let tsv = base.join("PercyStar").join("scan_cache_v9.tsv");
+    let Some(tsv) = crate::cache_file_path() else { return };
     let Ok(f) = File::open(tsv) else { return };
     use std::io::BufRead;
     let r = BufReader::new(f);
@@ -168,11 +170,10 @@ fn merge_scan_cache_models(ix: &mut WorldIndex) {
     }
 }
 
+/// v2: lives in our data folder, and is rebuilt once so archetype aliases resolve
+/// against scan-cache models too (v1 files predate the aliases).
 fn cache_path() -> Option<PathBuf> {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    Some(base.join("PercyStar").join("world_index_v1.bin"))
+    crate::app_data_dir().map(|d| d.join("world_index_v2.bin"))
 }
 
 fn save_world_index(path: &Path, rpf_len: u64, ix: &WorldIndex) {
@@ -334,6 +335,9 @@ pub fn build_or_load_world_index(levels_rpf: &Path) -> WorldIndex {
                 all_aliases.extend(aliases);
             }
         }
+        // Scan-cache models first, so an alias whose drawable only the folder scan found
+        // still resolves.
+        merge_scan_cache_models(&mut merged);
         for (arch, draw) in all_aliases {
             if let Some(&off) = merged.models.get(&draw) {
                 merged.models.entry(arch).or_insert(off);
@@ -342,7 +346,6 @@ pub fn build_or_load_world_index(levels_rpf: &Path) -> WorldIndex {
         merged
     });
 
-    merge_scan_cache_models(&mut ix);
     if let Some(cp) = cache_path() {
         save_world_index(&cp, sz, &ix);
     }

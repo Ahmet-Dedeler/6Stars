@@ -1284,6 +1284,7 @@ impl Rpf9App {
                                     let is_audio = p.file_name().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("audio.rpf")).unwrap_or(false);
                                     if is_audio {
                                         let needs_enrich = !cached_entries.iter().any(|e| e.kind == "DAT")
+                                            || cached_entries.iter().any(|e| e.kind == "AWC" && e.name.contains(['/', '\\', ':']))
                                             || cached_entries.iter().filter(|e| e.kind == "AWC").any(|e| e.name.contains("_Radio_Music_") || e.name.contains("_Score_Streams_"))
                                             || cached_entries.iter().filter(|e| e.kind == "AWC").take(10).all(|e| e.name.starts_with("sound_00") && e.name.matches('_').count() == 2);
                                         if needs_enrich {
@@ -1445,6 +1446,21 @@ impl Rpf9App {
         let cam = self.mesh3d.as_ref().map(|m| [m.yaw, m.pitch, m.zoom, m.pan_x, m.pan_y]);
         match pick {
             LodPick::File(idx) => {
+                // Rows can move if a rescan lands between the click and now; only follow the
+                // index if it is still a detail file of the model being viewed.
+                let still_sibling = {
+                    let st = self.state.lock().unwrap();
+                    match (self.selected.and_then(|i| st.entries.get(i)), st.entries.get(idx)) {
+                        (Some(cur), Some(next)) => {
+                            next.source_rpf == cur.source_rpf
+                                && lod_sibling_names(&cur.name).is_some_and(|names| names.iter().any(|n| n.eq_ignore_ascii_case(&next.name)))
+                        }
+                        _ => false,
+                    }
+                };
+                if !still_sibling {
+                    return;
+                }
                 let show = self.show_3d;
                 self.select_entry(idx);
                 self.show_3d = show;
@@ -3016,7 +3032,7 @@ impl Rpf9App {
 }
 
 /// Per-user data folder (scan cache, UI state, last folder).
-fn app_data_dir() -> Option<PathBuf> {
+pub(crate) fn app_data_dir() -> Option<PathBuf> {
     let base = if cfg!(windows) {
         std::env::var("LOCALAPPDATA").ok().map(PathBuf::from)
     } else if cfg!(target_os = "macos") {
@@ -3036,7 +3052,7 @@ fn app_data_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
-fn cache_file_path() -> Option<PathBuf> {
+pub(crate) fn cache_file_path() -> Option<PathBuf> {
     // v9 scanner rejects metadata and mid resource chunks that v8 listed as model entries
     app_data_dir().map(|d| d.join("scan_cache_v10.tsv"))
 }
@@ -4021,9 +4037,11 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
 
 fn display_entry_name(e: &RpfEntry, audio_named: bool) -> std::borrow::Cow<'_, str> {
     if !audio_named && e.kind == "AWC" && e.name.starts_with("sound_") && e.name.matches('_').count() > 2 {
-        if let Some(tail) = e.name.rsplit('_').next() {
-            if e.name.len() >= 10 {
-                return std::borrow::Cow::Owned(format!("{}_{}", &e.name[..10], tail));
+        // Generated names look like "sound_0001_<pack>_<n>st.awc"; leave anything else
+        // (loose files can have any name, including non-ASCII) untouched.
+        if let (Some(head), Some(tail)) = (e.name.get(..10), e.name.rsplit('_').next()) {
+            if head[6..].bytes().all(|b| b.is_ascii_digit()) && tail.ends_with("st.awc") {
+                return std::borrow::Cow::Owned(format!("{head}_{tail}"));
             }
         }
     }
@@ -4081,6 +4099,18 @@ fn enrich_audio_rpf_entries(audio_rpf: &PathBuf, total_sz: u64, entries: &mut Ve
                 }
                 meta_map.insert(entries[entry_idx].offset, meta.clone());
             }
+        }
+    }
+    // A bank never extends into the next one or past EOF. This also repairs caches written
+    // by builds that applied oversized catalog sizes (reads would fail with UnexpectedEof).
+    let mut by_off: Vec<usize> = awc_indices.clone();
+    by_off.sort_unstable_by_key(|&i| entries[i].offset);
+    for (k, &i) in by_off.iter().enumerate() {
+        let end = by_off.get(k + 1).map_or(total_sz, |&j| entries[j].offset);
+        let room = end.saturating_sub(entries[i].offset);
+        if entries[i].comp_size > room {
+            entries[i].comp_size = room;
+            entries[i].raw_size = entries[i].raw_size.min(room);
         }
     }
     meta_map
@@ -4782,6 +4812,12 @@ mod tests {
         let size = fs::metadata(&audio).unwrap().len();
         let meta = enrich_audio_rpf_entries(&audio, size, &mut entries);
         let dat = entries.iter().filter(|e| e.kind == "DAT").count();
+        let mut offs: Vec<(u64, u64)> = entries.iter().filter(|e| e.kind == "AWC").map(|e| (e.offset, e.comp_size)).collect();
+        offs.sort_unstable();
+        let overrun = offs.windows(2).filter(|w| w[0].0 + w[0].1 > w[1].0).count()
+            + offs.last().map_or(0, |&(o, c)| usize::from(o + c > size));
+        assert_eq!(overrun, 0, "catalog sizes must not run into the next bank or past EOF");
+        assert!(entries.iter().all(|e| e.kind != "AWC" || !e.name.contains(['/', '\\', ':'])));
         eprintln!("awc={awc} named={} dat={dat}", meta.len());
         for e in entries.iter().filter(|e| e.kind == "AWC").take(6) {
             eprintln!("  {} @ {:#x} size {}", e.name, e.offset, e.comp_size);
@@ -4807,6 +4843,32 @@ mod tests {
         }
         eprintln!("checked={checked} worse={worse}");
         assert!(checked > 0 && worse == 0);
+        // Banks whose size had to be capped must now read and decode.
+        for e in entries.iter().filter(|e| e.kind == "AWC" && before.get(&e.offset).is_some_and(|o| o.comp_size > e.comp_size)) {
+            let tracks = read_entry_bytes(e).map(|b| awc::decode_awc_bytes_in_memory(&b, "t", |_, _| {}).tracks.len());
+            eprintln!("  capped {} -> {:?} tracks", e.name, tracks);
+            assert!(tracks.is_ok_and(|n| n > 0), "{}", e.name);
+        }
+    }
+
+    #[test]
+    fn raw_audio_names_only_shorten_generated_names() {
+        let e = |name: &str| RpfEntry {
+            source_rpf: PathBuf::new(),
+            rpf_name: String::new(),
+            name: name.into(),
+            kind: "AWC",
+            offset: 0,
+            comp_size: 0,
+            raw_size: 0,
+            tracks: 0,
+            chunks: Vec::new(),
+        };
+        assert_eq!(display_entry_name(&e("sound_0001_Ambience_Nature_6st.awc"), false), "sound_0001_6st.awc");
+        // non-ASCII at the old fixed byte cut used to panic
+        for n in ["sound_abcé_1st.awc", "sound_x_é_y.awc", "sound_0001_a_b.wav"] {
+            assert_eq!(display_entry_name(&e(n), false), n);
+        }
     }
 
     #[test]
@@ -5507,7 +5569,11 @@ fn main() -> eframe::Result<()> {
         let bk2 = PathBuf::from(&args[2]);
         let out_dir = PathBuf::from(&args[3]);
         let max_f = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(30);
-        let dll = bk2.parent().map(|d| d.join("bink2w64.dll")).filter(|p| p.exists())
+        // Load the decoder only from an explicit path or next to our own exe, never from
+        // the video's folder (a DLL planted beside a clip would run as our code).
+        let dll = std::env::var_os("BINK2_DLL")
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("bink2w64.dll"))))
             .unwrap_or_else(|| PathBuf::from("bink2w64.dll"));
         match bink2::decode_bk2_to_pngs(&dll, &bk2, &out_dir, max_f) {
             Ok((info, n)) => println!("Decoded {n} frames ({}x{}) to {}", info.width, info.height, out_dir.display()),
