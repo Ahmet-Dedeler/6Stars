@@ -57,6 +57,7 @@ struct FrameUniforms {
     sky_horizon: [f32; 4],
     flags: [f32; 4], // x=enhanced_lighting, y=time_hours, z=map_min_x, w=map_span_x
     map_y: [f32; 4], // x=map_min_y, y=map_span_y, z=viewport_w, w=viewport_h
+    hud: [f32; 4],   // x=load_progress, y=loading_active, z=elapsed_sec, w=sgd5_count
 }
 
 pub struct WorldBatchInput {
@@ -75,6 +76,9 @@ pub struct WorldLaunchConfig {
 pub enum WorldStreamMsg {
     Batch(WorldBatchInput),
     MapCount(usize),
+    TotalArchetypes(usize),
+    ArchetypeDone,
+    Sgd5Count(usize),
 }
 
 pub fn launch_world_gpu_process(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -> Result<(), String> {
@@ -92,6 +96,15 @@ pub fn launch_world_gpu_process(common_rpf: Option<&Path>, levels_rpf: Option<&P
 }
 
 pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
+    #[cfg(windows)]
+    unsafe {
+        extern "system" {
+            fn GetCurrentProcess() -> isize;
+            fn SetPriorityClass(hProcess: isize, dwPriorityClass: u32) -> i32;
+        }
+        // below_normal keeps windows audio and desktop apps stutter-free during streaming
+        SetPriorityClass(GetCurrentProcess(), 0x0000_4000);
+    }
     let fallback_dir = crate::load_last_folder();
     let resolved_common = common_rpf.map(Path::to_path_buf).or_else(|| {
         fallback_dir.as_ref().map(|d| d.join("common.rpf")).filter(|p| p.exists())
@@ -108,14 +121,15 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
         batches: Vec::new(),
         levels_rpf: resolved_levels,
         map_count: 0,
-        start_pos: [-2351.0, -5533.0, 140.0],
+        start_pos: [-127.276, -1855.924, 24.0],
     };
     let Ok(event_loop) = EventLoop::builder().build() else {
         return;
     };
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(16);
+    let cam_track = Arc::new(std::sync::Mutex::new((Vec3::from_array(cfg.start_pos), 1u64)));
+    let cam_track_bg = Arc::clone(&cam_track);
     if let Some(lp) = cfg.levels_rpf.clone() {
-        let start = cfg.start_pos;
         std::thread::spawn(move || {
             // 1. fast-load brickell slod city blocks immediately
             if let Ok(mesh) = crate::model3d::decode_rage9_model_from_rpf(&lp, 8_679_358_480, "brickell_slod") {
@@ -124,46 +138,134 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
                     instances: vec![(Vec3::ZERO, Quat::IDENTITY, Vec3::ONE, [1.0; 4])],
                 }));
             }
-            // 2. build/load cached 0DRPz map placements + model index and stream all levels nearest-first
+            // 2. build/load cached 0DRPz map placements + model index
+            eprintln!("[world-gpu] loading/building world index from {}", lp.display());
             let ix = crate::mapdata::build_or_load_world_index(&lp);
+            eprintln!("[world-gpu] index ready: {} maps, {} models, {} entities", ix.map_count, ix.models.len(), ix.entities.len());
             let _ = tx.send(WorldStreamMsg::MapCount(ix.map_count));
-            let mut arch_groups: Vec<(u32, u64, f32, Vec<(Vec3, Quat, Vec3, [f32; 4])>)> = Vec::new();
-            let mut grouped: HashMap<u32, (f32, Vec<(Vec3, Quat, Vec3, [f32; 4])>)> = HashMap::new();
+
+            let mut grouped: HashMap<u32, (Vec3, Vec<(Vec3, Quat, Vec3, [f32; 4])>)> = HashMap::new();
+            let mut box_insts: Vec<(Vec3, Quat, Vec3, [f32; 4])> = Vec::new();
+            let start = cam_track_bg.lock().unwrap().0;
             for e in &ix.entities {
+                let p = Vec3::from_array(e.pos);
+                let q = Quat::from_xyzw(e.rot[0], e.rot[1], e.rot[2], e.rot[3]).normalize();
                 if !ix.models.contains_key(&e.archetype_hash) {
+                    if p.distance_squared(start) <= 2200.0 * 2200.0 && box_insts.len() < 12_000 {
+                        let h = e.archetype_hash;
+                        let r = 0.45 + ((h & 0xFF) as f32 / 255.0) * 0.45;
+                        let g = 0.45 + (((h >> 8) & 0xFF) as f32 / 255.0) * 0.45;
+                        let b = 0.50 + (((h >> 16) & 0xFF) as f32 / 255.0) * 0.45;
+                        box_insts.push((p, q, Vec3::new(14.0 * e.scale_xy, 14.0 * e.scale_xy, 18.0 * e.scale_z), [r, g, b, 1.0]));
+                    }
                     continue;
                 }
-                let dx = e.pos[0] - start[0];
-                let dy = e.pos[1] - start[1];
-                let d2 = dx * dx + dy * dy;
-                let q = Quat::from_xyzw(e.rot[0], e.rot[1], e.rot[2], e.rot[3]).normalize();
                 let sc = Vec3::new(e.scale_xy, e.scale_xy, e.scale_z);
-                let entry = grouped.entry(e.archetype_hash).or_insert_with(|| (d2, Vec::new()));
-                if d2 < entry.0 {
-                    entry.0 = d2;
-                }
-                entry.1.push((Vec3::from_array(e.pos), q, sc, [1.0; 4]));
+                let entry = grouped.entry(e.archetype_hash).or_insert_with(|| (p, Vec::new()));
+                entry.1.push((p, q, sc, [1.0; 4]));
             }
-            for (h, (d2, insts)) in grouped {
-                if let Some(&moff) = ix.models.get(&h) {
-                    arch_groups.push((h, moff, d2, insts));
-                }
+            if !box_insts.is_empty() {
+                let bmesh = Mesh3D::from_parts(
+                    "__placeholder_boxes__".into(),
+                    vec![
+                        [-0.5, -0.5, 0.0], [0.5, -0.5, 0.0], [0.5, 0.5, 0.0], [-0.5, 0.5, 0.0],
+                        [-0.5, -0.5, 1.0], [0.5, -0.5, 1.0], [0.5, 0.5, 1.0], [-0.5, 0.5, 1.0],
+                    ],
+                    vec![[0.0, 0.0]; 8],
+                    vec![
+                        [0, 1, 2], [0, 2, 3], [4, 6, 5], [4, 7, 6],
+                        [0, 4, 5], [0, 5, 1], [1, 5, 6], [1, 6, 2],
+                        [2, 6, 7], [2, 7, 3], [3, 7, 4], [3, 4, 0],
+                    ],
+                    vec![0; 12],
+                    Vec::new(),
+                    None,
+                    String::new(),
+                    1,
+                    0,
+                    "BOX".into(),
+                );
+                let _ = tx.send(WorldStreamMsg::Batch(WorldBatchInput { mesh: bmesh, instances: box_insts }));
             }
-            arch_groups.sort_by(|a, b| a.2.total_cmp(&b.2));
-            for (h, moff, _, insts) in arch_groups {
-                if let Ok(mesh) = crate::model3d::decode_rage9_model_from_rpf(&lp, moff, &format!("arch_{h:08x}")) {
-                    let lo = mesh.name.to_ascii_lowercase();
-                    if lo.ends_with("_shadow") || lo.ends_with("_pxy") || lo.ends_with("_lit_proxy") {
-                        continue;
-                    }
-                    if tx.send(WorldStreamMsg::Batch(WorldBatchInput { mesh, instances: insts })).is_err() {
-                        break;
-                    }
+
+            let all_groups: Vec<(u32, u64, Vec3, Vec<(Vec3, Quat, Vec3, [f32; 4])>)> = grouped
+                .into_iter()
+                .filter_map(|(h, (rep, insts))| ix.models.get(&h).map(|&moff| (h, moff, rep, insts)))
+                .collect();
+            eprintln!("[world-gpu] {} unique drawable archetypes indexed for live camera streaming", all_groups.len());
+
+            let mut loaded = std::collections::HashSet::<u32>::new();
+            let mut last_gen = 0u64;
+            let mut total_sent = 0usize;
+            loop {
+                let (cam_p, cur_gen) = *cam_track_bg.lock().unwrap();
+                if cur_gen == last_gen {
+                    std::thread::sleep(std::time::Duration::from_millis(80));
+                    continue;
                 }
+                last_gen = cur_gen;
+                let mut nearby: Vec<(usize, f32)> = all_groups
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (h, _, _, _))| !loaded.contains(h))
+                    .filter_map(|(idx, (_, _, _, insts))| {
+                        let d2 = insts.iter().map(|i| i.0.distance_squared(cam_p)).fold(f32::MAX, f32::min);
+                        (d2 <= 3200.0 * 3200.0).then_some((idx, d2))
+                    })
+                    .collect();
+                if nearby.is_empty() {
+                    continue;
+                }
+                nearby.sort_by(|a, b| a.1.total_cmp(&b.1));
+                let take_n = nearby.len().min(if total_sent == 0 { 1200 } else { 500 });
+                let batch_list: Vec<(u32, u64, Vec<(Vec3, Quat, Vec3, [f32; 4])>)> = nearby
+                    .into_iter()
+                    .take(take_n)
+                    .map(|(idx, _)| {
+                        let (h, moff, _, ref insts) = all_groups[idx];
+                        loaded.insert(h);
+                        (h, moff, insts.clone())
+                    })
+                    .collect();
+                total_sent += batch_list.len();
+                let _ = tx.send(WorldStreamMsg::TotalArchetypes(total_sent));
+                let groups = Arc::new(batch_list);
+                let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                std::thread::scope(|s| {
+                    for _ in 0..3 {
+                        let groups = Arc::clone(&groups);
+                        let cursor = Arc::clone(&cursor);
+                        let tx = tx.clone();
+                        let lp = lp.clone();
+                        let cam_track_bg = Arc::clone(&cam_track_bg);
+                        s.spawn(move || loop {
+                            if cam_track_bg.lock().unwrap().1 != last_gen {
+                                break;
+                            }
+                            let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if i >= groups.len() {
+                                break;
+                            }
+                            let (h, moff, ref insts) = groups[i];
+                            if let Ok(mesh) = crate::model3d::decode_rage9_model_from_rpf(&lp, moff, &format!("arch_{h:08x}")) {
+                                let lo = mesh.name.to_ascii_lowercase();
+                                if !(lo.ends_with("_shadow") || lo.ends_with("_pxy") || lo.ends_with("_lit_proxy")) {
+                                    if tx.send(WorldStreamMsg::Batch(WorldBatchInput { mesh, instances: insts.clone() })).is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            if tx.send(WorldStreamMsg::ArchetypeDone).is_err() {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        });
+                    }
+                });
             }
         });
     }
-    let mut app = GpuWorldApp::new(cfg, rx);
+    let mut app = GpuWorldApp::new(cfg, rx, cam_track);
     let _ = event_loop.run_app(&mut app);
 }
 
@@ -177,6 +279,7 @@ struct Uniforms {
     sky_horizon: vec4<f32>,
     flags: vec4<f32>,
     map_y: vec4<f32>,
+    hud: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -260,6 +363,11 @@ fn aces_tonemap(x: vec3<f32>) -> vec3<f32> {
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
+fn neutral_col(c: vec3<f32>, k: f32) -> vec3<f32> {
+    return mix(c, vec3<f32>(dot(c, vec3<f32>(0.2126, 0.7152, 0.0722))), k);
+}
+
+// cook-torrance pbr lighting adapted from sixng shader.wgsl
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let tex_c = textureSample(albedo_tex, albedo_samp, in.uv);
@@ -274,7 +382,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     let ndl = max(dot(n, l), 0.0);
     let ndh = max(dot(n, h), 0.0);
-    let ndv = max(dot(n, v), 0.0);
+    let ndv = max(dot(n, v), 0.001);
 
     var sh = sample_shadow(in.shadow_coord, ndl);
     let enhanced_lighting = u.flags.x > 0.5;
@@ -282,19 +390,34 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         sh = smoothstep(0.08, 0.92, sh);
     }
 
-    let sun_elev = clamp(l.z * 2.2, 0.0, 1.0);
-    let sun_col = mix(vec3<f32>(1.0, 0.48, 0.22), vec3<f32>(1.05, 0.98, 0.90), sun_elev) * (1.8 * sun_elev + 0.15);
-    let spec = pow(ndh, 48.0) * 0.28 * ndl;
-    let hemi = n.z * 0.5 + 0.5;
-    let sky_gi = mix(vec3<f32>(0.16, 0.17, 0.20), u.sky_zenith.rgb * 0.55 + u.sky_horizon.rgb * 0.35, hemi);
-    let bounce = select(0.0, 0.18 * (1.0 - ndv) * (0.4 + 0.6 * hemi), enhanced_lighting);
+    let rough = 0.62;
+    let metal = 0.06;
+    let a2 = rough * rough * rough * rough;
+    let dd = ndh * ndh * (a2 - 1.0) + 1.0;
+    let d_ggx = a2 / (3.14159 * dd * dd);
+    let k = (rough + 1.0) * (rough + 1.0) / 8.0;
+    let g_smith = (ndl / (ndl * (1.0 - k) + k)) * (ndv / (ndv * (1.0 - k) + k));
+    let f0 = mix(vec3<f32>(0.04), albedo, metal);
+    let fr = f0 + (1.0 - f0) * pow(1.0 - max(dot(h, v), 0.0), 5.0);
+    let spec = d_ggx * g_smith * fr / max(4.0 * ndl * ndv, 0.001);
+    let kd = (1.0 - fr) * (1.0 - metal);
 
-    let lit = albedo * (sky_gi * 0.65 + sun_col * ndl * sh) + vec3<f32>(spec * sh) + sky_gi * bounce;
+    let sun_elev = clamp(l.z * 2.2, 0.0, 1.0);
+    let sun_col = mix(vec3<f32>(1.0, 0.48, 0.22), vec3<f32>(1.05, 0.98, 0.90), sun_elev) * (2.2 * sun_elev + 0.18);
+    let direct = (kd * albedo / 3.14159 + spec) * sun_col * ndl * sh * 2.4;
+
+    let hemi = n.z * 0.5 + 0.5;
+    let amb_d = mix(neutral_col(u.sky_horizon.rgb, 0.78) * 0.55, neutral_col(u.sky_zenith.rgb, 0.78), hemi);
+    let fr_v = f0 + (max(vec3<f32>(1.0 - rough), f0) - f0) * pow(1.0 - ndv, 5.0);
+    let env = mix(u.sky_horizon.rgb, u.sky_zenith.rgb, 0.5) * 0.45;
+    let bounce = select(0.0, 0.14 * (1.0 - ndv) * (0.4 + 0.6 * hemi), enhanced_lighting);
+
+    let lit = direct + kd * albedo * amb_d + env * fr_v + amb_d * bounce;
 
     let dist = length(u.cam_pos.xyz - in.world_pos);
-    let fog = 1.0 - exp(-dist * 0.00011);
+    let fog = 1.0 - exp(-dist * 0.000028 * max(u.hud.w, 0.0));
     let fog_col = mix(u.sky_horizon.rgb, u.sky_zenith.rgb, 0.25);
-    let col = mix(lit, fog_col, clamp(fog, 0.0, 0.88));
+    let col = mix(lit, fog_col, clamp(fog, 0.0, 0.65)) * max(u.sky_zenith.w, 0.2);
     return vec4<f32>(aces_tonemap(col), 1.0);
 }
 
@@ -354,6 +477,86 @@ fn fs_minimap(in: MinimapOut) -> @location(0) vec4<f32> {
     }
     return vec4<f32>(c.rgb, 0.92);
 }
+
+struct WaterOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) world_pos: vec3<f32>,
+};
+
+@vertex
+fn vs_water(@builtin(vertex_index) vid: u32) -> WaterOut {
+    var quad = array<vec2<f32>, 6>(
+        vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0),
+        vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(-1.0, 1.0)
+    );
+    let p = quad[vid] * 26000.0;
+    let wp = vec3<f32>(p.x, p.y, -0.5);
+    var out: WaterOut;
+    out.clip_pos = u.view_proj * vec4<f32>(wp, 1.0);
+    out.world_pos = wp;
+    return out;
+}
+
+@fragment
+fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
+    let dist = length(u.cam_pos.xyz - in.world_pos);
+    let wave_fade = exp(-dist * 0.0015);
+    let t = u.hud.z;
+    let w1 = sin(in.world_pos.x * 0.11 + t * 1.4) * cos(in.world_pos.y * 0.13 - t * 1.1);
+    let w2 = sin((in.world_pos.x * 0.07 - in.world_pos.y * 0.09) - t * 0.8);
+    let n = normalize(vec3<f32>((w1 + w2) * 0.035 * wave_fade, (w1 - w2) * 0.035 * wave_fade, 1.0));
+    let v = normalize(u.cam_pos.xyz - in.world_pos);
+    let l = normalize(u.sun_dir.xyz);
+    let h = normalize(l + v);
+    let fres = pow(1.0 - max(dot(n, v), 0.0), 4.0);
+    let sun_elev = clamp(l.z * 2.2, 0.0, 1.0);
+    let deep = vec3<f32>(0.02, 0.11, 0.19) * (0.35 + 0.65 * sun_elev);
+    let sky_r = mix(u.sky_horizon.rgb, u.sky_zenith.rgb, 0.45);
+    let glint = pow(max(dot(n, h), 0.0), 140.0) * 1.6 * sun_elev;
+    let water_col = mix(deep, sky_r, clamp(fres * 0.85 + 0.08, 0.0, 0.92)) + vec3<f32>(glint);
+    let fog = clamp(1.0 - exp(-dist * 0.00010), 0.0, 0.90);
+    let fog_col = mix(u.sky_horizon.rgb, u.sky_zenith.rgb, 0.25);
+    return vec4<f32>(aces_tonemap(mix(water_col, fog_col, fog)), 1.0);
+}
+
+struct ProgOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_progress(@builtin(vertex_index) vid: u32) -> ProgOut {
+    var quad = array<vec2<f32>, 6>(
+        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0),
+        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, 1.0)
+    );
+    let q = quad[vid];
+    let w = max(u.map_y.z, 640.0);
+    let h = max(u.map_y.w, 480.0);
+    let bw = min(460.0, w * 0.5);
+    let bh = 14.0;
+    let px = (w - bw) * 0.5 + q.x * bw;
+    let py = 18.0 + q.y * bh;
+    var out: ProgOut;
+    out.pos = vec4<f32>((px / w) * 2.0 - 1.0, 1.0 - (py / h) * 2.0, 0.0, 1.0);
+    out.uv = q;
+    return out;
+}
+
+@fragment
+fn fs_progress(in: ProgOut) -> @location(0) vec4<f32> {
+    if (u.hud.y < 0.5) {
+        discard;
+    }
+    let border = in.uv.x < 0.006 || in.uv.x > 0.994 || in.uv.y < 0.12 || in.uv.y > 0.88;
+    if (border) {
+        return vec4<f32>(0.85, 0.90, 0.96, 0.85);
+    }
+    if (in.uv.x <= clamp(u.hud.x, 0.0, 1.0)) {
+        return vec4<f32>(0.22, 0.80, 0.98, 0.95);
+    }
+    return vec4<f32>(0.08, 0.10, 0.14, 0.80);
+}
 "#;
 
 struct GpuMeshBatch {
@@ -363,6 +566,10 @@ struct GpuMeshBatch {
     index_count: u32,
     inst_count: u32,
     tex_bind_group: wgpu::BindGroup,
+    bound_center: Vec3,
+    bound_radius: f32,
+    is_box: bool,
+    is_terrain: bool,
 }
 
 struct GpuState {
@@ -382,13 +589,24 @@ struct GpuState {
     shadow_pipeline: wgpu::RenderPipeline,
     main_pipeline: wgpu::RenderPipeline,
     sky_pipeline: wgpu::RenderPipeline,
+    water_pipeline: wgpu::RenderPipeline,
     minimap_pipeline: wgpu::RenderPipeline,
+    progress_pipeline: wgpu::RenderPipeline,
     minimap_bg: wgpu::BindGroup,
+    egui_renderer: egui_wgpu::Renderer,
     batches: Vec<GpuMeshBatch>,
     tri_count: usize,
     instance_count: usize,
     model_count: usize,
     map_count: usize,
+    stream_done: usize,
+    stream_total: usize,
+    sgd5_count: usize,
+    tex_bytes: usize,
+    geom_bytes: usize,
+    vram_oom: bool,
+    frame_idx: u64,
+    start_instant: Instant,
     map_min: [f32; 2],
     map_span: [f32; 2],
 }
@@ -413,16 +631,36 @@ fn upload_texture(
     bgl: &wgpu::BindGroupLayout,
     samp: &wgpu::Sampler,
     tex: &Texture2D,
-) -> wgpu::BindGroup {
-    let mut raw = Vec::with_capacity(tex.w * tex.h * 4);
-    for c in &tex.pixels {
-        raw.extend_from_slice(&c.to_array());
-    }
+    max_dim: usize,
+) -> (wgpu::BindGroup, usize) {
+    let w0 = tex.w.max(1);
+    let h0 = tex.h.max(1);
+    let scale = (w0.max(h0) + max_dim - 1) / max_dim.max(1);
+    let (w, h, raw) = if scale > 1 && tex.pixels.len() >= w0 * h0 {
+        let nw = (w0 / scale).max(1);
+        let nh = (h0 / scale).max(1);
+        let mut buf = Vec::with_capacity(nw * nh * 4);
+        for y in 0..nh {
+            let sy = (y * scale).min(h0 - 1);
+            for x in 0..nw {
+                let sx = (x * scale).min(w0 - 1);
+                buf.extend_from_slice(&tex.pixels[sy * w0 + sx].to_array());
+            }
+        }
+        (nw, nh, buf)
+    } else {
+        let mut buf = Vec::with_capacity(tex.pixels.len() * 4);
+        for c in &tex.pixels {
+            buf.extend_from_slice(&c.to_array());
+        }
+        (w0, h0, buf)
+    };
+    let bytes = raw.len();
     let gpu_tex = device.create_texture_with_data(
         queue,
         &wgpu::TextureDescriptor {
             label: Some("albedo"),
-            size: wgpu::Extent3d { width: tex.w.max(1) as u32, height: tex.h.max(1) as u32, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -434,14 +672,15 @@ fn upload_texture(
         &raw,
     );
     let view = gpu_tex.create_view(&wgpu::TextureViewDescriptor::default());
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("tex_bg"),
         layout: bgl,
         entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(samp) },
         ],
-    })
+    });
+    (bg, bytes)
 }
 
 fn compute_smooth_normals(mesh: &Mesh3D) -> Vec<[f32; 3]> {
@@ -495,7 +734,7 @@ impl GpuState {
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::AutoVsync,
+            present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -688,6 +927,29 @@ impl GpuState {
             cache: None,
         });
 
+        let water_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("water_pipe"),
+            layout: Some(&main_layout),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_water"), buffers: &[], compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_water"),
+                targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                compilation_options: Default::default(),
+            }),
+            primitive: Default::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
+
         let minimap_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("minimap_pipe"),
             layout: Some(&main_layout),
@@ -711,9 +973,33 @@ impl GpuState {
             cache: None,
         });
 
+        let progress_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("progress_pipe"),
+            layout: Some(&main_layout),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_progress"), buffers: &[], compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_progress"),
+                targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })],
+                compilation_options: Default::default(),
+            }),
+            primitive: Default::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
+
         let white_tex = Texture2D { w: 1, h: 1, pixels: vec![eframe::egui::Color32::from_rgb(190, 195, 205)] };
-        let white_bg = upload_texture(&device, &queue, &tex_bgl, &tex_samp, &white_tex);
-        let minimap_bg = upload_texture(&device, &queue, &tex_bgl, &tex_samp, &white_tex);
+        let (white_bg, _) = upload_texture(&device, &queue, &tex_bgl, &tex_samp, &white_tex, 256);
+        let (minimap_bg, _) = upload_texture(&device, &queue, &tex_bgl, &tex_samp, &white_tex, 256);
+        let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
 
         let mut st = Self {
             window,
@@ -732,13 +1018,24 @@ impl GpuState {
             shadow_pipeline,
             main_pipeline,
             sky_pipeline,
+            water_pipeline,
             minimap_pipeline,
+            progress_pipeline,
             minimap_bg,
+            egui_renderer,
             batches: Vec::new(),
             tri_count: 0,
             instance_count: 0,
             model_count: 0,
             map_count: cfg.map_count,
+            stream_done: 0,
+            stream_total: 0,
+            sgd5_count: 0,
+            tex_bytes: 0,
+            geom_bytes: 0,
+            vram_oom: false,
+            frame_idx: 0,
+            start_instant: Instant::now(),
             map_min: [-13000.0, -9000.0],
             map_span: [20000.0, 20000.0],
         };
@@ -746,15 +1043,12 @@ impl GpuState {
         if let Some(ref terrain) = cfg.terrain {
             st.map_min = [terrain.bmin[0], terrain.bmin[1]];
             st.map_span = [terrain.bmax[0] - terrain.bmin[0], terrain.bmax[1] - terrain.bmin[1]];
-            let tmesh = terrain.build_world_terrain_mesh(4);
+            let tmesh = terrain.build_terrain_mesh(8);
             if let Some(ref t) = tmesh.texture {
-                st.minimap_bg = upload_texture(&st.device, &st.queue, &st.tex_bgl, &st.tex_samp, t);
+                let (mbg, bytes) = upload_texture(&st.device, &st.queue, &st.tex_bgl, &st.tex_samp, t, 1024);
+                st.minimap_bg = mbg;
+                st.tex_bytes += bytes;
             }
-            st.add_batch(&WorldBatchInput {
-                mesh: tmesh,
-                instances: vec![(Vec3::ZERO, Quat::IDENTITY, Vec3::ONE, [1.0; 4])],
-            });
-            st.model_count = st.model_count.saturating_sub(1);
         }
 
         for b in &cfg.batches {
@@ -768,17 +1062,21 @@ impl GpuState {
         if b.mesh.verts.is_empty() || b.mesh.tris.is_empty() || b.instances.is_empty() {
             return;
         }
+        const MAX_GEOM_BYTES: usize = 1024 * 1024 * 1024;
+        let is_terrain = b.mesh.name == "mhiu_world_terrain";
+        let est_geom_bytes = b.mesh.verts.len() * std::mem::size_of::<GpuVertex>()
+            + b.mesh.tris.len() * 12
+            + b.instances.len() * std::mem::size_of::<GpuInstance>();
+        if !is_terrain && (self.vram_oom || self.geom_bytes.saturating_add(est_geom_bytes) > MAX_GEOM_BYTES) {
+            return;
+        }
+
         let normals = compute_smooth_normals(&b.mesh);
         let insts: Vec<GpuInstance> = b
             .instances
             .iter()
             .map(|&(pos, rot, scale, col)| GpuInstance::from_mat4(Mat4::from_scale_rotation_translation(scale, rot, pos), col))
             .collect();
-        let inst_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("m_inst"),
-            contents: bytemuck::cast_slice(&insts),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
 
         let mut by_geom: HashMap<u16, Vec<u32>> = HashMap::new();
         for (ti, &[i0, i1, i2]) in b.mesh.tris.iter().enumerate() {
@@ -800,36 +1098,88 @@ impl GpuState {
                 uv: b.mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]),
             })
             .collect();
+
+        self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let inst_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("m_inst"),
+            contents: bytemuck::cast_slice(&insts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
         let vb = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("m_vb"),
             contents: bytemuck::cast_slice(&gv),
             usage: wgpu::BufferUsages::VERTEX,
         });
-
+        let mut ibs = Vec::with_capacity(by_geom.len());
         for (g, indices) in by_geom {
             let ib = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("m_ib"),
                 contents: bytemuck::cast_slice(&indices),
                 usage: wgpu::BufferUsages::INDEX,
             });
-            let tex_bg = b
-                .mesh
-                .texture
-                .as_ref()
-                .or_else(|| b.mesh.geom_materials.get(g as usize).and_then(|m| m.texture.as_deref()))
-                .map(|t| upload_texture(&self.device, &self.queue, &self.tex_bgl, &self.tex_samp, t))
-                .unwrap_or_else(|| self.white_bg.clone());
+            ibs.push((g, indices.len() as u32, ib));
+        }
+        if let Some(err) = pollster_block_on(self.device.pop_error_scope()) {
+            self.vram_oom = true;
+            eprintln!(
+                "[world-gpu] GPU VRAM limit reached ({} MiB geom, {} MiB tex): {err}",
+                self.geom_bytes / (1024 * 1024),
+                self.tex_bytes / (1024 * 1024)
+            );
+            return;
+        }
+
+        let mut lmin = Vec3::splat(f32::MAX);
+        let mut lmax = Vec3::splat(f32::MIN);
+        for v in &b.mesh.verts {
+            let p = Vec3::from_array(*v);
+            lmin = lmin.min(p);
+            lmax = lmax.max(p);
+        }
+        let local_center = (lmin + lmax) * 0.5;
+        let local_rad = ((lmax - lmin) * 0.5).length();
+        let mut wmin = Vec3::splat(f32::MAX);
+        let mut wmax = Vec3::splat(f32::MIN);
+        for &(pos, rot, scale, _) in &b.instances {
+            let c = pos + rot * (local_center * scale);
+            let r = local_rad * scale.abs().max_element();
+            wmin = wmin.min(c - Vec3::splat(r));
+            wmax = wmax.max(c + Vec3::splat(r));
+        }
+        let bound_center = (wmin + wmax) * 0.5;
+        let bound_radius = ((wmax - wmin) * 0.5).length().max(1.0);
+
+        for (g, index_count, ib) in ibs {
+            let tex_bg = if self.tex_bytes < 512 * 1024 * 1024 {
+                b.mesh
+                    .texture
+                    .as_ref()
+                    .or_else(|| b.mesh.geom_materials.get(g as usize).and_then(|m| m.texture.as_deref()))
+                    .map(|t| {
+                        let (bg, bytes) = upload_texture(&self.device, &self.queue, &self.tex_bgl, &self.tex_samp, t, 128);
+                        self.tex_bytes += bytes;
+                        bg
+                    })
+                    .unwrap_or_else(|| self.white_bg.clone())
+            } else {
+                self.white_bg.clone()
+            };
 
             self.batches.push(GpuMeshBatch {
                 vb: vb.clone(),
                 ib,
                 inst_buf: inst_buf.clone(),
-                index_count: indices.len() as u32,
+                index_count,
                 inst_count: insts.len() as u32,
                 tex_bind_group: tex_bg,
+                bound_center,
+                bound_radius,
+                is_box: b.mesh.name == "__placeholder_boxes__",
+                is_terrain,
             });
         }
 
+        self.geom_bytes += est_geom_bytes;
         self.tri_count += b.mesh.tris.len() * insts.len();
         self.instance_count += insts.len();
         self.model_count += 1;
@@ -850,7 +1200,12 @@ struct GpuWorldApp {
     cfg: Option<WorldLaunchConfig>,
     terrain_ref: Option<Arc<WorldMapData>>,
     stream_rx: Receiver<WorldStreamMsg>,
+    cam_track: Arc<std::sync::Mutex<(Vec3, u64)>>,
+    last_stream_cam: Vec3,
     gpu: Option<GpuState>,
+    egui_ctx: eframe::egui::Context,
+    egui_events: Vec<eframe::egui::Event>,
+    pointer_pos: eframe::egui::Pos2,
     cam_pos: Vec3,
     vel_z: f32,
     yaw: f32,
@@ -859,6 +1214,11 @@ struct GpuWorldApp {
     auto_sun: bool,
     enhanced_lighting: bool,
     walk_mode: bool,
+    menu_open: bool,
+    show_models: bool,
+    show_boxes: bool,
+    fog_density: f32,
+    exposure: f32,
     keys: [bool; 8], // W A S D Q E Shift Space
     dragging: bool,
     last_cursor: Option<PhysicalPosition<f64>>,
@@ -867,20 +1227,30 @@ struct GpuWorldApp {
 }
 
 impl GpuWorldApp {
-    fn new(cfg: WorldLaunchConfig, stream_rx: Receiver<WorldStreamMsg>) -> Self {
+    fn new(cfg: WorldLaunchConfig, stream_rx: Receiver<WorldStreamMsg>, cam_track: Arc<std::sync::Mutex<(Vec3, u64)>>) -> Self {
         Self {
             cam_pos: Vec3::from_array(cfg.start_pos),
+            last_stream_cam: Vec3::from_array(cfg.start_pos),
             terrain_ref: cfg.terrain.clone(),
             cfg: Some(cfg),
             stream_rx,
+            cam_track,
             gpu: None,
+            egui_ctx: eframe::egui::Context::default(),
+            egui_events: Vec::new(),
+            pointer_pos: eframe::egui::Pos2::ZERO,
             vel_z: 0.0,
-            yaw: 0.4,
-            pitch: -0.18,
-            time_h: 10.50,
+            yaw: 0.65,
+            pitch: -0.08,
+            time_h: 13.50,
             auto_sun: false,
             enhanced_lighting: true,
             walk_mode: false,
+            menu_open: true,
+            show_models: true,
+            show_boxes: false,
+            fog_density: 0.70,
+            exposure: 1.0,
             keys: [false; 8],
             dragging: false,
             last_cursor: None,
@@ -924,13 +1294,34 @@ impl ApplicationHandler for GpuWorldApp {
                     g.resize(sz.width, sz.height);
                 }
             }
-            WindowEvent::MouseInput { state, button: MouseButton::Left | MouseButton::Right, .. } => {
-                self.dragging = state == ElementState::Pressed;
-                if !self.dragging {
-                    self.last_cursor = None;
+            WindowEvent::MouseInput { state, button, .. } => {
+                let pressed = state == ElementState::Pressed;
+                let egui_btn = match button {
+                    MouseButton::Left => Some(eframe::egui::PointerButton::Primary),
+                    MouseButton::Right => Some(eframe::egui::PointerButton::Secondary),
+                    MouseButton::Middle => Some(eframe::egui::PointerButton::Middle),
+                    _ => None,
+                };
+                if let Some(eb) = egui_btn {
+                    self.egui_events.push(eframe::egui::Event::PointerButton {
+                        pos: self.pointer_pos,
+                        button: eb,
+                        pressed,
+                        modifiers: Default::default(),
+                    });
+                }
+                let over_ui = self.menu_open && self.egui_ctx.wants_pointer_input();
+                if matches!(button, MouseButton::Left | MouseButton::Right) && (!pressed || !over_ui) {
+                    self.dragging = pressed;
+                    if !self.dragging {
+                        self.last_cursor = None;
+                    }
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
+                let scale = self.gpu.as_ref().map(|g| g.window.scale_factor() as f32).unwrap_or(1.0);
+                self.pointer_pos = eframe::egui::pos2(position.x as f32 / scale, position.y as f32 / scale);
+                self.egui_events.push(eframe::egui::Event::PointerMoved(self.pointer_pos));
                 if self.dragging {
                     if let Some(prev) = self.last_cursor {
                         let dx = (position.x - prev.x) as f32;
@@ -940,6 +1331,17 @@ impl ApplicationHandler for GpuWorldApp {
                     }
                     self.last_cursor = Some(position);
                 }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let (dx, dy) = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(x, y) => (x * 24.0, y * 24.0),
+                    winit::event::MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32),
+                };
+                self.egui_events.push(eframe::egui::Event::MouseWheel {
+                    unit: eframe::egui::MouseWheelUnit::Point,
+                    delta: eframe::egui::vec2(dx, dy),
+                    modifiers: Default::default(),
+                });
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let down = event.state == ElementState::Pressed;
@@ -953,6 +1355,8 @@ impl ApplicationHandler for GpuWorldApp {
                         KeyCode::KeyE => self.keys[5] = down,
                         KeyCode::ShiftLeft | KeyCode::ShiftRight => self.keys[6] = down,
                         KeyCode::Space => self.keys[7] = down,
+                        KeyCode::Home | KeyCode::F1 if down => self.menu_open = !self.menu_open,
+                        KeyCode::KeyB if down => self.show_boxes = !self.show_boxes,
                         KeyCode::F6 if down => self.auto_sun = !self.auto_sun,
                         KeyCode::KeyR if down => self.enhanced_lighting = !self.enhanced_lighting,
                         KeyCode::KeyG if down => {
@@ -971,10 +1375,14 @@ impl ApplicationHandler for GpuWorldApp {
                 self.last_frame = now;
 
                 if let Some(g) = &mut self.gpu {
-                    while let Ok(msg) = self.stream_rx.try_recv() {
+                    for _ in 0..2 {
+                        let Ok(msg) = self.stream_rx.try_recv() else { break };
                         match msg {
                             WorldStreamMsg::Batch(batch) => g.add_batch(&batch),
                             WorldStreamMsg::MapCount(mc) => g.map_count = mc,
+                            WorldStreamMsg::TotalArchetypes(t) => g.stream_total = t,
+                            WorldStreamMsg::ArchetypeDone => g.stream_done += 1,
+                            WorldStreamMsg::Sgd5Count(n) => g.sgd5_count = n,
                         }
                     }
                 }
@@ -1010,6 +1418,14 @@ impl ApplicationHandler for GpuWorldApp {
                     if self.keys[4] { self.cam_pos.z -= speed; }
                 }
 
+                if self.cam_pos.distance_squared(self.last_stream_cam) > 180.0 * 180.0 {
+                    self.last_stream_cam = self.cam_pos;
+                    if let Ok(mut ct) = self.cam_track.lock() {
+                        ct.0 = self.cam_pos;
+                        ct.1 += 1;
+                    }
+                }
+
                 let Some(g) = &mut self.gpu else { return };
                 let az = (self.time_h / 24.0) * std::f32::consts::TAU - 1.2;
                 let el = ((self.time_h - 6.0) / 12.0 * std::f32::consts::PI).sin() * 1.15;
@@ -1019,12 +1435,20 @@ impl ApplicationHandler for GpuWorldApp {
                     self.last_title = now;
                     let lighting = if self.enhanced_lighting { "Enhanced" } else { "Basic" };
                     let mode_lbl = if self.walk_mode { "WALK(G)" } else { "FLY(G)" };
+                    let load_lbl = if g.stream_total > 0 && g.stream_done < g.stream_total {
+                        format!(" | Load {}/{} ({:.0}%)", g.stream_done, g.stream_total, (g.stream_done as f32 / g.stream_total as f32) * 100.0)
+                    } else if g.stream_total > 0 {
+                        " | World Ready".to_string()
+                    } else {
+                        " | Indexing...".to_string()
+                    };
+                    let sgd_lbl = if g.sgd5_count > 0 { format!(" | SGD5: {}", g.sgd5_count) } else { String::new() };
                     g.window.set_title(&format!(
-                        "Percy6Stars 3D World | pos {:.0} {:.0} {:.0} | {} | Sun az {:.1} el {:+.1} (F6) | Time {:.2}h | {} maps | {} models | {} instances | {:.2} M tris | Lighting (R): {}",
+                        "Percy6Stars 3D World | pos {:.0} {:.0} {:.0} | {} | Sun az {:.1} el {:+.1} (F6) | Time {:.2}h | {} maps | {} models | {} instances | {:.2} M tris | Lighting (R): {}{}{}",
                         self.cam_pos.x, self.cam_pos.y, self.cam_pos.z, mode_lbl,
                         az.to_degrees().rem_euclid(360.0), el.to_degrees(),
                         self.time_h, g.map_count, g.model_count, g.instance_count,
-                        g.tri_count as f64 / 1e6, lighting
+                        g.tri_count as f64 / 1e6, lighting, load_lbl, sgd_lbl
                     ));
                 }
 
@@ -1040,8 +1464,10 @@ impl ApplicationHandler for GpuWorldApp {
                 let light_vp = light_proj * light_view;
 
                 let day_fac = (sun_dir.z * 2.5).clamp(0.0, 1.0);
-                let sky_zenith = [0.06 + day_fac * 0.20, 0.09 + day_fac * 0.42, 0.16 + day_fac * 0.72, 1.0];
+                let sky_zenith = [0.06 + day_fac * 0.20, 0.09 + day_fac * 0.42, 0.16 + day_fac * 0.72, self.exposure];
                 let sky_horizon = [0.14 + day_fac * 0.54, 0.16 + day_fac * 0.62, 0.24 + day_fac * 0.68, 1.0];
+                let load_prog = if g.stream_total > 0 { (g.stream_done as f32 / g.stream_total as f32).clamp(0.0, 1.0) } else { 0.02 };
+                let load_active = if g.stream_total == 0 || g.stream_done < g.stream_total { 1.0 } else { 0.0 };
 
                 let uni = FrameUniforms {
                     view_proj: view_proj.to_cols_array_2d(),
@@ -1052,14 +1478,16 @@ impl ApplicationHandler for GpuWorldApp {
                     sky_horizon,
                     flags: [if self.enhanced_lighting { 1.0 } else { 0.0 }, self.time_h, g.map_min[0], g.map_span[0]],
                     map_y: [g.map_min[1], g.map_span[1], g.config.width as f32, g.config.height as f32],
+                    hud: [load_prog, load_active, g.start_instant.elapsed().as_secs_f32(), self.fog_density],
                 };
                 g.queue.write_buffer(&g.uniform_buf, 0, bytemuck::bytes_of(&uni));
 
                 let Ok(frame) = g.surface.get_current_texture() else { return };
                 let view_tex = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
                 let mut enc = g.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world_enc") });
+                g.frame_idx = g.frame_idx.wrapping_add(1);
 
-                {
+                if g.frame_idx % 2 == 1 {
                     let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("shadow_pass"),
                         color_attachments: &[],
@@ -1074,6 +1502,12 @@ impl ApplicationHandler for GpuWorldApp {
                     rp.set_pipeline(&g.shadow_pipeline);
                     rp.set_bind_group(0, &g.uniform_bg, &[]);
                     for b in &g.batches {
+                        if b.bound_radius < 3.0 {
+                            continue;
+                        }
+                        if b.bound_radius < 5000.0 && (b.bound_center - light_target).length_squared() > (1200.0 + b.bound_radius).powi(2) {
+                            continue;
+                        }
                         rp.set_bind_group(1, &b.tex_bind_group, &[]);
                         rp.set_vertex_buffer(0, b.vb.slice(..));
                         rp.set_vertex_buffer(1, b.inst_buf.slice(..));
@@ -1104,8 +1538,33 @@ impl ApplicationHandler for GpuWorldApp {
                     rp.set_bind_group(2, &g.shadow_bg, &[]);
                     rp.draw(0..3, 0..1);
 
+                    rp.set_pipeline(&g.water_pipeline);
+                    rp.draw(0..6, 0..1);
+
                     rp.set_pipeline(&g.main_pipeline);
+                    let mut drawn = 0usize;
                     for b in &g.batches {
+                        if b.is_box && !self.show_boxes {
+                            continue;
+                        }
+                        if !b.is_box && !b.is_terrain && !self.show_models {
+                            continue;
+                        }
+                        if !b.is_terrain && b.bound_radius < 5000.0 {
+                            let to_b = b.bound_center - self.cam_pos;
+                            if to_b.dot(fwd) < -(b.bound_radius + 120.0) {
+                                continue;
+                            }
+                            let d2 = to_b.length_squared();
+                            let max_d = if b.bound_radius > 35.0 { 6500.0 } else if b.bound_radius < 2.0 { 450.0 } else { 3200.0 };
+                            if d2 > (max_d + b.bound_radius).powi(2) {
+                                continue;
+                            }
+                            drawn += 1;
+                            if drawn > 1400 {
+                                break;
+                            }
+                        }
                         rp.set_bind_group(1, &b.tex_bind_group, &[]);
                         rp.set_vertex_buffer(0, b.vb.slice(..));
                         rp.set_vertex_buffer(1, b.inst_buf.slice(..));
@@ -1116,6 +1575,111 @@ impl ApplicationHandler for GpuWorldApp {
                     rp.set_pipeline(&g.minimap_pipeline);
                     rp.set_bind_group(1, &g.minimap_bg, &[]);
                     rp.draw(0..6, 0..1);
+
+                    rp.set_pipeline(&g.progress_pipeline);
+                    rp.draw(0..6, 0..1);
+                }
+
+                if self.menu_open {
+                    let scale = g.window.scale_factor() as f32;
+                    let screen_desc = egui_wgpu::ScreenDescriptor {
+                        size_in_pixels: [g.config.width, g.config.height],
+                        pixels_per_point: scale,
+                    };
+                    let raw_in = eframe::egui::RawInput {
+                        screen_rect: Some(eframe::egui::Rect::from_min_size(
+                            eframe::egui::Pos2::ZERO,
+                            eframe::egui::vec2(g.config.width as f32 / scale, g.config.height as f32 / scale),
+                        )),
+                        events: std::mem::take(&mut self.egui_events),
+                        ..Default::default()
+                    };
+                    let full_out = self.egui_ctx.run(raw_in, |ctx| {
+                        let mut vis = eframe::egui::Visuals::dark();
+                        vis.window_fill = eframe::egui::Color32::from_rgba_premultiplied(20, 13, 31, 238);
+                        vis.panel_fill = eframe::egui::Color32::from_rgb(20, 13, 31);
+                        vis.window_stroke = eframe::egui::Stroke::new(1.2_f32, eframe::egui::Color32::from_rgb(255, 72, 165));
+                        vis.widgets.inactive.bg_fill = eframe::egui::Color32::from_rgb(36, 22, 54);
+                        vis.widgets.hovered.bg_fill = eframe::egui::Color32::from_rgb(56, 32, 82);
+                        vis.widgets.active.bg_fill = eframe::egui::Color32::from_rgb(255, 168, 28);
+                        vis.selection.bg_fill = eframe::egui::Color32::from_rgb(255, 168, 28);
+                        ctx.set_visuals(vis);
+
+                        eframe::egui::Window::new(
+                            eframe::egui::RichText::new("PERCYSTAR · WORLD & RESHADE (Home / F1)")
+                                .strong()
+                                .color(eframe::egui::Color32::from_rgb(255, 168, 28)),
+                        )
+                        .default_pos([g.config.width as f32 / scale - 370.0, 18.0])
+                        .default_width(350.0)
+                        .resizable(false)
+                        .show(ctx, |ui| {
+                            ui.label(
+                                eframe::egui::RichText::new(format!(
+                                    "{} maps · {}/{} models · {} inst · {:.2}M tris · {} MB VRAM",
+                                    g.map_count, g.model_count, g.stream_total, g.instance_count,
+                                    g.tri_count as f64 / 1e6, g.tex_bytes / (1024 * 1024)
+                                ))
+                                .size(11.0)
+                                .color(eframe::egui::Color32::from_rgb(95, 215, 255)),
+                            );
+                            ui.separator();
+                            ui.add(eframe::egui::Slider::new(&mut self.time_h, 0.0..=24.0).text("Time of Day (h)"));
+                            ui.add(eframe::egui::Slider::new(&mut self.fog_density, 0.0..=2.0).text("Fog Density"));
+                            ui.add(eframe::egui::Slider::new(&mut self.exposure, 0.3..=2.2).text("Exposure"));
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut self.auto_sun, "Auto Sun (F6)");
+                                ui.checkbox(&mut self.enhanced_lighting, "Enhanced lighting (R)");
+                            });
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut self.show_models, "Real Models");
+                                ui.checkbox(&mut self.show_boxes, "Boxes (B)");
+                                ui.checkbox(&mut self.walk_mode, "Walk (G)");
+                            });
+                            ui.horizontal(|ui| {
+                                let btn = eframe::egui::Button::new(
+                                    eframe::egui::RichText::new("Go to Downtown Brickell")
+                                        .strong()
+                                        .color(eframe::egui::Color32::BLACK),
+                                )
+                                .fill(eframe::egui::Color32::from_rgb(255, 168, 28));
+                                if ui.add(btn).clicked() {
+                                    self.cam_pos = Vec3::new(-127.276, -1855.924, 24.0);
+                                    self.yaw = 0.65;
+                                    self.pitch = -0.08;
+                                }
+                                ui.label(
+                                    eframe::egui::RichText::new(format!("Pos: {:.0}, {:.0}, {:.0}", self.cam_pos.x, self.cam_pos.y, self.cam_pos.z))
+                                        .size(11.0)
+                                        .color(eframe::egui::Color32::from_rgb(200, 190, 220)),
+                                );
+                            });
+                        });
+                    });
+                    for (id, delta) in &full_out.textures_delta.set {
+                        g.egui_renderer.update_texture(&g.device, &g.queue, *id, delta);
+                    }
+                    let tris = self.egui_ctx.tessellate(full_out.shapes, scale);
+                    g.egui_renderer.update_buffers(&g.device, &g.queue, &mut enc, &tris, &screen_desc);
+                    {
+                        let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("egui_pass"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &view_tex,
+                                resolve_target: None,
+                                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                        }).forget_lifetime();
+                        g.egui_renderer.render(&mut rp, &tris, &screen_desc);
+                    }
+                    for id in &full_out.textures_delta.free {
+                        g.egui_renderer.free_texture(id);
+                    }
+                } else {
+                    self.egui_events.clear();
                 }
 
                 g.queue.submit(Some(enc.finish()));

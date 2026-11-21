@@ -1,6 +1,6 @@
 [package]
 name = "rpf9_explorer"
-version = "1.8.2"
+version = "1.9.0"
 edition = "2021"
 
 [[bin]]
@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 eframe = "0.31"
+egui-wgpu = "0.31"
 flate2 = "1.0"
 rfd = "0.15"
 image = { version = "0.25", default-features = false, features = ["png", "bmp"] }

@@ -65,7 +65,7 @@ enum ParsedAdatHeader {
         flags: u32,
         sc: usize,
         raw_hdr_sz: usize,
-        data_chunks: Vec<(usize, usize)>,
+        data_chunks: Vec<(usize, usize, u32)>,
         skipped_chunks: Vec<String>,
     },
 }
@@ -112,7 +112,8 @@ fn parse_adat_header(data: &[u8]) -> ParsedAdatHeader {
         };
     }
 
-    let mut data_chunks = Vec::new();
+    let mut data_chunks: Vec<(usize, usize, u32)> = Vec::new();
+    let mut format_rates: Vec<u32> = Vec::new();
     let mut off = 16 + sc * 4;
     if off + 8 > hdr_sz {
         let mut details = vec![format!("flags=0x{flags:08X}, payload={} bytes", data.len())];
@@ -128,7 +129,7 @@ fn parse_adat_header(data: &[u8]) -> ParsedAdatHeader {
     let mut skipped_chunks: Vec<String> = Vec::new();
     let mut sample_entries: Vec<String> = Vec::new();
 
-    // unpack 64bit tag size offset entries lookign for 0x55 data blocks
+    // unpack 64bit tag size offset entries lookign for 0x55 data blocks and 0x76 format chunks
     while off + 8 <= hdr_sz {
         let val = ru64(data, off);
         let tag = (val >> 56) as u8;
@@ -142,7 +143,17 @@ fn parse_adat_header(data: &[u8]) -> ParsedAdatHeader {
         if sample_entries.len() < 8 {
             sample_entries.push(format!("tag=0x{tag:02X} off=0x{coff:X} sz={sz}"));
         }
-        if tag == 0x55 {
+        if tag == 0x76 && sz >= 10 && coff + 10 <= data.len() {
+            let sr = ru16(data, coff + 8) as u32;
+            if (8_000..=192_000).contains(&sr) {
+                format_rates.push(sr);
+                if let Some(last) = data_chunks.last_mut() {
+                    if last.2 == 0 {
+                        last.2 = sr;
+                    }
+                }
+            }
+        } else if tag == 0x55 {
             if sz == 0 {
                 skipped_chunks.push(format!("0x55 chunk at off=0x{coff:X} has sz=0"));
             } else if coff < 0x20 {
@@ -152,9 +163,9 @@ fn parse_adat_header(data: &[u8]) -> ParsedAdatHeader {
             } else if coff + sz > data.len() {
                 let avail = data.len() - coff;
                 skipped_chunks.push(format!("0x55 chunk truncated in RPF (off=0x{coff:X}, header_sz={sz}, clamped to {avail} bytes)"));
-                data_chunks.push((coff, avail));
+                data_chunks.push((coff, avail, 0));
             } else {
-                data_chunks.push((coff, sz));
+                data_chunks.push((coff, sz, 0));
             }
         }
         off += 8;
@@ -170,13 +181,25 @@ fn parse_adat_header(data: &[u8]) -> ParsedAdatHeader {
             let sz = ((val >> 28) & 0x0FFF_FFFF) as usize;
             let coff = (val & 0x0FFF_FFFF) as usize;
             if tag == 0x55 && sz > 0 && coff >= hdr_sz && coff < data.len() {
-                data_chunks.push((coff, sz.min(data.len() - coff)));
+                data_chunks.push((coff, sz.min(data.len() - coff), 0));
+            } else if tag == 0x76 && sz >= 10 && coff + 10 <= data.len() {
+                let sr = ru16(data, coff + 8) as u32;
+                if (8_000..=192_000).contains(&sr) {
+                    format_rates.push(sr);
+                }
             } else if !matches!(tag, 0x48 | 0x55 | 0x76 | 0xA3 | 0xBD | 0xFA | 0xFF) && coff > data.len() {
                 break;
             }
             back -= 8;
         }
         data_chunks.reverse();
+    }
+
+    let default_sr = format_rates.first().copied().unwrap_or(48_000);
+    for (idx, chunk) in data_chunks.iter_mut().enumerate() {
+        if chunk.2 == 0 {
+            chunk.2 = format_rates.get(idx).copied().unwrap_or(default_sr);
+        }
     }
 
     if data_chunks.is_empty() {
@@ -271,15 +294,15 @@ fn probe_superblock_streams(blob: &[u8]) -> Option<usize> {
     }
 }
 
-fn expand_superblock_jobs(data: &[u8], data_chunks: &[(usize, usize)]) -> Vec<(usize, usize, Option<(usize, usize)>)> {
+fn expand_superblock_jobs(data: &[u8], data_chunks: &[(usize, usize, u32)]) -> Vec<(usize, usize, u32, Option<(usize, usize)>)> {
     let mut jobs = Vec::with_capacity(data_chunks.len());
-    for &(coff, csz) in data_chunks {
+    for &(coff, csz, sr) in data_chunks {
         if let Some(n_sub) = probe_superblock_streams(&data[coff..coff + csz]) {
             for sub_idx in 0..n_sub {
-                jobs.push((coff, csz, Some((sub_idx, n_sub))));
+                jobs.push((coff, csz, sr, Some((sub_idx, n_sub))));
             }
         } else {
-            jobs.push((coff, csz, None));
+            jobs.push((coff, csz, sr, None));
         }
     }
     jobs
@@ -631,14 +654,14 @@ where
                     if idx >= total {
                         break;
                     }
-                    let (coff, csz, sub_stream) = jobs[idx];
+                    let (coff, csz, sample_rate, sub_stream) = jobs[idx];
                     match decode_opus_chunk_into(idx, data, coff, csz, sub_stream, &mut pcm_f32, &mut samples_i16) {
                         Ok(ch) => {
                             let name = format!("{stem}_s{idx:02}.wav");
                             local_tracks.push(LoadedWavTrack::from_pcm_summary(
                                 idx as u32 + 1,
                                 name,
-                                48_000,
+                                sample_rate,
                                 ch,
                                 &samples_i16,
                                 coff,
@@ -716,11 +739,11 @@ pub fn decode_awc_bytes_to_wavs_detailed(data: &[u8], out_dir: &Path, stem: &str
     let mut samples_i16 = Vec::new();
     let mut chunk_notes: Vec<String> = Vec::new();
 
-    for (idx, &(coff, csz, sub_stream)) in jobs.iter().enumerate() {
+    for (idx, &(coff, csz, sample_rate, sub_stream)) in jobs.iter().enumerate() {
         match decode_opus_chunk_into(idx, data, coff, csz, sub_stream, &mut pcm_f32, &mut samples_i16) {
             Ok(ch) => {
                 let wav_p = out_dir.join(format!("{stem}_s{idx:02}.wav"));
-                match write_pcm_wav(&wav_p, 48_000, ch, &samples_i16) {
+                match write_pcm_wav(&wav_p, sample_rate, ch, &samples_i16) {
                     Ok(()) => wavs.push((idx as u32 + 1, wav_p)),
                     Err(err) => chunk_notes.push(format!("Chunk #{idx}: WAV write error ({}): {err}", wav_p.display())),
                 }
@@ -849,6 +872,41 @@ mod tests {
         assert!(res.wavs.is_empty());
         assert!(res.summary.contains("No valid 0x55 Opus data chunks"));
         assert!(res.details.iter().any(|d| d.contains("0x48")));
+    }
+
+    #[test]
+    fn uses_0x76_sample_rate_for_opus_streams() {
+        let mut enc = OpusEncoder::new(48_000, 1, Application::Audio).unwrap();
+        let pcm = vec![0.0f32; 960];
+        let mut pkt = vec![0u8; 256];
+        let plen = enc.encode(&pcm, 960, &mut pkt).unwrap();
+        pkt.truncate(plen);
+
+        let mut blk = vec![0u8; 2048];
+        blk[0..2].copy_from_slice(&(plen as u16).to_le_bytes());
+        blk[2..2 + plen].copy_from_slice(&pkt);
+
+        let hdr_sz = 0x38usize;
+        let data_off = hdr_sz;
+        let fmt_off = data_off + blk.len();
+        let mut fmt_chunk = [0u8; 32];
+        fmt_chunk[8..10].copy_from_slice(&32_000u16.to_le_bytes());
+
+        let mut adat = vec![0u8; fmt_off + fmt_chunk.len()];
+        adat[0..4].copy_from_slice(b"ADAT");
+        adat[4..8].copy_from_slice(&0xFF02_0001u32.to_le_bytes());
+        adat[8..12].copy_from_slice(&1u32.to_le_bytes());
+        adat[12..16].copy_from_slice(&(hdr_sz as u32).to_le_bytes());
+        let e55: u64 = (0x55u64 << 56) | ((blk.len() as u64) << 28) | (data_off as u64);
+        let e76: u64 = (0x76u64 << 56) | ((fmt_chunk.len() as u64) << 28) | (fmt_off as u64);
+        adat[20..28].copy_from_slice(&e55.to_le_bytes());
+        adat[28..36].copy_from_slice(&e76.to_le_bytes());
+        adat[data_off..data_off + blk.len()].copy_from_slice(&blk);
+        adat[fmt_off..fmt_off + fmt_chunk.len()].copy_from_slice(&fmt_chunk);
+
+        let res = decode_awc_bytes_in_memory(&adat, "dispatch", |_, _| {});
+        assert_eq!(res.tracks.len(), 1);
+        assert_eq!(res.tracks[0].sample_rate, 32_000);
     }
 }
 

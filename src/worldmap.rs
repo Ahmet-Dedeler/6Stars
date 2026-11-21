@@ -128,16 +128,19 @@ impl WorldMapData {
 
     // build downsampled 3d terrain mesh (z-up, scaled 1:100 for smooth orbiting)
     pub fn build_terrain_mesh(&self, step: usize) -> Mesh3D {
-        self.build_terrain_mesh_scaled(step, 0.01, 0.04)
+        self.build_terrain_mesh_scaled(step.max(4), 0.01, 0.04, 512)
     }
 
-    // The GPU world places buildings, camera, and terrain in the same world units.
+    // The GPU world places buildings, camera, and terrain in the same world units (1:1),
+    // with the full 2048px hillshade texture.
     pub fn build_world_terrain_mesh(&self, step: usize) -> Mesh3D {
-        self.build_terrain_mesh_scaled(step, 1.0, 1.0)
+        let mut m = self.build_terrain_mesh_scaled(step, 1.0, 1.0, 2048);
+        m.name = "mhiu_world_terrain".into();
+        m
     }
 
-    fn build_terrain_mesh_scaled(&self, step: usize, xy_scale: f32, z_scale: f32) -> Mesh3D {
-        let step = step.max(4);
+    fn build_terrain_mesh_scaled(&self, step: usize, xy_scale: f32, z_scale: f32, max_tex: usize) -> Mesh3D {
+        let step = step.max(2);
         let gw = (self.w + step - 1) / step;
         let gh = (self.h + step - 1) / step;
         let mut verts = Vec::with_capacity(gw * gh);
@@ -165,8 +168,8 @@ impl WorldMapData {
             }
         }
         // bake hillshaded elevation texture for crisp 3d terrain
-        let tw = self.w.min(512);
-        let th = self.h.min(512);
+        let tw = self.w.min(max_tex);
+        let th = self.h.min(max_tex);
         let mut tpix = Vec::with_capacity(tw * th);
         for ty in 0..th {
             let py = (ty * self.h / th).min(self.h - 1);

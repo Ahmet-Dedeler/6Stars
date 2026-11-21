@@ -6,19 +6,44 @@ use tempfile::TempDir;
 #[cfg(windows)]
 use std::time::{Duration, Instant};
 
+/// Finds RAD's player. Order: `BINKPLAY_PATH`, next to the exe (or `tools/`), the working
+/// directory, `PATH`, then the usual RAD Video Tools install folders (upstream fix for
+/// rpatty-dev/PercyStar#15, where a missing player surfaced as "os error 3").
 pub fn player_path() -> Option<PathBuf> {
     let name = if cfg!(windows) { "binkplay.exe" } else { "binkplay" };
-    if let Some(path) = std::env::current_exe().ok()
-        .and_then(|p| p.parent().map(|d| d.join(name)))
-        .filter(|p| p.is_file())
-    {
-        return Some(path);
+    if let Some(p) = std::env::var_os("BINKPLAY_PATH") {
+        let p = PathBuf::from(p.to_string_lossy().trim().trim_matches('"'));
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
+        dirs.push(dir.clone());
+        dirs.push(dir.join("tools"));
     }
     #[cfg(windows)]
-    return ["ProgramFiles(x86)", "ProgramFiles"].into_iter()
-        .filter_map(std::env::var_os)
-        .map(|p| PathBuf::from(p).join("RADVideo").join(name))
-        .find(|p| p.is_file());
+    {
+        if let Ok(cwd) = std::env::current_dir() {
+            dirs.push(cwd.clone());
+            dirs.push(cwd.join("tools"));
+        }
+        if let Some(path) = std::env::var_os("PATH") {
+            dirs.extend(std::env::split_paths(&path));
+        }
+        for key in ["ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA", "USERPROFILE"] {
+            if let Some(base) = std::env::var_os(key) {
+                let base = PathBuf::from(base);
+                dirs.push(base.join("RADVideo"));
+                dirs.push(base.join("RAD Video Tools"));
+            }
+        }
+    }
+    if let Some(found) = dirs.into_iter().map(|d| d.join(name)).find(|p| p.is_file()) {
+        return Some(found);
+    }
+    #[cfg(windows)]
+    return None;
     #[cfg(not(windows))]
     Some(PathBuf::from(name))
 }
@@ -181,6 +206,8 @@ mod win {
         fn GetWindowLongW(hwnd: isize, index: i32) -> i32;
         fn SetWindowLongW(hwnd: isize, index: i32, value: i32) -> i32;
         fn SetWindowPos(hwnd: isize, after: isize, x: i32, y: i32, w: i32, h: i32, flags: u32) -> i32;
+        fn SetForegroundWindow(hwnd: isize) -> i32;
+        fn SetFocus(hwnd: isize) -> isize;
     }
 
     pub fn player_window(pid: u32) -> Option<isize> {
@@ -221,6 +248,10 @@ mod win {
                 SetWindowLongW(parent, GWL_STYLE, parent_style | WS_CLIPCHILDREN);
             }
             SetWindowPos(child, 0, 0, 0, 0, 0, UPDATE_FRAME);
+            // Keep keyboard focus on our window so Explorer arrow keys keep working while a
+            // clip plays (upstream fix for rpatty-dev/PercyStar#11).
+            SetForegroundWindow(parent);
+            SetFocus(parent);
             true
         }
     }
