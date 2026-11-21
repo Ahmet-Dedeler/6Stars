@@ -2,12 +2,22 @@
 // modes reattach to the parent console in main().
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 mod audio_player;
+mod anim;
 mod awc;
+mod boot;
+mod dat;
+mod dxbc;
 #[cfg(not(target_os = "macos"))]
 mod bink_dock;
 #[cfg(target_os = "macos")]
 mod bink_embed;
 mod gallery;
+mod mapdata;
+mod psin;
+mod rsc9;
+mod sgd5;
+mod world_gpu;
+mod worldmap;
 mod model3d;
 mod rdna2;
 mod tex;
@@ -25,11 +35,12 @@ use model3d::{
     probe_large_rage9_model_in_buf, render_mesh3d_viewport,
 };
 use rdna2::{
-    Ps09Cache, ShaderStage, format_gfx103_disasm, format_spirv_abi_summary, lift_to_hlsl,
-    lift_to_spirv,
+    Ps09Cache, Ps09ShaderEntry, ShaderStage, format_gfx103_disasm, format_spirv_abi_summary,
+    lift_to_hlsl, lift_to_spirv,
 };
 use tex::{
-    DecodedTexture, build_dds_dx10, decode_0drpz_text, decode_0drpz_text_min, decode_navmesh_from_rpf, decode_rbf0,
+    DecodedTexture, build_dds_dx10, decode_0drpz_text, decode_0drpz_text_min, decode_mhiu_heightmap, decode_navmesh_from_rpf,
+    decode_rbf0,
     decode_ttpf_texture, decode_txd_from_rpf, export_texture_png, inspect_gfx, probe_txd_header,
     scan_ttpf_descriptors,
 };
@@ -63,6 +74,7 @@ extern "system" {
     fn PlaySoundW(pszSound: *const u16, hmod: isize, fdwSound: u32) -> i32;
 }
 
+#[allow(dead_code)] // the AWC player has its own backends now
 pub fn play_wav_async(path: &Path) -> bool {
     const SND_FILENAME: u32 = 0x0002_0000;
     const SND_ASYNC: u32 = 1;
@@ -87,6 +99,7 @@ use std::sync::Mutex;
 
 static WAV_PROC: Mutex<Option<Child>> = Mutex::new(None);
 
+#[allow(dead_code)] // the AWC player has its own backends now
 pub fn play_wav_async(path: &Path) -> bool {
     stop_wav();
     let player = if cfg!(target_os = "macos") { "afplay" } else { "aplay" };
@@ -105,13 +118,14 @@ pub fn stop_wav() {
     }
 }
 }
-use plat::{play_wav_async, stop_wav};
+use plat::stop_wav;
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum AppTab {
     #[default]
     Explorer,
     ModelViewer,
+    WorldMap,
     Shaders,
 }
 
@@ -121,6 +135,13 @@ enum ShaderViewMode {
     Asm,
     Hlsl,
     SpirvAbi,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum ShaderSource {
+    #[default]
+    Ps09,
+    Sgd5,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
@@ -434,8 +455,7 @@ struct ScanState {
 struct MediaState {
     loading: bool,
     status: String,
-    awc_streams: Vec<(u32, PathBuf)>,
-    awc_dir: Option<tempfile::TempDir>,
+    loaded_tracks: Option<(Vec<audio_player::LoadedWavTrack>, Arc<Vec<u8>>)>,
     loaded_mesh: Option<Mesh3D>,
     loaded_textures: Option<Vec<DecodedTexture>>,
 }
@@ -449,6 +469,13 @@ struct UpdateState {
     status: String,
 }
 
+
+#[derive(Default)]
+struct Sgd5JobState {
+    running: bool,
+    status: String,
+    files: Option<Arc<Vec<sgd5::Sgd5File>>>,
+}
 fn parse_semver(s: &str) -> Option<(u32, u32, u32)> {
     let trimmed = s.trim().trim_start_matches(['v', 'V']);
     let core = trimmed.split(['-', '+']).next()?;
@@ -588,8 +615,6 @@ struct Rpf9App {
     watch_gen: Arc<Mutex<u64>>,
     #[cfg(not(target_os = "macos"))]
     bink_dock: Option<bink_dock::BinkDock>,
-    // in-panel player for the selected AWC's decoded streams
-    audio: Option<audio_player::AudioPlayer>,
     #[cfg(target_os = "macos")]
     bink_embed: Option<bink_embed::BinkEmbed>,
     bink_pending: Option<(PathBuf, String, video_clip::PendingClip)>,
@@ -599,6 +624,12 @@ struct Rpf9App {
     bink_loop: bool,
     mesh3d: Option<Mesh3D>,
     show_3d: bool,
+    anim_playing: bool,
+    anim_time: f32,
+    anim_dur: f32,
+    anim_tracks: usize,
+    anim_seed: u32,
+    anim_name: String,
     textures: Vec<DecodedTexture>,
     tex_sel: usize,
     tex_handle: Option<(usize, TextureHandle)>,
@@ -628,11 +659,14 @@ struct Rpf9App {
     mv_view: Vec<usize>,
     mv_view_key: Option<(u64, ModelCat, String, bool, bool)>,
     mv_rng: u64,
-    // list ordering shared by Explorer + Model Viewer; *_sort = order the cached view was built with
+    audio_player: audio_player::AudioPlayerState,
+    explorer_scroll_to_sel: bool,
+    // list ordering shared by explorer and model viewer
     sort_mode: SortMode,
     view_sort: SortMode,
     mv_sort: SortMode,
-    // dedicated RDNA2 (GFX10.3) PS\x00\x09 Shader Disassembler & HLSL/SPIR-V Lifter tab
+    world_map: worldmap::WorldMapState,
+    // dedicated rdna2 gfx103 ps09 shader disassembler and hlsl spirv lifter tab
     sh_cache: Option<Ps09Cache>,
     sh_status: String,
     sh_stage_filter: Option<ShaderStage>,
@@ -643,6 +677,55 @@ struct Rpf9App {
     // Explorer thumbnail grid for textures (List | Grid toggle)
     gallery: gallery::Gallery,
     grid_view: bool,
+    sh_source: ShaderSource,
+    sgd5_job: Arc<Mutex<Sgd5JobState>>,
+    sgd5_cache: Option<Arc<Vec<sgd5::Sgd5File>>>,
+    sgd5_group: usize,
+    sgd5_stage_filter: Option<&'static str>,
+    sgd5_search: String,
+    sgd5_selected: Option<usize>,
+    sgd5_cached_text: (Option<(usize, usize, ShaderViewMode)>, String),
+}
+
+fn sgd5_stage(stage: &str) -> ShaderStage {
+    match stage {
+        "VS" => ShaderStage::Vertex,
+        "PS" => ShaderStage::Pixel,
+        "GS" => ShaderStage::Geometry,
+        "DS" => ShaderStage::Domain,
+        "HS" => ShaderStage::Hull,
+        "CS" => ShaderStage::Compute,
+        _ => ShaderStage::Unknown,
+    }
+}
+
+fn sgd5_ps09_entry(shader: &sgd5::Sgd5Shader, fssm: &dxbc::FssmShader) -> Ps09ShaderEntry {
+    Ps09ShaderEntry {
+        index: shader.index,
+        code_offset: u32::try_from(fssm.code_offset).unwrap_or(0),
+        code_size: u32::try_from(fssm.code_size).unwrap_or(0),
+        stage: sgd5_stage(shader.stage),
+        num_threads: None,
+        rsrc1: None,
+        rsrc2: None,
+        bindings: Vec::new(),
+        pso_hash: shader.hash,
+        has_rt: false,
+        has_ngg: false,
+        insn_count: u32::try_from(rdna2::decode_gfx103(fssm.code(), 4000).len()).unwrap_or(0),
+    }
+}
+
+fn sgd5_stage_color(stage: &str) -> Color32 {
+    match stage {
+        "VS" => Color32::from_rgb(205, 145, 255),
+        "PS" => Color32::from_rgb(95, 235, 145),
+        "GS" => Color32::from_rgb(120, 220, 255),
+        "DS" => Color32::from_rgb(255, 190, 120),
+        "HS" => Color32::from_rgb(255, 140, 180),
+        "CS" => Color32::from_rgb(72, 210, 255),
+        _ => Color32::from_rgb(170, 170, 190),
+    }
 }
 
 impl Rpf9App {
@@ -670,7 +753,6 @@ impl Rpf9App {
             watch_gen: Arc::new(Mutex::new(0)),
             #[cfg(not(target_os = "macos"))]
             bink_dock: None,
-            audio: None,
             #[cfg(target_os = "macos")]
             bink_embed: None,
             bink_pending: None,
@@ -680,6 +762,12 @@ impl Rpf9App {
             bink_loop: true,
             mesh3d: None,
             show_3d: false,
+            anim_playing: false,
+            anim_time: 0.0,
+            anim_dur: 0.0,
+            anim_tracks: 0,
+            anim_seed: 0,
+            anim_name: String::new(),
             textures: Vec::new(),
             tex_sel: 0,
             tex_handle: None,
@@ -709,7 +797,10 @@ impl Rpf9App {
             sort_mode: SortMode::Relevance,
             view_sort: SortMode::Relevance,
             mv_sort: SortMode::Relevance,
+            world_map: worldmap::WorldMapState::default(),
             mv_rng: 0x9E37_79B9_7F4A_7C15,
+            audio_player: audio_player::AudioPlayerState::default(),
+            explorer_scroll_to_sel: false,
             sh_cache: None,
             sh_status: String::new(),
             sh_stage_filter: None,
@@ -719,6 +810,14 @@ impl Rpf9App {
             sh_cached_text: (None, String::new()),
             gallery: gallery::Gallery::new(),
             grid_view: true,
+            sh_source: ShaderSource::Ps09,
+            sgd5_job: Arc::new(Mutex::new(Sgd5JobState::default())),
+            sgd5_cache: None,
+            sgd5_group: 0,
+            sgd5_stage_filter: None,
+            sgd5_search: String::new(),
+            sgd5_selected: None,
+            sgd5_cached_text: (None, String::new()),
         };
         load_ui_state(&mut app);
         spawn_update_check(Arc::clone(&app.update), cc.egui_ctx.clone());
@@ -871,12 +970,14 @@ impl Rpf9App {
         self.preview.clear();
         self.mesh3d = None;
         self.show_3d = false;
+        self.anim_dur = 0.0;
+        self.anim_playing = false;
         self.textures.clear();
         self.tex_sel = 0;
         self.tex_handle = None;
         self.tex_zoom = 1.0;
         stop_wav();
-        self.audio = None;
+        self.audio_player.clear_all();
         self.stop_bink_player();
         self.media = Arc::new(Mutex::new(MediaState::default()));
     }
@@ -984,8 +1085,12 @@ impl Rpf9App {
             }
             match scan_single_rpf(&path, Some(&state)) {
                 Ok((hdr, mut entries)) => {
+                    let sig = fs::metadata(&path).ok().map(|m| (m.len(), m.modified().ok()));
                     let mut st = state.lock().unwrap();
                     if *watch_gen.lock().unwrap() != gen { return; } // replaced by a newer scan
+                    if let Some(sig) = sig {
+                        st.file_sig.insert(path.clone(), sig);
+                    }
                     st.header_info = hdr;
                     // keep the loose-media row if .bk2/.awc files were opened alongside this archive
                     let keep_loose = st.rpf_names.iter().any(|n| n == LOOSE_LABEL);
@@ -1345,8 +1450,31 @@ impl Rpf9App {
                     let is_text = e.kind == "XML"
                         || (!sample.is_empty()
                             && sample.iter().all(|&b| (32..127).contains(&b) || matches!(b, 9 | 10 | 13 | 0x80..)));
-                    if e.kind == "PSIN" {
-                        self.preview = parse_psin(&data);
+                    if e.kind == "HMAP" {
+                        if let Some(t) = decode_mhiu_heightmap(&data) {
+                            self.textures = vec![t];
+                            self.tex_sel = 0;
+                            self.tex_handle = None;
+                        } else {
+                            self.preview = format_hex(&data[..data.len().min(2048)]);
+                        }
+                    } else if e.kind == "PSIN" {
+                        self.preview = psin::parse_psin(&data);
+                    } else if e.kind == "ANIM" {
+                        self.preview = anim::parse_anim_dict(&data);
+                        let (dur, trk, seed) = anim::extract_anim_summary(&data);
+                        self.anim_dur = dur;
+                        self.anim_tracks = trk;
+                        self.anim_seed = seed;
+                        self.anim_name = e.name.clone();
+                        self.anim_time = 0.0;
+                        self.anim_playing = true;
+                        self.mesh3d = Some(anim::build_stickman_mesh(&e.name, 0.0, dur, trk, seed));
+                        self.show_3d = true;
+                    } else if e.kind == "DAT" {
+                        self.preview = dat::parse_dat(&data);
+                    } else if e.kind == "RSC9" {
+                        self.preview = rsc9::parse_rsc9(&data);
                     } else if e.kind == "RBF0" {
                         self.preview = decode_rbf0(&data).unwrap_or_else(|| format_hex(&data[..data.len().min(2048)]));
                     } else if e.kind == "GFX" {
@@ -1403,13 +1531,13 @@ impl Rpf9App {
                 c[match e.kind {
                     "VEH" => 1,
                     "MODEL" => 2,
-                    "TXD" | "TTPF" => 3,
+                    "TXD" | "TTPF" | "HMAP" => 3,
                     "RBF0" | "GFX" | "GXT" => 4,
                     "NAVM" => 5,
                     "BK2" => 6,
                     "AWC" => 7,
                     "XML" => 8,
-                    "PSIN" => 9,
+                    "PSIN" | "ANIM" | "RSC9" => 9,
                     _ => 10,
                 }] += 1;
             }
@@ -1428,13 +1556,13 @@ impl Rpf9App {
                     Category::All => true,
                     Category::Vehicles => e.kind == "VEH",
                     Category::Models => e.kind == "VEH" || (!self.vehicles_only && e.kind == "MODEL"),
-                    Category::Textures => e.kind == "TXD" || e.kind == "TTPF",
+                    Category::Textures => e.kind == "TXD" || e.kind == "TTPF" || e.kind == "HMAP",
                     Category::Ui => e.kind == "RBF0" || e.kind == "GFX" || e.kind == "GXT",
                     Category::NavMesh => e.kind == "NAVM",
                     Category::Videos => e.kind == "BK2",
                     Category::Audio => e.kind == "AWC",
                     Category::Xml => e.kind == "XML",
-                    Category::Resources => e.kind == "PSIN",
+                    Category::Resources => matches!(e.kind, "PSIN" | "ANIM" | "RSC9"),
                     Category::Binary => e.kind == "ZLIB",
                 };
                 let h = &self.hay[*i];
@@ -1776,15 +1904,15 @@ impl Rpf9App {
                     }
                 });
 
-                // Arrow key navigation when search box is not focused
-                if !sr.has_focus() && !self.mv_view.is_empty() {
-                    if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                // Arrow key / W-S navigation when search box is not focused
+                if !sr.has_focus() && !ctx.wants_keyboard_input() && !self.mv_view.is_empty() {
+                    if ui.input(|i| i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::S)) {
                         let next_i = match cur_pos {
                             Some(p) if p + 1 < self.mv_view.len() => p + 1,
                             _ => 0,
                         };
                         to_select = Some(self.mv_entries[self.mv_view[next_i]].0);
-                    } else if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                    } else if ui.input(|i| i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::W)) {
                         let next_i = match cur_pos {
                             Some(0) | None => self.mv_view.len() - 1,
                             Some(p) => p - 1,
@@ -1797,34 +1925,42 @@ impl Rpf9App {
                 ui.separator();
 
                 const ROW_H: f32 = 22.0;
+                let mut copied_msg: Option<String> = None;
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                 egui::ScrollArea::vertical()
                     .id_salt("mv_list_scroll")
                     .auto_shrink([false, false])
                     .show_rows(ui, ROW_H, self.mv_view.len(), |ui, range| {
-                        let rows: Vec<(usize, ModelCat, String, String, u64)> = {
+                        let rows: Vec<(usize, ModelCat, RpfEntry)> = {
                             let st = self.state.lock().unwrap();
                             self.mv_view[range]
                                 .iter()
                                 .filter_map(|&mi| {
                                     let (eidx, cat, _) = &self.mv_entries[mi];
-                                    st.entries.get(*eidx).map(|e| (*eidx, *cat, e.name.clone(), e.rpf_name.clone(), e.raw_size))
+                                    st.entries.get(*eidx).map(|e| (*eidx, *cat, e.clone()))
                                 })
                                 .collect()
                         };
-                        for (eidx, cat, name, rpf_name, raw_size) in rows {
+                        for (eidx, cat, e) in &rows {
                             let w = ui.available_width();
-                            let (tag, col) = model_cat_tag(cat);
+                            let (tag, col) = model_cat_tag(*cat);
                             ui.allocate_ui_with_layout(egui::vec2(w, ROW_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                 ui.set_height(ROW_H);
                                 ui.label(RichText::new(tag).strong().size(10.5).color(col));
-                                let label = format!("{name}  ·  {rpf_name}  ·  {}", format_size(raw_size));
-                                if ui.selectable_label(self.selected == Some(eidx), RichText::new(label).size(12.0)).clicked() {
-                                    to_select = Some(eidx);
+                                let label = format!("{}  ·  {}  ·  {}", e.name, e.rpf_name, format_size(e.raw_size));
+                                let resp = ui.selectable_label(self.selected == Some(*eidx), RichText::new(label).size(12.0));
+                                if resp.clicked() {
+                                    to_select = Some(*eidx);
+                                }
+                                if let Some(msg) = entry_context_menu(&resp, e) {
+                                    copied_msg = Some(msg);
                                 }
                             });
                         }
                     });
+                if let Some(msg) = copied_msg {
+                    self.state.lock().unwrap().status = msg;
+                }
             });
 
         if browse_videos {
@@ -1971,37 +2107,174 @@ impl Rpf9App {
         dirs.into_iter().find(|p| p.exists())
     }
 
+    fn spawn_sgd5_extraction(&self, ctx: egui::Context, input: PathBuf, output: PathBuf) {
+        {
+            let mut job = self.sgd5_job.lock().unwrap();
+            if job.running {
+                return;
+            }
+            job.running = true;
+            job.status = format!("Extracting SGD5 from {}...", input.display());
+        }
+
+        let job_state = self.sgd5_job.clone();
+        std::thread::spawn(move || {
+            let result = sgd5::extract_sgd5(&input, &output, 0);
+            let (status, files) = match result {
+                Ok(extraction) => {
+                    let effect_count = extraction
+                        .files
+                        .iter()
+                        .map(|file| file.effect_count as usize)
+                        .sum::<usize>();
+                    let status = format!(
+                        "Extracted {} DXBC shaders from {} SGD5 groups ({} effects) to {}",
+                        extraction.extracted_count,
+                        extraction.files.len(),
+                        effect_count,
+                        output.display()
+                    );
+                    (status, Some(Arc::new(extraction.files)))
+                }
+                Err(error) => (format!("SGD5 extraction failed: {error}"), None),
+            };
+            {
+                let mut job = job_state.lock().unwrap();
+                job.running = false;
+                job.status = status;
+                job.files = files;
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    fn spawn_sgd5_load(&mut self, ctx: egui::Context, input: PathBuf) {
+        {
+            let mut job = self.sgd5_job.lock().unwrap();
+            if job.running {
+                return;
+            }
+            job.running = true;
+            job.status = format!("Loading SGD5 from {}...", input.display());
+        }
+        self.sh_source = ShaderSource::Sgd5;
+
+        let job_state = self.sgd5_job.clone();
+        std::thread::spawn(move || {
+            let result = sgd5::load_sgd5(&input);
+            let (status, files) = match result {
+                Ok(files) => {
+                    let shader_count = files.iter().map(|file| file.shaders.len()).sum::<usize>();
+                    (
+                        format!(
+                            "Loaded {shader_count} SGD5 shaders from {} groups",
+                            files.len()
+                        ),
+                        Some(Arc::new(files)),
+                    )
+                }
+                Err(error) => (format!("SGD5 load failed: {error}"), None),
+            };
+            {
+                let mut job = job_state.lock().unwrap();
+                job.running = false;
+                job.status = status;
+                job.files = files;
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_sgd5_cache(&mut self) {
+        let files = self.sgd5_job.lock().unwrap().files.take();
+        if let Some(files) = files {
+            self.sgd5_group = 0;
+            self.sgd5_selected = Some(0);
+            self.sgd5_cached_text = (None, String::new());
+            self.sgd5_cache = Some(files);
+            if self.sh_cache.is_none() {
+                self.sh_source = ShaderSource::Sgd5;
+            }
+        }
+    }
+
     fn render_shader_tab(&mut self, ctx: &egui::Context) {
         let local_sh = self.find_local_shaders_dir();
         egui::SidePanel::left("sh_sidebar")
             .default_width(355.0)
-            .frame(egui::Frame::new().fill(Color32::from_rgb(20, 13, 31)).inner_margin(10.0))
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(20, 13, 31))
+                    .inner_margin(10.0),
+            )
             .show(ctx, |ui| {
                 ui.label(
-                    RichText::new("RDNA2 (GFX10.3) SHADER LIFTER")
+                    RichText::new("RDNA2 (GFX10.3) SHADER DATA")
                         .size(12.0)
                         .strong()
                         .color(Color32::from_rgb(72, 210, 255)),
                 );
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
+                    for (source, label) in [
+                        (ShaderSource::Ps09, "PS09 Runtime Cache"),
+                        (ShaderSource::Sgd5, "SGD5 DXBC Groups"),
+                    ] {
+                        let active = self.sh_source == source;
+                        let button = egui::Button::new(
+                            RichText::new(label)
+                                .size(12.0)
+                                .strong()
+                                .color(if active { Color32::BLACK } else { Color32::from_rgb(225, 215, 240) }),
+                        )
+                        .fill(if active { Color32::from_rgb(72, 210, 255) } else { Color32::from_rgb(36, 22, 54) });
+                        if ui.add(button).clicked() {
+                            self.sh_source = source;
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
                     if let Some(lp) = local_sh {
                         if ui
                             .add(
-                                egui::Button::new(RichText::new("★ Load Local PS09").color(Color32::BLACK).strong())
-                                    .fill(Color32::from_rgb(255, 168, 28)),
+                                egui::Button::new(
+                                    RichText::new("★ Load Local PS09")
+                                        .color(Color32::BLACK)
+                                        .strong(),
+                                )
+                                .fill(Color32::from_rgb(255, 168, 28)),
                             )
                             .clicked()
                         {
                             self.load_ps09_path(&lp);
                         }
                     }
-                    if ui.button("Open shaders.rpf / .ps09").clicked() {
+                    if ui.button("Open shaders.rpf (PS09 + SGD5)").clicked() {
                         if let Some(p) = rfd::FileDialog::new()
-                            .add_filter("RAGE 9 Shaders", &["rpf", "ps09", "bin"])
+                            .add_filter("RAGE 9 Shaders", &["rpf"])
                             .pick_file()
                         {
                             self.load_ps09_path(&p);
+                            self.spawn_sgd5_load(ctx.clone(), p);
+                            self.sh_source = ShaderSource::Ps09;
+                        }
+                    }
+                    if ui.button("Open PS09 .ps09").clicked() {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("PS09 Cache", &["ps09"])
+                            .pick_file()
+                        {
+                            self.load_ps09_path(&p);
+                            self.sh_source = ShaderSource::Ps09;
+                        }
+                    }
+                    if ui.button("Open SGD5 .bin").clicked() {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("SGD5 Shader Group", &["bin"])
+                            .pick_file()
+                        {
+                            self.spawn_sgd5_load(ctx.clone(), p);
                         }
                     }
                     if ui.button("Open zlib Dir...").clicked() {
@@ -2010,9 +2283,151 @@ impl Rpf9App {
                         }
                     }
                 });
+                ui.add_space(4.0);
+                let running = self.sgd5_job.lock().unwrap().running;
+                if ui
+                    .add_enabled(
+                        !running,
+                        egui::Button::new("Extract SGD5 from .rpf / .bin..."),
+                    )
+                    .clicked()
+                {
+                    if let Some(input) = rfd::FileDialog::new()
+                        .add_filter("SGD5 Containers", &["rpf", "bin"])
+                        .pick_file()
+                    {
+                        if let Some(output) = rfd::FileDialog::new().pick_folder() {
+                            self.spawn_sgd5_extraction(ctx.clone(), input, output);
+                            self.sh_source = ShaderSource::Sgd5;
+                        }
+                    }
+                }
+                let sgd5_status = self.sgd5_job.lock().unwrap().status.clone();
+                if !sgd5_status.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(sgd5_status)
+                            .size(10.5)
+                            .color(Color32::from_rgb(165, 225, 185)),
+                    );
+                }
+                if self.sh_source == ShaderSource::Sgd5 {
+                if let Some(files) = self.sgd5_cache.clone() {
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        for group_index in 0..files.len() {
+                            let label = format!("Group {group_index}");
+                            let active = self.sgd5_group == group_index;
+                            let button = egui::Button::new(
+                                RichText::new(label)
+                                    .size(11.5)
+                                    .strong()
+                                    .color(if active { Color32::BLACK } else { Color32::from_rgb(225, 215, 240) }),
+                            )
+                            .fill(if active { Color32::from_rgb(255, 168, 28) } else { Color32::from_rgb(38, 24, 58) });
+                            if ui.add(button).clicked() {
+                                self.sgd5_group = group_index;
+                                self.sgd5_selected = Some(0);
+                                self.sgd5_cached_text = (None, String::new());
+                                self.sh_source = ShaderSource::Sgd5;
+                            }
+                        }
+                    });
+                    let group = &files[self.sgd5_group.min(files.len() - 1)];
+                    let mut stage_counts = std::collections::BTreeMap::new();
+                    for shader in &group.shaders {
+                        *stage_counts.entry(shader.stage).or_insert(0usize) += 1;
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        let options = [
+                            (None, "All"),
+                            (Some("VS"), "VS"),
+                            (Some("PS"), "PS"),
+                            (Some("GS"), "GS"),
+                            (Some("DS"), "DS"),
+                            (Some("HS"), "HS"),
+                            (Some("CS"), "CS"),
+                        ];
+                        for (option, label) in options {
+                            let count = option.map_or(group.shaders.len(), |stage| {
+                                stage_counts.get(stage).copied().unwrap_or(0)
+                            });
+                            let color = option.map_or(
+                                Color32::from_rgb(225, 215, 240),
+                                sgd5_stage_color,
+                            );
+                            let active = self.sgd5_stage_filter == option;
+                            let button = egui::Button::new(
+                                RichText::new(format!("{label} ({count})"))
+                                    .size(11.0)
+                                    .strong()
+                                    .color(if active { Color32::BLACK } else { color }),
+                            )
+                            .fill(if active { color } else { Color32::from_rgb(36, 22, 54) });
+                            if ui.add(button).clicked() {
+                                self.sgd5_stage_filter = option;
+                                self.sgd5_selected = None;
+                                self.sh_source = ShaderSource::Sgd5;
+                            }
+                        }
+                    });
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.sgd5_search)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("Filter SGD5 shaders by name, hash, or stage..."),
+                    );
+                    let query = self.sgd5_search.trim().to_ascii_lowercase();
+                    let filtered: Vec<usize> = group
+                        .shaders
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, shader)| {
+                            self.sgd5_stage_filter
+                                .map_or(true, |stage| shader.stage == stage)
+                                && (query.is_empty()
+                                    || shader.name.to_ascii_lowercase().contains(&query)
+                                    || format!("0x{:016x}", shader.hash).contains(&query))
+                        })
+                        .map(|(index, _)| index)
+                        .collect();
+                    ui.label(format!("{} shaders", filtered.len()));
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show_rows(ui, 20.0, filtered.len(), |ui, range| {
+                            for index in filtered[range].iter().copied() {
+                                let shader = &group.shaders[index];
+                                let selected = self.sgd5_selected == Some(index);
+                                let color = sgd5_stage_color(shader.stage);
+                                let label = format!(
+                                    "[{}] #{:05} {} {:5}B",
+                                    shader.stage,
+                                    shader.index,
+                                    shader.name,
+                                    shader.uncompressed_size
+                                );
+                                let button = egui::Button::new(
+                                    RichText::new(label)
+                                        .monospace()
+                                        .size(11.0)
+                                        .color(if selected { Color32::BLACK } else { color }),
+                                )
+                                .fill(if selected { color } else { Color32::from_rgb(24, 15, 36) });
+                                if ui.add(button).clicked() {
+                                    self.sgd5_selected = Some(index);
+                                    self.sh_source = ShaderSource::Sgd5;
+                                }
+                            }
+                        });
+                }
+                }
+                if self.sh_source == ShaderSource::Ps09 {
                 if !self.sh_status.is_empty() {
                     ui.add_space(4.0);
-                    ui.label(RichText::new(&self.sh_status).size(10.5).color(Color32::from_rgb(165, 225, 185)));
+                    ui.label(
+                        RichText::new(&self.sh_status)
+                            .size(10.5)
+                            .color(Color32::from_rgb(165, 225, 185)),
+                    );
                 }
                 ui.add_space(6.0);
 
@@ -2026,7 +2441,7 @@ impl Rpf9App {
                             ShaderStage::Vertex => vs += 1,
                             ShaderStage::MeshNgg => ngg += 1,
                             ShaderStage::RayTracing => rt += 1,
-                            ShaderStage::Unknown => {}
+                            _ => {}
                         }
                     }
                     (c.shaders.len(), cs, ps, vs, ngg, rt)
@@ -2047,11 +2462,20 @@ impl Rpf9App {
                             RichText::new(format!("{lbl} ({cnt})"))
                                 .size(11.0)
                                 .strong()
-                                .color(if active { Color32::BLACK } else { Color32::from_rgb(220, 210, 240) }),
+                                .color(if active {
+                                    Color32::BLACK
+                                } else {
+                                    Color32::from_rgb(220, 210, 240)
+                                }),
                         )
-                        .fill(if active { Color32::from_rgb(72, 210, 255) } else { Color32::from_rgb(36, 22, 54) });
+                        .fill(if active {
+                            Color32::from_rgb(72, 210, 255)
+                        } else {
+                            Color32::from_rgb(36, 22, 54)
+                        });
                         if ui.add(btn).clicked() {
                             self.sh_stage_filter = opt;
+                            self.sh_source = ShaderSource::Ps09;
                         }
                     }
                 });
@@ -2092,11 +2516,9 @@ impl Rpf9App {
                         .map(|(i, _)| i)
                         .collect();
 
-                    egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(
-                        ui,
-                        20.0,
-                        filtered.len(),
-                        |ui, range| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show_rows(ui, 20.0, filtered.len(), |ui, range| {
                             for ri in range {
                                 let idx = filtered[ri];
                                 let s = &cache.shaders[idx];
@@ -2107,7 +2529,7 @@ impl Rpf9App {
                                     ShaderStage::Compute => Color32::from_rgb(72, 210, 255),
                                     ShaderStage::Pixel => Color32::from_rgb(95, 235, 145),
                                     ShaderStage::Vertex => Color32::from_rgb(205, 145, 255),
-                                    ShaderStage::Unknown => Color32::from_rgb(170, 170, 190),
+                                    _ => Color32::from_rgb(170, 170, 190),
                                 };
                                 let lbl = format!(
                                     "[{}] #{:05} · {:4}B · {}i · {}b",
@@ -2117,18 +2539,180 @@ impl Rpf9App {
                                     s.insn_count,
                                     s.bindings.len()
                                 );
-                                if ui.selectable_label(sel, RichText::new(lbl).monospace().size(11.5).color(col)).clicked() {
+                                if ui
+                                    .selectable_label(
+                                        sel,
+                                        RichText::new(lbl).monospace().size(11.5).color(col),
+                                    )
+                                    .clicked()
+                                {
                                     self.sh_selected = Some(idx);
+                                    self.sh_source = ShaderSource::Ps09;
                                 }
                             }
-                        },
-                    );
+                        });
+                }
                 }
             });
 
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(Color32::from_rgb(14, 9, 24)).inner_margin(12.0))
             .show(ctx, |ui| {
+                if self.sh_cache.is_some() && self.sgd5_cache.is_some() {
+                    ui.horizontal_wrapped(|ui| {
+                        for (source, label) in [
+                            (ShaderSource::Ps09, "PS09 Runtime Cache"),
+                            (ShaderSource::Sgd5, "SGD5 DXBC Groups"),
+                        ] {
+                            let active = self.sh_source == source;
+                            let button = egui::Button::new(
+                                RichText::new(label)
+                                    .size(12.0)
+                                    .strong()
+                                    .color(if active {
+                                        Color32::BLACK
+                                    } else {
+                                        Color32::from_rgb(225, 215, 240)
+                                    }),
+                            )
+                            .fill(if active {
+                                Color32::from_rgb(255, 168, 28)
+                            } else {
+                                Color32::from_rgb(38, 24, 58)
+                            });
+                            if ui.add(button).clicked() {
+                                self.sh_source = source;
+                            }
+                        }
+                    });
+                    ui.separator();
+                }
+
+                if self.sh_source == ShaderSource::Sgd5 {
+                if let Some(files) = self.sgd5_cache.clone() {
+                    let group_index = self.sgd5_group.min(files.len() - 1);
+                    if let Some(shader_index) = self.sgd5_selected {
+                        if let Some(shader) = files[group_index].shaders.get(shader_index) {
+                            match sgd5::decompress_shader(&files[group_index], shader) {
+                                Ok(blob) => match dxbc::extract_fssm(&blob) {
+                                    Ok(fssm) => {
+                                        let code = fssm.code().to_vec();
+                                        let entry = sgd5_ps09_entry(shader, &fssm);
+                                        let stem = format!(
+                                            "sgd5_{:05}_{}_{}",
+                                            shader.index,
+                                            shader.stage.to_lowercase(),
+                                            shader.name.replace(['/', '\\', ':'], "_")
+                                        );
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "SGD5 group {} · {} · {} · {} code bytes",
+                                                    group_index,
+                                                    shader.stage,
+                                                    shader.name,
+                                                    code.len()
+                                                ))
+                                                .strong()
+                                                .size(13.0)
+                                                .color(Color32::from_rgb(255, 168, 28)),
+                                            );
+                                            ui.separator();
+                                            for (mode, label) in [
+                                                (ShaderViewMode::Asm, "GFX10.3 ASM"),
+                                                (ShaderViewMode::Hlsl, "Lifted HLSL (SM 6.6)"),
+                                                (ShaderViewMode::SpirvAbi, "SPIR-V 1.5 / SGPR ABI"),
+                                            ] {
+                                                let active = self.sh_mode == mode;
+                                                let button = egui::Button::new(
+                                                    RichText::new(label)
+                                                        .size(12.0)
+                                                        .strong()
+                                                        .color(if active { Color32::BLACK } else { Color32::from_rgb(225, 215, 240) }),
+                                                )
+                                                .fill(if active { Color32::from_rgb(255, 168, 28) } else { Color32::from_rgb(38, 24, 58) });
+                                                if ui.add(button).clicked() {
+                                                    self.sh_mode = mode;
+                                                }
+                                            }
+                                            ui.separator();
+                                            if ui.button("Export .dxbc").clicked() {
+                                                if let Some(path) = rfd::FileDialog::new()
+                                                    .set_file_name(format!("{stem}.dxbc"))
+                                                    .save_file()
+                                                {
+                                                    let _ = fs::write(&path, &blob);
+                                                }
+                                            }
+                                            if ui.button("Export .asm").clicked() {
+                                                if let Some(path) = rfd::FileDialog::new()
+                                                    .set_file_name(format!("{stem}.asm"))
+                                                    .save_file()
+                                                {
+                                                    let _ = fs::write(&path, format_gfx103_disasm(&entry, &code));
+                                                }
+                                            }
+                                            if ui.button("Export .hlsl").clicked() {
+                                                if let Some(path) = rfd::FileDialog::new()
+                                                    .set_file_name(format!("{stem}.hlsl"))
+                                                    .save_file()
+                                                {
+                                                    let _ = fs::write(&path, lift_to_hlsl(&entry, &code));
+                                                }
+                                            }
+                                            if ui.button("Export .spv").clicked() {
+                                                if let Some(path) = rfd::FileDialog::new()
+                                                    .set_file_name(format!("{stem}.spv"))
+                                                    .save_file()
+                                                {
+                                                    let _ = fs::write(&path, lift_to_spirv(&entry, &code));
+                                                }
+                                            }
+                                        });
+                                        ui.add_space(8.0);
+                                        let key = Some((group_index, shader_index, self.sh_mode));
+                                        if self.sgd5_cached_text.0 != key {
+                                            let text = match self.sh_mode {
+                                                ShaderViewMode::Asm => format_gfx103_disasm(&entry, &code),
+                                                ShaderViewMode::Hlsl => lift_to_hlsl(&entry, &code),
+                                                ShaderViewMode::SpirvAbi => format_spirv_abi_summary(&entry, &code),
+                                            };
+                                            self.sgd5_cached_text = (key, text);
+                                        }
+                                        egui::ScrollArea::both()
+                                            .auto_shrink([false, false])
+                                            .show(ui, |ui| {
+                                                ui.add(
+                                                    egui::TextEdit::multiline(
+                                                        &mut self.sgd5_cached_text.1.as_str(),
+                                                    )
+                                                    .font(egui::TextStyle::Monospace)
+                                                    .desired_width(f32::INFINITY),
+                                                );
+                                            });
+                                        return;
+                                    }
+                                    Err(error) => {
+                                        ui.label(
+                                            RichText::new(format!("FSSM extraction failed: {error}"))
+                                                .color(Color32::from_rgb(255, 100, 120)),
+                                        );
+                                        return;
+                                    }
+                                },
+                                Err(error) => {
+                                    ui.label(
+                                        RichText::new(format!("DXBC decompression failed: {error}"))
+                                            .color(Color32::from_rgb(255, 100, 120)),
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+                }
+                if self.sh_source == ShaderSource::Ps09 {
                 if let (Some(ref cache), Some(sel_idx)) = (&self.sh_cache, self.sh_selected) {
                     if let Some(entry) = cache.shaders.get(sel_idx) {
                         let code = cache.shader_bytes(entry);
@@ -2196,10 +2780,11 @@ impl Rpf9App {
                         return;
                     }
                 }
+                }
                 ui.centered_and_justified(|ui| {
                     ui.label(
                         RichText::new(
-                            "Click '★ Load Local PS09' or 'Open shaders.rpf / .ps09' on the left to inspect the AMD RDNA2 (GFX10.3) shaders in a PSO cache.",
+                            "Open shaders.rpf to load the PS09 runtime cache and SGD5 DXBC groups, then select a shader to inspect its AMD RDNA2 (GFX10.3) code.",
                         )
                         .size(13.5)
                         .color(Color32::from_rgb(185, 180, 210)),
@@ -2207,6 +2792,7 @@ impl Rpf9App {
                 });
             });
     }
+
 
     fn export_entries(&self, indices: &[usize]) {
         let Some(out_dir) = rfd::FileDialog::new().pick_folder() else { return };
@@ -2286,11 +2872,11 @@ fn app_data_dir() -> Option<PathBuf> {
 }
 
 fn cache_file_path() -> Option<PathBuf> {
-    // v9: scanner rejects metadata/mid-resource chunks that v8 listed as MODEL entries
-    app_data_dir().map(|d| d.join("scan_cache_v9.tsv"))
+    // v9 scanner rejects metadata and mid resource chunks that v8 listed as model entries
+    app_data_dir().map(|d| d.join("scan_cache_v10.tsv"))
 }
 
-fn load_last_folder() -> Option<PathBuf> {
+pub(crate) fn load_last_folder() -> Option<PathBuf> {
     let s = fs::read_to_string(app_data_dir()?.join("last_folder.txt")).ok()?;
     let t = s.trim();
     (!t.is_empty()).then(|| PathBuf::from(t))
@@ -2355,7 +2941,11 @@ fn load_disk_cache_from(p: &Path) -> HashMap<String, Vec<RpfEntry>> {
             "BK2" => "BK2",
             "AWC" => "AWC",
             "XML" => "XML",
+            "DAT" => "DAT",
+            "HMAP" => "HMAP",
             "PSIN" => "PSIN",
+            "ANIM" => "ANIM",
+            "RSC9" => "RSC9",
             _ => "ZLIB",
         };
         // tolerate old 11 col cache rows and newer 10 col ones
@@ -2512,40 +3102,88 @@ fn loose_media_entry(path: &Path) -> Option<RpfEntry> {
 }
 
 fn decode_awc_for_player(e: &RpfEntry, media: &Arc<Mutex<MediaState>>) {
-    let result = (|| -> std::io::Result<_> {
-        let tmp = tempfile::Builder::new().prefix("percy6stars-audio-").tempdir()?;
-        let bytes = read_entry_bytes(e)?;
-        let wavs = awc::decode_awc_bytes_to_wavs(&bytes, tmp.path(), "stream");
-        Ok((tmp, wavs))
-    })();
-    let mut m = media.lock().unwrap();
-    m.loading = false;
-    match result {
-        Ok((tmp, wavs)) => {
-            m.status = format!("Decoded {} playable .wav stream(s) natively", wavs.len());
-            m.awc_streams = wavs;
-            m.awc_dir = Some(tmp);
+    match read_entry_bytes(e) {
+        Ok(bytes) => {
+            let res = awc::decode_awc_bytes_in_memory(&bytes, "stream", |done, total| {
+                if let Ok(mut m) = media.try_lock() {
+                    m.status = format!("Scanning AWC waveforms ({done}/{total})...");
+                }
+            });
+            let mut m = media.lock().unwrap();
+            m.loading = false;
+            if res.tracks.is_empty() {
+                let mut lines = vec![
+                    format!("Decoded 0 playable .wav stream(s) natively — {}", res.summary),
+                    format!(
+                        "Entry: {} ({} bytes read, comp={}, raw={}, offset=0x{:X}, RPF: {})",
+                        e.name, bytes.len(), e.comp_size, e.raw_size, e.offset, e.rpf_name
+                    ),
+                ];
+                lines.extend(res.details);
+                m.status = lines.join("\n");
+                m.loaded_tracks = None;
+            } else {
+                m.status = format!("Decoded {} playable .wav stream(s) natively", res.tracks.len());
+                m.loaded_tracks = Some((res.tracks, Arc::new(bytes)));
+            }
         }
-        Err(err) => m.status = format!("Read audio: {err}"),
+        Err(err) => {
+            let mut m = media.lock().unwrap();
+            m.loading = false;
+            m.status = format!(
+                "Decoded 0 playable .wav stream(s) natively — Read error: {err}\nEntry: {} (comp={}, raw={}, offset=0x{:X}, RPF: {})",
+                e.name, e.comp_size, e.raw_size, e.offset, e.rpf_name
+            );
+            m.loaded_tracks = None;
+        }
     }
 }
 
 fn setup_style(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
     let mut font_dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(windir) = std::env::var("WINDIR") {
+        font_dirs.push(PathBuf::from(windir).join("Fonts"));
+    }
+    if cfg!(windows) {
+        font_dirs.push(PathBuf::from(r"C:\Windows\Fonts"));
+    }
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
         font_dirs.push(PathBuf::from(local).join(r"Microsoft\Windows\Fonts"));
     }
     if let Ok(home) = std::env::var("HOME") {
-        font_dirs.push(PathBuf::from(home).join("Library/Fonts"));
+        font_dirs.push(PathBuf::from(&home).join("Library/Fonts"));
+        font_dirs.push(PathBuf::from(home).join(".local/share/fonts"));
     }
     font_dirs.push(PathBuf::from("/Library/Fonts"));
-    'dirs: for base in font_dirs {
+    font_dirs.push(PathBuf::from("/System/Library/Fonts"));
+    font_dirs.push(PathBuf::from("/usr/share/fonts"));
+
+    'dirs: for base in &font_dirs {
         for name in ["SF-Pro-Display-Regular.otf", "SF-Pro-Display-Medium.otf", "SF-Pro-Display-Semibold.otf"] {
             if let Ok(bytes) = fs::read(base.join(name)) {
                 fonts.font_data.insert("sf_pro".into(), Arc::new(FontData::from_owned(bytes)));
                 fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "sf_pro".into());
                 break 'dirs;
+            }
+        }
+    }
+
+    // load system unicode cjk korean japanese cyrillic fallback fonts so all 13 localizations render cleanly
+    let fallbacks: &[(&str, &[&str])] = &[
+        ("fb_ui", &["segoeui.ttf", "arial.ttf", "SFNS.ttf", "DejaVuSans.ttf"]),
+        ("fb_cjk", &["msyh.ttc", "YuGothR.ttc", "msgothic.ttc", "simsun.ttc", "PingFang.ttc", "Hiragino Sans GB.ttc", "NotoSansCJK-Regular.ttc"]),
+        ("fb_kr", &["malgun.ttf", "AppleSDGothicNeo.ttc"]),
+    ];
+    for (key, candidates) in fallbacks {
+        'cand: for cand in *candidates {
+            for base in &font_dirs {
+                if let Ok(bytes) = fs::read(base.join(cand)) {
+                    fonts.font_data.insert((*key).into(), Arc::new(FontData::from_owned(bytes)));
+                    fonts.families.entry(FontFamily::Proportional).or_default().push((*key).into());
+                    fonts.families.entry(FontFamily::Monospace).or_default().push((*key).into());
+                    break 'cand;
+                }
             }
         }
     }
@@ -2593,13 +3231,17 @@ fn kind_search_words(kind: &str) -> &'static str {
         "BK2" => "video movie bink",
         "AWC" => "audio sound",
         "TXD" | "TTPF" => "texture image",
+        "HMAP" => "texture image heightmap terrain map",
         "MODEL" => "model mesh",
         "VEH" => "vehicle model mesh",
         "NAVM" => "navmesh",
         "GXT" => "text strings",
         "RBF0" | "GFX" => "ui",
         "XML" => "config",
-        "PSIN" => "resource",
+        "PSIN" => "resource pso",
+        "ANIM" => "animation anim clip",
+        "RSC9" => "resource",
+        "DAT" => "audio sound metadata",
         "ZLIB" => "binary data",
         _ => "",
     }
@@ -2618,52 +3260,16 @@ fn kind_color(kind: &str) -> Color32 {
         "XML" => Color32::from_rgb(72, 210, 255),
         "AWC" => Color32::from_rgb(90, 235, 165),
         "BK2" => Color32::from_rgb(252, 175, 23),
+        "DAT" => Color32::from_rgb(135, 240, 165),
+        "HMAP" => Color32::from_rgb(72, 220, 155),
         "PSIN" => Color32::from_rgb(210, 120, 255),
+        "ANIM" => Color32::from_rgb(100, 225, 195),
+        "RSC9" => Color32::from_rgb(120, 185, 255),
         _ => Color32::from_rgb(145, 152, 168),
     }
 }
 
-fn parse_psin(data: &[u8]) -> String {
-    if data.len() < 16 || &data[..4] != b"PSIN" {
-        return format_hex(&data[..data.len().min(2048)]);
-    }
-    let mut out = String::new();
-    let data_sz = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
-    let root_hash = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-    let flags = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
-    out.push_str("=== RAGE PSIN (PSO Serialized Metadata) ===\n");
-    out.push_str(&format!("Total Size: {} B | PSIN Block: {} B | RootHash: 0x{:08x} | Flags: 0x{:08x}\n\n", data.len(), data_sz, root_hash, flags));
-    out.push_str("--- PSO Sections ---\n");
-    for tag in [b"LSCH", b"LENM", b"LSNS", b"LGID", b"LRSC", b"CHKS", b"PSCH", b"PMAP", b"STRF", b"STRS"] {
-        let mut pos = 0usize;
-        while let Some(rel) = data[pos..].windows(4).position(|w| w == tag) {
-            let off = pos + rel;
-            let sz = if off + 8 <= data.len() { u32::from_be_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]]) } else { 0 };
-            out.push_str(&format!("  {} @ 0x{:06x} (be_len={})\n", std::str::from_utf8(tag).unwrap_or("?"), off, sz));
-            pos = off + 4;
-        }
-    }
-    out.push_str("\n--- Readable Strings ---\n");
-    let mut cur = Vec::new();
-    let mut count = 0usize;
-    for &b in data {
-        if (32..127).contains(&b) {
-            cur.push(b);
-        } else if !cur.is_empty() {
-            if cur.len() >= 4 && !cur.iter().all(|&c| c == b'p' || c == b'a') {
-                out.push_str(&format!("  {}\n", String::from_utf8_lossy(&cur)));
-                count += 1;
-                if count >= 120 { break; }
-            }
-            cur.clear();
-        }
-    }
-    out.push_str("\n--- Header Hex (first 512 B) ---\n");
-    out.push_str(&format_hex(&data[..data.len().min(512)]));
-    out
-}
-
-/// Result-list ordering. `Relevance` = scan order, or best name match first while searching.
+// result list ordering relevance is scan order or best name match first while searching
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SortMode {
     Relevance,
@@ -2685,7 +3291,7 @@ impl SortMode {
     }
 }
 
-/// Compact "Sort:" dropdown; lists pick up the change on their next refresh.
+// compact sort dropdown lists pick up the change on next refresh
 fn sort_combo(ui: &mut egui::Ui, id: &str, mode: &mut SortMode) {
     egui::ComboBox::from_id_salt(id)
         .selected_text(RichText::new(format!("Sort: {}", mode.label())).size(11.0))
@@ -2695,6 +3301,45 @@ fn sort_combo(ui: &mut egui::Ui, id: &str, mode: &mut SortMode) {
                 ui.selectable_value(mode, m, m.label());
             }
         });
+}
+
+// right click context menu on file rows to copy name archive path directory or hex offset
+fn entry_context_menu(resp: &egui::Response, e: &RpfEntry) -> Option<String> {
+    let mut copied = None;
+    resp.context_menu(|ui| {
+        if ui.button("Copy File Name").clicked() {
+            ui.ctx().copy_text(e.name.clone());
+            copied = Some(format!("Copied name: {}", e.name));
+            ui.close_menu();
+        }
+        let rel = format!("{} / {}", e.rpf_name, e.name);
+        if ui.button("Copy Archive / File Path").clicked() {
+            ui.ctx().copy_text(rel.clone());
+            copied = Some(format!("Copied: {rel}"));
+            ui.close_menu();
+        }
+        let full = e.source_rpf.display().to_string();
+        if ui.button("Copy Source Archive Path").clicked() {
+            ui.ctx().copy_text(full.clone());
+            copied = Some(format!("Copied archive path: {full}"));
+            ui.close_menu();
+        }
+        if let Some(dir) = e.source_rpf.parent() {
+            let dir_s = dir.display().to_string();
+            if ui.button("Copy Directory Path").clicked() {
+                ui.ctx().copy_text(dir_s.clone());
+                copied = Some(format!("Copied directory: {dir_s}"));
+                ui.close_menu();
+            }
+        }
+        let loc = format!("{} @ 0x{:08x} ({})", e.rpf_name, e.offset, e.name);
+        if ui.button("Copy Offset Location").clicked() {
+            ui.ctx().copy_text(loc.clone());
+            copied = Some(format!("Copied: {loc}"));
+            ui.close_menu();
+        }
+    });
+    copied
 }
 
 fn format_size(bytes: u64) -> String {
@@ -2741,7 +3386,7 @@ fn read_entry_bytes(e: &RpfEntry) -> std::io::Result<Vec<u8>> {
         f.seek(SeekFrom::Start(e.offset))?;
         let mut raw = vec![0u8; e.comp_size as usize];
         f.read_exact(&mut raw)?;
-        if matches!(e.kind, "XML" | "PSIN" | "RBF0" | "GFX" | "GXT" | "ZLIB") {
+        if matches!(e.kind, "XML" | "DAT" | "PSIN" | "ANIM" | "RSC9" | "RBF0" | "GFX" | "GXT" | "ZLIB") {
             let mut out = Vec::new();
             ZlibDecoder::new(&raw[..]).read_to_end(&mut out)?;
             Ok(out)
@@ -2784,11 +3429,27 @@ fn probe_rage9_page(
     if olen < 0x80 { return None; }
     let vft = u64::from_le_bytes(probe_out[0..8].try_into().ok()?);
     let bmap = u64::from_le_bytes(probe_out[8..16].try_into().ok()?);
-    if vft != 0 || !(0x5000_0000..0x5800_0000).contains(&bmap) || &probe_out[0x10..0x15] == b"0DRPz" {
+    if vft != 0 || !(0x5000_0000..0x5800_0000).contains(&bmap) {
         return None;
     }
-    // Reject mid-resource virtual chunks that start directly with a grmGeometry struct
-    // (vft == 0, +0x08 == 0x5002xxxx ptr, +0x60 == 0x1601 magic) — never a resource root.
+    // 0. crClipDictionary (.ycd animation dictionary with 0DRPz tag at +0x10)
+    if let Some((aname, clip_cnt)) = anim::probe_anim_dict(&probe_out[..olen]) {
+        return Some(RpfEntry {
+            source_rpf: path.to_path_buf(),
+            rpf_name: rname.to_string(),
+            name: aname,
+            kind: "ANIM",
+            offset: off + p as u64,
+            comp_size: probe_dec.total_in(),
+            raw_size: olen as u64,
+            tracks: clip_cnt,
+            chunks: Vec::new(),
+        });
+    }
+    if &probe_out[0x10..0x15] == b"0DRPz" {
+        return None;
+    }
+    // reject mid resource virtual chunks that start directly with a grmgeometry struct
     if u64::from_le_bytes(probe_out[0x60..0x68].try_into().ok()?) == 0x1601 {
         return None;
     }
@@ -2840,7 +3501,19 @@ fn probe_rage9_page(
         && (1..=64).contains(&probe_out[bmap_off + 9]);
     let (mname, is_veh, vlen) = if fits_single_chunk {
         if !has_rage9_meshlets(&probe_out[..olen]) {
-            return None;
+            let rsc_name = rsc9::probe_cutscene_rsc9(&probe_out[..olen])
+                .unwrap_or_else(|| format!("rsc9_{:08x}_{}B.rsc9", off + p as u64, olen));
+            return Some(RpfEntry {
+                source_rpf: path.to_path_buf(),
+                rpf_name: rname.to_string(),
+                name: rsc_name,
+                kind: "RSC9",
+                offset: off + p as u64,
+                comp_size: probe_dec.total_in(),
+                raw_size: olen as u64,
+                tracks: 0,
+                chunks: Vec::new(),
+            });
         }
         let (mname, _) = extract_rage9_model_name(&probe_out[..olen])?;
         (mname.clone(), is_vehicle_virtual(&probe_out[..olen], &mname), olen)
@@ -2955,8 +3628,16 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
     let mut hdr = [0u8; 64];
     let n = f.read(&mut hdr)?;
     let magic = String::from_utf8_lossy(&hdr[..n.min(4)]).into_owned();
-    let hdr_hex: String = hdr[4..n.min(16)].iter().map(|b| format!("{b:02x}")).collect();
-    let hdr_info = format!("{magic}  ·  {sz} B  ·  {hdr_hex}");
+    let (data_off, hdr_info) = if n >= 40 && &hdr[..4] == b"9FPR" {
+        let doff = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
+        let nlen = u32::from_le_bytes([hdr[12], hdr[13], hdr[14], hdr[15]]);
+        let ecnt = u32::from_le_bytes([hdr[36], hdr[37], hdr[38], hdr[39]]);
+        let start = if doff >= 0x40 && (doff as u64) < sz { doff } else { 0x40 };
+        (start, format!("{magic}  ·  {sz} B  ·  {ecnt} entries  ·  data@0x{start:x}  ·  names={nlen}B"))
+    } else {
+        let hdr_hex: String = hdr[4..n.min(16)].iter().map(|b| format!("{b:02x}")).collect();
+        (0x40usize, format!("{magic}  ·  {sz} B  ·  {hdr_hex}"))
+    };
     if let Some(st) = progress_state {
         st.lock().unwrap().header_info = hdr_info.clone();
     }
@@ -3078,7 +3759,7 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
     }
 
     if let Some(data) = whole {
-        let mut i = 0x40usize;
+        let mut i = data_off.min(data.len());
         let mut stitch_chunks: Vec<(u64, u64)> = Vec::new();
         let mut stitch_raw = 0u64;
         let mut stitch_head: Vec<u8> = Vec::new();
@@ -3115,13 +3796,32 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
                                 let tag = extract_xml_tag(&stitch_head[trimmed..]).unwrap_or_else(|| "config".into());
                                 ("XML", format!("{z_idx:04}_{tag}.xml"))
                             } else if stitch_head.starts_with(b"RBF0") {
-                                ("RBF0", format!("{z_idx:04}_ui.rbf"))
+                                let slug: String = stitch_head[12..].iter()
+                                    .skip_while(|&&b| !b.is_ascii_alphabetic())
+                                    .take_while(|&&b| b.is_ascii_alphanumeric() || b == b'_')
+                                    .map(|&b| b as char)
+                                    .take(36)
+                                    .collect();
+                                let nm = if slug.len() >= 4 { format!("{z_idx:04}_{slug}.rbf") } else { format!("{z_idx:04}_ui.rbf") };
+                                ("RBF0", nm)
                             } else if stitch_head.starts_with(b"GFX") {
                                 ("GFX", format!("{z_idx:04}_scaleform.gfx"))
                             } else if let Some(slug) = tex::probe_gxt_snippet(&stitch_head) {
                                 ("GXT", format!("{z_idx:04}_{slug}.gxt"))
+                            } else if stitch_head.starts_with(b"MHIU") {
+                                ("HMAP", format!("{z_idx:04}_world_heightmap_2048.mhiu"))
                             } else if stitch_head.starts_with(b"PSIN") {
                                 ("PSIN", format!("{z_idx:04}_resource.psin"))
+                            } else if let Some(ver) = dat::probe_dat(&stitch_head) {
+                                ("DAT", format!("{z_idx:04}_aud_dat{ver}.rel"))
+                            } else if stitch_head.starts_with(b"AMB_STREAM_") {
+                                ("XML", format!("{z_idx:04}_audio_packlist.txt"))
+                            } else if stitch_head.starts_with(b"driverSettings_") {
+                                ("XML", format!("{z_idx:04}_audio_driver_settings.txt"))
+                            } else if stitch_head.starts_with(b"BaseCommon:") {
+                                ("XML", format!("{z_idx:04}_audio_mounts.txt"))
+                            } else if rsc9::is_qqqq_table(&stitch_head) {
+                                ("RSC9", format!("{z_idx:04}_rsc9_table.bin"))
                             } else {
                                 ("ZLIB", format!("{z_idx:04}_data.bin"))
                             };
@@ -3173,7 +3873,8 @@ impl eframe::App for Rpf9App {
             );
         }
         self.poll_bink_player(ctx);
-        let (media_loading, media_status, awc_streams) = {
+        self.poll_sgd5_cache();
+        let (media_loading, media_status) = {
             let mut m = self.media.lock().unwrap();
             if let Some(mesh) = m.loaded_mesh.take() {
                 self.textures.clear();
@@ -3189,7 +3890,10 @@ impl eframe::App for Rpf9App {
                 self.tex_handle = None;
                 self.tex_zoom = 1.0;
             }
-            (m.loading, m.status.clone(), m.awc_streams.clone())
+            if let Some((tracks, awc_bytes)) = m.loaded_tracks.take() {
+                self.audio_player.set_tracks(tracks, awc_bytes);
+            }
+            (m.loading, m.status.clone())
         };
 
         egui::TopBottomPanel::top("top").frame(egui::Frame::new().fill(Color32::from_rgb(24, 14, 36)).inner_margin(10.0)).show(ctx, |ui| {
@@ -3202,10 +3906,11 @@ impl eframe::App for Rpf9App {
                 ui.label(RichText::new("RPF9").size(13.0).strong().color(Color32::from_rgb(255, 72, 165)));
                 ui.label(RichText::new(format!("v{APP_VERSION}")).size(11.5).color(Color32::from_rgb(165, 145, 195)));
                 ui.add_space(10.0);
-                // Top-level mode tabs: Explorer | Model Viewer | Shaders (RDNA2)
+                // Top-level mode tabs: Explorer | Model Viewer | World Map | Shaders (RDNA2)
                 for (tab_id, label) in [
                     (AppTab::Explorer, "Explorer"),
                     (AppTab::ModelViewer, "Model Viewer"),
+                    (AppTab::WorldMap, "World Map"),
                     (AppTab::Shaders, "Shaders (RDNA2)"),
                 ] {
                     let active = self.tab == tab_id;
@@ -3221,6 +3926,21 @@ impl eframe::App for Rpf9App {
                         if tab_id == AppTab::ModelViewer {
                             self.stop_bink_player();
                             self.show_3d = true;
+                        } else if tab_id == AppTab::WorldMap {
+                            self.stop_bink_player();
+                            if self.world_map.data.is_none() {
+                                let common = self.target_path.as_ref().and_then(|p| {
+                                    if p.is_dir() { Some(p.join("common.rpf")) }
+                                    else if p.file_name().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("common.rpf")).unwrap_or(false) { Some(p.clone()) }
+                                    else { p.parent().map(|d| d.join("common.rpf")) }
+                                }).filter(|p| p.exists());
+                                if let Some(cp) = common {
+                                    if let Ok(d) = worldmap::load_mhiu_from_rpf(&cp) {
+                                        self.world_map.status = format!("Loaded {}x{} MHIU", d.w, d.h);
+                                        self.world_map.data = Some(d);
+                                    }
+                                }
+                            }
                         } else if tab_id == AppTab::Shaders {
                             self.stop_bink_player();
                             if self.sh_cache.is_none() {
@@ -3284,6 +4004,18 @@ impl eframe::App for Rpf9App {
                             self.export_entries(&[i]);
                         }
                     }
+                    if ui.button("Copy Path").on_hover_text("Copy selected file path (or right-click any row for more copy options)").clicked() {
+                        if let Some(i) = self.selected {
+                            let copied = {
+                                let st = self.state.lock().unwrap();
+                                st.entries.get(i).map(|e| format!("{} / {}", e.rpf_name, e.name))
+                            };
+                            if let Some(s) = copied {
+                                ui.ctx().copy_text(s.clone());
+                                self.state.lock().unwrap().status = format!("Copied: {s}");
+                            }
+                        }
+                    }
                     let r = ui.add(egui::TextEdit::singleline(&mut self.filter).desired_width(250.0).hint_text("Search (Ctrl+F) · words AND · -exclude"));
                     if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
                         r.request_focus();
@@ -3311,27 +4043,56 @@ impl eframe::App for Rpf9App {
 
         if self.tab == AppTab::ModelViewer {
             self.render_model_viewer_tab(ctx, media_loading, &media_status);
+        } else if self.tab == AppTab::WorldMap {
+            let nav_tiles: Vec<(usize, f32, f32)> = {
+                let st = self.state.lock().unwrap();
+                st.entries.iter().enumerate().filter_map(|(i, e)| {
+                    if e.kind == "NAVM" {
+                        worldmap::parse_nav_coords(&e.name).map(|(wx, wy)| (i, wx, wy))
+                    } else { None }
+                }).collect()
+            };
+            let common = self.target_path.as_ref().and_then(|p| {
+                if p.is_dir() { Some(p.join("common.rpf")) }
+                else { p.parent().map(|d| d.join("common.rpf")) }
+            }).filter(|p| p.exists());
+            let levels = self.target_path.as_ref().and_then(|p| {
+                if p.is_dir() { Some(p.join("levels.rpf")) }
+                else { p.parent().map(|d| d.join("levels.rpf")) }
+            }).filter(|p| p.exists());
+            let mut clicked_nav = None;
+            egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::from_rgb(13, 9, 21)).inner_margin(10.0)).show(ctx, |ui| {
+                clicked_nav = worldmap::render_world_map_ui(ui, ctx, &mut self.world_map, &nav_tiles, common.as_deref(), levels.as_deref());
+            });
+            if let Some(idx) = clicked_nav {
+                self.tab = AppTab::Explorer;
+                self.select_entry(idx);
+            }
         } else if self.tab == AppTab::Shaders {
             self.render_shader_tab(ctx);
         } else {
         egui::SidePanel::left("tree").default_width(195.0).frame(egui::Frame::new().fill(Color32::from_rgb(18, 12, 28)).inner_margin(8.0)).show(ctx, |ui| {
             self.refresh_view();
             let c = self.counts;
-            ui.label(RichText::new("ARCHIVE TREE").size(11.0).color(Color32::from_rgb(110, 118, 134)));
+            ui.label(RichText::new("FILTER BY TYPE").size(11.0).color(Color32::from_rgb(145, 135, 175)));
             ui.add_space(4.0);
+            let has_entries = c[0] > 0;
             for (cat, label, count) in [
                 (Category::All, "All Files", c[0]),
-                (Category::Vehicles, "Vehicles (.#ft)", c[1]),
-                (Category::Models, "3D Models (.#dr/.#ft)", c[2] + c[1]),
-                (Category::Textures, "Textures (.#td/.ttpf)", c[3]),
-                (Category::Ui, "UI & Text (RBF0/GFX/GXT)", c[4]),
-                (Category::NavMesh, "NavMesh (.ynv)", c[5]),
-                (Category::Videos, "Videos (.bk2)", c[6]),
-                (Category::Audio, "Audio (.awc)", c[7]),
-                (Category::Xml, "Configs (.xml)", c[8]),
-                (Category::Resources, "Resources (.psin)", c[9]),
-                (Category::Binary, "Binary (.bin)", c[10]),
+                (Category::Vehicles, "Vehicles", c[1]),
+                (Category::Models, "3D Models", c[2] + c[1]),
+                (Category::Textures, "Textures", c[3]),
+                (Category::Ui, "UI & Text", c[4]),
+                (Category::NavMesh, "NavMesh 3D", c[5]),
+                (Category::Videos, "Videos", c[6]),
+                (Category::Audio, "Audio", c[7]),
+                (Category::Xml, "Configs (XML)", c[8]),
+                (Category::Resources, "Anim / PSO / RSC9", c[9]),
+                (Category::Binary, "Binary", c[10]),
             ] {
+                if has_entries && cat != Category::All && count == 0 {
+                    continue;
+                }
                 if ui.selectable_label(self.category == cat, format!("{label} ({count})")).clicked() {
                     self.category = cat;
                 }
@@ -3372,6 +4133,41 @@ impl eframe::App for Rpf9App {
             // Thumbnails make sense for the Textures category and for an opened .ttpf.
             let texture_view = self.category == Category::Textures
                 || self.target_path.as_deref().is_some_and(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("ttpf")));
+            // list keyboard navigation (upstream); the grid handles its own arrow keys
+            if !(texture_view && self.grid_view) && !ctx.wants_keyboard_input() && !self.view.is_empty() && self.audio_player.tracks.is_empty() {
+                let cur_pos = self.selected.and_then(|sel| self.view.iter().position(|&i| i == sel));
+                let allow_wasd = !self.show_3d;
+                let step_to: Option<usize> = ctx.input(|i| {
+                    if i.key_pressed(egui::Key::ArrowDown) || (allow_wasd && i.key_pressed(egui::Key::S)) {
+                        Some(match cur_pos {
+                            Some(p) => (p + 1).min(self.view.len() - 1),
+                            None => 0,
+                        })
+                    } else if i.key_pressed(egui::Key::ArrowUp) || (allow_wasd && i.key_pressed(egui::Key::W)) {
+                        Some(match cur_pos {
+                            Some(p) => p.saturating_sub(1),
+                            None => self.view.len() - 1,
+                        })
+                    } else if i.key_pressed(egui::Key::PageDown) {
+                        Some(cur_pos.map_or(0, |p| (p + 15).min(self.view.len() - 1)))
+                    } else if i.key_pressed(egui::Key::PageUp) {
+                        Some(cur_pos.map_or(0, |p| p.saturating_sub(15)))
+                    } else if i.key_pressed(egui::Key::Home) {
+                        Some(0)
+                    } else if i.key_pressed(egui::Key::End) {
+                        Some(self.view.len() - 1)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(pos) = step_to {
+                    let target_idx = self.view[pos];
+                    if self.selected != Some(target_idx) {
+                        self.select_entry(target_idx);
+                        self.explorer_scroll_to_sel = true;
+                    }
+                }
+            }
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("{} results", self.view.len())).size(11.0).color(Color32::from_rgb(110, 118, 134)));
                 if texture_view {
@@ -3402,6 +4198,7 @@ impl eframe::App for Rpf9App {
                             .map(|(i, e)| {
                                 let key = matches!(e.kind, "TTPF" | "TXD").then(|| gallery::ThumbKey {
                                     source: e.source_rpf.clone(),
+                                    revision: st.file_sig.get(&e.source_rpf).copied(),
                                     offset: e.offset,
                                     index: if e.kind == "TTPF" { e.tracks } else { 0 },
                                     kind: e.kind,
@@ -3419,7 +4216,9 @@ impl eframe::App for Rpf9App {
                 return;
             }
             let mut clicked = None;
-            // Rows MUST be exactly ROW_H tall or show_rows miscomputes the total height (blank space / jumpy scroll)
+            let mut copied_msg: Option<String> = None;
+            let scroll_to_sel = std::mem::take(&mut self.explorer_scroll_to_sel);
+            // rows must be exactly row_h tall or show_rows miscomputes total height
             const ROW_H: f32 = 20.0;
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
             egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, ROW_H, self.view.len(), |ui, range| {
@@ -3438,12 +4237,23 @@ impl eframe::App for Rpf9App {
                         } else {
                             format!("{}  ({})", e.name, sz_s)
                         };
-                        if ui.selectable_label(self.selected == Some(*idx), RichText::new(label).size(12.5)).clicked() {
+                        let is_sel = self.selected == Some(*idx);
+                        let resp = ui.selectable_label(is_sel, RichText::new(label).size(12.5));
+                        if is_sel && scroll_to_sel {
+                            resp.scroll_to_me(Some(egui::Align::Center));
+                        }
+                        if resp.clicked() {
                             clicked = Some(*idx);
+                        }
+                        if let Some(msg) = entry_context_menu(&resp, e) {
+                            copied_msg = Some(msg);
                         }
                     });
                 }
             });
+            if let Some(msg) = copied_msg {
+                self.state.lock().unwrap().status = msg;
+            }
             if let Some(i) = clicked {
                 self.select_entry(i);
             }
@@ -3472,15 +4282,32 @@ impl eframe::App for Rpf9App {
                     draw_spinner(ui, 24.0);
                     ui.label(RichText::new(&media_status).color(Color32::from_rgb(252, 175, 23)));
                 });
-            } else if !awc_streams.is_empty() {
-                if !self.audio.as_ref().is_some_and(|a| a.matches(&awc_streams)) {
-                    self.audio = Some(audio_player::AudioPlayer::new(&awc_streams));
-                }
-                if let Some(a) = self.audio.as_mut() {
-                    a.ui(ui, &media_status);
-                }
+            } else if !self.audio_player.tracks.is_empty() {
+                audio_player::render_awc_audio_view(ui, ctx, &mut self.audio_player, &media_status);
             } else if !media_status.is_empty() {
-                ui.label(RichText::new(&media_status).color(Color32::from_rgb(255, 140, 120)));
+                let mut lines = media_status.lines();
+                let headline = lines.next().unwrap_or(&media_status);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(headline).strong().color(Color32::from_rgb(255, 140, 120)));
+                    if ui.small_button("Copy").clicked() {
+                        ctx.copy_text(media_status.clone());
+                    }
+                });
+                let rest: Vec<&str> = lines.collect();
+                if !rest.is_empty() {
+                    ui.add_space(6.0);
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(30, 18, 44))
+                        .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(110, 58, 78)))
+                        .inner_margin(8.0)
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
+                                for line in rest {
+                                    ui.label(RichText::new(line).monospace().size(11.5).color(Color32::from_rgb(235, 210, 215)));
+                                }
+                            });
+                        });
+                }
             } else if !self.textures.is_empty() {
                 if self.tex_sel >= self.textures.len() {
                     self.tex_sel = 0;
@@ -3556,9 +4383,30 @@ impl eframe::App for Rpf9App {
             } else if let Some(mesh) = self.mesh3d.as_mut() {
                 let mut toggle_3d = self.show_3d;
                 ui.horizontal(|ui| {
-                    if ui.selectable_label(!toggle_3d, "Hex / Info").clicked() { toggle_3d = false; }
-                    if ui.selectable_label(toggle_3d, "3D Model View").clicked() { toggle_3d = true; }
+                    if ui.selectable_label(!toggle_3d, "Info").clicked() { toggle_3d = false; }
+                    if ui.selectable_label(toggle_3d, if self.anim_dur > 0.0 { "3D Dummy" } else { "3D View" }).clicked() { toggle_3d = true; }
+                    if self.anim_dur > 0.0 {
+                        ui.separator();
+                        if ui.button(if self.anim_playing { "Pause" } else { "Play" }).clicked() {
+                            self.anim_playing = !self.anim_playing;
+                        }
+                        let mut t = self.anim_time;
+                        if ui.add(egui::Slider::new(&mut t, 0.0..=self.anim_dur).suffix("s").fixed_decimals(2)).changed() {
+                            self.anim_time = t;
+                            let next = anim::build_stickman_mesh(&self.anim_name, t, self.anim_dur, self.anim_tracks, self.anim_seed);
+                            mesh.verts = next.verts;
+                            mesh.dirty = true;
+                        }
+                    }
                 });
+                if self.anim_dur > 0.0 && self.anim_playing && toggle_3d {
+                    let dt = ctx.input(|i| i.unstable_dt).clamp(0.001, 0.05);
+                    self.anim_time = (self.anim_time + dt) % self.anim_dur.max(0.1);
+                    let next = anim::build_stickman_mesh(&self.anim_name, self.anim_time, self.anim_dur, self.anim_tracks, self.anim_seed);
+                    mesh.verts = next.verts;
+                    mesh.dirty = true;
+                    ctx.request_repaint();
+                }
                 self.show_3d = toggle_3d;
                 ui.separator();
                 if self.show_3d {
@@ -3714,6 +4562,41 @@ mod tests {
     }
 
     #[test]
+    fn sgd5_shader_lifts_through_gfx103_paths() {
+        let shader = sgd5::Sgd5Shader {
+            stage: "VS",
+            index: 7,
+            name: "synthetic_vertex".into(),
+            wave_size: 32,
+            compressed_size: 8,
+            uncompressed_size: 8,
+            hash: 0x0123_4567_89ab_cdef,
+            register_count: 8,
+            cbuffer_count: 1,
+            texture_count: 0,
+            binary_offset: 0,
+        };
+        let mut data = vec![0u8; 0x20];
+        data.extend_from_slice(&0xBFA0_0003u32.to_le_bytes());
+        data.extend_from_slice(&0xBF81_0000u32.to_le_bytes());
+        let fssm = dxbc::FssmShader {
+            code_offset: 0x20,
+            code_size: 8,
+            data,
+        };
+        let entry = sgd5_ps09_entry(&shader, &fssm);
+
+        assert_eq!(entry.stage, ShaderStage::Vertex);
+        assert_eq!(entry.pso_hash, shader.hash);
+        assert_eq!(entry.insn_count, 2);
+        assert!(lift_to_hlsl(&entry, fssm.code()).contains("VSMain"));
+        assert_eq!(
+            &lift_to_spirv(&entry, fssm.code())[..4],
+            &0x0723_0203u32.to_le_bytes()
+        );
+    }
+
+    #[test]
     fn deswizzle_and_ui_decoders_work() {
         // 4KB SW_4KB_D bijective permutation test on 64x64 BC7 (16x16 blocks, 1 tile)
         let mut raw = vec![0u8; 4096];
@@ -3757,7 +4640,7 @@ mod tests {
         let xml = decode_rbf0(&rbf).expect("RBF0 should decode");
         assert!(xml.contains("<Root id=\"42\" />"), "got: {xml}");
 
-        // Scaleform GFX inspector test
+        // scaleform gfx inspector test
         let mut gfx = Vec::new();
         gfx.extend_from_slice(b"GFX\x2a");
         gfx.extend_from_slice(&128u32.to_le_bytes());
@@ -3765,6 +4648,13 @@ mod tests {
         let dump = inspect_gfx(&gfx);
         assert!(dump.contains("Version: 42"));
         assert!(dump.contains("com.example.hud.HudMap"));
+        // unicode 13 language gxt text table probe and decode test
+        let mut gxt = vec![0u8; 0x60];
+        gxt[0x10..0x15].copy_from_slice(b"0DRPz");
+        gxt.extend_from_slice("彩色字幕\0Привет мир\0한국어 자막\0日本語テキスト\0".as_bytes());
+        assert!(tex::probe_gxt_snippet(&gxt).is_some());
+        let txt = decode_0drpz_text(&gxt).expect("unicode gxt should decode");
+        assert!(txt.contains("彩色字幕") && txt.contains("Привет мир") && txt.contains("한국어 자막") && txt.contains("日本語テキスト"));
     }
 
     /// Writes sample PNGs from a big .ttpf so decode quality can be eyeballed:
@@ -4142,7 +5032,7 @@ fn disasm_shaders_cli(src: &Path, out_dir: &Path, limit: usize) {
             ShaderStage::Vertex => vs += 1,
             ShaderStage::MeshNgg => ngg += 1,
             ShaderStage::RayTracing => rt += 1,
-            ShaderStage::Unknown => {}
+            _ => {}
         }
         let nt = s.num_threads.map(|[x, y, z]| format!("{x}x{y}x{z}")).unwrap_or_default();
         csv.push_str(&format!(
@@ -4164,6 +5054,64 @@ fn disasm_shaders_cli(src: &Path, out_dir: &Path, limit: usize) {
     println!("Wrote shaders_index.csv + {dump_n} shaders (.asm/.hlsl/.spv) to {}", out_dir.display());
 }
 
+fn extract_sgd5_cli(src: &Path, out_dir: &Path, limit: usize) {
+    match sgd5::extract_sgd5(src, out_dir, limit) {
+        Ok(extraction) => {
+            let mut stage_counts = std::collections::BTreeMap::new();
+            for file in &extraction.files {
+                for shader in &file.shaders {
+                    *stage_counts.entry(shader.stage).or_insert(0usize) += 1;
+                }
+            }
+            let counts = stage_counts
+                .iter()
+                .map(|(stage, count)| format!("{stage}={count}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let shader_count = extraction
+                .files
+                .iter()
+                .map(|file| file.shaders.len())
+                .sum::<usize>();
+            let effect_count = extraction
+                .files
+                .iter()
+                .map(|file| file.effect_count as usize)
+                .sum::<usize>();
+            println!(
+                "Loaded SGD5: {} groups, {shader_count} shaders ({counts}), {effect_count} effects",
+                extraction.files.len()
+            );
+            println!(
+                "Extracted {} DXBC shaders and {} manifests to {}",
+                extraction.extracted_count,
+                extraction.manifests.len(),
+                out_dir.display()
+            );
+        }
+        Err(error) => {
+            eprintln!("Failed to extract SGD5 from {}: {error}", src.display());
+        }
+    }
+}
+
+fn disassemble_dxbc_cli(src: &Path, output: Option<&PathBuf>) {
+    match fs::read(src) {
+        Ok(data) => {
+            let text = dxbc::disassemble(&data);
+            match output {
+                Some(path) => {
+                    if let Err(error) = fs::write(path, &text) {
+                        eprintln!("Failed to write {}: {error}", path.display());
+                    }
+                }
+                None => println!("{text}"),
+            }
+        }
+        Err(error) => eprintln!("Failed to read {}: {error}", src.display()),
+    }
+}
+
 fn main() -> eframe::Result<()> {
     // remove leftover old exe from previous self update
     if let Ok(cur) = std::env::current_exe() {
@@ -4179,9 +5127,71 @@ fn main() -> eframe::Result<()> {
         }
         unsafe { AttachConsole(u32::MAX) };
     }
+    if args.len() >= 2 && args[1] == "--gpu-world" {
+        let mut common_p: Option<PathBuf> = None;
+        let mut levels_p: Option<PathBuf> = None;
+        let mut idx = 2usize;
+        while idx + 1 < args.len() {
+            if args[idx] == "--common" {
+                common_p = Some(PathBuf::from(&args[idx + 1]));
+                idx += 2;
+            } else if args[idx] == "--levels" {
+                levels_p = Some(PathBuf::from(&args[idx + 1]));
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+        }
+        world_gpu::run_gpu_world_cli(common_p.as_deref(), levels_p.as_deref());
+        return Ok(());
+    }
+    if args.len() >= 3 && args[1] == "--probe-maps" {
+        mapdata::probe_maps_cli(&PathBuf::from(&args[2]));
+        return Ok(());
+    }
+    if args.len() >= 3 && args[1] == "--inspect-exe" {
+        let exe_path = PathBuf::from(&args[2]);
+        match fs::read(&exe_path) {
+            Ok(data) => {
+                println!("{}", boot::inspect_pe64_for_bringup(&data));
+                if let Some(dir) = exe_path.parent() {
+                    if let Ok(cfg) = fs::read_to_string(dir.join("MicrosoftGame.Config")) {
+                        let lay = fs::read_dir(dir).ok().and_then(|rd| {
+                            rd.filter_map(|e| e.ok()).find_map(|e| {
+                                let n = e.file_name().to_string_lossy().into_owned();
+                                if n.starts_with("layout_") && n.ends_with(".xml") {
+                                    fs::read_to_string(e.path()).ok()
+                                } else {
+                                    None
+                                }
+                            })
+                        });
+                        println!("{}", boot::summarize_gdk_manifest(&cfg, lay.as_deref()));
+                    }
+                }
+            }
+            Err(e) => eprintln!("Failed to read {}: {e}", exe_path.display()),
+        }
+        return Ok(());
+    }
     if args.len() >= 4 && args[1] == "--disasm-shaders" {
         let lim = args.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(25);
         disasm_shaders_cli(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), lim);
+        return Ok(());
+    }
+    if args.len() >= 4 && args[1] == "--extract-sgd5" {
+        let lim = args
+            .get(4)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        extract_sgd5_cli(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), lim);
+        return Ok(());
+    }
+    if args.len() >= 3 && args[1] == "--disassemble-dxbc" {
+        disassemble_dxbc_cli(
+            &PathBuf::from(&args[2]),
+            args.get(3).map(PathBuf::from).as_ref(),
+        );
         return Ok(());
     }
     if args.len() >= 4 && args[1] == "--dump-textures" {
