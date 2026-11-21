@@ -1,5 +1,6 @@
 ﻿mod awc;
 mod dxbc;
+mod psin;
 mod sgd5;
 mod model3d;
 mod rdna2;
@@ -1294,7 +1295,7 @@ impl Rpf9App {
                         || (!sample.is_empty()
                             && sample.iter().all(|&b| (32..127).contains(&b) || matches!(b, 9 | 10 | 13 | 0x80..)));
                     if e.kind == "PSIN" {
-                        self.preview = parse_psin(&data);
+                        self.preview = psin::parse_psin(&data);
                     } else if e.kind == "RBF0" {
                         self.preview = decode_rbf0(&data).unwrap_or_else(|| format_hex(&data[..data.len().min(2048)]));
                     } else if e.kind == "GFX" {
@@ -2850,46 +2851,6 @@ fn kind_color(kind: &str) -> Color32 {
         "PSIN" => Color32::from_rgb(210, 120, 255),
         _ => Color32::from_rgb(145, 152, 168),
     }
-}
-
-fn parse_psin(data: &[u8]) -> String {
-    if data.len() < 16 || &data[..4] != b"PSIN" {
-        return format_hex(&data[..data.len().min(2048)]);
-    }
-    let mut out = String::new();
-    let data_sz = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
-    let root_hash = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-    let flags = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
-    out.push_str("=== RAGE PSIN (PSO Serialized Metadata) ===\n");
-    out.push_str(&format!("Total Size: {} B | PSIN Block: {} B | RootHash: 0x{:08x} | Flags: 0x{:08x}\n\n", data.len(), data_sz, root_hash, flags));
-    out.push_str("--- PSO Sections ---\n");
-    for tag in [b"LSCH", b"LENM", b"LSNS", b"LGID", b"LRSC", b"CHKS", b"PSCH", b"PMAP", b"STRF", b"STRS"] {
-        let mut pos = 0usize;
-        while let Some(rel) = data[pos..].windows(4).position(|w| w == tag) {
-            let off = pos + rel;
-            let sz = if off + 8 <= data.len() { u32::from_be_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]]) } else { 0 };
-            out.push_str(&format!("  {} @ 0x{:06x} (be_len={})\n", std::str::from_utf8(tag).unwrap_or("?"), off, sz));
-            pos = off + 4;
-        }
-    }
-    out.push_str("\n--- Readable Strings ---\n");
-    let mut cur = Vec::new();
-    let mut count = 0usize;
-    for &b in data {
-        if (32..127).contains(&b) {
-            cur.push(b);
-        } else if !cur.is_empty() {
-            if cur.len() >= 4 && !cur.iter().all(|&c| c == b'p' || c == b'a') {
-                out.push_str(&format!("  {}\n", String::from_utf8_lossy(&cur)));
-                count += 1;
-                if count >= 120 { break; }
-            }
-            cur.clear();
-        }
-    }
-    out.push_str("\n--- Header Hex (first 512 B) ---\n");
-    out.push_str(&format_hex(&data[..data.len().min(512)]));
-    out
 }
 
 // result list ordering relevance is scan order or best name match first while searching
