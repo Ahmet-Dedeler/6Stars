@@ -3,6 +3,7 @@ use eframe::egui::{self, Color32, ColorImage, CornerRadius, TextureHandle, Textu
 use flate2::{Decompress, FlushDecompress};
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 pub struct WorldMapData {
     pub w: usize,
@@ -21,6 +22,8 @@ pub struct WorldMapState {
     pub show_nav_overlay: bool,
     pub show_3d_terrain: bool,
     pub terrain_mesh: Option<Mesh3D>,
+    pub loading: bool,
+    pending_mesh: Arc<Mutex<Option<Result<Mesh3D, String>>>>,
 }
 
 impl Default for WorldMapState {
@@ -33,6 +36,8 @@ impl Default for WorldMapState {
             show_nav_overlay: true,
             show_3d_terrain: false,
             terrain_mesh: None,
+            loading: false,
+            pending_mesh: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -221,6 +226,21 @@ pub fn render_world_map_ui(
     common_rpf: Option<&Path>,
     levels_rpf: Option<&Path>,
 ) -> Option<usize> {
+    if let Some(res) = wm.pending_mesh.lock().unwrap().take() {
+        wm.loading = false;
+        match res {
+            Ok(mut m) => {
+                m.sky_bg = true;
+                wm.status = format!("Loaded {} ({} parts, {} geoms) — WASD/Q/E + Drag to fly", m.name, m.parts.len(), m.geom_count);
+                wm.terrain_mesh = Some(m);
+                wm.show_3d_terrain = true;
+            }
+            Err(e) => wm.status = format!("SLOD load failed: {e}"),
+        }
+    }
+    if wm.loading {
+        ctx.request_repaint();
+    }
     let mut clicked_nav = None;
     ui.horizontal(|ui| {
         if ui.button("Load World Map").clicked() {
@@ -237,17 +257,19 @@ pub fn render_world_map_ui(
                 wm.status = "Open a game folder or common.rpf first".into();
             }
         }
-        if ui.button("3D City Blocks (Brickell SLOD)").clicked() {
+        let btn_lbl = if wm.loading { "Loading City Blocks..." } else { "3D City Blocks (Brickell SLOD)" };
+        if ui.add_enabled(!wm.loading, egui::Button::new(btn_lbl)).clicked() {
             if let Some(lp) = levels_rpf {
-                match crate::model3d::decode_rage9_model_from_rpf(lp, 8_679_358_480, "brickell_slod") {
-                    Ok(mut m) => {
-                        m.sky_bg = true;
-                        wm.status = format!("Loaded {} ({} parts, {} geoms) — WASD/Q/E + Drag to fly", m.name, m.parts.len(), m.geom_count);
-                        wm.terrain_mesh = Some(m);
-                        wm.show_3d_terrain = true;
-                    }
-                    Err(e) => wm.status = format!("SLOD load failed: {e}"),
-                }
+                let lp = lp.to_path_buf();
+                let slot = Arc::clone(&wm.pending_mesh);
+                let c = ctx.clone();
+                wm.loading = true;
+                wm.status = "Loading Brickell SLOD (317 geoms + TTPF textures)...".into();
+                std::thread::spawn(move || {
+                    let res = crate::model3d::decode_rage9_model_from_rpf(&lp, 8_679_358_480, "brickell_slod");
+                    *slot.lock().unwrap() = Some(res);
+                    c.request_repaint();
+                });
             } else {
                 wm.status = "Open game folder (needs levels.rpf)".into();
             }
