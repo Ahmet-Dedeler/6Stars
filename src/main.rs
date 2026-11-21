@@ -1914,6 +1914,25 @@ impl Rpf9App {
                 );
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
+                    for (source, label) in [
+                        (ShaderSource::Ps09, "PS09 Runtime Cache"),
+                        (ShaderSource::Sgd5, "SGD5 DXBC Groups"),
+                    ] {
+                        let active = self.sh_source == source;
+                        let button = egui::Button::new(
+                            RichText::new(label)
+                                .size(12.0)
+                                .strong()
+                                .color(if active { Color32::BLACK } else { Color32::from_rgb(225, 215, 240) }),
+                        )
+                        .fill(if active { Color32::from_rgb(72, 210, 255) } else { Color32::from_rgb(36, 22, 54) });
+                        if ui.add(button).clicked() {
+                            self.sh_source = source;
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
                     if let Some(lp) = local_sh {
                         if ui
                             .add(
@@ -1927,29 +1946,33 @@ impl Rpf9App {
                             .clicked()
                         {
                             self.load_ps09_path(&lp);
-                            if lp
-                                .extension()
-                                .and_then(|extension| extension.to_str())
-                                .is_some_and(|extension| extension.eq_ignore_ascii_case("rpf"))
-                            {
-                                self.spawn_sgd5_load(ctx.clone(), lp);
-                                self.sh_source = ShaderSource::Ps09;
-                            }
                         }
                     }
-                    if ui.button("Open shaders.rpf / .ps09 / .bin").clicked() {
+                    if ui.button("Open shaders.rpf (PS09 + SGD5)").clicked() {
                         if let Some(p) = rfd::FileDialog::new()
-                            .add_filter("RAGE 9 Shaders", &["rpf", "ps09", "bin"])
+                            .add_filter("RAGE 9 Shaders", &["rpf"])
                             .pick_file()
                         {
                             self.load_ps09_path(&p);
-                            if p.extension()
-                                .and_then(|extension| extension.to_str())
-                                .is_some_and(|extension| extension.eq_ignore_ascii_case("rpf"))
-                            {
-                                self.spawn_sgd5_load(ctx.clone(), p);
-                                self.sh_source = ShaderSource::Ps09;
-                            }
+                            self.spawn_sgd5_load(ctx.clone(), p);
+                            self.sh_source = ShaderSource::Ps09;
+                        }
+                    }
+                    if ui.button("Open PS09 .ps09").clicked() {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("PS09 Cache", &["ps09"])
+                            .pick_file()
+                        {
+                            self.load_ps09_path(&p);
+                            self.sh_source = ShaderSource::Ps09;
+                        }
+                    }
+                    if ui.button("Open SGD5 .bin").clicked() {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("SGD5 Shader Group", &["bin"])
+                            .pick_file()
+                        {
+                            self.spawn_sgd5_load(ctx.clone(), p);
                         }
                     }
                     if ui.button("Open zlib Dir...").clicked() {
@@ -1960,7 +1983,7 @@ impl Rpf9App {
                 });
                 ui.separator();
                 ui.label(
-                    RichText::new("SGD5 / DXBC EXTRACTION")
+                    RichText::new("SGD5 DXBC GROUPS")
                         .size(12.0)
                         .strong()
                         .color(Color32::from_rgb(72, 210, 255)),
@@ -1980,6 +2003,7 @@ impl Rpf9App {
                     {
                         if let Some(output) = rfd::FileDialog::new().pick_folder() {
                             self.spawn_sgd5_extraction(ctx.clone(), input, output);
+                            self.sh_source = ShaderSource::Sgd5;
                         }
                     }
                 }
@@ -2006,6 +2030,7 @@ impl Rpf9App {
                             .color(Color32::from_rgb(165, 225, 185)),
                     );
                 }
+                if self.sh_source == ShaderSource::Sgd5 {
                 if let Some(files) = self.sgd5_cache.clone() {
                     ui.add_space(6.0);
                     ui.horizontal_wrapped(|ui| {
@@ -2018,6 +2043,7 @@ impl Rpf9App {
                                 self.sgd5_group = group_index;
                                 self.sgd5_selected = Some(0);
                                 self.sgd5_cached_text = (None, String::new());
+                                self.sh_source = ShaderSource::Sgd5;
                             }
                         }
                     });
@@ -2047,6 +2073,7 @@ impl Rpf9App {
                             {
                                 self.sgd5_stage_filter = option;
                                 self.sgd5_selected = None;
+                                self.sh_source = ShaderSource::Sgd5;
                             }
                         }
                     });
@@ -2091,10 +2118,13 @@ impl Rpf9App {
                                     .clicked()
                                 {
                                     self.sgd5_selected = Some(index);
+                                    self.sh_source = ShaderSource::Sgd5;
                                 }
                             }
                         });
                 }
+                }
+                if self.sh_source == ShaderSource::Ps09 {
                 if !self.sh_status.is_empty() {
                     ui.add_space(4.0);
                     ui.label(
@@ -2149,6 +2179,7 @@ impl Rpf9App {
                         });
                         if ui.add(btn).clicked() {
                             self.sh_stage_filter = opt;
+                            self.sh_source = ShaderSource::Ps09;
                         }
                     }
                 });
@@ -2220,9 +2251,11 @@ impl Rpf9App {
                                     .clicked()
                                 {
                                     self.sh_selected = Some(idx);
+                                    self.sh_source = ShaderSource::Ps09;
                                 }
                             }
                         });
+                }
                 }
             });
 
