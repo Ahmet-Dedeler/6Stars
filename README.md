@@ -29,7 +29,7 @@
 
 ## What This Fork Adds
 
-- **BK2 video on Apple Silicon and Windows x64:** Select a `.bk2` to play it in the preview panel. Both build scripts include the decoder, so there's no second app to install. On Windows, click the video and press Space to pause, or use its slider to seek.
+- **BK2 video on Apple Silicon and Windows x64:** Open **Videos** from the Model Viewer or **Videos (.bk2)** in Explorer, then select a clip to play it. Both build scripts include the decoder, so there's no second app to install. On Windows, click the video and press Space to pause, or use its slider to seek.
 - **AWC audio previews:** Play and seek through individual streams without exporting them first. The decoder also reads multichannel banks and files with extra stream-table headers that upstream can miss.
 - **Better 3D previews:** Drawables in a model dictionary appear separately instead of stacked on top of each other. Fixed rotated meshes and false model entries, added streamed `.ttpf` textures and vehicle paint previews, and added a **Highest detail only** toggle for character and clothing models.
 - **More accurate model colors:** The viewer finds shared textures across packs, binds them to the right materials, and reads both packed and floating-point UVs. If it can't find a usable color texture, it shows that part in gray. When a texture's full-size mip is BCPack (which isn't decoded yet), it falls back to the largest smaller mip stored plainly. That recovers about a third of blocked textures, labeled **Reduced resolution**.

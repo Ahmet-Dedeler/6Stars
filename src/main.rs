@@ -619,6 +619,7 @@ struct Rpf9App {
     mv_detail_job: Option<mpsc::Receiver<DetailIndex>>,
     mv_entries: Vec<(usize, ModelCat, String)>,
     mv_counts: [usize; 11],
+    mv_video_count: usize,
     mv_ver: u64,
     mv_view: Vec<usize>,
     mv_view_key: Option<(u64, ModelCat, String, bool, bool)>,
@@ -694,6 +695,7 @@ impl Rpf9App {
             mv_detail_job: None,
             mv_entries: Vec::new(),
             mv_counts: [0; 11],
+            mv_video_count: 0,
             mv_ver: u64::MAX,
             mv_view: Vec::new(),
             mv_view_key: None,
@@ -838,6 +840,14 @@ impl Rpf9App {
         self.audio = None;
         self.stop_bink_player();
         self.media = Arc::new(Mutex::new(MediaState::default()));
+    }
+
+    fn browse_videos(&mut self) {
+        self.reset_selection();
+        self.tab = AppTab::Explorer;
+        self.category = Category::Videos;
+        self.selected_rpf = "All RPFs".into();
+        self.filter.clear();
     }
 
     fn import_catalog_csv(&mut self, csv_path: &Path) {
@@ -1443,8 +1453,10 @@ impl Rpf9App {
             let st = self.state.lock().unwrap();
             let mut entries = Vec::new();
             let mut counts = [0usize; 11];
+            let mut video_count = 0;
             for (idx, e) in st.entries.iter().enumerate() {
                 if !matches!(e.kind, "MODEL" | "VEH" | "NAVM") {
+                    video_count += usize::from(e.kind == "BK2");
                     continue;
                 }
                 let cat = classify_model_cat(e.kind, &e.name);
@@ -1458,6 +1470,7 @@ impl Rpf9App {
             drop(st);
             self.mv_entries = entries;
             self.mv_counts = counts;
+            self.mv_video_count = video_count;
             self.mv_ver = ver;
             self.mv_view_key = None;
         }
@@ -1583,6 +1596,7 @@ impl Rpf9App {
     fn render_model_viewer_tab(&mut self, ctx: &egui::Context, media_loading: bool, media_status: &str) {
         self.refresh_mv_view();
         let mut to_select: Option<usize> = None;
+        let mut browse_videos = false;
 
         egui::SidePanel::left("mv_sidebar")
             .default_width(360.0)
@@ -1658,6 +1672,15 @@ impl Rpf9App {
                             ui.end_row();
                         }
                     }
+                    let videos = RichText::new(format!("Videos ({})", self.mv_video_count))
+                        .size(11.5)
+                        .strong()
+                        .color(kind_color("BK2"));
+                    let button = egui::Button::new(videos)
+                        .min_size(egui::vec2(162.0, 22.0))
+                        .fill(Color32::from_rgb(32, 20, 48));
+                    browse_videos = ui.add(button).on_hover_text("Browse all .bk2 clips in Explorer").clicked();
+                    ui.end_row();
                 });
 
                 ui.add_space(8.0);
@@ -1769,6 +1792,12 @@ impl Rpf9App {
                         }
                     });
             });
+
+        if browse_videos {
+            self.browse_videos();
+            ctx.request_repaint();
+            return;
+        }
 
         if let Some(i) = to_select.or_else(|| {
             self.active_detail_index()?.get(&self.selected?).copied()
