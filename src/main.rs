@@ -506,6 +506,7 @@ struct ScanState {
     rpf_names: Vec<String>,
     file_sig: HashMap<PathBuf, (u64, Option<SystemTime>)>,
     audio_bank_meta: HashMap<u64, dat::ResolvedAwcMeta>,
+    radio_stations: Vec<String>,
     ver: u64,
 }
 
@@ -514,7 +515,7 @@ struct MediaState {
     loading: bool,
     status: String,
     loaded_tracks: Option<(Vec<audio_player::LoadedWavTrack>, Arc<Vec<u8>>)>,
-    loaded_bank_info: Option<String>,
+    loaded_bank_ctx: Option<audio_player::AudioBankContext>,
     bink_child_pid: Option<u32>,
     bink_hwnd: Option<isize>,
     bink_clip: Option<PathBuf>,
@@ -1136,10 +1137,18 @@ impl Rpf9App {
                                                     e.name = display_entry_name(e, false).into_owned();
                                                 }
                                             }
-                                            st.audio_bank_meta = enrich_audio_rpf_entries(p, meta.len(), cached_entries);
+                                            let (meta_map, stations) = enrich_audio_rpf_entries(p, meta.len(), cached_entries);
+                                            st.audio_bank_meta = meta_map;
+                                            if !stations.is_empty() {
+                                                st.radio_stations = stations;
+                                            }
                                             disk_cache_dirty = true;
                                         } else if st.audio_bank_meta.is_empty() {
-                                            st.audio_bank_meta = enrich_audio_rpf_entries(p, meta.len(), cached_entries);
+                                            let (meta_map, stations) = enrich_audio_rpf_entries(p, meta.len(), cached_entries);
+                                            st.audio_bank_meta = meta_map;
+                                            if !stations.is_empty() {
+                                                st.radio_stations = stations;
+                                            }
                                         }
                                     }
                                     let is_levels = p.file_name().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("levels.rpf")).unwrap_or(false);
@@ -1399,14 +1408,14 @@ impl Rpf9App {
                 }
             }
         } else if e.kind == "AWC" {
-            let bank_info = if e.rpf_name.eq_ignore_ascii_case("audio.rpf") {
+            let bank_ctx = if e.rpf_name.eq_ignore_ascii_case("audio.rpf") {
                 self.state.lock().unwrap().audio_bank_meta.get(&e.offset).map(|meta| {
-                    let used = if meta.used_by.is_empty() {
-                        String::new()
-                    } else {
-                        format!("  |  Used by: {}", meta.used_by.join(", "))
-                    };
-                    format!("Pack: {}  |  Bank: 0x{:08x}  |  Exact: {} B{}", meta.pack_name, meta.bank_hash, meta.exact_size, used)
+                    audio_player::AudioBankContext {
+                        pack_name: meta.pack_name.clone(),
+                        bank_hash: meta.bank_hash,
+                        exact_size: meta.exact_size,
+                        used_by: meta.used_by.clone(),
+                    }
                 })
             } else {
                 None
@@ -1415,7 +1424,7 @@ impl Rpf9App {
             {
                 let mut m = media.lock().unwrap();
                 m.loading = true;
-                m.loaded_bank_info = bank_info;
+                m.loaded_bank_ctx = bank_ctx;
                 m.status = format!("Decoding {} Opus streams...", e.name);
             }
             std::thread::spawn(move || decode_awc_for_player(&e, &media));
@@ -3644,7 +3653,7 @@ fn display_entry_name(e: &RpfEntry, audio_named: bool) -> std::borrow::Cow<'_, s
     std::borrow::Cow::Borrowed(&e.name)
 }
 
-fn enrich_audio_rpf_entries(audio_rpf: &PathBuf, total_sz: u64, entries: &mut Vec<RpfEntry>) -> HashMap<u64, dat::ResolvedAwcMeta> {
+fn enrich_audio_rpf_entries(audio_rpf: &PathBuf, total_sz: u64, entries: &mut Vec<RpfEntry>) -> (HashMap<u64, dat::ResolvedAwcMeta>, Vec<String>) {
     let mut meta_map = HashMap::new();
     let awc_indices: Vec<usize> = entries
         .iter()
@@ -3657,7 +3666,7 @@ fn enrich_audio_rpf_entries(audio_rpf: &PathBuf, total_sz: u64, entries: &mut Ve
         .map(|&i| entries[i].offset)
         .unwrap_or(19_509_248);
     let Some(cat) = dat::parse_audio_rpf_catalog(audio_rpf, first_awc_off) else {
-        return meta_map;
+        return (meta_map, Vec::new());
     };
     let rname = audio_rpf
         .file_name()
@@ -3697,7 +3706,7 @@ fn enrich_audio_rpf_entries(audio_rpf: &PathBuf, total_sz: u64, entries: &mut Ve
             }
         }
     }
-    meta_map
+    (meta_map, cat.radio_stations)
 }
 
 impl eframe::App for Rpf9App {
@@ -3721,10 +3730,18 @@ impl eframe::App for Rpf9App {
             }
             if let Some((tracks, awc_bytes)) = m.loaded_tracks.take() {
                 self.audio_player.set_tracks(tracks, awc_bytes);
-                self.audio_player.bank_info = m.loaded_bank_info.take();
+                self.audio_player.bank_ctx = m.loaded_bank_ctx.take();
+                if self.audio_player.radio_stations.is_empty() {
+                    let stations = self.state.lock().unwrap().radio_stations.clone();
+                    self.audio_player.radio_stations = stations;
+                }
             }
             (m.loading, m.status.clone())
         };
+        if let Some(q) = self.audio_player.requested_search.take() {
+            self.category = Category::Audio;
+            self.filter = q;
+        }
 
         egui::TopBottomPanel::top("top").frame(egui::Frame::new().fill(Color32::from_rgb(24, 14, 36)).inner_margin(10.0)).show(ctx, |ui| {
             ui.horizontal(|ui| {

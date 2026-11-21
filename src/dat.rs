@@ -50,6 +50,7 @@ pub struct ResolvedAwcMeta {
 pub struct AudioRpfCatalog {
     pub banks: Vec<AudioBankMeta>,
     pub metadata_chunks: Vec<(String, &'static str, u64, u64, Vec<(u64, u64)>)>,
+    pub radio_stations: Vec<String>,
 }
 
 fn is_zlib_hdr(d: &[u8]) -> bool {
@@ -192,6 +193,7 @@ pub fn parse_audio_rpf_catalog(audio_rpf: &Path, first_awc_off: u64) -> Option<A
     let mut metadata_chunks = Vec::new();
     let mut raw_banks: Vec<(u32, u64, u64, u32)> = Vec::new();
     let mut bank_labels: HashMap<u32, Vec<String>> = HashMap::new();
+    let mut radio_stations: Vec<String> = Vec::new();
 
     for (z_idx, (off, chunks, payload)) in files.iter().enumerate() {
         let num = z_idx + 1;
@@ -218,6 +220,16 @@ pub fn parse_audio_rpf_catalog(audio_rpf: &Path, first_awc_off: u64) -> Option<A
         } else if payload.starts_with(b"BaseCommon:") {
             ("XML", format!("{num:04}_audio_mounts.txt"))
         } else if payload.starts_with(b"core.ambience.") {
+            if let Ok(txt) = std::str::from_utf8(payload) {
+                for line in txt.lines() {
+                    let t = line.trim();
+                    if let Some(rest) = t.strip_prefix("Core.RadioStation.").or_else(|| t.strip_prefix("core.radiostation.")) {
+                        if !rest.is_empty() && !radio_stations.iter().any(|s| s == rest) {
+                            radio_stations.push(rest.to_string());
+                        }
+                    }
+                }
+            }
             ("XML", format!("{num:04}_audio_radiostations_and_packs.txt"))
         } else {
             ("ZLIB", format!("{num:04}_audio_meta.bin"))
@@ -297,6 +309,7 @@ pub fn parse_audio_rpf_catalog(audio_rpf: &Path, first_awc_off: u64) -> Option<A
         return Some(AudioRpfCatalog {
             banks: Vec::new(),
             metadata_chunks,
+            radio_stations,
         });
     }
 
@@ -359,6 +372,7 @@ pub fn parse_audio_rpf_catalog(audio_rpf: &Path, first_awc_off: u64) -> Option<A
     Some(AudioRpfCatalog {
         banks,
         metadata_chunks,
+        radio_stations,
     })
 }
 
