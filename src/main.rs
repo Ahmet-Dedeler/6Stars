@@ -31,7 +31,7 @@ mod audit_tests;
 #[cfg(test)]
 mod demo_capture;
 use model3d::{
-    Mesh3D, decode_rage9_model_from_rpf, extract_0drpz_mesh, extract_rage9_model_name,
+    Mesh3D, decode_rage9_model_from_rpf, decode_rage9_model_from_rpf_lod, extract_0drpz_mesh, extract_rage9_model_name,
     has_rage9_meshlets, is_vehicle_virtual, is_zlib_head, model_detail_score, parse_obj,
     probe_large_rage9_model_in_buf, render_mesh3d_viewport,
 };
@@ -402,6 +402,56 @@ enum Category {
     Binary,
 }
 
+/// A LOD switch requested from the 3D viewer header (ported from asm512's fork,
+/// rpatty-dev/PercyStar#19).
+#[derive(Clone, Copy)]
+enum LodPick {
+    /// Entry index of a sibling detail file (`_hi` / `_mid` / base).
+    File(usize),
+    /// LOD slot inside the current file.
+    Level(usize),
+}
+
+/// File names of a model's three detail files, high to low: `stem_hi`, `stem_mid`, `stem`.
+fn lod_sibling_names(name: &str) -> Option<[String; 3]> {
+    let (stem, ext) = name.rsplit_once('.')?;
+    let lower = stem.to_ascii_lowercase();
+    let cut = if lower.ends_with("_hi") { 3 } else if lower.ends_with("_mid") { 4 } else { 0 };
+    let base = &stem[..stem.len() - cut];
+    if base.is_empty() {
+        return None;
+    }
+    Some([format!("{base}_hi.{ext}"), format!("{base}_mid.{ext}"), format!("{base}.{ext}")])
+}
+
+/// Detail-file and in-file LOD buttons for the viewer header. Returns the clicked switch.
+fn lod_switch_ui(ui: &mut egui::Ui, mesh: &Mesh3D, siblings: &[(&'static str, usize)], selected: Option<usize>) -> Option<LodPick> {
+    let mut pick = None;
+    let levels = mesh.lod_geoms.iter().filter(|&&n| n > 0).count();
+    if siblings.is_empty() && levels < 2 {
+        return None;
+    }
+    ui.separator();
+    ui.label(RichText::new("Detail:").size(11.0).color(Color32::from_rgb(130, 138, 156)));
+    for &(lbl, idx) in siblings {
+        if ui.selectable_label(selected == Some(idx), lbl).on_hover_text("Separate detail-level file of this model").clicked() && selected != Some(idx) {
+            pick = Some(LodPick::File(idx));
+        }
+    }
+    if levels >= 2 {
+        for (l, &n) in mesh.lod_geoms.iter().enumerate() {
+            if n == 0 {
+                continue;
+            }
+            let tip = format!("{n} geometries stored in this file");
+            if ui.selectable_label(mesh.lod == l, model3d::LOD_NAMES[l]).on_hover_text(tip).clicked() && mesh.lod != l {
+                pick = Some(LodPick::Level(l));
+            }
+        }
+    }
+    pick
+}
+
 #[derive(Clone, Debug)]
 struct RpfEntry {
     source_rpf: PathBuf,
@@ -650,6 +700,12 @@ struct Rpf9App {
     mv_cat: ModelCat,
     mv_filter: String,
     mv_hide_lods: bool,
+    /// Detail-level files of the selected model (label, entry index), high to low.
+    lod_siblings: Vec<(&'static str, usize)>,
+    /// LOD switch clicked in a viewer header, applied at the start of the next frame.
+    lod_pick: Option<LodPick>,
+    /// Camera (yaw, pitch, zoom, pan x, pan y) carried across a LOD switch.
+    lod_keep_cam: Option<[f32; 5]>,
     mv_high_detail: bool,
     mv_detail_index: Option<DetailIndex>,
     mv_detail_job: Option<mpsc::Receiver<DetailIndex>>,
@@ -787,6 +843,9 @@ impl Rpf9App {
             mv_cat: ModelCat::All,
             mv_filter: String::new(),
             mv_hide_lods: true,
+            lod_siblings: Vec::new(),
+            lod_pick: None,
+            lod_keep_cam: None,
             mv_high_detail: false,
             mv_detail_index: None,
             mv_detail_job: None,
@@ -970,6 +1029,9 @@ impl Rpf9App {
 
     fn reset_selection(&mut self) {
         self.selected = None;
+        self.lod_siblings.clear();
+        self.lod_pick = None;
+        self.lod_keep_cam = None;
         self.preview.clear();
         self.mesh3d = None;
         self.show_3d = false;
@@ -1301,36 +1363,74 @@ impl Rpf9App {
         });
     }
 
+    /// Other detail-level files of `e` in the same archive (`stem_hi`, `stem_mid`, `stem`).
+    fn find_lod_siblings(&self, e: &RpfEntry) -> Vec<(&'static str, usize)> {
+        let Some(names) = lod_sibling_names(&e.name) else { return Vec::new() };
+        let mut found: [Option<usize>; 3] = [None; 3];
+        let st = self.state.lock().unwrap();
+        for (i, o) in st.entries.iter().enumerate() {
+            if (o.kind != "MODEL" && o.kind != "VEH") || o.source_rpf != e.source_rpf {
+                continue;
+            }
+            for (k, n) in names.iter().enumerate() {
+                if found[k].is_none() && o.name.eq_ignore_ascii_case(n) {
+                    found[k] = Some(i);
+                }
+            }
+        }
+        let out: Vec<_> = ["Hi", "Mid", "Low"].into_iter().zip(found).filter_map(|(l, f)| f.map(|i| (l, i))).collect();
+        if out.len() < 2 { Vec::new() } else { out }
+    }
+
+    fn spawn_model_decode(&self, e: &RpfEntry, lod: usize) {
+        let media = Arc::clone(&self.media);
+        {
+            let mut m = media.lock().unwrap();
+            m.loading = true;
+            m.status = format!("Decoding RAGE9 meshlets: {}...", e.name);
+        }
+        let src = e.source_rpf.clone();
+        let off = e.offset;
+        let nm = e.name.clone();
+        std::thread::spawn(move || {
+            let res = decode_rage9_model_from_rpf_lod(&src, off, &nm, lod);
+            let mut m = media.lock().unwrap();
+            m.loading = false;
+            match res {
+                Ok(mesh) => {
+                    m.status.clear();
+                    m.loaded_mesh = Some(mesh);
+                }
+                Err(err) => m.status = format!("Model decode error ({nm}): {err}"),
+            }
+        });
+    }
+
+    /// Switches the viewed model to another detail file or in-file LOD, keeping the camera.
+    fn apply_lod_pick(&mut self, pick: LodPick) {
+        let cam = self.mesh3d.as_ref().map(|m| [m.yaw, m.pitch, m.zoom, m.pan_x, m.pan_y]);
+        match pick {
+            LodPick::File(idx) => {
+                let show = self.show_3d;
+                self.select_entry(idx);
+                self.show_3d = show;
+            }
+            LodPick::Level(lod) => {
+                let Some(e) = self.selected.and_then(|i| self.state.lock().unwrap().entries.get(i).cloned()) else { return };
+                self.spawn_model_decode(&e, lod);
+            }
+        }
+        self.lod_keep_cam = cam;
+    }
+
     fn select_entry(&mut self, idx: usize) {
         let Some(e) = self.state.lock().unwrap().entries.get(idx).cloned() else { return };
         self.reset_selection();
         self.selected = Some(idx);
 
         if e.kind == "MODEL" || e.kind == "VEH" {
-            let media = Arc::clone(&self.media);
-            {
-                let mut m = media.lock().unwrap();
-                m.loading = true;
-                m.status = format!("Decoding RAGE9 meshlets: {}...", e.name);
-            }
-            let src = e.source_rpf.clone();
-            let off = e.offset;
-            let nm = e.name.clone();
-            std::thread::spawn(move || {
-                match decode_rage9_model_from_rpf(&src, off, &nm) {
-                    Ok(mesh) => {
-                        let mut m = media.lock().unwrap();
-                        m.loading = false;
-                        m.status.clear();
-                        m.loaded_mesh = Some(mesh);
-                    }
-                    Err(err) => {
-                        let mut m = media.lock().unwrap();
-                        m.loading = false;
-                        m.status = format!("Model decode error ({nm}): {err}");
-                    }
-                }
-            });
+            self.lod_siblings = self.find_lod_siblings(&e);
+            self.spawn_model_decode(&e, 0);
             return;
         }
 
@@ -2029,6 +2129,9 @@ impl Rpf9App {
                             .size(11.5)
                             .color(Color32::from_rgb(170, 200, 230)),
                         );
+                        if let Some(pick) = lod_switch_ui(ui, mesh, &self.lod_siblings, self.selected) {
+                            self.lod_pick = Some(pick);
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             // Quick camera presets
                             for (lbl, yaw, pitch) in [
@@ -3890,11 +3993,20 @@ impl eframe::App for Rpf9App {
         }
         self.poll_bink_player(ctx);
         self.poll_sgd5_cache();
+        if let Some(pick) = self.lod_pick.take() {
+            self.apply_lod_pick(pick);
+        }
         let (media_loading, media_status) = {
             let mut m = self.media.lock().unwrap();
-            if let Some(mesh) = m.loaded_mesh.take() {
+            if let Some(mut mesh) = m.loaded_mesh.take() {
                 self.textures.clear();
                 self.tex_handle = None;
+                if let Some([yaw, pitch, zoom, pan_x, pan_y]) = self.lod_keep_cam.take() {
+                    (mesh.yaw, mesh.pitch, mesh.zoom, mesh.pan_x, mesh.pan_y) = (yaw, pitch, zoom, pan_x, pan_y);
+                }
+                if let Some((lbl, _)) = self.lod_siblings.iter().find(|(_, i)| Some(*i) == self.selected) {
+                    mesh.lod_label = format!("{lbl} detail file · {}", mesh.lod_label);
+                }
                 self.mesh3d = Some(mesh);
                 self.show_3d = true;
             }
@@ -4413,6 +4525,8 @@ impl eframe::App for Rpf9App {
                             mesh.verts = next.verts;
                             mesh.dirty = true;
                         }
+                    } else if let Some(pick) = lod_switch_ui(ui, mesh, &self.lod_siblings, self.selected) {
+                        self.lod_pick = Some(pick);
                     }
                 });
                 if self.anim_dur > 0.0 && self.anim_playing && toggle_3d {
@@ -4492,6 +4606,17 @@ impl eframe::App for Rpf9App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lod_sibling_names_cover_hi_mid_and_base() {
+        let want = ["a_b_bonnet_01_hi.#ft".to_string(), "a_b_bonnet_01_mid.#ft".into(), "a_b_bonnet_01.#ft".into()];
+        for n in ["a_b_bonnet_01_hi.#ft", "a_b_bonnet_01_mid.#ft", "a_b_bonnet_01.#ft", "A_B_BONNET_01_HI.#ft"] {
+            let got = lod_sibling_names(n).unwrap();
+            assert!(got.iter().zip(&want).all(|(g, w)| g.eq_ignore_ascii_case(w)), "{n}: {got:?}");
+        }
+        assert!(lod_sibling_names("noext").is_none());
+        assert!(lod_sibling_names("_hi.#ft").is_none());
+    }
 
     #[test]
     fn model_viewer_categories_classify_correctly() {
