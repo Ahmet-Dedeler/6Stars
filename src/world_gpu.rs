@@ -57,6 +57,7 @@ struct FrameUniforms {
     sky_horizon: [f32; 4],
     flags: [f32; 4], // x=rt_on, y=time_hours, z=map_min_x, w=map_span_x
     map_y: [f32; 4], // x=map_min_y, y=map_span_y, z=viewport_w, w=viewport_h
+    hud: [f32; 4],   // x=load_progress, y=loading_active, z=elapsed_sec, w=sgd5_count
 }
 
 pub struct WorldBatchInput {
@@ -75,6 +76,26 @@ pub struct WorldLaunchConfig {
 pub enum WorldStreamMsg {
     Batch(WorldBatchInput),
     MapCount(usize),
+    TotalArchetypes(usize),
+    ArchetypeDone,
+    Sgd5Count(usize),
+}
+
+fn count_sgd5_shaders_in_rpf(shaders_rpf: &Path) -> usize {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(shaders_rpf) else { return 0 };
+    let mut buf = vec![0u8; 8 * 1024 * 1024];
+    let mut total = 0usize;
+    loop {
+        let Ok(n) = f.read(&mut buf) else { break };
+        if n < 16 { break; }
+        for w in buf[..n].windows(4) {
+            if w == b"SGD5" {
+                total += 1;
+            }
+        }
+    }
+    total
 }
 
 pub fn launch_world_gpu_process(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -> Result<(), String> {
@@ -153,17 +174,44 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
             }
             eprintln!("[world-gpu] matched {} unique drawable archetypes to stream", arch_groups.len());
             arch_groups.sort_by(|a, b| a.2.total_cmp(&b.2));
-            for (h, moff, _, insts) in arch_groups {
-                if let Ok(mesh) = crate::model3d::decode_rage9_model_from_rpf(&lp, moff, &format!("arch_{h:08x}")) {
-                    let lo = mesh.name.to_ascii_lowercase();
-                    if lo.ends_with("_shadow") || lo.ends_with("_pxy") || lo.ends_with("_lit_proxy") {
-                        continue;
-                    }
-                    if tx.send(WorldStreamMsg::Batch(WorldBatchInput { mesh, instances: insts })).is_err() {
-                        break;
-                    }
-                }
+            let _ = tx.send(WorldStreamMsg::TotalArchetypes(arch_groups.len()));
+            if let Some(sp) = lp.parent().map(|d| d.join("shaders.rpf")).filter(|p| p.exists()) {
+                let tx_s = tx.clone();
+                std::thread::spawn(move || {
+                    let n = count_sgd5_shaders_in_rpf(&sp);
+                    eprintln!("[world-gpu] indexed {} SGD5 shader packs from {}", n, sp.display());
+                    let _ = tx_s.send(WorldStreamMsg::Sgd5Count(n));
+                });
             }
+            let groups = Arc::new(arch_groups);
+            let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let n_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).clamp(2, 8);
+            std::thread::scope(|s| {
+                for _ in 0..n_workers {
+                    let groups = Arc::clone(&groups);
+                    let cursor = Arc::clone(&cursor);
+                    let tx = tx.clone();
+                    let lp = lp.clone();
+                    s.spawn(move || loop {
+                        let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= groups.len() {
+                            break;
+                        }
+                        let (h, moff, _, ref insts) = groups[i];
+                        if let Ok(mesh) = crate::model3d::decode_rage9_model_from_rpf(&lp, moff, &format!("arch_{h:08x}")) {
+                            let lo = mesh.name.to_ascii_lowercase();
+                            if !(lo.ends_with("_shadow") || lo.ends_with("_pxy") || lo.ends_with("_lit_proxy")) {
+                                if tx.send(WorldStreamMsg::Batch(WorldBatchInput { mesh, instances: insts.clone() })).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        if tx.send(WorldStreamMsg::ArchetypeDone).is_err() {
+                            break;
+                        }
+                    });
+                }
+            });
         });
     }
     let mut app = GpuWorldApp::new(cfg, rx);
@@ -180,6 +228,7 @@ struct Uniforms {
     sky_horizon: vec4<f32>,
     flags: vec4<f32>,
     map_y: vec4<f32>,
+    hud: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -357,6 +406,85 @@ fn fs_minimap(in: MinimapOut) -> @location(0) vec4<f32> {
     }
     return vec4<f32>(c.rgb, 0.92);
 }
+
+struct WaterOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) world_pos: vec3<f32>,
+};
+
+@vertex
+fn vs_water(@builtin(vertex_index) vid: u32) -> WaterOut {
+    var quad = array<vec2<f32>, 6>(
+        vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0),
+        vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(-1.0, 1.0)
+    );
+    let p = quad[vid] * 26000.0;
+    let wp = vec3<f32>(p.x, p.y, -0.5);
+    var out: WaterOut;
+    out.clip_pos = u.view_proj * vec4<f32>(wp, 1.0);
+    out.world_pos = wp;
+    return out;
+}
+
+@fragment
+fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
+    let t = u.hud.z;
+    let w1 = sin(in.world_pos.x * 0.045 + t * 1.4) * cos(in.world_pos.y * 0.045 - t * 1.1);
+    let w2 = sin((in.world_pos.x + in.world_pos.y) * 0.021 - t * 0.8);
+    let n = normalize(vec3<f32>((w1 + w2) * 0.04, (w1 - w2) * 0.04, 1.0));
+    let v = normalize(u.cam_pos.xyz - in.world_pos);
+    let l = normalize(u.sun_dir.xyz);
+    let h = normalize(l + v);
+    let fres = pow(1.0 - max(dot(n, v), 0.0), 4.0);
+    let sun_elev = clamp(l.z * 2.2, 0.0, 1.0);
+    let deep = vec3<f32>(0.02, 0.11, 0.19) * (0.35 + 0.65 * sun_elev);
+    let sky_r = mix(u.sky_horizon.rgb, u.sky_zenith.rgb, 0.45);
+    let glint = pow(max(dot(n, h), 0.0), 140.0) * 1.6 * sun_elev;
+    let water_col = mix(deep, sky_r, clamp(fres * 0.85 + 0.08, 0.0, 0.92)) + vec3<f32>(glint);
+    let dist = length(u.cam_pos.xyz - in.world_pos);
+    let fog = clamp(1.0 - exp(-dist * 0.00010), 0.0, 0.90);
+    let fog_col = mix(u.sky_horizon.rgb, u.sky_zenith.rgb, 0.25);
+    return vec4<f32>(aces_tonemap(mix(water_col, fog_col, fog)), 1.0);
+}
+
+struct ProgOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_progress(@builtin(vertex_index) vid: u32) -> ProgOut {
+    var quad = array<vec2<f32>, 6>(
+        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0),
+        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, 1.0)
+    );
+    let q = quad[vid];
+    let w = max(u.map_y.z, 640.0);
+    let h = max(u.map_y.w, 480.0);
+    let bw = min(460.0, w * 0.5);
+    let bh = 14.0;
+    let px = (w - bw) * 0.5 + q.x * bw;
+    let py = 18.0 + q.y * bh;
+    var out: ProgOut;
+    out.pos = vec4<f32>((px / w) * 2.0 - 1.0, 1.0 - (py / h) * 2.0, 0.0, 1.0);
+    out.uv = q;
+    return out;
+}
+
+@fragment
+fn fs_progress(in: ProgOut) -> @location(0) vec4<f32> {
+    if (u.hud.y < 0.5) {
+        discard;
+    }
+    let border = in.uv.x < 0.006 || in.uv.x > 0.994 || in.uv.y < 0.12 || in.uv.y > 0.88;
+    if (border) {
+        return vec4<f32>(0.85, 0.90, 0.96, 0.85);
+    }
+    if (in.uv.x <= clamp(u.hud.x, 0.0, 1.0)) {
+        return vec4<f32>(0.22, 0.80, 0.98, 0.95);
+    }
+    return vec4<f32>(0.08, 0.10, 0.14, 0.80);
+}
 "#;
 
 struct GpuMeshBatch {
@@ -385,13 +513,19 @@ struct GpuState {
     shadow_pipeline: wgpu::RenderPipeline,
     main_pipeline: wgpu::RenderPipeline,
     sky_pipeline: wgpu::RenderPipeline,
+    water_pipeline: wgpu::RenderPipeline,
     minimap_pipeline: wgpu::RenderPipeline,
+    progress_pipeline: wgpu::RenderPipeline,
     minimap_bg: wgpu::BindGroup,
     batches: Vec<GpuMeshBatch>,
     tri_count: usize,
     instance_count: usize,
     model_count: usize,
     map_count: usize,
+    stream_done: usize,
+    stream_total: usize,
+    sgd5_count: usize,
+    start_instant: Instant,
     has_hw_rt: bool,
     map_min: [f32; 2],
     map_span: [f32; 2],
@@ -697,6 +831,29 @@ impl GpuState {
             cache: None,
         });
 
+        let water_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("water_pipe"),
+            layout: Some(&main_layout),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_water"), buffers: &[], compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_water"),
+                targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                compilation_options: Default::default(),
+            }),
+            primitive: Default::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
+
         let minimap_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("minimap_pipe"),
             layout: Some(&main_layout),
@@ -704,6 +861,29 @@ impl GpuState {
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some("fs_minimap"),
+                targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })],
+                compilation_options: Default::default(),
+            }),
+            primitive: Default::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        let progress_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("progress_pipe"),
+            layout: Some(&main_layout),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_progress"), buffers: &[], compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_progress"),
                 targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })],
                 compilation_options: Default::default(),
             }),
@@ -741,13 +921,19 @@ impl GpuState {
             shadow_pipeline,
             main_pipeline,
             sky_pipeline,
+            water_pipeline,
             minimap_pipeline,
+            progress_pipeline,
             minimap_bg,
             batches: Vec::new(),
             tri_count: 0,
             instance_count: 0,
             model_count: 0,
             map_count: cfg.map_count,
+            stream_done: 0,
+            stream_total: 0,
+            sgd5_count: 0,
+            start_instant: Instant::now(),
             has_hw_rt,
             map_min: [-13000.0, -9000.0],
             map_span: [20000.0, 20000.0],
@@ -987,10 +1173,14 @@ impl ApplicationHandler for GpuWorldApp {
                 self.last_frame = now;
 
                 if let Some(g) = &mut self.gpu {
-                    while let Ok(msg) = self.stream_rx.try_recv() {
+                    for _ in 0..24 {
+                        let Ok(msg) = self.stream_rx.try_recv() else { break };
                         match msg {
                             WorldStreamMsg::Batch(batch) => g.add_batch(&batch),
                             WorldStreamMsg::MapCount(mc) => g.map_count = mc,
+                            WorldStreamMsg::TotalArchetypes(t) => g.stream_total = t,
+                            WorldStreamMsg::ArchetypeDone => g.stream_done += 1,
+                            WorldStreamMsg::Sgd5Count(n) => g.sgd5_count = n,
                         }
                     }
                 }
@@ -1035,12 +1225,20 @@ impl ApplicationHandler for GpuWorldApp {
                     self.last_title = now;
                     let rt_lbl = if !self.rt_on { "OFF" } else if g.has_hw_rt { "HW-RT" } else { "SS-RT/GI" };
                     let mode_lbl = if self.walk_mode { "WALK(G)" } else { "FLY(G)" };
+                    let load_lbl = if g.stream_total > 0 && g.stream_done < g.stream_total {
+                        format!(" | Load {}/{} ({:.0}%)", g.stream_done, g.stream_total, (g.stream_done as f32 / g.stream_total as f32) * 100.0)
+                    } else if g.stream_total > 0 {
+                        " | World Ready".to_string()
+                    } else {
+                        " | Indexing...".to_string()
+                    };
+                    let sgd_lbl = if g.sgd5_count > 0 { format!(" | SGD5: {}", g.sgd5_count) } else { String::new() };
                     g.window.set_title(&format!(
-                        "PercyStar 3D World | pos {:.0} {:.0} {:.0} | {} | Sun az {:.1} el {:+.1} (F6) | Time {:.2}h | {} maps | {} models | {} instances | {:.2} M tris | RT: {}",
+                        "PercyStar 3D World | pos {:.0} {:.0} {:.0} | {} | Sun az {:.1} el {:+.1} (F6) | Time {:.2}h | {} maps | {} models | {} instances | {:.2} M tris | RT: {}{}{}",
                         self.cam_pos.x, self.cam_pos.y, self.cam_pos.z, mode_lbl,
                         az.to_degrees().rem_euclid(360.0), el.to_degrees(),
                         self.time_h, g.map_count, g.model_count, g.instance_count,
-                        g.tri_count as f64 / 1e6, rt_lbl
+                        g.tri_count as f64 / 1e6, rt_lbl, load_lbl, sgd_lbl
                     ));
                 }
 
@@ -1058,6 +1256,8 @@ impl ApplicationHandler for GpuWorldApp {
                 let day_fac = (sun_dir.z * 2.5).clamp(0.0, 1.0);
                 let sky_zenith = [0.06 + day_fac * 0.20, 0.09 + day_fac * 0.42, 0.16 + day_fac * 0.72, 1.0];
                 let sky_horizon = [0.14 + day_fac * 0.54, 0.16 + day_fac * 0.62, 0.24 + day_fac * 0.68, 1.0];
+                let load_prog = if g.stream_total > 0 { (g.stream_done as f32 / g.stream_total as f32).clamp(0.0, 1.0) } else { 0.02 };
+                let load_active = if g.stream_total == 0 || g.stream_done < g.stream_total { 1.0 } else { 0.0 };
 
                 let uni = FrameUniforms {
                     view_proj: view_proj.to_cols_array_2d(),
@@ -1068,6 +1268,7 @@ impl ApplicationHandler for GpuWorldApp {
                     sky_horizon,
                     flags: [if self.rt_on { 1.0 } else { 0.0 }, self.time_h, g.map_min[0], g.map_span[0]],
                     map_y: [g.map_min[1], g.map_span[1], g.config.width as f32, g.config.height as f32],
+                    hud: [load_prog, load_active, g.start_instant.elapsed().as_secs_f32(), g.sgd5_count as f32],
                 };
                 g.queue.write_buffer(&g.uniform_buf, 0, bytemuck::bytes_of(&uni));
 
@@ -1120,6 +1321,9 @@ impl ApplicationHandler for GpuWorldApp {
                     rp.set_bind_group(2, &g.shadow_bg, &[]);
                     rp.draw(0..3, 0..1);
 
+                    rp.set_pipeline(&g.water_pipeline);
+                    rp.draw(0..6, 0..1);
+
                     rp.set_pipeline(&g.main_pipeline);
                     for b in &g.batches {
                         rp.set_bind_group(1, &b.tex_bind_group, &[]);
@@ -1131,6 +1335,9 @@ impl ApplicationHandler for GpuWorldApp {
 
                     rp.set_pipeline(&g.minimap_pipeline);
                     rp.set_bind_group(1, &g.minimap_bg, &[]);
+                    rp.draw(0..6, 0..1);
+
+                    rp.set_pipeline(&g.progress_pipeline);
                     rp.draw(0..6, 0..1);
                 }
 
