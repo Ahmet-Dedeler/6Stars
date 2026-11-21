@@ -45,6 +45,14 @@ pub struct ResourceBinding {
 }
 
 #[derive(Clone, Debug)]
+pub struct Ps09ResourceName {
+    pub declaration: String,
+    pub register: String,
+    pub name: Option<String>,
+    pub hash: u32,
+}
+
+#[derive(Clone, Debug)]
 pub struct Ps09ShaderEntry {
     pub index: u32,
     pub code_offset: u32,
@@ -54,6 +62,7 @@ pub struct Ps09ShaderEntry {
     pub rsrc1: Option<u32>,
     pub rsrc2: Option<u32>,
     pub bindings: Vec<ResourceBinding>,
+    pub resource_names: Vec<Ps09ResourceName>,
     pub pso_hash: u64,
     pub sga_hash: Option<u64>,
     pub has_rt: bool,
@@ -378,6 +387,7 @@ impl Ps09Cache {
                 rsrc1: r1,
                 rsrc2: r2,
                 bindings,
+                resource_names: Vec::new(),
                 pso_hash,
                 sga_hash: None,
                 has_rt,
@@ -963,6 +973,37 @@ pub fn format_gfx103_disasm(entry: &Ps09ShaderEntry, code: &[u8]) -> String {
             );
         }
     }
+    if !entry.resource_names.is_empty() {
+        let resolved = entry
+            .resource_names
+            .iter()
+            .filter(|resource| resource.name.is_some())
+            .count();
+        let _ = writeln!(
+            s,
+            "; SGD5 Bindings ({} named / {}):",
+            resolved,
+            entry.resource_names.len()
+        );
+        for resource in &entry.resource_names {
+            match &resource.name {
+                Some(name) => {
+                    let _ = writeln!(
+                        s,
+                        ";   {:>10} {} {}",
+                        resource.register, resource.declaration, name
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        s,
+                        ";   {:>10} {} hash=0x{:08x}",
+                        resource.register, resource.declaration, resource.hash
+                    );
+                }
+            }
+        }
+    }
     let _ = writeln!(s, "; =============================================================================\n");
     for ins in &insns {
         let mut hx = String::new();
@@ -1020,6 +1061,22 @@ pub fn lift_to_hlsl(entry: &Ps09ShaderEntry, code: &[u8]) -> String {
         }
     }
     if !entry.bindings.is_empty() {
+        let _ = writeln!(s);
+    }
+    let named_resources: Vec<_> = entry
+        .resource_names
+        .iter()
+        .filter(|resource| resource.name.is_some())
+        .collect();
+    if !named_resources.is_empty() {
+        for resource in named_resources {
+            let name = resource.name.as_deref().unwrap_or_default();
+            let _ = writeln!(
+                s,
+                "{} {} : register({});",
+                resource.declaration, name, resource.register
+            );
+        }
         let _ = writeln!(s);
     }
 
@@ -1342,6 +1399,37 @@ pub fn format_spirv_abi_summary(entry: &Ps09ShaderEntry, code: &[u8]) -> String 
         let _ = writeln!(s, "COMPUTE_PGM_RSRC2 : 0x{r2:08X} (user_sgpr={}, tgid_x={}, tgid_y={}, tgid_z={})",
             (r2 >> 1) & 0x1F, (r2 >> 7) & 1, (r2 >> 8) & 1, (r2 >> 9) & 1);
     }
+    if !entry.resource_names.is_empty() {
+        let resolved = entry
+            .resource_names
+            .iter()
+            .filter(|resource| resource.name.is_some())
+            .count();
+        let _ = writeln!(
+            s,
+            "\n--- SGD5 Resource Bindings ({} named / {}) ---",
+            resolved,
+            entry.resource_names.len()
+        );
+        for resource in &entry.resource_names {
+            match &resource.name {
+                Some(name) => {
+                    let _ = writeln!(
+                        s,
+                        "  {:<10} {} {}",
+                        resource.register, resource.declaration, name
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        s,
+                        "  {:<10} {} hash=0x{:08x}",
+                        resource.register, resource.declaration, resource.hash
+                    );
+                }
+            }
+        }
+    }
     let _ = writeln!(s, "\n--- PS\\x00\\x09 0x41 USER_DATA Root-Signature Bindings ({}) ---", entry.bindings.len());
     if entry.bindings.is_empty() {
         let _ = writeln!(s, "  (No 0x41 records linked to this stage — uses inline root constants or bindless heap)");
@@ -1402,6 +1490,7 @@ mod tests {
             rsrc1: None,
             rsrc2: None,
             bindings: vec![],
+            resource_names: vec![],
             pso_hash: 0xDEAD_BEEF,
             sga_hash: None,
             has_rt: false,
