@@ -4488,6 +4488,31 @@ fn main() -> eframe::Result<()> {
         let _ = fs::remove_file(cur.with_extension("exe.old"));
     }
     let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 3 && args[1] == "--inspect-exe" {
+        let exe_path = PathBuf::from(&args[2]);
+        match fs::read(&exe_path) {
+            Ok(data) => {
+                println!("{}", boot::inspect_pe64_for_bringup(&data));
+                if let Some(dir) = exe_path.parent() {
+                    if let Ok(cfg) = fs::read_to_string(dir.join("MicrosoftGame.Config")) {
+                        let lay = fs::read_dir(dir).ok().and_then(|rd| {
+                            rd.filter_map(|e| e.ok()).find_map(|e| {
+                                let n = e.file_name().to_string_lossy().into_owned();
+                                if n.starts_with("layout_") && n.ends_with(".xml") {
+                                    fs::read_to_string(e.path()).ok()
+                                } else {
+                                    None
+                                }
+                            })
+                        });
+                        println!("{}", boot::summarize_gdk_manifest(&cfg, lay.as_deref()));
+                    }
+                }
+            }
+            Err(e) => eprintln!("Failed to read {}: {e}", exe_path.display()),
+        }
+        return Ok(());
+    }
     if args.len() >= 4 && args[1] == "--disasm-shaders" {
         let lim = args.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(25);
         disasm_shaders_cli(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), lim);
