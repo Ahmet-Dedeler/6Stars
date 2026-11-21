@@ -2,6 +2,8 @@ use flate2::read::ZlibDecoder;
 use std::ffi::c_void;
 use std::fmt::Write as _;
 use std::io::Read;
+#[cfg(windows)]
+use std::sync::OnceLock;
 
 const DXBC_MAGIC: &[u8; 4] = b"DXBC";
 const FSSM_MAGIC: &[u8; 4] = b"FSSM";
@@ -136,8 +138,7 @@ fn disassemble_with_dxc(data: &[u8]) -> Result<String, String> {
         return Err("not a DXBC container".into());
     }
 
-    let library = load_dxc_library()?;
-    let create_instance = get_dxc_create_instance(library)?;
+    let create_instance = cached_dxc_create_instance()?;
     let mut compiler = std::ptr::null_mut::<c_void>();
     unsafe {
         let status = create_instance(
@@ -228,6 +229,21 @@ unsafe fn release(instance: *mut c_void) {
     }
     let release = com_call::<unsafe extern "system" fn(*mut c_void) -> u32>(instance, 2);
     release(instance);
+}
+
+#[cfg(windows)]
+type DxcCreateInstanceFn =
+    unsafe extern "system" fn(*const c_void, *const c_void, *mut *mut c_void) -> i32;
+
+#[cfg(windows)]
+fn cached_dxc_create_instance() -> Result<DxcCreateInstanceFn, String> {
+    static DXC_CREATE: OnceLock<Result<DxcCreateInstanceFn, String>> = OnceLock::new();
+    DXC_CREATE
+        .get_or_init(|| {
+            let library = load_dxc_library()?;
+            get_dxc_create_instance(library)
+        })
+        .clone()
 }
 
 #[cfg(windows)]
