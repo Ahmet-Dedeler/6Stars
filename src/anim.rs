@@ -16,8 +16,8 @@ fn vptr_off(ptr: u64) -> Option<usize> {
     }
 }
 
-// extract primary duration in seconds and track count from crClipDictionary
-pub fn extract_anim_summary(data: &[u8]) -> (f32, usize) {
+// extract primary duration in seconds, track count, and clip hash seed from crClipDictionary
+pub fn extract_anim_summary(data: &[u8]) -> (f32, usize, u32) {
     let mut dur = 2.0f32;
     for o in (0x60..data.len().saturating_sub(0x38)).step_by(4) {
         let d = f32::from_bits(rd32(data, o));
@@ -31,7 +31,13 @@ pub fn extract_anim_summary(data: &[u8]) -> (f32, usize) {
         }
     }
     let tracks = data.windows(4).filter(|w| w[0] == 0x09 && w[1] == 0x00).count().max(1);
-    (dur, tracks)
+    let mut seed = rd32(data, 0x20);
+    if let Some(hoff) = vptr_off(rd64(data, 0x28)) {
+        if hoff + 8 <= data.len() {
+            seed ^= rd32(data, hoff).rotate_left(7) ^ rd32(data, hoff + 4);
+        }
+    }
+    (dur, tracks, seed)
 }
 
 fn push_limb(
@@ -83,30 +89,51 @@ fn push_limb(
     }
 }
 
-// build articulated 3d stickman dummy posed at time_sec for animation playback preview
-pub fn build_stickman_mesh(name: &str, time_sec: f32, duration_sec: f32, track_count: usize) -> crate::model3d::Mesh3D {
-    let phase = (time_sec / duration_sec.max(0.1)) * std::f32::consts::TAU * (track_count.clamp(1, 8) as f32).sqrt();
+// build z-up articulated 3d stickman dummy posed at time_sec (-y faces camera)
+pub fn build_stickman_mesh(
+    name: &str,
+    time_sec: f32,
+    duration_sec: f32,
+    track_count: usize,
+    seed: u32,
+) -> crate::model3d::Mesh3D {
+    let freq = 1.0 + ((seed & 0xF) as f32) * 0.15;
+    let phase = (time_sec / duration_sec.max(0.1)) * std::f32::consts::TAU * freq;
     let sw = phase.sin();
     let cw = phase.cos();
+    let mode = seed % 4;
+    let stride = match mode {
+        0 => 0.24,  // walk/stride
+        1 => 0.04,  // idle/subtle shift
+        2 => 0.10,  // gesture/reach
+        _ => 0.16,  // crouch/action
+    };
+    let crouch = if mode == 3 { 0.18 } else { 0.0 };
+    let arm_raise = match mode {
+        2 => 0.35 + 0.18 * sw,
+        3 => 0.20,
+        _ => 0.0,
+    };
 
-    let pelvis = [0.0, 0.95 + 0.04 * (phase * 2.0).sin().abs(), 0.0];
-    let chest = [0.04 * sw, pelvis[1] + 0.45, 0.03 * cw];
-    let neck = [chest[0], chest[1] + 0.14, chest[2]];
-    let head_top = [neck[0], neck[1] + 0.22, neck[2]];
+    // z is up, -y is forward toward camera
+    let pelvis = [0.0, 0.0, 0.95 - crouch + 0.03 * (phase * 2.0).sin().abs()];
+    let chest = [0.03 * sw, -0.02 * cw - crouch * 0.3, pelvis[2] + 0.45];
+    let neck = [chest[0], chest[1], chest[2] + 0.14];
+    let head_top = [neck[0] + 0.02 * cw, neck[1] - 0.02, neck[2] + 0.22];
 
-    let l_sh = [chest[0] - 0.22, chest[1] - 0.03, chest[2]];
-    let r_sh = [chest[0] + 0.22, chest[1] - 0.03, chest[2]];
-    let l_el = [l_sh[0] - 0.08, l_sh[1] - 0.28, l_sh[2] + 0.22 * sw];
-    let r_el = [r_sh[0] + 0.08, r_sh[1] - 0.28, r_sh[2] - 0.22 * sw];
-    let l_ha = [l_el[0] - 0.03, l_el[1] - 0.24, l_el[2] + 0.24 * sw + 0.10];
-    let r_ha = [r_el[0] + 0.03, r_el[1] - 0.24, r_el[2] - 0.24 * sw + 0.10];
+    let l_sh = [chest[0] - 0.22, chest[1], chest[2] - 0.03];
+    let r_sh = [chest[0] + 0.22, chest[1], chest[2] - 0.03];
+    let l_el = [l_sh[0] - 0.08, l_sh[1] - 0.20 * sw - arm_raise * 0.4, l_sh[2] - 0.26 + arm_raise * 0.5];
+    let r_el = [r_sh[0] + 0.08, r_sh[1] + 0.20 * sw - arm_raise * 0.4, r_sh[2] - 0.26 + arm_raise * 0.5];
+    let l_ha = [l_el[0] - 0.03, l_el[1] - 0.22 * sw - 0.12 - arm_raise * 0.5, l_el[2] - 0.20 + arm_raise * 0.7];
+    let r_ha = [r_el[0] + 0.03, r_el[1] + 0.22 * sw - 0.12 - arm_raise * 0.5, r_el[2] - 0.20 + arm_raise * 0.7];
 
-    let l_hi = [pelvis[0] - 0.11, pelvis[1] - 0.03, pelvis[2]];
-    let r_hi = [pelvis[0] + 0.11, pelvis[1] - 0.03, pelvis[2]];
-    let l_kn = [l_hi[0], l_hi[1] - 0.42, l_hi[2] - 0.24 * sw];
-    let r_kn = [r_hi[0], r_hi[1] - 0.42, r_hi[2] + 0.24 * sw];
-    let l_ft = [l_kn[0], (l_kn[1] - 0.44).max(0.02), l_kn[2] - 0.18 * sw - 0.06 * cw];
-    let r_ft = [r_kn[0], (r_kn[1] - 0.44).max(0.02), r_kn[2] + 0.18 * sw + 0.06 * cw];
+    let l_hi = [pelvis[0] - 0.11, pelvis[1], pelvis[2] - 0.03];
+    let r_hi = [pelvis[0] + 0.11, pelvis[1], pelvis[2] - 0.03];
+    let l_kn = [l_hi[0], l_hi[1] + stride * sw - crouch * 0.4, l_hi[2] - 0.42 + crouch * 0.3];
+    let r_kn = [r_hi[0], r_hi[1] - stride * sw - crouch * 0.4, r_hi[2] - 0.42 + crouch * 0.3];
+    let l_ft = [l_kn[0], l_kn[1] + stride * 0.8 * sw + 0.05 * cw, (l_kn[2] - 0.44).max(0.02)];
+    let r_ft = [r_kn[0], r_kn[1] - stride * 0.8 * sw - 0.05 * cw, (r_kn[2] - 0.44).max(0.02)];
 
     let mut verts = Vec::with_capacity(160);
     let mut uvs = Vec::with_capacity(160);
@@ -283,10 +310,10 @@ mod tests {
         assert!(txt.contains("Clips: 2"));
         assert!(txt.contains("0xdeadbeef"));
         assert!(txt.contains("duration=48.133s (~1444 frames @ 30fps)"));
-        let (dur, trk) = extract_anim_summary(&buf);
+        let (dur, trk, seed) = extract_anim_summary(&buf);
         assert!((dur - 48.133335).abs() < 0.01);
         assert!(trk >= 1);
-        let m = build_stickman_mesh("test_clip", 0.5, dur, trk);
+        let m = build_stickman_mesh("test_clip", 0.5, dur, trk, seed);
         assert!(!m.verts.is_empty());
         assert!(!m.tris.is_empty());
     }

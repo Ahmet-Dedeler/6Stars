@@ -642,6 +642,7 @@ struct Rpf9App {
     anim_time: f32,
     anim_dur: f32,
     anim_tracks: usize,
+    anim_seed: u32,
     anim_name: String,
     textures: Vec<DecodedTexture>,
     tex_sel: usize,
@@ -764,6 +765,7 @@ impl Rpf9App {
             anim_time: 0.0,
             anim_dur: 0.0,
             anim_tracks: 0,
+            anim_seed: 0,
             anim_name: String::new(),
             textures: Vec::new(),
             tex_sel: 0,
@@ -1314,13 +1316,14 @@ impl Rpf9App {
                         self.preview = psin::parse_psin(&data);
                     } else if e.kind == "ANIM" {
                         self.preview = anim::parse_anim_dict(&data);
-                        let (dur, trk) = anim::extract_anim_summary(&data);
+                        let (dur, trk, seed) = anim::extract_anim_summary(&data);
                         self.anim_dur = dur;
                         self.anim_tracks = trk;
+                        self.anim_seed = seed;
                         self.anim_name = e.name.clone();
                         self.anim_time = 0.0;
                         self.anim_playing = true;
-                        self.mesh3d = Some(anim::build_stickman_mesh(&e.name, 0.0, dur, trk));
+                        self.mesh3d = Some(anim::build_stickman_mesh(&e.name, 0.0, dur, trk, seed));
                         self.show_3d = true;
                     } else if e.kind == "DAT" {
                         self.preview = dat::parse_dat(&data);
@@ -3859,7 +3862,7 @@ impl eframe::App for Rpf9App {
                         let mut t = self.anim_time;
                         if ui.add(egui::Slider::new(&mut t, 0.0..=self.anim_dur).suffix("s").fixed_decimals(2)).changed() {
                             self.anim_time = t;
-                            let next = anim::build_stickman_mesh(&self.anim_name, t, self.anim_dur, self.anim_tracks);
+                            let next = anim::build_stickman_mesh(&self.anim_name, t, self.anim_dur, self.anim_tracks, self.anim_seed);
                             mesh.verts = next.verts;
                             mesh.dirty = true;
                         }
@@ -3868,7 +3871,7 @@ impl eframe::App for Rpf9App {
                 if self.anim_dur > 0.0 && self.anim_playing && toggle_3d {
                     let dt = ctx.input(|i| i.unstable_dt).clamp(0.001, 0.05);
                     self.anim_time = (self.anim_time + dt) % self.anim_dur.max(0.1);
-                    let next = anim::build_stickman_mesh(&self.anim_name, self.anim_time, self.anim_dur, self.anim_tracks);
+                    let next = anim::build_stickman_mesh(&self.anim_name, self.anim_time, self.anim_dur, self.anim_tracks, self.anim_seed);
                     mesh.verts = next.verts;
                     mesh.dirty = true;
                     ctx.request_repaint();
