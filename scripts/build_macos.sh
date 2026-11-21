@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Builds dist/6Stars.app: universal (arm64 + x86_64), fat LTO, CPU-tuned per arch, ad-hoc signed.
+# Builds dist/6Stars.app: universal (arm64 + x86_64), fat LTO, CPU-tuned per arch.
+# Signed with your Developer ID / Apple Development certificate when one is in the keychain
+# (SIXSTARS_SIGN_IDENTITY overrides), otherwise ad-hoc.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -8,6 +10,22 @@ APP="${SIXSTARS_APP_PATH:-${PERCYSTAR_APP_PATH:-dist/6Stars.app}}"
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 export MACOSX_DEPLOYMENT_TARGET=11.0
+
+# A real certificate gives the app a stable identity (bundle id + team), so macOS keeps
+# privacy grants like Downloads access across rebuilds. Ad-hoc signatures are tied to the
+# exact binary, so every rebuild asks again.
+if [[ -z "${SIXSTARS_SIGN_IDENTITY:-}" ]]; then
+  ids=$(security find-identity -v -p codesigning 2>/dev/null || true)
+  SIXSTARS_SIGN_IDENTITY=$(grep -o '"Developer ID Application: [^"]*"' <<<"$ids" | head -1 | tr -d '"')
+  [[ -n "$SIXSTARS_SIGN_IDENTITY" ]] || SIXSTARS_SIGN_IDENTITY=$(grep -o '"Apple Development: [^"]*"' <<<"$ids" | head -1 | tr -d '"')
+  [[ -n "$SIXSTARS_SIGN_IDENTITY" ]] || SIXSTARS_SIGN_IDENTITY=-
+fi
+export SIXSTARS_SIGN_IDENTITY
+if [[ "$SIXSTARS_SIGN_IDENTITY" == "-" ]]; then
+  echo "Signing ad-hoc: macOS will ask for folder access again after each rebuild." >&2
+else
+  echo "Signing with: $SIXSTARS_SIGN_IDENTITY"
+fi
 
 if [[ -e "$APP" || -L "$APP" ]]; then
   echo "$APP already exists. Set SIXSTARS_APP_PATH to a new output path." >&2
@@ -112,7 +130,7 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
 PLIST
 
 bash scripts/build_bink_macos.sh "$bundle"
-codesign --force --sign - "$bundle"
+codesign --force --timestamp=none --sign "$SIXSTARS_SIGN_IDENTITY" "$bundle"
 codesign --verify --deep --strict "$bundle"
 mv "$bundle" "$APP"
 echo "Built $APP ($(du -sh "$APP" | cut -f1))"

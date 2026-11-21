@@ -66,5 +66,5 @@ clang -arch arm64 -mmacosx-version-min=12.0 -fobjc-arc -Os -shared \
   "$tmp/bridge/src/libBinkHUD.m" -o "$helpers/libBinkHUD.dylib"
 cp "$tmp/bridge/LICENSE" "$app/Contents/Resources/BinkBridge-LICENSE.txt"
 for helper in "$helpers/BinkMacArmPlayer" "$helpers/libBinkHUD.dylib"; do
-  codesign --force --sign - "$helper"
+  codesign --force --timestamp=none --sign "${SIXSTARS_SIGN_IDENTITY:--}" "$helper"
 done

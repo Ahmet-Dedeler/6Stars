@@ -43,6 +43,7 @@ Adding a kind, format or category means touching all the places it shows up. Mis
 ## Build and test
 - macOS app: `bash scripts/build_macos.sh` builds `dist/6Stars.app` (set `SIXSTARS_APP_PATH` for a side-by-side test build). Windows: `scripts/build_windows.ps1` builds `dist\6Stars-Win64`, with `binkplay.exe` next to the exe.
 - Data-gated tests: `PERCYSTAR_LEVELS_RPF=<levels.rpf>` (model regressions), `PERCYSTAR_BK2=<file.bk2>` (in-panel Bink, run with `-- --ignored`), `PERCYSTAR_AUDIT=1` (+ `PERCYSTAR_AUDIT_CACHE`, `PERCYSTAR_AUDIT_N`) for the per-format coverage audit in `src/audit_tests.rs`.
+- macOS signing: `build_macos.sh` signs with the keychain's Developer ID / Apple Development certificate so the app keeps its Downloads permission across rebuilds. Don't switch it back to ad-hoc, and don't launch throwaway test builds of the app against the user's Downloads folder: each one is a new privacy prompt.
 - Never play sound or steal focus in tests: Bink tests run at volume 0. Don't click media in the live app to "verify".
 - Use your own `CARGO_TARGET_DIR` when another agent may be building at the same time.
 
