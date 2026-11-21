@@ -50,6 +50,8 @@ If this is your first PR, a typo fix is a good place to start. The [contributing
 - **Better 3D previews:** Drawables in a model dictionary appear separately instead of stacked on top of each other. Fixed rotated meshes and false model entries, added streamed `.ttpf` textures and vehicle paint previews, and added a **Highest detail only** toggle for character and clothing models.
 - **More accurate model colors:** The viewer finds shared textures across packs, binds them to the right materials, and reads both packed and floating-point UVs. If it can't find a usable color texture, it shows that part in gray. When a texture's full-size mip is BCPack (which isn't decoded yet), it falls back to the largest smaller mip stored plainly. That recovers about a third of blocked textures, labeled **Reduced resolution**.
 - **Open files directly:** Use **Open File...**, drag files into Percy6Stars, or choose Percy6Stars in **Open With**. This works for `.rpf`, `.ttpf`, `.bk2`, `.awc`, `.obj`, and `.ps09`. Models and shader caches open in their own tabs. Standalone videos and sound banks are added to the current list.
+- **Texture gallery:** In **Textures**, or with a `.ttpf` open, switch the file list from **List** to **Grid** to browse every texture as a thumbnail. Thumbnails load in the background as you scroll, arrow keys move through the grid, and the slider sets their size. Idea and tile patterns from [paryzius/ttpf-viewer](https://github.com/paryzius/ttpf-viewer) (MIT).
+- **Sharper `.ttpf` decoding:** Small icons and some short mip chains that used to come out scrambled or black now decode cleanly, using ttpf-viewer's tile patterns where they fit better than ours. Character parts (eyes, heads, clothing, animals) now pick up their own textures, and eyes show their iris instead of a gray ball.
 - **Easier browsing:** Search matches file types, so "video" or "sound" finds clips with generated names. Model names that match no rule go to **Uncategorized** instead of World / Map. Sort the Explorer and Model Viewer by name or size. Small text tables show their strings instead of hex, and binary blobs no longer show up as XML just because they start with `<`.
 
 ## Build from Source
@@ -191,6 +193,8 @@ Percy6Stars/
 │   ├── rdna2.rs              # PS\x00\x09 parser, GFX10.3 disassembler, HLSL / SPIR-V lifter
 │   ├── model3d.rs            # Meshlet decoder, UV/TXD parser and software renderer
 │   ├── tex.rs                # RDNA2 textures, TTPF, RBF0, GFx, 0DRPz and CNavMesh
+│   ├── ttpf_tile.rs          # TTPF tile patterns from paryzius/ttpf-viewer (MIT)
+│   ├── gallery.rs            # Explorer texture thumbnail grid
 │   ├── awc.rs                # Pure-Rust ADAT (.awc) Opus -> .wav decoder
 │   └── demo_capture.rs       # Offscreen README demo recorder (test only)
 ├── app.rc / build.rs         # Win32 icon resource
@@ -222,4 +226,4 @@ Rights holders with a concern can [open an issue](https://github.com/Ahmet-Dedel
 
 ## License
 
-Licensed under the [PercyStar Non-Commercial Attribution & Copyleft License v1.2](LICENSE) from [PercyStar](https://github.com/rpatty-dev/PercyStar) by @rpatty-dev. Free to use, fork and modify, not for commercial use. Three modules are also [MIT](LICENSE-MIT): `audio_player.rs`, `mac_open.rs` and `video_clip.rs`.
+Licensed under the [PercyStar Non-Commercial Attribution & Copyleft License v1.2](LICENSE) from [PercyStar](https://github.com/rpatty-dev/PercyStar) by @rpatty-dev. Free to use, fork and modify, not for commercial use. Three modules are also [MIT](LICENSE-MIT): `audio_player.rs`, `mac_open.rs` and `video_clip.rs`. `ttpf_tile.rs` is ported from [paryzius/ttpf-viewer](https://github.com/paryzius/ttpf-viewer) and stays under its MIT license, with the copyright notice in the file.

@@ -7,9 +7,11 @@ mod awc;
 mod bink_dock;
 #[cfg(target_os = "macos")]
 mod bink_embed;
+mod gallery;
 mod model3d;
 mod rdna2;
 mod tex;
+mod ttpf_tile;
 #[cfg(target_os = "macos")]
 mod mac_open;
 mod video_clip;
@@ -638,6 +640,9 @@ struct Rpf9App {
     sh_selected: Option<usize>,
     sh_mode: ShaderViewMode,
     sh_cached_text: (Option<(usize, ShaderViewMode)>, String),
+    // Explorer thumbnail grid for textures (List | Grid toggle)
+    gallery: gallery::Gallery,
+    grid_view: bool,
 }
 
 impl Rpf9App {
@@ -712,6 +717,8 @@ impl Rpf9App {
             sh_selected: None,
             sh_mode: ShaderViewMode::Asm,
             sh_cached_text: (None, String::new()),
+            gallery: gallery::Gallery::new(),
+            grid_view: true,
         };
         load_ui_state(&mut app);
         spawn_update_check(Arc::clone(&app.update), cc.egui_ctx.clone());
@@ -3362,12 +3369,55 @@ impl eframe::App for Rpf9App {
                 ui.add_space(4.0);
             }
             self.refresh_view();
+            // Thumbnails make sense for the Textures category and for an opened .ttpf.
+            let texture_view = self.category == Category::Textures
+                || self.target_path.as_deref().is_some_and(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("ttpf")));
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("{} results", self.view.len())).size(11.0).color(Color32::from_rgb(110, 118, 134)));
+                if texture_view {
+                    ui.add_space(6.0);
+                    if ui.selectable_label(!self.grid_view, "List").clicked() { self.grid_view = false; }
+                    if ui.selectable_label(self.grid_view, "Grid").on_hover_text("Thumbnails of every texture. Arrow keys move the selection.").clicked() { self.grid_view = true; }
+                    if self.grid_view {
+                        ui.spacing_mut().slider_width = 70.0;
+                        ui.add(egui::Slider::new(&mut self.gallery.size, gallery::SIZES).show_value(false))
+                            .on_hover_text("Thumbnail size");
+                    }
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     sort_combo(ui, "explorer_sort_combo", &mut self.sort_mode);
                 });
             });
+            if texture_view && self.grid_view {
+                let (state, view, is_folder) = (&self.state, &self.view, self.is_folder);
+                let picked = self.gallery.grid_ui(
+                    ui,
+                    view.len(),
+                    self.selected,
+                    |range| {
+                        let st = state.lock().unwrap();
+                        view[range]
+                            .iter()
+                            .filter_map(|&i| st.entries.get(i).map(|e| (i, e)))
+                            .map(|(i, e)| {
+                                let key = matches!(e.kind, "TTPF" | "TXD").then(|| gallery::ThumbKey {
+                                    source: e.source_rpf.clone(),
+                                    offset: e.offset,
+                                    index: if e.kind == "TTPF" { e.tracks } else { 0 },
+                                    kind: e.kind,
+                                });
+                                let label = gallery::tile_label(e.kind, &e.name);
+                                (i, key, if is_folder { format!("{label} · {}", e.rpf_name) } else { label })
+                            })
+                            .collect()
+                    },
+                    |idx| view.iter().position(|&i| i == idx),
+                );
+                if let Some(i) = picked {
+                    self.select_entry(i);
+                }
+                return;
+            }
             let mut clicked = None;
             // Rows MUST be exactly ROW_H tall or show_rows miscomputes the total height (blank space / jumpy scroll)
             const ROW_H: f32 = 20.0;
