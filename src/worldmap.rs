@@ -218,6 +218,7 @@ pub fn render_world_map_ui(
     wm: &mut WorldMapState,
     nav_tiles: &[(usize, f32, f32)],
     common_rpf: Option<&Path>,
+    levels_rpf: Option<&Path>,
 ) -> Option<usize> {
     let mut clicked_nav = None;
     ui.horizontal(|ui| {
@@ -235,12 +236,26 @@ pub fn render_world_map_ui(
                 wm.status = "Open a game folder or common.rpf first".into();
             }
         }
+        if ui.button("3D City Blocks (Brickell SLOD)").clicked() {
+            if let Some(lp) = levels_rpf {
+                match crate::model3d::decode_rage9_model_from_rpf(lp, 8_679_358_480, "brickell_slod") {
+                    Ok(m) => {
+                        wm.status = format!("Loaded {} ({} parts, {} geoms) — WASD/Drag to fly", m.name, m.parts.len(), m.geom_count);
+                        wm.terrain_mesh = Some(m);
+                        wm.show_3d_terrain = true;
+                    }
+                    Err(e) => wm.status = format!("SLOD load failed: {e}"),
+                }
+            } else {
+                wm.status = "Open game folder (needs levels.rpf)".into();
+            }
+        }
         ui.checkbox(&mut wm.show_nav_overlay, format!("NavMesh Overlay ({})", nav_tiles.len()));
-        if wm.data.is_some() {
+        if wm.data.is_some() || wm.terrain_mesh.is_some() {
             if ui.selectable_label(!wm.show_3d_terrain, "2D Map").clicked() {
                 wm.show_3d_terrain = false;
             }
-            if ui.selectable_label(wm.show_3d_terrain, "3D Terrain").clicked() {
+            if ui.selectable_label(wm.show_3d_terrain, "3D World").clicked() {
                 wm.show_3d_terrain = true;
                 if wm.terrain_mesh.is_none() {
                     if let Some(d) = &wm.data {

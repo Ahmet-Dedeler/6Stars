@@ -3658,9 +3658,13 @@ impl eframe::App for Rpf9App {
                 if p.is_dir() { Some(p.join("common.rpf")) }
                 else { p.parent().map(|d| d.join("common.rpf")) }
             }).filter(|p| p.exists());
+            let levels = self.target_path.as_ref().and_then(|p| {
+                if p.is_dir() { Some(p.join("levels.rpf")) }
+                else { p.parent().map(|d| d.join("levels.rpf")) }
+            }).filter(|p| p.exists());
             let mut clicked_nav = None;
             egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::from_rgb(13, 9, 21)).inner_margin(10.0)).show(ctx, |ui| {
-                clicked_nav = worldmap::render_world_map_ui(ui, ctx, &mut self.world_map, &nav_tiles, common.as_deref());
+                clicked_nav = worldmap::render_world_map_ui(ui, ctx, &mut self.world_map, &nav_tiles, common.as_deref(), levels.as_deref());
             });
             if let Some(idx) = clicked_nav {
                 self.tab = AppTab::Explorer;
