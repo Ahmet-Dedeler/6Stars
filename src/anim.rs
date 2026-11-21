@@ -90,7 +90,14 @@ pub fn parse_anim_dict(data: &[u8]) -> String {
             let ahash = rd32(data, e);
             let asize = rd32(data, e + 4);
             let aptr = rd64(data, e + 8);
-            let _ = writeln!(out, "  [{idx:02}] anim=0x{ahash:08x} block_sz=0x{asize:04x} ptr=0x{aptr:08x}");
+            let tracks = vptr_off(aptr)
+                .filter(|&o| o + 32 <= data.len())
+                .map(|o| {
+                    let end = (o + asize as usize).min(data.len());
+                    data[o..end].windows(4).filter(|w| w[0] == 0x09 && w[1] == 0x00).count()
+                })
+                .unwrap_or(0);
+            let _ = writeln!(out, "  [{idx:02}] anim=0x{ahash:08x} block_sz=0x{asize:04x} ptr=0x{aptr:08x} tracks~={tracks}");
         }
     }
     out
