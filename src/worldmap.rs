@@ -155,6 +155,7 @@ impl WorldMapData {
             "World Terrain".into(),
         );
         m.shade_mode = ShadeMode::Solid;
+        m.sky_bg = true;
         m
     }
 }
@@ -239,8 +240,9 @@ pub fn render_world_map_ui(
         if ui.button("3D City Blocks (Brickell SLOD)").clicked() {
             if let Some(lp) = levels_rpf {
                 match crate::model3d::decode_rage9_model_from_rpf(lp, 8_679_358_480, "brickell_slod") {
-                    Ok(m) => {
-                        wm.status = format!("Loaded {} ({} parts, {} geoms) — WASD/Drag to fly", m.name, m.parts.len(), m.geom_count);
+                    Ok(mut m) => {
+                        m.sky_bg = true;
+                        wm.status = format!("Loaded {} ({} parts, {} geoms) — WASD/Q/E + Drag to fly", m.name, m.parts.len(), m.geom_count);
                         wm.terrain_mesh = Some(m);
                         wm.show_3d_terrain = true;
                     }

@@ -85,6 +85,7 @@ pub struct Mesh3D {
     pub pan_y: f32,
     pub shade_mode: ShadeMode,
     pub auto_spin: bool,
+    pub sky_bg: bool,
     // reused softwre rasterizer buffrs zero allocs per fram
     fb_w: usize,
     fb_h: usize,
@@ -182,6 +183,7 @@ impl Mesh3D {
             pan_y: 0.0,
             shade_mode: ShadeMode::Textured,
             auto_spin: false,
+            sky_bg: false,
             fb_w: 0,
             fb_h: 0,
             color_buf: Vec::new(),
@@ -1279,11 +1281,29 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
 
     for y in 0..h {
         let t = (y as f32) / (h.max(1) as f32);
-        let c = Color32::from_rgb(
-            (11.0 + t * 9.0) as u8,
-            (12.0 + t * 10.0) as u8,
-            (17.0 + t * 14.0) as u8,
-        );
+        let c = if mesh.sky_bg {
+            if t < 0.56 {
+                let s = t / 0.56;
+                Color32::from_rgb(
+                    (78.0 + s * 108.0) as u8,
+                    (134.0 + s * 84.0) as u8,
+                    (202.0 + s * 40.0) as u8,
+                )
+            } else {
+                let s = (t - 0.56) / 0.44;
+                Color32::from_rgb(
+                    (52.0 - s * 22.0) as u8,
+                    (78.0 - s * 28.0) as u8,
+                    (102.0 - s * 30.0) as u8,
+                )
+            }
+        } else {
+            Color32::from_rgb(
+                (11.0 + t * 9.0) as u8,
+                (12.0 + t * 10.0) as u8,
+                (17.0 + t * 14.0) as u8,
+            )
+        };
         mesh.color_buf[y * w..(y + 1) * w].fill(c);
     }
     mesh.z_buf.fill(f32::NEG_INFINITY);
