@@ -18,6 +18,37 @@ pub fn is_qqqq_table(head: &[u8]) -> bool {
     rd64(head, 0) == 0 && (1..=200_000).contains(&cnt) && p0 >= 0x40 && p0 < 0x1000_0000
 }
 
+// detect rage 9 cinematic / cutscene rsc9 resource (pack:/cinematic + .anim)
+pub fn probe_cutscene_rsc9(data: &[u8]) -> Option<String> {
+    let pos = data.windows(14).position(|w| w == b"pack:/cinematic" || w.starts_with(b"pack:/cinemat"))?;
+    let mut anim_hit = data.windows(5).any(|w| w == b".anim");
+    if !anim_hit {
+        anim_hit = data.windows(4).any(|w| w == b"_p1_" || w == b"_p2_");
+    }
+    if !anim_hit {
+        return None;
+    }
+    // extract readable scene or prop slug
+    let mut cur = Vec::new();
+    let mut best = String::from("scene");
+    for &b in &data[..data.len().min(4096)] {
+        if b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-') {
+            cur.push(b);
+        } else {
+            if cur.len() >= 8 {
+                let s = String::from_utf8_lossy(&cur);
+                if !s.starts_with("pack") && (s.contains('_') || s.contains('-')) {
+                    best = s.chars().take(40).collect();
+                    break;
+                }
+            }
+            cur.clear();
+        }
+    }
+    let _ = pos;
+    Some(format!("cutscene_{best}.cutc"))
+}
+
 // decode 0x71717171 tagged rsc9 table or generic rsc9 virtual blockmap
 pub fn parse_rsc9(data: &[u8]) -> String {
     if is_qqqq_table(data) {
@@ -79,6 +110,29 @@ pub fn parse_rsc9_generic(data: &[u8]) -> String {
         let q1 = if o + 8 < data.len() { rd64(data, o + 8) } else { 0 };
         let _ = writeln!(out, "  +0x{o:02x}: {q0:016x} {q1:016x}");
     }
+
+    // extract embedded asset, anim, and actor strings
+    let mut cur = Vec::new();
+    let mut strs = Vec::new();
+    for &b in data.iter().take(65536) {
+        if (32..127).contains(&b) {
+            cur.push(b);
+        } else {
+            if cur.len() >= 4 {
+                strs.push(String::from_utf8_lossy(&cur).into_owned());
+                if strs.len() >= 64 {
+                    break;
+                }
+            }
+            cur.clear();
+        }
+    }
+    if !strs.is_empty() {
+        let _ = writeln!(out, "\n--- Embedded Strings / Cast / Anim Tracks ({}) ---", strs.len());
+        for s in strs {
+            let _ = writeln!(out, "  {s}");
+        }
+    }
     out
 }
 
@@ -138,5 +192,18 @@ mod tests {
         assert!(txt.contains("Root Entries: 1"));
         assert!(txt.contains("0x71717171 Ptrs: 1"));
         assert!(txt.contains("0x12345678"));
+    }
+
+    #[test]
+    fn probes_cutscene_rsc9_and_strings() {
+        let mut buf = vec![0u8; 0x80];
+        buf[0x10..0x22].copy_from_slice(b"pack:/cinematic_q8");
+        buf[0x30..0x39].copy_from_slice(b"60_0.anim");
+        buf[0x40..0x50].copy_from_slice(b"ant_srch_ext_p1_");
+        let nm = probe_cutscene_rsc9(&buf).expect("should detect cutscene");
+        assert!(nm.starts_with("cutscene_"));
+        let txt = parse_rsc9_generic(&buf);
+        assert!(txt.contains("pack:/cinematic_q8"));
+        assert!(txt.contains("60_0.anim"));
     }
 }

@@ -3101,10 +3101,12 @@ fn probe_rage9_page(
         && (1..=64).contains(&probe_out[bmap_off + 9]);
     let (mname, is_veh, vlen) = if fits_single_chunk {
         if !has_rage9_meshlets(&probe_out[..olen]) {
+            let rsc_name = rsc9::probe_cutscene_rsc9(&probe_out[..olen])
+                .unwrap_or_else(|| format!("rsc9_{:08x}_{}B.rsc9", off + p as u64, olen));
             return Some(RpfEntry {
                 source_rpf: path.to_path_buf(),
                 rpf_name: rname.to_string(),
-                name: format!("rsc9_{:08x}_{}B.rsc9", off + p as u64, olen),
+                name: rsc_name,
                 kind: "RSC9",
                 offset: off + p as u64,
                 comp_size: probe_dec.total_in(),
