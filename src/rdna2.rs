@@ -5,6 +5,8 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
+// parsed for completeness; not every field is shown in the UI yet
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ShaderStage {
     Compute,
@@ -54,6 +56,8 @@ pub struct Ps09ShaderEntry {
     pub insn_count: u32,
 }
 
+// parsed for completeness; not every field is shown in the UI yet
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct Ps09Header {
     pub id: String,
@@ -410,6 +414,8 @@ impl Ps09Cache {
 // AMD RDNA2 (GFX10.3) ISA DECODER & DISASSEMBLER
 // =============================================================================
 
+// parsed for completeness; not every field is shown in the UI yet
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct DecodedInsn {
     pub offset: usize,
@@ -421,6 +427,8 @@ pub struct DecodedInsn {
     pub kind: InsnKind,
 }
 
+// parsed for completeness; not every field is shown in the UI yet
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum InsnKind {
     EndPgm,

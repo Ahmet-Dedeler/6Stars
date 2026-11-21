@@ -713,7 +713,7 @@ impl Rpf9App {
         spawn_update_check(Arc::clone(&app.update), cc.egui_ctx.clone());
         clean_stale_temp_dirs();
         // reopen the last folder, unless we were launched to open a folder or archive
-        let opens_archive = open_paths.iter().any(|p| p.is_dir() || loose_media_entry(p).is_none());
+        let opens_archive = open_paths.iter().any(|p| p.is_dir() || (p.is_file() && loose_media_entry(p).is_none() && is_archive_file(p)));
         if let Some(last) = load_last_folder().filter(|_| !opens_archive) {
             if last.is_dir() {
                 app.start_folder_scan(last);
@@ -938,7 +938,13 @@ impl Rpf9App {
                     let mut st = state.lock().unwrap();
                     if *watch_gen.lock().unwrap() != gen { return; } // replaced by a newer scan
                     st.header_info = hdr;
+                    // keep the loose-media row if .bk2/.awc files were opened alongside this archive
+                    let keep_loose = st.rpf_names.iter().any(|n| n == LOOSE_LABEL);
                     st.rpf_names = vec![archive_label(&path)];
+                    if keep_loose && st.rpf_names[0] != LOOSE_LABEL {
+                        st.rpf_names.push(LOOSE_LABEL.into());
+                        st.rpf_names.sort();
+                    }
                     let n = entries.len();
                     st.entries.append(&mut entries);
                     st.ver += 1;
@@ -2505,6 +2511,8 @@ fn kind_search_words(kind: &str) -> &'static str {
         "GXT" => "text strings",
         "RBF0" | "GFX" => "ui",
         "XML" => "config",
+        "PSIN" => "resource",
+        "ZLIB" => "binary data",
         _ => "",
     }
 }
