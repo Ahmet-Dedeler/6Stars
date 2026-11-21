@@ -499,6 +499,7 @@ struct ScanState {
     entries: Vec<RpfEntry>,
     rpf_names: Vec<String>,
     file_sig: HashMap<PathBuf, (u64, Option<SystemTime>)>,
+    audio_bank_meta: HashMap<u64, dat::ResolvedAwcMeta>,
     ver: u64,
 }
 
@@ -507,6 +508,7 @@ struct MediaState {
     loading: bool,
     status: String,
     loaded_tracks: Option<(Vec<audio_player::LoadedWavTrack>, Arc<Vec<u8>>)>,
+    loaded_bank_ctx: Option<audio_player::AudioBankContext>,
     loaded_mesh: Option<Mesh3D>,
     loaded_textures: Option<Vec<DecodedTexture>>,
 }
@@ -686,11 +688,13 @@ struct Rpf9App {
     tex_handle: Option<(usize, TextureHandle)>,
     tex_zoom: f32,
     vehicles_only: bool,
+    audio_named: bool,
     // cachd ui list so huge scans never re filter or clone evry fram
     view: Vec<usize>,
-    view_key: Option<(u64, String, Category, String, bool)>,
+    view_key: Option<(u64, String, Category, String, bool, bool)>,
     hay: Vec<String>,
     hay_ver: u64,
+    hay_audio_named: bool,
     counts: [usize; 11],
     cached_rpf_names: Vec<String>,
     last_rebuild: Instant,
@@ -831,10 +835,12 @@ impl Rpf9App {
             tex_handle: None,
             tex_zoom: 1.0,
             vehicles_only: false,
+            audio_named: true,
             view: Vec::new(),
             view_key: None,
             hay: Vec::new(),
             hay_ver: u64::MAX,
+            hay_audio_named: true,
             counts: [0; 11],
             cached_rpf_names: Vec::new(),
             last_rebuild: Instant::now(),
@@ -1257,6 +1263,7 @@ impl Rpf9App {
 
                 let mut changed = Vec::new();
                 let mut cache_hits = 0usize;
+                let mut disk_cache_dirty = false;
                 {
                     let mut st = state.lock().unwrap();
                     if *watch_gen.lock().unwrap() != gen { return; } // replaced by a newer scan
@@ -1266,7 +1273,24 @@ impl Rpf9App {
                             let sig = (meta.len(), meta.modified().ok());
                             if st.file_sig.get(p) != Some(&sig) {
                                 let key = format!("{}|{}|{}", p.display(), meta.len(), mtime_s);
-                                if let Some(cached_entries) = disk_cache.get(&key) {
+                                if let Some(cached_entries) = disk_cache.get_mut(&key) {
+                                    let is_audio = p.file_name().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("audio.rpf")).unwrap_or(false);
+                                    if is_audio {
+                                        let needs_enrich = !cached_entries.iter().any(|e| e.kind == "DAT")
+                                            || cached_entries.iter().filter(|e| e.kind == "AWC").any(|e| e.name.contains("_Radio_Music_") || e.name.contains("_Score_Streams_"))
+                                            || cached_entries.iter().filter(|e| e.kind == "AWC").take(10).all(|e| e.name.starts_with("sound_00") && e.name.matches('_').count() == 2);
+                                        if needs_enrich {
+                                            for e in cached_entries.iter_mut() {
+                                                if e.kind == "AWC" {
+                                                    e.name = display_entry_name(e, false).into_owned();
+                                                }
+                                            }
+                                            st.audio_bank_meta = enrich_audio_rpf_entries(p, meta.len(), cached_entries);
+                                            disk_cache_dirty = true;
+                                        } else if st.audio_bank_meta.is_empty() {
+                                            st.audio_bank_meta = enrich_audio_rpf_entries(p, meta.len(), cached_entries);
+                                        }
+                                    }
                                     let is_levels = p.file_name().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("levels.rpf")).unwrap_or(false);
                                     st.entries.retain(|e| &e.source_rpf != p || (is_levels && e.offset >= VEH_ZONE_OFF));
                                     st.entries.extend(cached_entries.iter().cloned());
@@ -1287,6 +1311,9 @@ impl Rpf9App {
                         st.rpf_names.sort();
                         st.status = format!("Loaded {cache_hits} cached RPFs ({} entries)...", st.entries.len());
                     }
+                }
+                if disk_cache_dirty {
+                    save_disk_cache(&disk_cache);
                 }
 
                 if !changed.is_empty() {
@@ -1547,10 +1574,21 @@ impl Rpf9App {
             return;
         }
         if e.kind == "AWC" {
+            let bank_ctx = if e.rpf_name.eq_ignore_ascii_case("audio.rpf") {
+                self.state.lock().unwrap().audio_bank_meta.get(&e.offset).map(|meta| {
+                    audio_player::AudioBankContext {
+                        pack_name: meta.pack_name.clone(),
+                        used_by: meta.used_by.clone(),
+                    }
+                })
+            } else {
+                None
+            };
             let media = Arc::clone(&self.media);
             {
                 let mut m = media.lock().unwrap();
                 m.loading = true;
+                m.loaded_bank_ctx = bank_ctx;
                 m.status = format!("Decoding {} Opus streams...", e.name);
             }
             std::thread::spawn(move || decode_awc_for_player(&e, &media));
@@ -1613,13 +1651,13 @@ impl Rpf9App {
     // throtled view rebuilder runs 4x a sec during live scans
     fn refresh_view(&mut self) {
         let ver = self.state.lock().unwrap().ver;
-        let key = (ver, self.filter.clone(), self.category.clone(), self.selected_rpf.clone(), self.vehicles_only);
+        let key = (ver, self.filter.clone(), self.category.clone(), self.selected_rpf.clone(), self.vehicles_only, self.audio_named);
         if self.view_sort != self.sort_mode {
             self.view_key = None;
         }
         if let Some(old) = &self.view_key {
             if *old == key { return; }
-            let only_ver = old.1 == key.1 && old.2 == key.2 && old.3 == key.3 && old.4 == key.4;
+            let only_ver = old.1 == key.1 && old.2 == key.2 && old.3 == key.3 && old.4 == key.4 && old.5 == key.5;
             if only_ver && self.last_rebuild.elapsed() < Duration::from_millis(1000) {
                 return;
             }
@@ -1630,12 +1668,13 @@ impl Rpf9App {
         self.rebuild_view(key);
     }
 
-    fn rebuild_view(&mut self, key: (u64, String, Category, String, bool)) {
+    fn rebuild_view(&mut self, key: (u64, String, Category, String, bool, bool)) {
         let st = self.state.lock().unwrap();
-        if self.hay_ver != st.ver {
-            self.hay = st.entries.iter().map(|e| format!("{}|{}|{}|{}", e.name, e.rpf_name, e.kind, kind_search_words(e.kind)).to_lowercase()).collect();
+        if self.hay_ver != st.ver || self.hay_audio_named != self.audio_named {
+            self.hay = st.entries.iter().map(|e| format!("{}|{}|{}|{}|{}", e.name, display_entry_name(e, false), e.rpf_name, e.kind, kind_search_words(e.kind)).to_lowercase()).collect();
             self.cached_rpf_names = st.rpf_names.clone();
             self.hay_ver = st.ver;
+            self.hay_audio_named = self.audio_named;
             let mut c = [0usize; 11];
             for e in &st.entries {
                 c[0] += 1;
@@ -3962,11 +4001,82 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
                     }
                 }
             }
-            i += 16;
+                i += 16;
         }
     }
 
+    if rname.eq_ignore_ascii_case("audio.rpf") {
+        enrich_audio_rpf_entries(path, sz, &mut found);
+    }
+
     Ok((hdr_info, found))
+}
+
+fn display_entry_name(e: &RpfEntry, audio_named: bool) -> std::borrow::Cow<'_, str> {
+    if !audio_named && e.kind == "AWC" && e.name.starts_with("sound_") && e.name.matches('_').count() > 2 {
+        if let Some(tail) = e.name.rsplit('_').next() {
+            if e.name.len() >= 10 {
+                return std::borrow::Cow::Owned(format!("{}_{}", &e.name[..10], tail));
+            }
+        }
+    }
+    std::borrow::Cow::Borrowed(&e.name)
+}
+
+fn enrich_audio_rpf_entries(audio_rpf: &PathBuf, total_sz: u64, entries: &mut Vec<RpfEntry>) -> HashMap<u64, dat::ResolvedAwcMeta> {
+    let mut meta_map = HashMap::new();
+    let awc_indices: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.kind == "AWC")
+        .map(|(i, _)| i)
+        .collect();
+    let first_awc_off = awc_indices
+        .first()
+        .map(|&i| entries[i].offset)
+        .unwrap_or(19_509_248);
+    let Some(cat) = dat::parse_audio_rpf_catalog(audio_rpf, first_awc_off) else {
+        return meta_map;
+    };
+    let rname = audio_rpf
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    if !entries.iter().any(|e| e.kind == "DAT") {
+        for (name, kind, off, raw_size, chunks) in &cat.metadata_chunks {
+            let comp_size: u64 = chunks.iter().map(|c| c.1).sum();
+            entries.push(RpfEntry {
+                source_rpf: audio_rpf.clone(),
+                rpf_name: rname.clone(),
+                name: name.clone(),
+                kind,
+                offset: *off,
+                comp_size,
+                raw_size: *raw_size,
+                tracks: 0,
+                chunks: chunks.clone(),
+            });
+        }
+    }
+    if !awc_indices.is_empty() && !cat.banks.is_empty() {
+        let awc_offs_tracks: Vec<(u64, u32)> = awc_indices
+            .iter()
+            .map(|&i| (entries[i].offset, entries[i].tracks))
+            .collect();
+        let resolved = dat::resolve_awc_names_from_catalog(&awc_offs_tracks, total_sz, &cat);
+        for (k, &entry_idx) in awc_indices.iter().enumerate() {
+            if let Some(Some(meta)) = resolved.get(k) {
+                entries[entry_idx].name = meta.name.clone();
+                if meta.exact_size > 0 {
+                    entries[entry_idx].comp_size = meta.exact_size;
+                    entries[entry_idx].raw_size = meta.exact_size;
+                }
+                meta_map.insert(entries[entry_idx].offset, meta.clone());
+            }
+        }
+    }
+    meta_map
 }
 
 impl eframe::App for Rpf9App {
@@ -4020,9 +4130,14 @@ impl eframe::App for Rpf9App {
             }
             if let Some((tracks, awc_bytes)) = m.loaded_tracks.take() {
                 self.audio_player.set_tracks(tracks, awc_bytes);
+                self.audio_player.bank_ctx = m.loaded_bank_ctx.take();
             }
             (m.loading, m.status.clone())
         };
+        if let Some(q) = self.audio_player.requested_search.take() {
+            self.category = Category::Audio;
+            self.filter = q;
+        }
 
         egui::TopBottomPanel::top("top").frame(egui::Frame::new().fill(Color32::from_rgb(24, 14, 36)).inner_margin(10.0)).show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -4257,6 +4372,20 @@ impl eframe::App for Rpf9App {
                 });
                 ui.add_space(4.0);
             }
+            if self.category == Category::Audio {
+                ui.horizontal(|ui| {
+                    let btn = egui::Button::new(
+                        RichText::new(if self.audio_named { "Audio Names: ON" } else { "Audio Names: OFF (Raw)" })
+                            .strong()
+                            .color(if self.audio_named { Color32::BLACK } else { Color32::from_rgb(255, 72, 165) }),
+                    )
+                    .fill(if self.audio_named { Color32::from_rgb(90, 235, 165) } else { Color32::from_rgb(38, 24, 56) });
+                    if ui.add(btn).clicked() {
+                        self.audio_named = !self.audio_named;
+                    }
+                });
+                ui.add_space(4.0);
+            }
             self.refresh_view();
             // Thumbnails make sense for the Textures category and for an opened .ttpf.
             let texture_view = self.category == Category::Textures
@@ -4360,10 +4489,11 @@ impl eframe::App for Rpf9App {
                         ui.set_height(ROW_H);
                         ui.label(RichText::new(format!("{:<4}", e.kind)).strong().size(11.5).color(kind_color(e.kind)));
                         let sz_s = format_size(e.raw_size);
+                        let dname = display_entry_name(e, self.audio_named);
                         let label = if self.is_folder {
-                            format!("{} / {}  ({})", e.rpf_name, e.name, sz_s)
+                            format!("{} / {}  ({})", e.rpf_name, dname, sz_s)
                         } else {
-                            format!("{}  ({})", e.name, sz_s)
+                            format!("{}  ({})", dname, sz_s)
                         };
                         let is_sel = self.selected == Some(*idx);
                         let resp = ui.selectable_label(is_sel, RichText::new(label).size(12.5));
@@ -4606,6 +4736,48 @@ impl eframe::App for Rpf9App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Names AWC banks from audio.rpf's DAT catalog using entries from an existing scan cache.
+    /// Gate: PERCYSTAR_AUDIT_CACHE=<scan_cache_vN.tsv> and PERCYSTAR_AUDIO_RPF=<audio.rpf>.
+    #[test]
+    fn audio_rpf_banks_get_catalog_names() {
+        let (Some(cache), Some(audio)) = (std::env::var_os("PERCYSTAR_AUDIT_CACHE"), std::env::var_os("PERCYSTAR_AUDIO_RPF")) else { return };
+        let audio = PathBuf::from(audio);
+        let Some(mut entries) = load_disk_cache_from(Path::new(&cache))
+            .into_iter()
+            .find(|(k, _)| k.starts_with(&format!("{}|", audio.display())))
+            .map(|(_, v)| v)
+        else { return };
+        let awc = entries.iter().filter(|e| e.kind == "AWC").count();
+        let size = fs::metadata(&audio).unwrap().len();
+        let meta = enrich_audio_rpf_entries(&audio, size, &mut entries);
+        let dat = entries.iter().filter(|e| e.kind == "DAT").count();
+        eprintln!("awc={awc} named={} dat={dat}", meta.len());
+        for e in entries.iter().filter(|e| e.kind == "AWC").take(6) {
+            eprintln!("  {} @ {:#x} size {}", e.name, e.offset, e.comp_size);
+        }
+        assert!(dat > 0 && meta.len() * 2 > awc, "catalog should name most banks");
+        // Renamed banks use the catalog's exact size; they must still decode at least as well.
+        let before: HashMap<u64, RpfEntry> = load_disk_cache_from(Path::new(&cache))
+            .into_values()
+            .flatten()
+            .filter(|e| e.source_rpf == audio && e.kind == "AWC")
+            .map(|e| (e.offset, e))
+            .collect();
+        let (mut worse, mut checked) = (0, 0);
+        for e in entries.iter().filter(|e| e.kind == "AWC" && meta.contains_key(&e.offset)).step_by(97).take(40) {
+            let Some(old) = before.get(&e.offset) else { continue };
+            let n = |x: &RpfEntry| read_entry_bytes(x).map(|b| awc::decode_awc_bytes_in_memory(&b, "t", |_, _| {}).tracks.len()).unwrap_or(0);
+            let (a, b) = (n(old), n(e));
+            checked += 1;
+            if b < a {
+                worse += 1;
+                eprintln!("  fewer tracks: {} {a} -> {b}", e.name);
+            }
+        }
+        eprintln!("checked={checked} worse={worse}");
+        assert!(checked > 0 && worse == 0);
+    }
 
     #[test]
     fn lod_sibling_names_cover_hi_mid_and_base() {
