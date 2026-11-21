@@ -22,6 +22,7 @@ If you're here to make a PR, start with [CONTRIBUTING.md](CONTRIBUTING.md). This
 - For code changes, run both before opening a PR when possible. Docs and license notices don't need a Rust build.
   - `cargo test` (debug, ~20 s once warm; `--release` re-runs fat LTO and takes ~10 min, so save it for the data-gated audits below)
   - `cargo check --all-targets --target x86_64-pc-windows-msvc` (install with `rustup target add x86_64-pc-windows-msvc`)
+- `.githooks/pre-push` runs `cargo test` when a push touches Rust code (`src/`, `Cargo.*`, `build.rs`). Enable it once per clone with `git config core.hooksPath .githooks` (worktrees share it). Only skip it with `--no-verify` for docs or an emergency, and say so in the PR.
 - Windows CI (`windows`) is a required check on `main`: it runs the tests on Windows and builds the package, without fat LTO. A red check blocks the merge, so fix it rather than bypassing it.
 - On Windows, release builds use the GUI subsystem (no console; CLI `--` modes call `AttachConsole`). Helpers need `CREATE_NO_WINDOW`, and paths can have spaces, Unicode, and apostrophes. PowerShell 5.1 needs TLS 1.2 forced, and scripts are run with `-ExecutionPolicy Bypass`.
 - On macOS, Finder opens files through `application:openURLs:` (`src/mac_open.rs`), not argv. For a new file type, also update `UTImportedTypeDeclarations` / `CFBundleDocumentTypes` in `scripts/build_macos.sh`.
