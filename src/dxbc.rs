@@ -525,6 +525,7 @@ mod tests {
         let path = std::env::var_os("PERCYSTAR_DXIL").expect("set PERCYSTAR_DXIL");
         let data = std::fs::read(path).unwrap();
         let text = disassemble_with_dxc(&data).unwrap();
-        assert!(text.contains("define void @main") || text.contains("dx.op"), "{text}");
+        // Every DXIL module names its entry points in `!dx.entryPoints`, whatever they are called.
+        assert!(text.contains("!dx.entryPoints"), "{text}");
     }
 }
