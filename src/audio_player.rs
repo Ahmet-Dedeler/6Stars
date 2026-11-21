@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Ahmet Dedeler
+
 //! In-panel player for decoded AWC streams (16-bit PCM WAVs written by `awc.rs`).
 //!
 //! Playback goes through the platform `play_wav_async` (PlaySound on Windows, afplay on macOS),
