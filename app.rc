@@ -1,8 +1,8 @@
 1 ICON "assets/logo.ico"
 
 1 VERSIONINFO
-FILEVERSION 1,4,1,0
-PRODUCTVERSION 1,4,1,0
+FILEVERSION 1,5,0,0
+PRODUCTVERSION 1,5,0,0
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0x0L
 FILEOS 0x40004L
@@ -15,11 +15,11 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "rpatty-dev"
       VALUE "FileDescription", "6Stars RPF9 Explorer (based on PercyStar by rpatty-dev)"
-      VALUE "FileVersion", "1.4.1.0"
+      VALUE "FileVersion", "1.5.0.0"
       VALUE "InternalName", "6Stars"
       VALUE "OriginalFilename", "6Stars.exe"
       VALUE "ProductName", "6Stars"
-      VALUE "ProductVersion", "1.4.1"
+      VALUE "ProductVersion", "1.5.0"
     END
   END
   BLOCK "VarFileInfo"
