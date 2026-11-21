@@ -759,7 +759,8 @@ fn sgd5_ps09_entry(shader: &sgd5::Sgd5Shader, fssm: &dxbc::FssmShader) -> Ps09Sh
         rsrc1: None,
         rsrc2: None,
         bindings: Vec::new(),
-        pso_hash: shader.hash,
+        pso_hash: 0,
+        sga_hash: Some(shader.sga_hash),
         has_rt: false,
         has_ngg: false,
         insn_count: u32::try_from(rdna2::decode_gfx103(fssm.code(), 4000).len()).unwrap_or(0),
@@ -2247,7 +2248,7 @@ impl Rpf9App {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.sgd5_search)
                             .desired_width(f32::INFINITY)
-                            .hint_text("Filter SGD5 shaders by name, hash, or stage..."),
+                            .hint_text("Filter SGD5 shaders by name, SGA hash, or stage..."),
                     );
                     let query = self.sgd5_search.trim().to_ascii_lowercase();
                     let filtered: Vec<usize> = group
@@ -2259,7 +2260,7 @@ impl Rpf9App {
                                 .map_or(true, |stage| shader.stage == stage)
                                 && (query.is_empty()
                                     || shader.name.to_ascii_lowercase().contains(&query)
-                                    || format!("0x{:016x}", shader.hash).contains(&query))
+                                    || format!("0x{:016x}", shader.sga_hash).contains(&query))
                         })
                         .map(|(index, _)| index)
                         .collect();
@@ -4224,7 +4225,7 @@ mod tests {
             wave_size: 32,
             compressed_size: 8,
             uncompressed_size: 8,
-            hash: 0x0123_4567_89ab_cdef,
+            sga_hash: 0x0123_4567_89ab_cdef,
             register_count: 8,
             cbuffer_count: 1,
             texture_count: 0,
@@ -4241,7 +4242,7 @@ mod tests {
         let entry = sgd5_ps09_entry(&shader, &fssm);
 
         assert_eq!(entry.stage, ShaderStage::Vertex);
-        assert_eq!(entry.pso_hash, shader.hash);
+        assert_eq!(entry.sga_hash, Some(shader.sga_hash));
         assert_eq!(entry.insn_count, 2);
         assert!(lift_to_hlsl(&entry, fssm.code()).contains("VSMain"));
         assert_eq!(

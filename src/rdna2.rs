@@ -55,6 +55,7 @@ pub struct Ps09ShaderEntry {
     pub rsrc2: Option<u32>,
     pub bindings: Vec<ResourceBinding>,
     pub pso_hash: u64,
+    pub sga_hash: Option<u64>,
     pub has_rt: bool,
     pub has_ngg: bool,
     pub insn_count: u32,
@@ -378,6 +379,7 @@ impl Ps09Cache {
                 rsrc2: r2,
                 bindings,
                 pso_hash,
+                sga_hash: None,
                 has_rt,
                 has_ngg,
                 insn_count,
@@ -937,7 +939,7 @@ pub fn format_gfx103_disasm(entry: &Ps09ShaderEntry, code: &[u8]) -> String {
          ; Shader #{idx} | Stage: {st} | PSO Hash: 0x{h:016X} | Size: {sz} bytes ({ic} insns)",
         idx = entry.index,
         st = entry.stage.tag(),
-        h = entry.pso_hash,
+        h = entry.sga_hash.unwrap_or(entry.pso_hash),
         sz = entry.code_size,
         ic = insns.len()
     );
@@ -981,7 +983,8 @@ pub fn lift_to_hlsl(entry: &Ps09ShaderEntry, code: &[u8]) -> String {
     let mut s = String::with_capacity(insns.len() * 44 + 1024);
     let _ = writeln!(s, "// ============================================================================");
     let _ = writeln!(s, "// PercyStar Clean-Room GFX10.3 (RDNA2) -> HLSL SM 6.6 Lifted Shader");
-    let _ = writeln!(s, "// Shader #{} | Stage: {} | PSO 0x{:016X}", entry.index, entry.stage.tag(), entry.pso_hash);
+    let hash_kind = if entry.sga_hash.is_some() { "SGA" } else { "PSO" };
+    let _ = writeln!(s, "// Shader #{} | Stage: {} | {hash_kind} 0x{:016X}", entry.index, entry.stage.tag(), entry.sga_hash.unwrap_or(entry.pso_hash));
     if entry.has_rt {
         let _ = writeln!(s, "// Uses RDNA2 Hardware Raytracing (image_bvh64_intersect_ray -> RayQuery)");
     }
@@ -1327,7 +1330,8 @@ pub fn format_spirv_abi_summary(entry: &Ps09ShaderEntry, code: &[u8]) -> String 
     let _ = writeln!(s, "=== SPIR-V 1.5 & D3D12.X / RDNA2 SGPR ABI SUMMARY ===");
     let _ = writeln!(s, "Shader Index      : #{}", entry.index);
     let _ = writeln!(s, "Detected Stage    : {} (has_rt={}, has_ngg={})", entry.stage.tag(), entry.has_rt, entry.has_ngg);
-    let _ = writeln!(s, "PSO Hash          : 0x{:016X}", entry.pso_hash);
+    let hash_kind = if entry.sga_hash.is_some() { "SGA Hash" } else { "PSO Hash" };
+    let _ = writeln!(s, "{hash_kind:<17}: 0x{:016X}", entry.sga_hash.unwrap_or(entry.pso_hash));
     let _ = writeln!(s, "Code Offset/Size  : 0x{:08X} / {} bytes ({} GFX10.3 insns)", entry.code_offset, entry.code_size, entry.insn_count);
     let _ = writeln!(s, "Lifted SPIR-V 1.5 : {} bytes ({} words, magic=0x07230203)", spv.len(), words);
     if let Some([x, y, z]) = entry.num_threads {
@@ -1399,6 +1403,7 @@ mod tests {
             rsrc2: None,
             bindings: vec![],
             pso_hash: 0xDEAD_BEEF,
+            sga_hash: None,
             has_rt: false,
             has_ngg: false,
             insn_count: 7,

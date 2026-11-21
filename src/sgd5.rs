@@ -23,7 +23,7 @@ pub struct Sgd5Shader {
     pub wave_size: u8,
     pub compressed_size: u32,
     pub uncompressed_size: u32,
-    pub hash: u64,
+    pub sga_hash: u64,
     pub register_count: u16,
     pub cbuffer_count: u16,
     pub texture_count: u16,
@@ -123,7 +123,7 @@ fn parse_shader(
     let compressed_size = rd32(data, cursor + 1)?;
     let binary_offset = cursor + 5;
     cursor = binary_offset + compressed_size as usize;
-    let hash = rd64(data, cursor)?;
+    let sga_hash = rd64(data, cursor)?;
     cursor += 8;
 
     let root_signature_end = cursor
@@ -186,7 +186,7 @@ fn parse_shader(
             wave_size,
             compressed_size,
             uncompressed_size,
-            hash,
+            sga_hash,
             register_count,
             cbuffer_count,
             texture_count,
@@ -337,7 +337,7 @@ fn extract_sgd5_file(
     });
 
     let mut manifest = String::from(
-        "index,stage,name,wave_size,compressed_size,uncompressed_size,hash,registers,cbuffers,textures,filename\n",
+        "index,stage,name,wave_size,compressed_size,uncompressed_size,sga_hash,registers,cbuffers,textures,filename\n",
     );
     for shader in selected {
         let blob = decompress_shader(&file, shader)?;
@@ -358,7 +358,7 @@ fn extract_sgd5_file(
             shader.wave_size,
             shader.compressed_size,
             shader.uncompressed_size,
-            shader.hash,
+            shader.sga_hash,
             shader.register_count,
             shader.cbuffer_count,
             shader.texture_count,
