@@ -4749,6 +4749,17 @@ fn main() -> eframe::Result<()> {
         mapdata::probe_maps_cli(&PathBuf::from(&args[2]));
         return Ok(());
     }
+    if args.len() >= 3 && args[1] == "--export-psin" {
+        let tsv = args.iter().any(|a| a == "--tsv");
+        match fs::read(&args[2]) {
+            Ok(data) => match psin::parse_psin_doc(&data) {
+                Ok(doc) => print!("{}", doc.export_placements_csv(None, tsv)),
+                Err(e) => eprintln!("PSIN error: {e}"),
+            },
+            Err(e) => eprintln!("Read error: {e}"),
+        }
+        return Ok(());
+    }
     if args.len() >= 3 && args[1] == "--inspect-exe" {
         let exe_path = PathBuf::from(&args[2]);
         match fs::read(&exe_path) {

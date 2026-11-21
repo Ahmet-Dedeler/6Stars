@@ -118,6 +118,17 @@ impl WorldMapData {
     }
 
     // build downsampled 3d terrain mesh (z-up, scaled 1:100 for smooth orbiting)
+    pub fn build_world_terrain_mesh(&self, step: usize) -> Mesh3D {
+        let mut m = self.build_terrain_mesh(step);
+        for v in &mut m.verts {
+            v[0] *= 100.0;
+            v[1] *= 100.0;
+            v[2] *= 25.0;
+        }
+        m.name = "mhiu_world_terrain".into();
+        m
+    }
+
     pub fn build_terrain_mesh(&self, step: usize) -> Mesh3D {
         let step = step.max(4);
         let gw = (self.w + step - 1) / step;

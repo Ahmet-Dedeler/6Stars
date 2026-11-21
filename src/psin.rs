@@ -14,6 +14,10 @@ const KNOWN_NAMES: &[&str] = &[
     "Script", "ModelName", "ArchetypeName", "TextureName", "AudioName", "AnimName",
     "x", "y", "z", "w", "r", "g", "b", "a",
     "CMapData", "CMapTypes", "CEntityDef", "CBaseArchetypeDef", "CMloArchetypeDef",
+    "CMloRoomDef", "CMloPortalDef", "CMloEntitySet", "CMloInstanceDef", "fwEntityDef",
+    "entities", "archetypeName", "position", "rotation", "scaleXY", "scaleZ",
+    "rooms", "portals", "entitySets", "attachedObjects", "flags", "lodDist", "childLodDist",
+    "parentIndex", "numChildren", "roomIndex", "entitySet",
     "CDataFileMgr__ContentDef", "CDataFileMgr__ContentChangeSetDef",
     "CWeaponInfo", "CVehicleModelInfo", "CPedModelInfo", "CScenarioPoint",
     "CVehiclePointsMeta", "CTuningFile", "CDamageDataManager", "GridAtlasInfo",
@@ -51,6 +55,85 @@ pub struct PsinInstance {
     pub tag: u32,
     pub size: u32,
     pub offset: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PsinFixup {
+    pub src_off: usize,
+    pub dst_inst: usize,
+    pub dst_off: usize,
+}
+
+#[derive(Clone, Debug)]
+pub enum PsinValue {
+    Bool(bool),
+    U8(u8),
+    U16(u16),
+    U32(u32),
+    F32(f32),
+    U64(u64),
+    Vec3([f32; 3]),
+    Vec4([f32; 4]),
+    Hash(u32),
+    Array {
+        elem_type: u32,
+        len: u32,
+        target_inst: Option<usize>,
+    },
+    Enum {
+        raw: i64,
+        name_hash: Option<u32>,
+        enum_hash: u32,
+    },
+    Struct(u32),
+    Raw(Vec<u8>),
+}
+
+#[derive(Clone, Debug)]
+pub struct PsinFieldValue {
+    pub name_hash: u32,
+    pub offset: u32,
+    pub type_raw: u32,
+    pub ref_hash: u32,
+    pub value: PsinValue,
+}
+
+#[derive(Clone, Debug)]
+pub struct PsinDecodedInstance {
+    pub index: usize,
+    pub tag: u32,
+    pub size: u32,
+    pub offset: usize,
+    pub fields: Vec<PsinFieldValue>,
+    pub raw: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PsinEntityPlacement {
+    pub archetype_hash: u32,
+    pub position: [f32; 3],
+    pub rotation: [f32; 4],
+    pub scale: [f32; 3],
+    pub room_index: Option<i32>,
+    pub flags: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PsinMloInfo {
+    pub name_hash: u32,
+    pub room_count: u32,
+    pub portal_count: u32,
+    pub entity_set_count: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct PsinDocument {
+    pub total_bytes: usize,
+    pub sections: Vec<(String, usize)>,
+    pub structs: Vec<PsinStruct>,
+    pub enums: Vec<PsinEnum>,
+    pub fixups: Vec<PsinFixup>,
+    pub instances: Vec<PsinDecodedInstance>,
 }
 
 pub fn joaat(s: &str) -> u32 {
@@ -161,77 +244,146 @@ fn parse_lenm(lenm: &[u8]) -> Vec<PsinEnum> {
     enums
 }
 
-fn fmt_field_val(
+fn parse_lrsc(lrsc: &[u8], inst_count: usize, payload_len: usize) -> Vec<PsinFixup> {
+    let mut fixups = Vec::new();
+    // rage9 lrsc supports 16-byte (src_off, dst_inst, dst_off, pad) or 8-byte (src_off, dst_inst) records
+    if lrsc.len() >= 16 && lrsc.len() % 16 == 0 {
+        let mut off = 0usize;
+        while off + 16 <= lrsc.len() {
+            let src_off = rd32(lrsc, off) as usize;
+            let dst_inst = rd32(lrsc, off + 4) as usize;
+            let dst_off = rd32(lrsc, off + 8) as usize;
+            if src_off < payload_len && dst_inst < inst_count {
+                fixups.push(PsinFixup { src_off, dst_inst, dst_off });
+            }
+            off += 16;
+        }
+    }
+    if fixups.is_empty() && lrsc.len() >= 8 && lrsc.len() % 8 == 0 {
+        let mut off = 0usize;
+        while off + 8 <= lrsc.len() {
+            let src_off = rd32(lrsc, off) as usize;
+            let dst_inst = rd32(lrsc, off + 4) as usize;
+            if src_off < payload_len && dst_inst < inst_count {
+                fixups.push(PsinFixup { src_off, dst_inst, dst_off: 0 });
+            }
+            off += 8;
+        }
+    }
+    fixups
+}
+
+fn decode_field_val(
     block: &[u8],
+    inst_offset: usize,
     f: &PsinField,
     enum_map: &HashMap<u32, &PsinEnum>,
-) -> String {
+    fixup_map: &HashMap<usize, usize>,
+) -> PsinValue {
     let o = f.offset as usize;
     let kind = f.type_raw & 0xFF;
     match kind {
-        0x01 if o < block.len() => format!("bool({})", block[o] != 0),
-        0x02 | 0x10 if o < block.len() => format!("u8({})", block[o]),
-        0x11 | 0x12 if o + 2 <= block.len() => {
-            let v = u16::from_le_bytes([block[o], block[o + 1]]);
-            format!("u16({v})")
-        }
+        0x01 if o < block.len() => PsinValue::Bool(block[o] != 0),
+        0x02 | 0x10 if o < block.len() => PsinValue::U8(block[o]),
+        0x11 | 0x12 if o + 2 <= block.len() => PsinValue::U16(u16::from_le_bytes([block[o], block[o + 1]])),
         0x13..=0x16 if o + 4 <= block.len() => {
             let v = rd32(block, o);
             let fv = f32::from_bits(v);
             if fv.is_finite() && fv.abs() > 1e-6 && fv.abs() < 1e7 && v >= 0x3800_0000 {
-                format!("f32({fv:.4}) / 0x{v:08x}")
+                PsinValue::F32(fv)
             } else {
-                format!("{v} (0x{v:08x})")
+                PsinValue::U32(v)
             }
         }
-        0x17 | 0x18 if o + 8 <= block.len() => format!("u64(0x{:016x})", rd64(block, o)),
-        0x20..=0x22 if o + 12 <= block.len() => {
-            let x = f32::from_bits(rd32(block, o));
-            let y = f32::from_bits(rd32(block, o + 4));
-            let z = f32::from_bits(rd32(block, o + 8));
-            format!("vec3({x:.3}, {y:.3}, {z:.3})")
-        }
-        0x44 | 0x48 | 0x4a if o + 4 <= block.len() => {
-            let h = rd32(block, o);
-            format!("hash({})", fmt_hash(h))
-        }
+        0x17 | 0x18 if o + 8 <= block.len() => PsinValue::U64(rd64(block, o)),
+        0x20..=0x22 if o + 12 <= block.len() => PsinValue::Vec3([
+            f32::from_bits(rd32(block, o)),
+            f32::from_bits(rd32(block, o + 4)),
+            f32::from_bits(rd32(block, o + 8)),
+        ]),
+        0x23 | 0x24 if o + 16 <= block.len() => PsinValue::Vec4([
+            f32::from_bits(rd32(block, o)),
+            f32::from_bits(rd32(block, o + 4)),
+            f32::from_bits(rd32(block, o + 8)),
+            f32::from_bits(rd32(block, o + 12)),
+        ]),
+        0x44 | 0x48 | 0x4a if o + 4 <= block.len() => PsinValue::Hash(rd32(block, o)),
         0x52 | 0x5c if o + 12 <= block.len() => {
             let cnt = rd32(block, o + 8);
-            format!("array(len={cnt})")
+            let ptr_lo = rd32(block, o) as usize;
+            let abs_off = inst_offset + o;
+            let target_inst = fixup_map
+                .get(&abs_off)
+                .copied()
+                .or_else(|| (ptr_lo != 0 && (ptr_lo >> 24) == 0).then_some(ptr_lo));
+            PsinValue::Array {
+                elem_type: f.ref_hash,
+                len: cnt,
+                target_inst,
+            }
         }
         0x60 if o < block.len() => {
             let v = block[o] as i64;
-            if let Some(en) = enum_map.get(&f.ref_hash) {
-                if let Some((_, nh)) = en.values.iter().find(|(ev, _)| *ev == v) {
-                    return format!("enum({} = {})", v, fmt_hash(*nh));
-                }
+            let name_hash = enum_map
+                .get(&f.ref_hash)
+                .and_then(|en| en.values.iter().find(|(ev, _)| *ev == v).map(|(_, nh)| *nh));
+            PsinValue::Enum {
+                raw: v,
+                name_hash,
+                enum_hash: f.ref_hash,
             }
-            format!("enum({v} @ {})", fmt_hash(f.ref_hash))
         }
-        0x05 => format!("struct({})", fmt_hash(f.ref_hash)),
+        0x05 => PsinValue::Struct(f.ref_hash),
         _ => {
             let end = (o + 8).min(block.len());
-            if o < end {
-                let hex: String = block[o..end].iter().map(|b| format!("{b:02x}")).collect();
-                format!("type=0x{kind:02x} [{hex}]")
-            } else {
+            PsinValue::Raw(block.get(o..end).unwrap_or(&[]).to_vec())
+        }
+    }
+}
+
+fn fmt_psin_value(v: &PsinValue, type_raw: u32) -> String {
+    match v {
+        PsinValue::Bool(b) => format!("bool({b})"),
+        PsinValue::U8(x) => format!("u8({x})"),
+        PsinValue::U16(x) => format!("u16({x})"),
+        PsinValue::U32(x) => format!("{x} (0x{x:08x})"),
+        PsinValue::F32(f) => {
+            let bits = f.to_bits();
+            format!("f32({f:.4}) / 0x{bits:08x}")
+        }
+        PsinValue::U64(x) => format!("u64(0x{x:016x})"),
+        PsinValue::Vec3(a) => format!("vec3({:.3}, {:.3}, {:.3})", a[0], a[1], a[2]),
+        PsinValue::Vec4(a) => format!("vec4({:.3}, {:.3}, {:.3}, {:.3})", a[0], a[1], a[2], a[3]),
+        PsinValue::Hash(h) => format!("hash({})", fmt_hash(*h)),
+        PsinValue::Array { len, target_inst, .. } => match target_inst {
+            Some(ti) => format!("array(len={len} -> inst[{ti}])"),
+            None => format!("array(len={len})"),
+        },
+        PsinValue::Enum { raw, name_hash: Some(nh), .. } => format!("enum({raw} = {})", fmt_hash(*nh)),
+        PsinValue::Enum { raw, name_hash: None, enum_hash } => format!("enum({raw} @ {})", fmt_hash(*enum_hash)),
+        PsinValue::Struct(h) => format!("struct({})", fmt_hash(*h)),
+        PsinValue::Raw(bytes) => {
+            let kind = type_raw & 0xFF;
+            if bytes.is_empty() {
                 format!("type=0x{kind:02x}")
+            } else {
+                let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                format!("type=0x{kind:02x} [{hex}]")
             }
         }
     }
 }
 
-// decode rage 9 binary pso (psin + lsch + lenm + lsns + lrsc + chks)
-pub fn parse_psin(data: &[u8]) -> String {
+pub fn parse_psin_doc(data: &[u8]) -> Result<PsinDocument, String> {
     if data.len() < 16 || &data[..4] != b"PSIN" {
-        return String::from("Not a valid PSIN container");
+        return Err("Not a valid PSIN container".into());
     }
     let chunks = parse_iff_chunks(data);
     let psin_body = chunks.iter().find(|(t, _)| *t == b"PSIN").map(|(_, b)| *b).unwrap_or(&[]);
     let lsch_body = chunks.iter().find(|(t, _)| *t == b"LSCH").map(|(_, b)| *b).unwrap_or(&[]);
     let lenm_body = chunks.iter().find(|(t, _)| *t == b"LENM").map(|(_, b)| *b).unwrap_or(&[]);
+    let lrsc_body = chunks.iter().find(|(t, _)| *t == b"LRSC").map(|(_, b)| *b).unwrap_or(&[]);
 
-    // parse instance entry table up to pppppppp sentinel
     let mut i = 0usize;
     let mut raw_insts = Vec::new();
     while i + 8 <= psin_body.len() {
@@ -255,45 +407,234 @@ pub fn parse_psin(data: &[u8]) -> String {
 
     let structs = parse_lsch(lsch_body);
     let enums = parse_lenm(lenm_body);
+    let fixups = parse_lrsc(lrsc_body, insts.len(), inst_payload.len());
+    let fixup_map: HashMap<usize, usize> = fixups.iter().map(|fx| (fx.src_off, fx.dst_inst)).collect();
     let struct_map: HashMap<u32, &PsinStruct> = structs.iter().map(|s| (s.hash, s)).collect();
     let enum_map: HashMap<u32, &PsinEnum> = enums.iter().map(|e| (e.hash, e)).collect();
+
+    let mut decoded = Vec::with_capacity(insts.len());
+    for (idx, inst) in insts.iter().enumerate() {
+        let end = (inst.offset + inst.size as usize).min(inst_payload.len());
+        let block = inst_payload.get(inst.offset..end).unwrap_or(&[]);
+        let mut fields = Vec::new();
+        if let Some(st) = struct_map.get(&inst.tag) {
+            for f in st.fields.iter().filter(|f| f.name_hash != 0x0000_0100) {
+                fields.push(PsinFieldValue {
+                    name_hash: f.name_hash,
+                    offset: f.offset,
+                    type_raw: f.type_raw,
+                    ref_hash: f.ref_hash,
+                    value: decode_field_val(block, inst.offset, f, &enum_map, &fixup_map),
+                });
+            }
+        }
+        decoded.push(PsinDecodedInstance {
+            index: idx,
+            tag: inst.tag,
+            size: inst.size,
+            offset: inst.offset,
+            fields,
+            raw: block.to_vec(),
+        });
+    }
+
+    Ok(PsinDocument {
+        total_bytes: data.len(),
+        sections: chunks
+            .iter()
+            .map(|(t, b)| (String::from_utf8_lossy(t).into_owned(), b.len() + 8))
+            .collect(),
+        structs,
+        enums,
+        fixups,
+        instances: decoded,
+    })
+}
+
+impl PsinDocument {
+    fn placement_from_instance(inst: &PsinDecodedInstance) -> Option<PsinEntityPlacement> {
+        let mut arch = None;
+        let mut pos = None;
+        let mut rot = [0.0f32, 0.0, 0.0, 1.0];
+        let mut scale = [1.0f32; 3];
+        let mut room_index = None;
+        let mut flags = 0u32;
+        let h_arch = joaat("archetypeName");
+        let h_arch2 = joaat("ArchetypeName");
+        let h_pos = joaat("position");
+        let h_pos2 = joaat("Position");
+        let h_rot = joaat("rotation");
+        let h_rot2 = joaat("Rotation");
+        let h_sxy = joaat("scaleXY");
+        let h_sz = joaat("scaleZ");
+        let h_room = joaat("roomIndex");
+        let h_flags = joaat("flags");
+        let h_flags2 = joaat("Flags");
+        for f in &inst.fields {
+            if f.name_hash == h_arch || f.name_hash == h_arch2 {
+                if let PsinValue::Hash(h) | PsinValue::U32(h) = f.value { arch = Some(h); }
+            } else if f.name_hash == h_pos || f.name_hash == h_pos2 {
+                if let PsinValue::Vec3(p) = f.value { pos = Some(p); }
+            } else if f.name_hash == h_rot || f.name_hash == h_rot2 {
+                if let PsinValue::Vec4(q) = f.value { rot = q; }
+            } else if f.name_hash == h_sxy {
+                if let PsinValue::F32(s) = f.value { scale[0] = s; scale[1] = s; }
+            } else if f.name_hash == h_sz {
+                if let PsinValue::F32(s) = f.value { scale[2] = s; }
+            } else if f.name_hash == h_room {
+                if let PsinValue::U32(r) = f.value { room_index = Some(r as i32); }
+            } else if f.name_hash == h_flags || f.name_hash == h_flags2 {
+                if let PsinValue::U32(fl) = f.value { flags = fl; }
+            }
+        }
+        Some(PsinEntityPlacement {
+            archetype_hash: arch?,
+            position: pos.unwrap_or([0.0; 3]),
+            rotation: rot,
+            scale,
+            room_index,
+            flags,
+        })
+    }
+
+    pub fn extract_placements(&self) -> Vec<PsinEntityPlacement> {
+        let h_map = joaat("CMapData");
+        let h_ent = joaat("CEntityDef");
+        let h_ents_field = joaat("entities");
+        let mut out = Vec::new();
+        let mut seen = vec![false; self.instances.len()];
+        let mut visited_insts = Vec::new();
+
+        for inst in &self.instances {
+            if inst.tag == h_map {
+                for f in &inst.fields {
+                    if f.name_hash == h_ents_field {
+                        if let PsinValue::Array { len, target_inst: Some(ti), .. } = f.value {
+                            visited_insts.push((ti, len as usize));
+                        }
+                    }
+                }
+            }
+        }
+
+        for (start_idx, len) in visited_insts {
+            for idx in start_idx..(start_idx + len).min(self.instances.len()) {
+                let inst = &self.instances[idx];
+                if (inst.tag == h_ent || inst.tag == 0) && !seen[idx] {
+                    if let Some(p) = Self::placement_from_instance(inst) {
+                        seen[idx] = true;
+                        out.push(p);
+                    }
+                }
+            }
+        }
+
+        for (idx, inst) in self.instances.iter().enumerate() {
+            if inst.tag == h_ent && !seen[idx] {
+                if let Some(p) = Self::placement_from_instance(inst) {
+                    seen[idx] = true;
+                    out.push(p);
+                }
+            }
+        }
+        out
+    }
+
+    pub fn extract_mlos(&self) -> Vec<PsinMloInfo> {
+        let h_mlo = joaat("CMloArchetypeDef");
+        let h_name = joaat("Name");
+        let h_rooms = joaat("rooms");
+        let h_portals = joaat("portals");
+        let h_sets = joaat("entitySets");
+        let mut out = Vec::new();
+        for inst in &self.instances {
+            if inst.tag != h_mlo {
+                continue;
+            }
+            let mut info = PsinMloInfo { name_hash: inst.tag, room_count: 0, portal_count: 0, entity_set_count: 0 };
+            for f in &inst.fields {
+                if f.name_hash == h_name {
+                    if let PsinValue::Hash(h) | PsinValue::U32(h) = f.value { info.name_hash = h; }
+                } else if f.name_hash == h_rooms {
+                    if let PsinValue::Array { len, .. } = f.value { info.room_count = len; }
+                } else if f.name_hash == h_portals {
+                    if let PsinValue::Array { len, .. } = f.value { info.portal_count = len; }
+                } else if f.name_hash == h_sets {
+                    if let PsinValue::Array { len, .. } = f.value { info.entity_set_count = len; }
+                }
+            }
+            out.push(info);
+        }
+        out
+    }
+
+    pub fn export_placements_csv(&self, models: Option<&HashMap<u32, u64>>, tsv: bool) -> String {
+        let sep = if tsv { '\t' } else { ',' };
+        let mut out = format!("archetype_hash{sep}drawable_offset{sep}pos_x{sep}pos_y{sep}pos_z{sep}rot_x{sep}rot_y{sep}rot_z{sep}rot_w{sep}scale_x{sep}scale_y{sep}scale_z{sep}room_index{sep}flags\n");
+        for p in self.extract_placements() {
+            let off_s = models
+                .and_then(|m| m.get(&p.archetype_hash))
+                .map(|o| format!("0x{o:x}"))
+                .unwrap_or_default();
+            let room_s = p.room_index.map(|r| r.to_string()).unwrap_or_default();
+            let _ = writeln!(
+                out,
+                "0x{:08x}{sep}{off_s}{sep}{:.4}{sep}{:.4}{sep}{:.4}{sep}{:.5}{sep}{:.5}{sep}{:.5}{sep}{:.5}{sep}{:.3}{sep}{:.3}{sep}{:.3}{sep}{room_s}{sep}0x{:x}",
+                p.archetype_hash, p.position[0], p.position[1], p.position[2],
+                p.rotation[0], p.rotation[1], p.rotation[2], p.rotation[3],
+                p.scale[0], p.scale[1], p.scale[2], p.flags
+            );
+        }
+        out
+    }
+}
+
+// decode rage 9 binary pso (psin + lsch + lenm + lsns + lrsc + chks)
+pub fn parse_psin(data: &[u8]) -> String {
+    let doc = match parse_psin_doc(data) {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
 
     let mut out = String::with_capacity(2048);
     let _ = writeln!(
         out,
-        "=== RAGE 9 PSIN (Binary PSO Decoder) ===\nTotal: {} B | Chunks: {} | Structs: {} | Enums: {} | Instances: {}",
-        data.len(),
-        chunks.len(),
-        structs.len(),
-        enums.len(),
-        insts.len()
+        "=== RAGE 9 PSIN (Binary PSO Decoder) ===\nTotal: {} B | Chunks: {} | Structs: {} | Enums: {} | Instances: {} | Fixups: {}",
+        doc.total_bytes,
+        doc.sections.len(),
+        doc.structs.len(),
+        doc.enums.len(),
+        doc.instances.len(),
+        doc.fixups.len()
     );
     let _ = write!(out, "Sections:");
-    for (tag, body) in &chunks {
-        let _ = write!(out, " {}({}B)", String::from_utf8_lossy(tag), body.len() + 8);
+    for (tag, sz) in &doc.sections {
+        let _ = write!(out, " {tag}({sz}B)");
     }
     out.push_str("\n\n");
 
-    // decoded instances
+    let placements = doc.extract_placements();
+    let mlos = doc.extract_mlos();
+    if !placements.is_empty() || !mlos.is_empty() {
+        let _ = writeln!(out, "Scene Summary: {} entity placements, {} MLO interiors\n", placements.len(), mlos.len());
+    }
+
     let _ = writeln!(out, "--- Decoded Instances ---");
-    for (idx, inst) in insts.iter().enumerate().take(64) {
-        let end = (inst.offset + inst.size as usize).min(inst_payload.len());
-        let block = inst_payload.get(inst.offset..end).unwrap_or(&[]);
-        if let Some(st) = struct_map.get(&inst.tag) {
-            let _ = writeln!(out, "[{idx}] <{} size=0x{:x} fields={}>", fmt_hash(st.hash), inst.size, st.fields.len());
-            for f in st.fields.iter().filter(|f| f.name_hash != 0x0000_0100).take(48) {
-                let val = fmt_field_val(block, f, &enum_map);
-                let _ = writeln!(out, "  +0x{:03x} {} = {val}", f.offset, fmt_hash(f.name_hash));
+    for inst in doc.instances.iter().take(64) {
+        if !inst.fields.is_empty() {
+            let _ = writeln!(out, "[{}] <{} size=0x{:x} fields={}>", inst.index, fmt_hash(inst.tag), inst.size, inst.fields.len());
+            for f in inst.fields.iter().take(48) {
+                let _ = writeln!(out, "  +0x{:03x} {} = {}", f.offset, fmt_hash(f.name_hash), fmt_psin_value(&f.value, f.type_raw));
             }
         } else {
-            let ascii_preview: String = block.iter().take(64).map(|&b| if (32..127).contains(&b) { b as char } else { '.' }).collect();
-            let _ = writeln!(out, "[{idx}] <heap/blob 0x{:08x} size=0x{:x}> \"{ascii_preview}\"", inst.tag, inst.size);
+            let ascii_preview: String = inst.raw.iter().take(64).map(|&b| if (32..127).contains(&b) { b as char } else { '.' }).collect();
+            let _ = writeln!(out, "[{}] <heap/blob 0x{:08x} size=0x{:x}> \"{ascii_preview}\"", inst.index, inst.tag, inst.size);
         }
     }
 
-    if !enums.is_empty() {
-        let _ = writeln!(out, "\n--- LENM Enums ({}) ---", enums.len());
-        for en in enums.iter().take(24) {
+    if !doc.enums.is_empty() {
+        let _ = writeln!(out, "\n--- LENM Enums ({}) ---", doc.enums.len());
+        for en in doc.enums.iter().take(24) {
             let _ = writeln!(out, "enum {} ({} values):", fmt_hash(en.hash), en.values.len());
             for (val, nh) in en.values.iter().take(16) {
                 let _ = writeln!(out, "  {val} = {}", fmt_hash(*nh));
@@ -301,8 +642,8 @@ pub fn parse_psin(data: &[u8]) -> String {
         }
     }
 
-    let _ = writeln!(out, "\n--- LSCH Schema ({} structs) ---", structs.len());
-    for st in structs.iter().take(24) {
+    let _ = writeln!(out, "\n--- LSCH Schema ({} structs) ---", doc.structs.len());
+    for st in doc.structs.iter().take(24) {
         let _ = writeln!(out, "struct {} size=0x{:x} flags=0x{:x} fields={}", fmt_hash(st.hash), st.size, st.flags, st.fields.len());
     }
     out
@@ -380,5 +721,88 @@ mod tests {
         assert!(out.contains("42 (0x0000002a)"));
         assert!(out.contains("bool(true)"));
         assert!(out.contains("enum(2 = Active"));
+    }
+
+    #[test]
+    fn resolves_lrsc_arrays_and_exports_placements_csv() {
+        let mut buf = Vec::new();
+        let mut psin = Vec::new();
+        let h_map = joaat("CMapData");
+        let h_ent = joaat("CEntityDef");
+        // inst 0: CMapData (16B), inst 1: CEntityDef (32B)
+        psin.extend_from_slice(&h_map.to_le_bytes());
+        psin.extend_from_slice(&16u32.to_le_bytes());
+        psin.extend_from_slice(&[0u8; 8]);
+        psin.extend_from_slice(&h_ent.to_le_bytes());
+        psin.extend_from_slice(&32u32.to_le_bytes());
+        psin.extend_from_slice(&[0u8; 8]);
+        psin.extend_from_slice(b"pppppppp");
+        // payload 0 (16B): array(len=1) at +0
+        psin.extend_from_slice(&0u64.to_le_bytes());
+        psin.extend_from_slice(&1u32.to_le_bytes());
+        psin.extend_from_slice(&0u32.to_le_bytes());
+        // payload 1 (32B): archetypeName @0, position @4 (10,20,30), rotation @16 (0,0,0,1)
+        psin.extend_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        psin.extend_from_slice(&10.0f32.to_le_bytes());
+        psin.extend_from_slice(&20.0f32.to_le_bytes());
+        psin.extend_from_slice(&30.0f32.to_le_bytes());
+        psin.extend_from_slice(&0.0f32.to_le_bytes());
+        psin.extend_from_slice(&0.0f32.to_le_bytes());
+        psin.extend_from_slice(&0.0f32.to_le_bytes());
+        psin.extend_from_slice(&1.0f32.to_le_bytes());
+
+        buf.extend_from_slice(b"PSIN");
+        buf.extend_from_slice(&((8 + psin.len()) as u32).to_be_bytes());
+        buf.extend_from_slice(&psin);
+
+        // LSCH: CMapData (1 field: entities @0 type 0x52), CEntityDef (3 fields)
+        let mut lsch = Vec::new();
+        for (h, sz, fc) in [(h_map, 16u32, 1u32), (h_ent, 32u32, 3u32)] {
+            lsch.extend_from_slice(&h.to_le_bytes());
+            lsch.extend_from_slice(&[0u8; 12]);
+            lsch.extend_from_slice(&[0xAA; 8]);
+            lsch.extend_from_slice(&sz.to_le_bytes());
+            lsch.extend_from_slice(&(fc << 16).to_le_bytes());
+        }
+        // CMapData.entities
+        lsch.extend_from_slice(&joaat("entities").to_le_bytes());
+        lsch.extend_from_slice(&0u32.to_le_bytes());
+        lsch.extend_from_slice(&0x52u32.to_le_bytes());
+        lsch.extend_from_slice(&h_ent.to_le_bytes());
+        // CEntityDef fields
+        lsch.extend_from_slice(&joaat("archetypeName").to_le_bytes());
+        lsch.extend_from_slice(&0u32.to_le_bytes());
+        lsch.extend_from_slice(&0x44u32.to_le_bytes());
+        lsch.extend_from_slice(&0u32.to_le_bytes());
+        lsch.extend_from_slice(&joaat("position").to_le_bytes());
+        lsch.extend_from_slice(&4u32.to_le_bytes());
+        lsch.extend_from_slice(&0x20u32.to_le_bytes());
+        lsch.extend_from_slice(&0u32.to_le_bytes());
+        lsch.extend_from_slice(&joaat("rotation").to_le_bytes());
+        lsch.extend_from_slice(&16u32.to_le_bytes());
+        lsch.extend_from_slice(&0x23u32.to_le_bytes());
+        lsch.extend_from_slice(&0u32.to_le_bytes());
+
+        buf.extend_from_slice(b"LSCH");
+        buf.extend_from_slice(&((8 + lsch.len()) as u32).to_be_bytes());
+        buf.extend_from_slice(&lsch);
+
+        // LRSC: fixup src_off=0 -> dst_inst=1
+        let mut lrsc = Vec::new();
+        lrsc.extend_from_slice(&0u32.to_le_bytes());
+        lrsc.extend_from_slice(&1u32.to_le_bytes());
+        lrsc.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(b"LRSC");
+        buf.extend_from_slice(&((8 + lrsc.len()) as u32).to_be_bytes());
+        buf.extend_from_slice(&lrsc);
+
+        let doc = parse_psin_doc(&buf).unwrap();
+        assert_eq!(doc.fixups.len(), 1);
+        let placements = doc.extract_placements();
+        assert_eq!(placements.len(), 1);
+        assert_eq!(placements[0].archetype_hash, 0xDEAD_BEEF);
+        assert_eq!(placements[0].position, [10.0, 20.0, 30.0]);
+        let csv = doc.export_placements_csv(None, false);
+        assert!(csv.contains("0xdeadbeef,,10.0000,20.0000,30.0000"));
     }
 }

@@ -312,6 +312,11 @@ fn aces_tonemap(x: vec3<f32>) -> vec3<f32> {
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
+fn neutral_col(c: vec3<f32>, k: f32) -> vec3<f32> {
+    return mix(c, vec3<f32>(dot(c, vec3<f32>(0.2126, 0.7152, 0.0722))), k);
+}
+
+// cook-torrance pbr lighting adapted from sixng shader.wgsl
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let tex_c = textureSample(albedo_tex, albedo_samp, in.uv);
@@ -326,7 +331,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     let ndl = max(dot(n, l), 0.0);
     let ndh = max(dot(n, h), 0.0);
-    let ndv = max(dot(n, v), 0.0);
+    let ndv = max(dot(n, v), 0.001);
 
     var sh = sample_shadow(in.shadow_coord, ndl);
     let rt_on = u.flags.x > 0.5;
@@ -334,14 +339,29 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         sh = smoothstep(0.08, 0.92, sh);
     }
 
-    let sun_elev = clamp(l.z * 2.2, 0.0, 1.0);
-    let sun_col = mix(vec3<f32>(1.0, 0.48, 0.22), vec3<f32>(1.05, 0.98, 0.90), sun_elev) * (1.8 * sun_elev + 0.15);
-    let spec = pow(ndh, 48.0) * 0.28 * ndl;
-    let hemi = n.z * 0.5 + 0.5;
-    let sky_gi = mix(vec3<f32>(0.16, 0.17, 0.20), u.sky_zenith.rgb * 0.55 + u.sky_horizon.rgb * 0.35, hemi);
-    let rt_bounce = select(0.0, 0.18 * (1.0 - ndv) * (0.4 + 0.6 * hemi), rt_on);
+    let rough = 0.62;
+    let metal = 0.06;
+    let a2 = rough * rough * rough * rough;
+    let dd = ndh * ndh * (a2 - 1.0) + 1.0;
+    let d_ggx = a2 / (3.14159 * dd * dd);
+    let k = (rough + 1.0) * (rough + 1.0) / 8.0;
+    let g_smith = (ndl / (ndl * (1.0 - k) + k)) * (ndv / (ndv * (1.0 - k) + k));
+    let f0 = mix(vec3<f32>(0.04), albedo, metal);
+    let fr = f0 + (1.0 - f0) * pow(1.0 - max(dot(h, v), 0.0), 5.0);
+    let spec = d_ggx * g_smith * fr / max(4.0 * ndl * ndv, 0.001);
+    let kd = (1.0 - fr) * (1.0 - metal);
 
-    let lit = albedo * (sky_gi * 0.65 + sun_col * ndl * sh) + vec3<f32>(spec * sh) + sky_gi * rt_bounce;
+    let sun_elev = clamp(l.z * 2.2, 0.0, 1.0);
+    let sun_col = mix(vec3<f32>(1.0, 0.48, 0.22), vec3<f32>(1.05, 0.98, 0.90), sun_elev) * (2.2 * sun_elev + 0.18);
+    let direct = (kd * albedo / 3.14159 + spec) * sun_col * ndl * sh * 2.4;
+
+    let hemi = n.z * 0.5 + 0.5;
+    let amb_d = mix(neutral_col(u.sky_horizon.rgb, 0.78) * 0.55, neutral_col(u.sky_zenith.rgb, 0.78), hemi);
+    let fr_v = f0 + (max(vec3<f32>(1.0 - rough), f0) - f0) * pow(1.0 - ndv, 5.0);
+    let env = mix(u.sky_horizon.rgb, u.sky_zenith.rgb, 0.5) * 0.45;
+    let rt_bounce = select(0.0, 0.14 * (1.0 - ndv) * (0.4 + 0.6 * hemi), rt_on);
+
+    let lit = direct + kd * albedo * amb_d + env * fr_v + amb_d * rt_bounce;
 
     let dist = length(u.cam_pos.xyz - in.world_pos);
     let fog = 1.0 - exp(-dist * 0.00011);
@@ -428,10 +448,12 @@ fn vs_water(@builtin(vertex_index) vid: u32) -> WaterOut {
 
 @fragment
 fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
+    let dist = length(u.cam_pos.xyz - in.world_pos);
+    let wave_fade = exp(-dist * 0.0015);
     let t = u.hud.z;
-    let w1 = sin(in.world_pos.x * 0.045 + t * 1.4) * cos(in.world_pos.y * 0.045 - t * 1.1);
-    let w2 = sin((in.world_pos.x + in.world_pos.y) * 0.021 - t * 0.8);
-    let n = normalize(vec3<f32>((w1 + w2) * 0.04, (w1 - w2) * 0.04, 1.0));
+    let w1 = sin(in.world_pos.x * 0.11 + t * 1.4) * cos(in.world_pos.y * 0.13 - t * 1.1);
+    let w2 = sin((in.world_pos.x * 0.07 - in.world_pos.y * 0.09) - t * 0.8);
+    let n = normalize(vec3<f32>((w1 + w2) * 0.035 * wave_fade, (w1 - w2) * 0.035 * wave_fade, 1.0));
     let v = normalize(u.cam_pos.xyz - in.world_pos);
     let l = normalize(u.sun_dir.xyz);
     let h = normalize(l + v);
@@ -441,7 +463,6 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let sky_r = mix(u.sky_horizon.rgb, u.sky_zenith.rgb, 0.45);
     let glint = pow(max(dot(n, h), 0.0), 140.0) * 1.6 * sun_elev;
     let water_col = mix(deep, sky_r, clamp(fres * 0.85 + 0.08, 0.0, 0.92)) + vec3<f32>(glint);
-    let dist = length(u.cam_pos.xyz - in.world_pos);
     let fog = clamp(1.0 - exp(-dist * 0.00010), 0.0, 0.90);
     let fog_col = mix(u.sky_horizon.rgb, u.sky_zenith.rgb, 0.25);
     return vec4<f32>(aces_tonemap(mix(water_col, fog_col, fog)), 1.0);
@@ -494,6 +515,8 @@ struct GpuMeshBatch {
     index_count: u32,
     inst_count: u32,
     tex_bind_group: wgpu::BindGroup,
+    bound_center: Vec3,
+    bound_radius: f32,
 }
 
 struct GpuState {
@@ -942,7 +965,7 @@ impl GpuState {
         if let Some(ref terrain) = cfg.terrain {
             st.map_min = [terrain.bmin[0], terrain.bmin[1]];
             st.map_span = [terrain.bmax[0] - terrain.bmin[0], terrain.bmax[1] - terrain.bmin[1]];
-            let tmesh = terrain.build_terrain_mesh(4);
+            let tmesh = terrain.build_world_terrain_mesh(4);
             if let Some(ref t) = tmesh.texture {
                 st.minimap_bg = upload_texture(&st.device, &st.queue, &st.tex_bgl, &st.tex_samp, t);
             }
@@ -1002,6 +1025,26 @@ impl GpuState {
             usage: wgpu::BufferUsages::VERTEX,
         });
 
+        let mut lmin = Vec3::splat(f32::MAX);
+        let mut lmax = Vec3::splat(f32::MIN);
+        for v in &b.mesh.verts {
+            let p = Vec3::from_array(*v);
+            lmin = lmin.min(p);
+            lmax = lmax.max(p);
+        }
+        let local_center = (lmin + lmax) * 0.5;
+        let local_rad = ((lmax - lmin) * 0.5).length();
+        let mut wmin = Vec3::splat(f32::MAX);
+        let mut wmax = Vec3::splat(f32::MIN);
+        for &(pos, rot, scale, _) in &b.instances {
+            let c = pos + rot * (local_center * scale);
+            let r = local_rad * scale.abs().max_element();
+            wmin = wmin.min(c - Vec3::splat(r));
+            wmax = wmax.max(c + Vec3::splat(r));
+        }
+        let bound_center = (wmin + wmax) * 0.5;
+        let bound_radius = ((wmax - wmin) * 0.5).length().max(1.0);
+
         for (g, indices) in by_geom {
             let ib = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("m_ib"),
@@ -1023,6 +1066,8 @@ impl GpuState {
                 index_count: indices.len() as u32,
                 inst_count: insts.len() as u32,
                 tex_bind_group: tex_bg,
+                bound_center,
+                bound_radius,
             });
         }
 
@@ -1291,6 +1336,9 @@ impl ApplicationHandler for GpuWorldApp {
                     rp.set_pipeline(&g.shadow_pipeline);
                     rp.set_bind_group(0, &g.uniform_bg, &[]);
                     for b in &g.batches {
+                        if b.bound_radius < 5000.0 && (b.bound_center - light_target).length_squared() > (2200.0 + b.bound_radius).powi(2) {
+                            continue;
+                        }
                         rp.set_bind_group(1, &b.tex_bind_group, &[]);
                         rp.set_vertex_buffer(0, b.vb.slice(..));
                         rp.set_vertex_buffer(1, b.inst_buf.slice(..));
@@ -1326,6 +1374,15 @@ impl ApplicationHandler for GpuWorldApp {
 
                     rp.set_pipeline(&g.main_pipeline);
                     for b in &g.batches {
+                        if b.bound_radius < 5000.0 {
+                            let to_b = b.bound_center - self.cam_pos;
+                            if to_b.dot(fwd) < -(b.bound_radius + 150.0) {
+                                continue;
+                            }
+                            if to_b.length_squared() > (7500.0 + b.bound_radius).powi(2) {
+                                continue;
+                            }
+                        }
                         rp.set_bind_group(1, &b.tex_bind_group, &[]);
                         rp.set_vertex_buffer(0, b.vb.slice(..));
                         rp.set_vertex_buffer(1, b.inst_buf.slice(..));
