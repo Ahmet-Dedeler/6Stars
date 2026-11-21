@@ -53,3 +53,7 @@ The audit only reads the BK2 headers. To verify decoded frames, pause and seek a
 PERCYSTAR_BINK_APP=dist/6Stars.app PERCYSTAR_BK2=/path/to/sample.bk2 \
   cargo test --release bink_embed -- --ignored --nocapture
 ```
+
+## Full-size mip placement (2026-11-21)
+
+Where a texture's mip 0 starts isn't fully given by its descriptor. Since v1.6.1, when the original guess and the mip-chain layout disagree (28,137 of 314,841 decodable textures), 6Stars decodes each candidate and keeps the one whose mip 1 is a 2x downscale of its mip 0. Against v1.4.1 this fixes **13,895 textures** that used to show the strip of smaller mips instead of the image (mostly props, maps and vehicles); UI textures are unchanged. Re-run with `PERCYSTAR_DUMP=<dump root> cargo test --release ttpf_mip0_choice_audit -- --ignored --nocapture`.
