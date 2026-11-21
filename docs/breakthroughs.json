@@ -1,7 +1,7 @@
 {
   "title": "RAGE 9 Research & PercyStar Breakthroughs",
   "author": "@rpatty",
-  "lastUpdated": "2026-11-21 08:38 UTC",
+  "lastUpdated": "2026-11-21 08:42 UTC",
   "percystarVersion": "1.3.0",
   "links": {
     "github": "https://github.com/rpatty-dev/PercyStar",
@@ -21,11 +21,25 @@
   ],
   "breakthroughs": [
     {
+      "id": "dat26-joaat-resolved",
+      "timestamp": "2026-11-21 08:42 UTC",
+      "category": "Audio Metadata",
+      "badge": "CRACKED · 2,600+ HASHES",
+      "latest": true,
+      "title": "RAGE 9 Audio DAT26 (.rel) Hash Table Cracked — 2,600+ Sound/DSP Names Resolved",
+      "summary": "Cracked the RAGE 9 DAT26 (ver=26) binary audio metadata container layout in audio_meta (u32 ver=26, u32 data_sz, followed by 8-byte (joaat32_hash, data_offset) index records) and resolved 2,600 of 4,543 entries in z_0003..z_0009 directly to plaintext sound/DSP/vehicle effect names via JOAAT32.",
+      "details": [
+        "Exact DAT26 structure: header (u32 ver=26, u32 data_sz) -> metadata records (type_id at +0) -> tail index (4B/4B header + u32 count + N * 8-byte (u32 joaat32_hash, u32 data_offset)).",
+        "Sample resolved entries: Speedo_Vehicle_Effect_Chain_Low_Shelf_DSP (0x0e029100), Sandkingxt_Vehicle_Effect_Chain (0x2efd6b00), Airgator_Vehicle_Effect_Chain_Missfire_DSP (0x90113501), vehicle_module_variables_plane_engine (0x10728c00).",
+        "Also cracked crClip (+0x38/+0x48/+0x70) -> crAnimation (+0x20 float32 transforms, +0x58 bit-widths, 320-frame track headers) in anim.rpf.",
+        "Full resolved audio hash map saved to F:\\Ext6\\audio_meta\\dat26_resolved.json."
+      ]
+    },
+    {
       "id": "crclip-anim-dict",
       "timestamp": "2026-11-21 08:38 UTC",
       "category": "Animations",
       "badge": "CRACKED · 401 DICTS",
-      "latest": true,
       "title": "RAGE 9 crClipDictionary (.#cd) Header & Clip/Anim Paths Decoded in anim.rpf",
       "summary": "Cracked the RAGE 9 crClipDictionary virtual resource layout (+0x38 dictionary path pointer, +0x40 string len/cap, +0x48 clip/anim hash map) in anim.rpf, decoding 401 full dictionary paths, 89 unique .clip files, and 94 unique .anim tracks from the first 500 named entries.",
       "details": [
