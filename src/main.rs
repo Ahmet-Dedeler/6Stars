@@ -3029,7 +3029,24 @@ fn probe_rage9_page(
     if olen < 0x80 { return None; }
     let vft = u64::from_le_bytes(probe_out[0..8].try_into().ok()?);
     let bmap = u64::from_le_bytes(probe_out[8..16].try_into().ok()?);
-    if vft != 0 || !(0x5000_0000..0x5800_0000).contains(&bmap) || &probe_out[0x10..0x15] == b"0DRPz" {
+    if vft != 0 || !(0x5000_0000..0x5800_0000).contains(&bmap) {
+        return None;
+    }
+    // 0. crClipDictionary (.ycd animation dictionary with 0DRPz tag at +0x10)
+    if let Some((aname, clip_cnt)) = anim::probe_anim_dict(&probe_out[..olen]) {
+        return Some(RpfEntry {
+            source_rpf: path.to_path_buf(),
+            rpf_name: rname.to_string(),
+            name: aname,
+            kind: "ANIM",
+            offset: off + p as u64,
+            comp_size: probe_dec.total_in(),
+            raw_size: olen as u64,
+            tracks: clip_cnt,
+            chunks: Vec::new(),
+        });
+    }
+    if &probe_out[0x10..0x15] == b"0DRPz" {
         return None;
     }
     // reject mid resource virtual chunks that start directly with a grmgeometry struct
@@ -3073,20 +3090,6 @@ fn probe_rage9_page(
             comp_size: probe_dec.total_in(),
             raw_size: olen as u64,
             tracks: tex_cnt as u32,
-            chunks: Vec::new(),
-        });
-    }
-    // 2b. crClipDictionary (.ycd animation dictionary)
-    if let Some((aname, clip_cnt)) = anim::probe_anim_dict(&probe_out[..olen]) {
-        return Some(RpfEntry {
-            source_rpf: path.to_path_buf(),
-            rpf_name: rname.to_string(),
-            name: aname,
-            kind: "ANIM",
-            offset: off + p as u64,
-            comp_size: probe_dec.total_in(),
-            raw_size: olen as u64,
-            tracks: clip_cnt,
             chunks: Vec::new(),
         });
     }
