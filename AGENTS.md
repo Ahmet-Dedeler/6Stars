@@ -52,6 +52,9 @@ When we added video previews, searching for "video" still found nothing. This ch
 - Keep Developer ID / Apple Development signing in `build_macos.sh` so the app keeps its Downloads permission across rebuilds. Use a separate test folder for throwaway builds so we don't trigger new privacy prompts for Downloads.
 - Use the silent Bink tests (volume 0) instead of clicking media in the live app. Tests should leave the user's audio and focus alone.
 - Use your own `CARGO_TARGET_DIR` when another agent may be building at the same time.
+- Installing a local build: the app ignores `osascript ... quit`, so stop it with `pkill -x Percy6Stars`, move the old `/Applications/Percy6Stars.app` to the Trash, then `ditto dist/Percy6Stars.app /Applications/Percy6Stars.app`.
+- Decode bug or render bug? Dump the one entry in a throwaway `#[ignore]` test: find it via `load_disk_cache_from(cache_file_path())` and call the decoder the UI uses (see `src/audit_tests.rs`). Don't commit it.
+- The 3D view is a CPU rasterizer in `src/model3d.rs`: Z-up, orbits the visible bounding-box center, perspective-correct UVs (weighted by `persp_buf`). Keep new textured paths perspective-correct, or textures slide while orbiting.
 
 ## Media notes
 - macOS BK2: `src/bink_embed.rs` hosts the bundled Bink decoder and frame bridge (`github.com/Ahmet-Dedeler/bink-player-mac`, `src/embed.inc`). Change both sides together.
