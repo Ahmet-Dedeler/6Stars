@@ -20,8 +20,10 @@ If you're here to make a PR, start with [CONTRIBUTING.md](CONTRIBUTING.md). This
 - We support macOS (Apple Silicon first, universal build) and Windows x64.
 - Put platform code behind `#[cfg(target_os = "macos")]` or `#[cfg(windows)]`. Give the other OS a working path or a message that explains what's not supported, so people aren't left wondering if a button is broken.
 - For code changes, run both before opening a PR when possible. Docs and license notices don't need a Rust build.
-  - `cargo test --release`
-  - `cargo check --release --all-targets --target x86_64-pc-windows-msvc` (install with `rustup target add x86_64-pc-windows-msvc`)
+  - `cargo test` (debug, ~20 s once warm; `--release` re-runs fat LTO and takes ~10 min, so save it for the data-gated audits below)
+  - `cargo check --all-targets --target x86_64-pc-windows-msvc` (install with `rustup target add x86_64-pc-windows-msvc`)
+- `.githooks/pre-push` runs `cargo test` when a push touches Rust code (`src/`, `Cargo.*`, `build.rs`). Enable it once per clone with `git config core.hooksPath .githooks` (worktrees share it). Only skip it with `--no-verify` for docs or an emergency, and say so in the PR.
+- Windows CI (`windows`) is a required check on `main`: it runs the tests on Windows and builds the package, without fat LTO. A red check blocks the merge, so fix it rather than bypassing it.
 - On Windows, release builds use the GUI subsystem (no console; CLI `--` modes call `AttachConsole`). Helpers need `CREATE_NO_WINDOW`, and paths can have spaces, Unicode, and apostrophes. PowerShell 5.1 needs TLS 1.2 forced, and scripts are run with `-ExecutionPolicy Bypass`.
 - On macOS, Finder opens files through `application:openURLs:` (`src/mac_open.rs`), not argv. For a new file type, also update `UTImportedTypeDeclarations` / `CFBundleDocumentTypes` in `scripts/build_macos.sh`.
 - If you don't have both platforms, say what you tested and what you couldn't run. Windows CI runs on PRs; don't describe a compile check as a runtime test.
@@ -50,6 +52,9 @@ When we added video previews, searching for "video" still found nothing. This ch
 - Keep Developer ID / Apple Development signing in `build_macos.sh` so the app keeps its Downloads permission across rebuilds. Use a separate test folder for throwaway builds so we don't trigger new privacy prompts for Downloads.
 - Use the silent Bink tests (volume 0) instead of clicking media in the live app. Tests should leave the user's audio and focus alone.
 - Use your own `CARGO_TARGET_DIR` when another agent may be building at the same time.
+- Installing a local build: the app ignores `osascript ... quit`, so stop it with `pkill -x Percy6Stars`, move the old `/Applications/Percy6Stars.app` to the Trash, then `ditto dist/Percy6Stars.app /Applications/Percy6Stars.app`.
+- Decode bug or render bug? Dump the one entry in a throwaway `#[ignore]` test: find it via `load_disk_cache_from(cache_file_path())` and call the decoder the UI uses (see `src/audit_tests.rs`). Don't commit it.
+- The 3D view is a CPU rasterizer in `src/model3d.rs`: Z-up, orbits the visible bounding-box center, perspective-correct UVs (weighted by `persp_buf`). Keep new textured paths perspective-correct, or textures slide while orbiting.
 
 ## Media notes
 - macOS BK2: `src/bink_embed.rs` hosts the bundled Bink decoder and frame bridge (`github.com/Ahmet-Dedeler/bink-player-mac`, `src/embed.inc`). Change both sides together.
