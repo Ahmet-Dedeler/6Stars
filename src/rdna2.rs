@@ -1,4 +1,4 @@
-// Clean-room Xbox Series X (Scarlett / AMD RDNA2 GFX10.3) PS\x00\x09 PSO Cache parser,
+﻿// Clean-room Xbox Series X (Scarlett / AMD RDNA2 GFX10.3) PS\x00\x09 PSO Cache parser,
 // GFX10.3 ISA disassembler, HLSL SM 6.6 lifter, and SPIR-V 1.5 binary emitter.
 // Based on AMD RDNA 2 ISA Reference Guide & Mesa RADV/ACO gfx1030 public encoding tables.
 
@@ -10,6 +10,9 @@ pub enum ShaderStage {
     Compute,
     Pixel,
     Vertex,
+    Geometry,
+    Domain,
+    Hull,
     MeshNgg,
     RayTracing,
     Unknown,
@@ -21,6 +24,9 @@ impl ShaderStage {
             Self::Compute => "CS",
             Self::Pixel => "PS",
             Self::Vertex => "VS",
+            Self::Geometry => "GS",
+            Self::Domain => "DS",
+            Self::Hull => "HS",
             Self::MeshNgg => "NGG",
             Self::RayTracing => "RT",
             Self::Unknown => "GFX10",
@@ -1026,6 +1032,15 @@ pub fn lift_to_hlsl(entry: &Ps09ShaderEntry, code: &[u8]) -> String {
         ShaderStage::Vertex => {
             let _ = writeln!(s, "void VSMain(uint vid : SV_VertexID, out float4 pos : SV_Position)");
         }
+        ShaderStage::Geometry => {
+            let _ = writeln!(s, "[maxvertexcount(3)]\nvoid GSMain(triangle float4 input[3] : SV_Position, inout TriangleStream<float4> output)");
+        }
+        ShaderStage::Domain => {
+            let _ = writeln!(s, r#"[domain("tri")]\nvoid DSMain(float3 bary : SV_DomainLocation, out float4 pos : SV_Position)"#);
+        }
+        ShaderStage::Hull => {
+            let _ = writeln!(s, r#"[domain("tri")][outputcontrolpoints(3)]\nvoid HSMain(InputPatch<float4, 3> input, uint id : SV_OutputControlPointID)"#);
+        }
         ShaderStage::MeshNgg => {
             let _ = writeln!(s, "[outputtopology(\"triangle\")]\n[numthreads(64, 1, 1)]\nvoid MSMain(uint gtid : SV_GroupThreadID)");
         }
@@ -1267,6 +1282,9 @@ pub fn lift_to_spirv(entry: &Ps09ShaderEntry, code: &[u8]) -> Vec<u8> {
     let exec_model = match entry.stage {
         ShaderStage::Pixel => 4u32,  // Fragment
         ShaderStage::Vertex => 0u32, // Vertex
+        ShaderStage::Geometry => 3u32,
+        ShaderStage::Domain => 2u32,
+        ShaderStage::Hull => 1u32,
         _ => 5u32,                   // GLCompute
     };
     push_spv_str(&mut body, 15, &[exec_model, id_main], "main", &[]); // OpEntryPoint
