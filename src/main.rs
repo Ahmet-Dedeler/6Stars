@@ -4787,7 +4787,10 @@ fn main() -> eframe::Result<()> {
                 idx += 1;
             }
         }
-        world_gpu::run_gpu_world_cli(common_p.as_deref(), levels_p.as_deref());
+        if let Err(error) = world_gpu::run_gpu_world_cli(common_p.as_deref(), levels_p.as_deref()) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
         return Ok(());
     }
     if args.len() >= 3 && args[1] == "--probe-maps" {

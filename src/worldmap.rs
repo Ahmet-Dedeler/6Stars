@@ -25,6 +25,8 @@ pub struct WorldMapState {
     pub terrain_mesh: Option<Mesh3D>,
     pub loading: bool,
     pending_mesh: Arc<Mutex<Option<Result<Mesh3D, String>>>>,
+    gpu_launch: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    gpu_starting: bool,
 }
 
 impl Default for WorldMapState {
@@ -39,6 +41,8 @@ impl Default for WorldMapState {
             terrain_mesh: None,
             loading: false,
             pending_mesh: Arc::new(Mutex::new(None)),
+            gpu_launch: None,
+            gpu_starting: false,
         }
     }
 }
@@ -279,6 +283,23 @@ pub fn render_world_map_ui(
     common_rpf: Option<&Path>,
     levels_rpf: Option<&Path>,
 ) -> Option<usize> {
+    while let Some(rx) = &wm.gpu_launch {
+        match rx.try_recv() {
+            Ok(result) => {
+                wm.gpu_starting = false;
+                wm.status = match result {
+                    Ok(()) => "GPU World opened in a separate window".into(),
+                    Err(error) => format!("GPU World failed: {error}"),
+                };
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                wm.gpu_starting = false;
+                wm.gpu_launch = None;
+                break;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+        }
+    }
     if let Some(res) = wm.pending_mesh.lock().unwrap().take() {
         wm.loading = false;
         match res {
@@ -345,9 +366,13 @@ pub fn render_world_map_ui(
                 wm.pan = [0.0, 0.0];
             }
         }
-        if ui.button("Launch 3D GPU World (wgpu)").on_hover_text("Open DX12/Vulkan GPU 3D World with PBR, Sun/Time-of-Day (F6), Minimap & Raytracing (R)").clicked() {
-            match crate::world_gpu::launch_world_gpu_process(common_rpf, levels_rpf) {
-                Ok(()) => wm.status = "Launched 3D GPU World window (streaming MHIU + Brickell SLOD)".into(),
+        if ui.add_enabled(!wm.gpu_starting, egui::Button::new("Launch 3D GPU World (wgpu)")).on_hover_text("Open DX12/Vulkan GPU 3D World with PBR, Sun/Time-of-Day (F6), Minimap & Raytracing (R)").clicked() {
+            match crate::world_gpu::launch_world_gpu_process(common_rpf, levels_rpf, ctx.clone()) {
+                Ok(rx) => {
+                    wm.gpu_launch = Some(rx);
+                    wm.gpu_starting = true;
+                    wm.status = "Starting GPU World...".into();
+                }
                 Err(e) => wm.status = e,
             }
         }

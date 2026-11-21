@@ -81,7 +81,11 @@ pub enum WorldStreamMsg {
     Sgd5Count(usize),
 }
 
-pub fn launch_world_gpu_process(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -> Result<(), String> {
+pub fn launch_world_gpu_process(
+    common_rpf: Option<&Path>,
+    levels_rpf: Option<&Path>,
+    ctx: eframe::egui::Context,
+) -> Result<Receiver<Result<(), String>>, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("--gpu-world");
@@ -91,11 +95,53 @@ pub fn launch_world_gpu_process(common_rpf: Option<&Path>, levels_rpf: Option<&P
     if let Some(l) = levels_rpf {
         cmd.arg("--levels").arg(l);
     }
-    cmd.spawn().map_err(|e| format!("Failed to launch 3D GPU World: {e}"))?;
-    Ok(())
+    use std::process::Stdio;
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to launch 3D GPU World: {e}"))?;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader, Read};
+        let stderr = child.stderr.take().unwrap();
+        let errors = std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = BufReader::new(stderr).read_to_string(&mut text);
+            text
+        });
+        let mut ready = false;
+        for line in BufReader::new(child.stdout.take().unwrap()).lines() {
+            match line {
+                Ok(line) if line == "WORLD_READY" => {
+                    ready = true;
+                    let _ = tx.send(Ok(()));
+                    ctx.request_repaint();
+                }
+                Ok(line) if line.starts_with("WORLD_ERROR ") => {
+                    let _ = tx.send(Err(line[12..].to_string()));
+                    ctx.request_repaint();
+                }
+                Err(error) => {
+                    let _ = tx.send(Err(format!("GPU viewer output failed: {error}")));
+                    ctx.request_repaint();
+                }
+                _ => {}
+            }
+        }
+        let status = child.wait();
+        let errors = errors.join().unwrap_or_default();
+        if !ready || status.as_ref().map_or(true, |s| !s.success()) {
+            let _ = tx.send(Err(format!("GPU viewer exited ({status:?}): {}", errors.trim())));
+            ctx.request_repaint();
+        }
+    });
+    Ok(rx)
 }
 
-pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
+pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -> Result<(), String> {
     #[cfg(windows)]
     unsafe {
         extern "system" {
@@ -112,10 +158,11 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
     let resolved_levels = levels_rpf.map(Path::to_path_buf).or_else(|| {
         fallback_dir.as_ref().map(|d| d.join("levels.rpf")).filter(|p| p.exists())
     });
-    let terrain = resolved_common
-        .as_deref()
-        .and_then(|p| crate::worldmap::load_mhiu_from_rpf(p).ok())
-        .map(Arc::new);
+    if resolved_common.is_none() && resolved_levels.is_none() {
+        return Err("No world archives found; open a game folder first".into());
+    }
+    let terrain = resolved_common.as_deref()
+        .map(|p| crate::worldmap::load_mhiu_from_rpf(p).map(Arc::new)).transpose()?;
     let cfg = WorldLaunchConfig {
         terrain,
         batches: Vec::new(),
@@ -123,9 +170,7 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
         map_count: 0,
         start_pos: [-127.276, -1855.924, 24.0],
     };
-    let Ok(event_loop) = EventLoop::builder().build() else {
-        return;
-    };
+    let event_loop = EventLoop::builder().build().map_err(|e| format!("Cannot start GPU event loop: {e}"))?;
     let (tx, rx) = mpsc::sync_channel(16);
     let cam_track = Arc::new(std::sync::Mutex::new((Vec3::from_array(cfg.start_pos), 1u64)));
     let cam_track_bg = Arc::clone(&cam_track);
@@ -266,7 +311,8 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
         });
     }
     let mut app = GpuWorldApp::new(cfg, rx, cam_track);
-    let _ = event_loop.run_app(&mut app);
+    event_loop.run_app(&mut app).map_err(|e| format!("GPU event loop failed: {e}"))?;
+    match app.failure { Some(error) => Err(error), None => Ok(()) }
 }
 
 const WORLD_WGSL: &str = r#"
@@ -1231,6 +1277,8 @@ struct GpuWorldApp {
     last_cursor: Option<PhysicalPosition<f64>>,
     last_frame: Instant,
     last_title: Instant,
+    ready: bool,
+    failure: Option<String>,
 }
 
 impl GpuWorldApp {
@@ -1263,6 +1311,8 @@ impl GpuWorldApp {
             last_cursor: None,
             last_frame: Instant::now(),
             last_title: Instant::now(),
+            ready: false,
+            failure: None,
         }
     }
 
@@ -1285,8 +1335,13 @@ impl ApplicationHandler for GpuWorldApp {
         let attrs = Window::default_attributes()
             .with_title("PercyStar 3D World (wgpu)")
             .with_inner_size(winit::dpi::LogicalSize::new(1440.0, 860.0));
-        let Ok(win) = event_loop.create_window(attrs) else {
-            return;
+        let win = match event_loop.create_window(attrs) {
+            Ok(win) => win,
+            Err(error) => {
+                self.failure = Some(format!("Could not create GPU World window: {error}"));
+                event_loop.exit();
+                return;
+            }
         };
         let win = Arc::new(win);
         let cfg = self.cfg.take().unwrap_or(WorldLaunchConfig {
@@ -1297,6 +1352,7 @@ impl ApplicationHandler for GpuWorldApp {
             start_pos: [0.0, 0.0, 120.0],
         });
         self.gpu = Some(GpuState::new(win, &cfg));
+        self.gpu.as_ref().unwrap().window.request_redraw();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -1697,6 +1753,12 @@ impl ApplicationHandler for GpuWorldApp {
 
                 g.queue.submit(Some(enc.finish()));
                 frame.present();
+                if !self.ready {
+                    use std::io::Write;
+                    println!("WORLD_READY");
+                    let _ = std::io::stdout().flush();
+                    self.ready = true;
+                }
                 g.window.request_redraw();
             }
             _ => {}
@@ -1721,4 +1783,16 @@ fn pollster_block_on<F: std::future::Future>(fut: F) -> F::Output {
         }
         std::thread::yield_now();
     }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    #[test]
+    fn missing_world_archive_reports_an_error() {
+        let missing = Path::new("target/missing-world-regression.rpf");
+        assert!(!missing.exists());
+        assert!(run_gpu_world_cli(Some(missing), None).is_err());
+    }
+
 }
