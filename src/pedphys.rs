@@ -247,18 +247,22 @@ pub fn packed_followers(buf: &[u8], first: usize, max_walk: usize, file_off: u64
 }
 
 /// Where [`walk_packed`] starts.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum WalkStart {
     /// At a recognised resource's zlib stream: skip it and probe the ones behind it.
     After(usize),
-    /// Where an earlier walk ran out of its buffer: find the next stream from here and probe it.
+    /// At a stream an earlier walk couldn't finish: inflate and probe it (it may start a page:
+    /// only streams found by searching stop there).
+    Stream(usize),
+    /// Where an earlier walk ran out of its buffer between streams: find the next one from here.
     Resume(usize),
 }
 
-/// [`packed_followers`] that also says when the walk ran out of `buf` in the middle of a group
-/// (the second value: the file offset to resume from with [`WalkStart::Resume`]). The scanner
-/// reads big archives in windows, so a group near a window's end carries on in the next one.
-pub fn walk_packed(buf: &[u8], start: WalkStart, max_walk: usize, file_off: u64, path: &Path, rname: &str) -> (Vec<RpfEntry>, Option<u64>) {
+/// [`packed_followers`] that also says when the walk ran out of `buf` in the middle of a group:
+/// the file offset to carry on from, and how (positions in it relative to a window starting at
+/// that offset). The scanner reads big archives in windows, so a group near a window's end
+/// carries on in the next one.
+pub fn walk_packed(buf: &[u8], start: WalkStart, max_walk: usize, file_off: u64, path: &Path, rname: &str) -> (Vec<RpfEntry>, Option<(u64, WalkStart)>) {
     use flate2::{Decompress, FlushDecompress, Status};
     enum Next {
         At(usize),
@@ -285,10 +289,11 @@ pub fn walk_packed(buf: &[u8], start: WalkStart, max_walk: usize, file_off: u64,
     let mut out = Vec::new();
     let (first, mut s, mut probe_s) = match start {
         WalkStart::After(f) => (f, f, false),
+        WalkStart::Stream(f) => (f, f, true),
         WalkStart::Resume(p) => match next(p) {
             Next::At(n) => (p, n, true),
             Next::Stop => return (out, None),
-            Next::OutOfBuf => return (out, Some(file_off + p as u64)),
+            Next::OutOfBuf => return (out, Some((file_off + p as u64, WalkStart::Resume(0)))),
         },
     };
     let mut dec = Decompress::new(true);
@@ -323,8 +328,10 @@ pub fn walk_packed(buf: &[u8], start: WalkStart, max_walk: usize, file_off: u64,
             }
         };
         if !ended {
-            // a stream cut off by the end of the window is walked again from its start
-            return (out, ran_out.then_some(file_off + s as u64));
+            // a stream cut off by the end of the window is walked again from its start, probed
+            // unless it is the recognised resource the walk began at
+            let again = if probe_s { WalkStart::Stream(0) } else { WalkStart::After(0) };
+            return (out, ran_out.then_some((file_off + s as u64, again)));
         }
         if probe_s {
             let whole = dec.total_out() as usize;
@@ -348,7 +355,7 @@ pub fn walk_packed(buf: &[u8], start: WalkStart, max_walk: usize, file_off: u64,
                 probe_s = true;
             }
             Next::Stop => break,
-            Next::OutOfBuf => return (out, Some(file_off + pos as u64)),
+            Next::OutOfBuf => return (out, Some((file_off + pos as u64, WalkStart::Resume(0)))),
         }
     }
     (out, None)
@@ -2278,13 +2285,24 @@ mod tests {
         for cut in [cloth_at + 8, cloth_at - 8] {
             let (f, resume) = walk_packed(&page[..cut], WalkStart::After(16), 1 << 20, 0x5000, Path::new("x.rpf"), "x.rpf");
             assert!(f.is_empty());
-            let at = resume.expect("walk stopped at the window's end") as usize - 0x5000;
+            let (at, how) = resume.expect("walk stopped at the window's end");
+            let at = at as usize - 0x5000;
             // (the padding after the cloth runs to this test page's end, so that walk asks to
             // resume too; in a file the next stream starts a page and ends it)
-            let (f, _) = walk_packed(&page[at..], WalkStart::Resume(0), 1 << 20, 0x5000 + at as u64, Path::new("x.rpf"), "x.rpf");
+            let (f, _) = walk_packed(&page[at..], how, 1 << 20, 0x5000 + at as u64, Path::new("x.rpf"), "x.rpf");
             assert_eq!(f.len(), 1);
             assert_eq!((f[0].kind, f[0].offset), ("CLOTH", 0x5000 + cloth_at as u64));
         }
+
+        // the window ends inside the recognised stream itself, which starts a page (offset
+        // ...010): the walk retries that stream (without counting it) instead of stopping at
+        // the page start, and finds the cloth behind it
+        let cut = 16 + z(&gs).len() / 2;
+        let (f, resume) = walk_packed(&page[..cut], WalkStart::After(16), 1 << 20, 0x5000, Path::new("x.rpf"), "x.rpf");
+        assert!(f.is_empty());
+        assert_eq!(resume, Some((0x5010, WalkStart::After(0))));
+        let (f, _) = walk_packed(&page[16..], WalkStart::After(0), 1 << 20, 0x5010, Path::new("x.rpf"), "x.rpf");
+        assert_eq!(f.iter().map(|e| (e.kind, e.offset)).collect::<Vec<_>>(), vec![("CLOTH", 0x5000 + cloth_at as u64)]);
     }
 
     #[test]
@@ -2603,10 +2621,8 @@ mod tests {
         };
         let Some(entries) = packs_entries() else { return };
         std::fs::create_dir_all(&out).unwrap();
-        // a fresh sandbox HOME so the real app data is never read or written (and nothing
-        // under the output directory is deleted)
-        let home = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", home.path());
+        // sandbox HOME so the real app data is never read or written (restored on return)
+        let _home = crate::context_capture::SandboxHome::new();
 
         let pick = |kind: &str, ok: &dyn Fn(&RpfEntry) -> bool| {
             let name = std::env::var(format!("SIXSTARS_PEDPHYS_{kind}")).ok();

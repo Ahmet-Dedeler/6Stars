@@ -4788,7 +4788,7 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
                     // big archives are read in windows: a group that runs past this one is
                     // walked on from the file (a stream bigger than the window stops it)
                     let mut last = None;
-                    while let Some(at) = resume.filter(|_| whole.is_none()) {
+                    while let Some((at, how)) = resume.filter(|_| whole.is_none()) {
                         let walked = (at - group) as usize;
                         if at >= sz || walked >= WALK || last == Some(at) {
                             break;
@@ -4797,7 +4797,7 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
                         let mut win = Vec::with_capacity(16 << 20);
                         f.seek(SeekFrom::Start(at))?;
                         (&mut f).take(16 << 20).read_to_end(&mut win)?;
-                        let (more, r) = pedphys::walk_packed(&win, pedphys::WalkStart::Resume(0), WALK - walked, at, path, &rname);
+                        let (more, r) = pedphys::walk_packed(&win, how, WALK - walked, at, path, &rname);
                         found.extend(more);
                         resume = r;
                         need_seek = true;

@@ -615,7 +615,7 @@ impl Rpf9App {
                 live.insert(*i, d);
             }
             let mut x = self.live_vehicle_config(*i);
-            if let Some(v) = self.ctx_ui.related.as_ref().filter(|v| v.entry == *i) {
+            if let Some(v) = self.ctx_ui.related.as_ref().filter(|v| v.entry == *i && v.index_ver == ver) {
                 x.extend(v.textures.clone().unwrap_or_default());
             }
             if !x.is_empty() {
@@ -696,7 +696,7 @@ impl Rpf9App {
         let done = Arc::clone(&self.ctx_ui.done);
         let have = self.ctx_ui.index.clone();
         let mut extra = self.live_vehicle_config(idx);
-        if let Some(v) = self.ctx_ui.related.as_ref().filter(|v| v.entry == idx) {
+        if let Some(v) = self.ctx_ui.related.as_ref().filter(|v| v.entry == idx && v.index_ver == ver) {
             extra.extend(v.textures.clone().unwrap_or_default());
         }
         let ctx = ctx.clone();
@@ -1087,7 +1087,7 @@ fn safe_file_name(s: &str) -> String {
 /// What [`extract_bundle`] wrote.
 struct Extracted {
     folder: PathBuf,
-    /// Files written in full.
+    /// Entries with output kept (in full, or in part for a TXD).
     written: usize,
     /// Entries that failed (decode or write), or that were written only in part (a TXD with
     /// some textures missing). Each has an `"error"` in the manifest.
@@ -1173,10 +1173,12 @@ fn extract_bundle(dir: &Path, items: &[(RpfEntry, Option<Related>)]) -> Result<E
                 Err(err) => (None, Some(err.to_string())),
             },
         };
+        // counted apart: a TXD with some textures written is both kept and incomplete
+        if file.is_some() {
+            written += 1;
+        }
         if err.is_some() {
             failed.push(e.name.clone());
-        } else if file.is_some() {
-            written += 1;
         }
         let mut fields = vec![
             format!("\"path\":{}", cc::json_str(&cc::full_path(e))),

@@ -104,6 +104,32 @@ fn entries(root: &Path) -> Vec<RpfEntry> {
     out
 }
 
+/// Points `HOME` at a fresh temporary directory so a capture never reads or writes the real
+/// app data, and puts the previous value back when dropped (also on panic), so later tests in
+/// the same process don't see a deleted directory.
+pub(crate) struct SandboxHome {
+    prev: Option<std::ffi::OsString>,
+    _dir: tempfile::TempDir,
+}
+
+impl SandboxHome {
+    pub(crate) fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", dir.path());
+        Self { prev, _dir: dir }
+    }
+}
+
+impl Drop for SandboxHome {
+    fn drop(&mut self) {
+        match self.prev.take() {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+}
+
 #[test]
 #[ignore]
 fn context_capture() {
@@ -112,10 +138,8 @@ fn context_capture() {
         return;
     };
     fs::create_dir_all(&out).unwrap();
-    // a fresh sandbox HOME so the real app data is never read or written (and nothing under
-    // the output directory is deleted)
-    let home = tempfile::tempdir().unwrap();
-    std::env::set_var("HOME", home.path());
+    // sandbox HOME so the real app data is never read or written (restored on return)
+    let _home = SandboxHome::new();
     let logo = image::load_from_memory(include_bytes!("../assets/logo.png")).ok().map(|img| {
         let rgba = img.to_rgba8();
         (rgba.as_raw().to_vec(), rgba.width(), rgba.height())
