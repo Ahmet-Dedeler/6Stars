@@ -34,6 +34,7 @@ const IID_IDXC_RESULT: Guid = Guid::from_values(
     [0x94, 0x61, 0x6f, 0x87, 0xaf, 0x5e, 0x06, 0x59],
 );
 
+#[cfg(windows)]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Guid {
@@ -43,6 +44,7 @@ struct Guid {
     data4: [u8; 8],
 }
 
+#[cfg(windows)]
 impl Guid {
     const fn from_values(data1: u32, data2: u16, data3: u16, data4: [u8; 8]) -> Self {
         Self {
