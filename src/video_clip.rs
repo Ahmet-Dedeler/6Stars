@@ -1,4 +1,8 @@
+// Percy6Stars by Ahmet Dedeler (https://github.com/Ahmet-Dedeler, https://ahmetdedeler.com)
+// Fork of PercyStar by rpatty-dev (https://github.com/rpatty-dev/PercyStar).
+// Source: https://github.com/Ahmet-Dedeler/Percy6Stars
 // SPDX-License-Identifier: MIT
+// If you copy, vendor or port this file, keep this header and credit both projects in your README.
 // Copyright (c) 2026 Ahmet Dedeler
 
 use std::fs::File;

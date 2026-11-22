@@ -64,3 +64,18 @@ When we added video previews, searching for "video" still found nothing. This ch
 - Upstream sync: `rpatty-dev/PercyStar` is merged into the fork with a real merge (not cherry-picks), keeping both histories. Keep our decoders where they measure better and note the measurement in the commit.
 - Use SixNG (GPLv3) to read up on formats, not as a source of code to copy into this repo.
 - Other PercyStar forks share upstream's license, so their code can be merged with credit (asm512's LOD switching, GamingChelsea's audio catalog). Their open upstream PRs may land upstream later; expect the next upstream sync to touch the same code. asm512's per-texture material layers (rpatty-dev/PercyStar#19) were not taken because they replace our material resolver.
+
+## Reusing this code
+
+Files written for this fork start with the Percy6Stars credit header (see `src/gallery.rs`). Files from upstream PercyStar keep upstream's headers; don't add ours to them.
+
+When vendoring, copying or porting code from this repo into another project:
+
+- Keep the header at the top of each file (author, source link, license). Don't strip it in a port to another language either; carry it over as a comment.
+- Copy the license files (`LICENSE`, plus `LICENSE-MIT` for MIT files) next to the code.
+- Credit the project in the other project's README or credits section, for example: `Percy6Stars by Ahmet Dedeler (https://github.com/Ahmet-Dedeler/Percy6Stars)`. Percy6Stars is a fork of PercyStar by rpatty-dev: its license requires crediting rpatty-dev with a link to https://github.com/rpatty-dev/PercyStar and keeping the same license, so credit both. Files marked `SPDX-License-Identifier: MIT` are MIT.
+- Prefer depending on this repo (git dependency or package) over copying files, so fixes and new formats reach you.
+
+---
+
+Ahmet Dedeler · [github.com/Ahmet-Dedeler](https://github.com/Ahmet-Dedeler) · [ahmetdedeler.com](https://ahmetdedeler.com)

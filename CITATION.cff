@@ -1,0 +1,15 @@
+cff-version: 1.2.0
+message: "If you use or build on this project, please credit it as below."
+type: software
+title: "Percy6Stars"
+abstract: "Percy6Stars, a fork of PercyStar by rpatty-dev: an RPF9/TTPF archive explorer with texture, model, audio and video previews."
+authors:
+  - given-names: Ahmet
+    family-names: Dedeler
+    alias: Ahmet-Dedeler
+    website: "https://ahmetdedeler.com"
+  - alias: rpatty-dev
+    name: "rpatty-dev (PercyStar)"
+    website: "https://github.com/rpatty-dev/PercyStar"
+repository-code: "https://github.com/Ahmet-Dedeler/Percy6Stars"
+url: "https://github.com/Ahmet-Dedeler/Percy6Stars"
