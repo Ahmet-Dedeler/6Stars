@@ -187,15 +187,19 @@ Requires **Rust** (`x86_64-pc-windows-gnu` with MinGW `windres`/`dlltool`, or `m
 
 ## Credits & Community
 
-- **Original Creator**: `@rpatty-dev` (`@rpatty`)
-- **Contributors**:
-  - `@Ahmet-Dedeler` ([Percy6Stars](https://github.com/Ahmet-Dedeler/Percy6Stars)) — macOS build & 3D viewer PRs (#6, #7), `RADTools.exe` installer fix, mip0/mip1 placement insight, cutout/glass/decal blending, shadow-proxy hiding, and Videos/OBJ/PS09 UX improvements.
-  - `@GamingChelsea` (PR #10) — AWC decode diagnostics, 512 KB superblock stream splitting, and waveform audio player foundation (upgraded with zero-copy ring buffers, smooth drag scrubbing, stream filter, Loop/Auto-Next, WAV export, and keyboard shortcuts).
-  - `@kotelkonrad` (Issue #11) — suggested arrow-key / WASD asset browsing navigation.
-  - `@techfoundrynz` (PRs #12, #13) — 40-bit/21-bit `>4 GiB` TTPF texture addressing and format 99 `float3` meshlet vertex-stream decoder.
-  - `@paryzius` ([ttpf-viewer](https://github.com/paryzius/ttpf-viewer)) — `.ttpf` reduced-mip fallback when mip 0 sits in unreadable BCPack/truncated chunks.
-  - `@holdmysocks` ([SixNG](https://github.com/holdmysocks/SixNG)) — `0DRPz` (`0x7a`) map placement schema (`0xd3593fa6` / `0xce501483`) for world entity streaming.
-  - `@Xyzstk` — `SGD5` & `DXBC`/`FSSM` RDNA2 shader PR (#8).
+- **Original Creator:** [@rpatty-dev](https://github.com/rpatty-dev) (`@rpatty`)
+- **Code & Research Contributors:**
+  - [@clayeon](https://github.com/clayeon) (PR #34) — Emergency lights with siren sequencer timing, modular fragment/roofbar composition, and `packs.rpf` `0x7a` authored vehicle configurations.
+  - [@worstgirlinamerica](https://github.com/worstgirlinamerica) (PRs #30, #31, #32, #33) — `scripts/build_linux.sh`, AWC superblock directory & stereo channel fix in `awc_extract.py`, `cfg(windows)` gating, and explicit `f32` literal fix.
+  - [@Xyzstk](https://github.com/Xyzstk) (PRs #8, #29) — `SGD5` shader-group parser, `DXBC`/`FSSM` extraction, and reflection resource naming.
+  - [@techfoundrynz](https://github.com/techfoundrynz) (PRs #12, #13, #21–#28) — `>4 GiB` TTPF addressing, format 99 `float3` meshlets, world-scale MHIU terrain in GPU World, north-up 2D map & heightmap alignment, Model Viewer sidebar stability, window/taskbar icons, startup feedback, and `Cargo.lock` sync.
+  - [@asm512](https://github.com/asm512) (PR #19) — In-file & sibling vehicle LOD switching (`Hi`/`Mid`/`Low`, `LOD0`–`LOD3`) and per-texture material layers + Texture Browser.
+  - [@GamingChelsea](https://github.com/GamingChelsea) (PRs #10, #18) — `audio.rpf` DAT metadata catalog & AWC auto-naming, AWC decode diagnostics, superblock stream splitting, and waveform audio player foundation.
+  - [@Ahmet-Dedeler](https://github.com/Ahmet-Dedeler) ([Percy6Stars](https://github.com/Ahmet-Dedeler/Percy6Stars), PRs #6, #7, Issue #9) — macOS build & 3D viewer decoding, sorting, `RADTools.exe` fix, cutout/glass/decal blending, and licensing feedback.
+  - [@paryzius](https://github.com/paryzius) ([ttpf-viewer](https://github.com/paryzius/ttpf-viewer)) — `.ttpf` reduced-mip fallback for unreadable mip 0 chunks.
+  - [@holdmysocks](https://github.com/holdmysocks) ([SixNG](https://github.com/holdmysocks/SixNG)) — `0DRPz` (`0x7a`) map placement schema for world entity streaming.
+- **Bug Reports & Feature Suggestions (Issues):**
+  - [@YellowMaker](https://github.com/YellowMaker) (#20 — 2D world map orientation), [@adamjuankili](https://github.com/adamjuankili) (#17 — GPU World `m_vb` VRAM crash), [@crexlight](https://github.com/crexlight) (#16 — police dispatch `.awc` sample rate), [@Bluredguy](https://github.com/Bluredguy) (#15 — `binkplay.exe` path lookup), [@rbence05](https://github.com/rbence05) (#14 — PSIN placed scene assembly), [@kotelkonrad](https://github.com/kotelkonrad) (#11 — keyboard/arrow navigation across Explorer, models, audio & video), [@CedarCoder1](https://github.com/CedarCoder1) (#5 — copy file names & paths), [@Mrsuss60](https://github.com/Mrsuss60) (#4 — sort by name & size), [@adastmin1](https://github.com/adastmin1) (#2, #3 — multi-language & audio/text feedback).
 
 ```powershell
 cargo test --release
