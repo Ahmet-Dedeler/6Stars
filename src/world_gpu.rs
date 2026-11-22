@@ -13,7 +13,7 @@ use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::window::{Icon, Window, WindowId};
 
 mod smoke;
 pub use smoke::run_gpu_world_smoke;
@@ -1296,9 +1296,20 @@ impl ApplicationHandler for GpuWorldApp {
         if self.gpu.is_some() {
             return;
         }
+        let icon = image::load_from_memory(include_bytes!("../assets/logo.png")).ok().and_then(|image| {
+                let image = image.into_rgba8();
+                let (w, h) = image.dimensions();
+                Icon::from_rgba(image.into_raw(), w, h).ok()
+            });
         let attrs = Window::default_attributes()
             .with_title("PercyStar 3D World (wgpu)")
+            .with_window_icon(icon.clone())
             .with_inner_size(winit::dpi::LogicalSize::new(1440.0, 860.0));
+        #[cfg(windows)]
+        let attrs = {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs.with_taskbar_icon(icon)
+        };
         let Ok(win) = event_loop.create_window(attrs) else {
             return;
         };
