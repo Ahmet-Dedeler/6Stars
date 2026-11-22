@@ -613,6 +613,7 @@ struct GpuMeshBatch {
     ib: wgpu::Buffer,
     inst_buf: wgpu::Buffer,
     index_count: u32,
+    index_format: wgpu::IndexFormat,
     inst_count: u32,
     tex_bind_group: wgpu::BindGroup,
     bound_center: Vec3,
@@ -1128,8 +1129,10 @@ impl GpuState {
         }
         const MAX_GEOM_BYTES: usize = 1024 * 1024 * 1024;
         let is_terrain = b.mesh.name == "mhiu_world_terrain";
+        let use_u16 = b.mesh.verts.len() <= u16::MAX as usize;
+        let idx_fmt = if use_u16 { wgpu::IndexFormat::Uint16 } else { wgpu::IndexFormat::Uint32 };
         let est_geom_bytes = b.mesh.verts.len() * std::mem::size_of::<GpuVertex>()
-            + b.mesh.tris.len() * 12
+            + b.mesh.tris.len() * if use_u16 { 6 } else { 12 }
             + b.instances.len() * std::mem::size_of::<GpuInstance>();
         if !is_terrain && (self.vram_oom || self.geom_bytes.saturating_add(est_geom_bytes) > MAX_GEOM_BYTES) {
             return;
@@ -1176,11 +1179,20 @@ impl GpuState {
         });
         let mut ibs = Vec::with_capacity(by_geom.len());
         for (g, indices) in by_geom {
-            let ib = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("m_ib"),
-                contents: bytemuck::cast_slice(&indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
+            let ib = if use_u16 {
+                let idx16: Vec<u16> = indices.iter().map(|&i| i as u16).collect();
+                self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("m_ib16"),
+                    contents: bytemuck::cast_slice(&idx16),
+                    usage: wgpu::BufferUsages::INDEX,
+                })
+            } else {
+                self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("m_ib32"),
+                    contents: bytemuck::cast_slice(&indices),
+                    usage: wgpu::BufferUsages::INDEX,
+                })
+            };
             ibs.push((g, indices.len() as u32, ib));
         }
         if let Some(err) = pollster_block_on(self.device.pop_error_scope()) {
@@ -1234,6 +1246,7 @@ impl GpuState {
                 ib,
                 inst_buf: inst_buf.clone(),
                 index_count,
+                index_format: idx_fmt,
                 inst_count: insts.len() as u32,
                 tex_bind_group: tex_bg,
                 bound_center,
@@ -1284,7 +1297,7 @@ struct GpuWorldApp {
     show_boxes: bool,
     fog_density: f32,
     exposure: f32,
-    keys: [bool; 8], // W A S D Q E Shift Space
+    keys: [bool; 9], // W A S D Q E Shift Space Ctrl
     dragging: bool,
     last_cursor: Option<PhysicalPosition<f64>>,
     last_frame: Instant,
@@ -1319,7 +1332,7 @@ impl GpuWorldApp {
             show_boxes: false,
             fog_density: 0.70,
             exposure: 1.0,
-            keys: [false; 8],
+            keys: [false; 9],
             dragging: false,
             last_cursor: None,
             last_frame: Instant::now(),
@@ -1449,6 +1462,7 @@ impl ApplicationHandler for GpuWorldApp {
                         KeyCode::KeyE => self.keys[5] = down,
                         KeyCode::ShiftLeft | KeyCode::ShiftRight => self.keys[6] = down,
                         KeyCode::Space => self.keys[7] = down,
+                        KeyCode::ControlLeft | KeyCode::ControlRight => self.keys[8] = down,
                         KeyCode::Home | KeyCode::F1 if down => self.menu_open = !self.menu_open,
                         KeyCode::KeyB if down => self.show_boxes = !self.show_boxes,
                         KeyCode::F6 if down => self.auto_sun = !self.auto_sun,
@@ -1469,7 +1483,11 @@ impl ApplicationHandler for GpuWorldApp {
                 self.last_frame = now;
 
                 if let Some(g) = &mut self.gpu {
-                    for _ in 0..2 {
+                    let upload_start = Instant::now();
+                    for _ in 0..8 {
+                        if upload_start.elapsed().as_micros() >= 6000 {
+                            break;
+                        }
                         let Ok(msg) = self.stream_rx.try_recv() else { break };
                         match msg {
                             WorldStreamMsg::Batch(batch) => g.add_batch(&batch),
@@ -1489,9 +1507,11 @@ impl ApplicationHandler for GpuWorldApp {
                 let right = fwd.cross(Vec3::Z).normalize_or(Vec3::Y);
                 let move_fwd = if self.walk_mode { fwd_flat } else { fwd };
                 let speed = if self.walk_mode {
-                    if self.keys[6] { 45.0 } else { 14.0 }
+                    if self.keys[6] { 45.0 } else if self.keys[8] { 4.0 } else { 14.0 }
                 } else if self.keys[6] {
                     650.0
+                } else if self.keys[8] {
+                    28.0
                 } else {
                     140.0
                 } * dt;
@@ -1605,7 +1625,7 @@ impl ApplicationHandler for GpuWorldApp {
                         rp.set_bind_group(1, &b.tex_bind_group, &[]);
                         rp.set_vertex_buffer(0, b.vb.slice(..));
                         rp.set_vertex_buffer(1, b.inst_buf.slice(..));
-                        rp.set_index_buffer(b.ib.slice(..), wgpu::IndexFormat::Uint32);
+                        rp.set_index_buffer(b.ib.slice(..), b.index_format);
                         rp.draw_indexed(0..b.index_count, 0, 0..b.inst_count);
                     }
                 }
@@ -1665,7 +1685,7 @@ impl ApplicationHandler for GpuWorldApp {
                         rp.set_bind_group(1, &b.tex_bind_group, &[]);
                         rp.set_vertex_buffer(0, b.vb.slice(..));
                         rp.set_vertex_buffer(1, b.inst_buf.slice(..));
-                        rp.set_index_buffer(b.ib.slice(..), wgpu::IndexFormat::Uint32);
+                        rp.set_index_buffer(b.ib.slice(..), b.index_format);
                         rp.draw_indexed(0..b.index_count, 0, 0..b.inst_count);
                     }
 
