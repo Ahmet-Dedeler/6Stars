@@ -90,7 +90,9 @@ pub fn parse_0drpz_map_entities(sys: &[u8]) -> Option<Vec<EntityPlacement>> {
             ];
             let sxy = rf32(sys, cur + 0x54);
             let sz_s = rf32(sys, cur + 0x58);
-            if pos.iter().all(|v| v.is_finite() && v.abs() < 30_000.0) && rot.iter().all(|v| v.is_finite()) {
+            // an all zero rotation is an empty slot and would normalize to nan downstream
+            let rot_len2: f32 = rot.iter().map(|v| v * v).sum();
+            if pos.iter().all(|v| v.is_finite() && v.abs() < 30_000.0) && rot_len2.is_finite() && rot_len2 > 1e-6 {
                 out.push(EntityPlacement {
                     archetype_hash: arch,
                     pos,

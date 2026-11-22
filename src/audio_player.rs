@@ -738,7 +738,11 @@ impl AudioPlayerState {
         *pending.lock().unwrap() = None;
         std::thread::spawn(move || {
             let res = awc::decode_single_awc_chunk(&raw, coff, csz, sub_stream).map(|(_, pcm)| pcm);
-            *pending.lock().unwrap() = Some((gen, idx, res));
+            // a slower older request must not replace the result of a newer one or the player waits forever
+            let mut slot = pending.lock().unwrap();
+            if slot.as_ref().map_or(true, |(newest, _, _)| *newest <= gen) {
+                *slot = Some((gen, idx, res));
+            }
         });
     }
 

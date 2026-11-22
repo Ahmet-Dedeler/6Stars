@@ -67,7 +67,8 @@ impl Mesh3D {
         MatInfo {
             name: format!("geom_{g:03}{}", if auxiliary { "_aux" } else if paint { "_paint" } else if glass { "_glass" } else { "" }),
             color: if paint { self.paint_color } else if glass { [0.62, 0.71, 0.78] } else { DEFAULT_COLOR },
-            opacity: if glass { GLASS_PREVIEW_ALPHA as f32 / 255.0 } else { 1.0 },
+            // glass that carries its own coverage in the texture is not dimmed twice
+            opacity: if matches!(pass, MaterialPass::Glass { texture_alpha: false }) || (glass && m.is_some_and(|m| m.texture.is_none())) { GLASS_PREVIEW_ALPHA as f32 / 255.0 } else { 1.0 },
             texture: m.and_then(|m| m.texture.as_ref()),
             normal: m.and_then(|m| m.normal.as_ref()),
             pass,
