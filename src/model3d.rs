@@ -2469,6 +2469,35 @@ mod showcase_tests {
         }
     }
 
+    // siren emitters glow over the frame flash with the sequencer and hide behind nearer geometry
+    #[test]
+    fn siren_glow_flashes_and_respects_depth() {
+        let mut m = showcase();
+        m.yaw = 0.0;
+        m.pitch = 0.0;
+        // one emitter in the open above the ground and one inside the opaque box
+        m.els_points = vec![
+            ElsPoint { position: [0.0, 0.0, 2.2], bank: false, slot: 1 },
+            ElsPoint { position: [0.0, -1.9, 0.5], bank: true, slot: 4 },
+        ];
+        m.has_els = true;
+        rasterize_mesh(&mut m, 400, 300);
+        let off = m.color_buf.clone();
+        m.els_enabled = true;
+        m.els_flash = false;
+        rasterize_mesh(&mut m, 400, 300);
+        let on = m.color_buf.clone();
+        let red_gain: i64 = on.iter().zip(&off).map(|(a, b)| a.r() as i64 - b.r() as i64).sum();
+        let blue_gain: i64 = on.iter().zip(&off).map(|(a, b)| a.b() as i64 - b.b() as i64).sum();
+        assert!(red_gain > 2000, "the visible red emitter glows: {red_gain}");
+        assert!(blue_gain < red_gain / 4, "the blue emitter inside the box stays hidden: {blue_gain}");
+        // flashing at a phase where slot 1 is dark draws nothing
+        m.els_flash = true;
+        m.els_flash_phase = 1;
+        rasterize_mesh(&mut m, 400, 300);
+        assert!(m.color_buf == off, "a dark sequencer step adds no glow");
+    }
+
     // shared edges are drawn exactly once so glass does not double blend along its diagonal
     #[test]
     fn shared_edges_are_watertight_and_never_double_blended() {
