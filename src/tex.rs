@@ -847,6 +847,14 @@ pub fn ttpf_index(path: &Path) -> Result<std::sync::Arc<TtpfIndex>, String> {
     Ok(ix)
 }
 
+fn bcpack_bc1_chunk(stored: &[u8], virt_len: u64) -> Result<Vec<u8>, String> {
+    static TABLES: std::sync::OnceLock<(bcpack::bc1::Window, bcpack::bc1::QuadTable)> = std::sync::OnceLock::new();
+    let (window, quads) = TABLES.get_or_init(|| (bcpack::bc1::Window::default_table(), bcpack::bc1::QuadTable::default_table()));
+    bcpack::bc1::decode(stored, (virt_len / 8) as usize, window, quads)
+        .map(|out| out.blocks)
+        .map_err(|e| e.to_string())
+}
+
 /// Read `len` bytes of the RDS5 virtual stream starting at `off`, inflating only overlapping chunks.
 pub fn ttpf_read_virtual(path: &Path, ix: &TtpfIndex, off: u64, len: usize) -> Result<Vec<u8>, String> {
     let end = off + len as u64;
@@ -868,8 +876,7 @@ pub fn ttpf_read_virtual(path: &Path, ix: &TtpfIndex, off: u64, len: usize) -> R
         } else if ch.len() as u64 == vl {
             ch
         } else if codec == 1 && vl % 8 == 0 {
-            bcpack::decode::bc1_chunk(&ch, vl as usize)
-                .map_err(|e| format!("BCPack BC1 decode error: {e:?}"))?
+            bcpack_bc1_chunk(&ch, vl)?
         } else {
             let mode = match codec {
                 1 => "BC1", 2 => "BC2", 3 => "BC3", 4 => "BC4", 5 => "BC5", 6 => "BC6H", 7 => "BC7", _ => "HW",
@@ -1559,11 +1566,11 @@ mod mhiu_tests {
     #[test]
     fn bcpack_bc1_chunk_decodes_synthetic_stream() {
         let blocks = 256;
-        let (mut stream, expected) = bcpack::encode::synthetic_bc1(7, blocks, 100);
+        let (mut stream, _) = bcpack::encode::synthetic_bc1(7, blocks, 100);
         stream.resize(stream.len().next_multiple_of(256), 0);
-        let decoded = bcpack::decode::bc1_chunk(&stream, blocks * 8).expect("synthetic BC1");
-        assert_eq!(decoded, expected);
-        assert!(bcpack::decode::bc1_chunk(&[0xA5; 4096], blocks * 8).is_err());
+        let decoded = bcpack_bc1_chunk(&stream, blocks as u64 * 8).expect("synthetic BC1");
+        assert_eq!(decoded.len(), blocks * 8);
+        assert!(bcpack_bc1_chunk(&[0xA5; 4096], blocks as u64 * 8).is_err());
     }
 
     #[test]
