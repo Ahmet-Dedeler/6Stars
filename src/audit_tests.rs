@@ -24,6 +24,7 @@ fn check(e: &RpfEntry, tmp: &Path) -> Result<String, String> {
         "TXD" => tex::decode_txd_from_rpf(&e.source_rpf, e.offset).and_then(|t| {
             if t.is_empty() { Err("0 textures".into()) } else { Ok(format!("{} textures", t.len())) }
         }),
+        k if pedphys::is_kind(k) => pedphys::audit_decode(e),
         "TTPF" => decode_ttpf_texture(&e.source_rpf, e.tracks as usize).map(|t| match t.full_size {
             Some((fw, fh)) => format!("{}x{} reduced from {fw}x{fh}", t.w, t.h),
             None => format!("{}x{}", t.w, t.h),

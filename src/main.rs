@@ -21,6 +21,7 @@ mod sgd5;
 mod world_gpu;
 mod worldmap;
 mod model3d;
+mod pedphys;
 mod rdna2;
 mod tex;
 mod ttpf_tile;
@@ -403,6 +404,7 @@ enum Category {
     Xml,
     Resources,
     Binary,
+    PedPhysics,
 }
 
 const MODEL_TEX_TIP: &str = "Open every texture this model's materials use as flat images for inspection and export";
@@ -736,7 +738,9 @@ struct Rpf9App {
     hay: Vec<String>,
     hay_ver: u64,
     hay_audio_named: bool,
-    counts: [usize; 11],
+    counts: [usize; 12],
+    /// Preview of a hair groom, cloth, soft body or head delta entry.
+    pedphys_view: Option<pedphys::PedPhysView>,
     cached_rpf_names: Vec<String>,
     last_rebuild: Instant,
     update: Arc<Mutex<UpdateState>>,
@@ -945,7 +949,8 @@ impl Rpf9App {
             hay: Vec::new(),
             hay_ver: u64::MAX,
             hay_audio_named: true,
-            counts: [0; 11],
+            counts: [0; 12],
+            pedphys_view: None,
             cached_rpf_names: Vec::new(),
             last_rebuild: Instant::now(),
             update: Arc::new(Mutex::new(UpdateState::default())),
@@ -1186,6 +1191,7 @@ impl Rpf9App {
         self.lod_keep_cam = None;
         self.preview.clear();
         self.mesh3d = None;
+        self.pedphys_view = None;
         self.show_3d = false;
         self.anim_dur = 0.0;
         self.anim_playing = false;
@@ -2240,6 +2246,12 @@ impl Rpf9App {
             return;
         }
 
+        if pedphys::is_kind(e.kind) {
+            let st = self.state.lock().unwrap();
+            self.pedphys_view = Some(pedphys::PedPhysView::open(&e, &st.entries));
+            return;
+        }
+
         if e.kind == "NAVM" {
             let media = Arc::clone(&self.media);
             {
@@ -2454,10 +2466,11 @@ impl Rpf9App {
             self.cached_rpf_names = st.rpf_names.clone();
             self.hay_ver = st.ver;
             self.hay_audio_named = self.audio_named;
-            let mut c = [0usize; 11];
+            let mut c = [0usize; 12];
             for e in &st.entries {
                 c[0] += 1;
                 c[match e.kind {
+                    k if pedphys::is_kind(k) => 11,
                     "VEH" => 1,
                     "MODEL" => 2,
                     "TXD" | "TTPF" | "HMAP" => 3,
@@ -2493,6 +2506,7 @@ impl Rpf9App {
                     Category::Xml => e.kind == "XML",
                     Category::Resources => matches!(e.kind, "PSIN" | "ANIM" | "RSC9" | "META7A"),
                     Category::Binary => e.kind == "ZLIB",
+                    Category::PedPhysics => pedphys::is_kind(e.kind),
                 };
                 let h = &self.hay[*i];
                 cat_ok
@@ -3775,6 +3789,10 @@ impl Rpf9App {
                         ok += 1;
                     }
                 }
+            } else if pedphys::is_kind(e.kind) {
+                if pedphys::export_entry(&e, &out_dir).is_ok() {
+                    ok += 1;
+                }
             } else if e.kind == "RBF0" {
                 if let Ok(data) = read_entry_bytes(&e) {
                     let xml = decode_rbf0(&data).unwrap_or_else(|| String::from_utf8_lossy(&data).into_owned());
@@ -3816,8 +3834,9 @@ pub(crate) fn app_data_dir() -> Option<PathBuf> {
 }
 
 pub(crate) fn cache_file_path() -> Option<PathBuf> {
-    // v9 scanner rejects metadata and mid resource chunks that v8 listed as model entries
-    app_data_dir().map(|d| d.join("scan_cache_v10.tsv"))
+    // v9 scanner rejects metadata and mid resource chunks that v8 listed as model entries;
+    // v11 lists hair grooms, cloth, soft bodies and head deltas as their own kinds
+    app_data_dir().map(|d| d.join("scan_cache_v11.tsv"))
 }
 
 pub(crate) fn load_last_folder() -> Option<PathBuf> {
@@ -3833,10 +3852,10 @@ fn save_last_folder(folder: &Path) {
     }
 }
 
-const CATS: [Category; 11] = [
+const CATS: [Category; 12] = [
     Category::All, Category::Vehicles, Category::Models, Category::Textures,
     Category::Ui, Category::NavMesh, Category::Videos, Category::Audio,
-    Category::Xml, Category::Resources, Category::Binary,
+    Category::Xml, Category::Resources, Category::Binary, Category::PedPhysics,
 ];
 
 fn save_ui_state(app: &Rpf9App) {
@@ -3891,6 +3910,10 @@ fn load_disk_cache_from(p: &Path) -> HashMap<String, Vec<RpfEntry>> {
             "ANIM" => "ANIM",
             "RSC9" => "RSC9",
             "META7A" => "META7A",
+            "HAIR" => "HAIR",
+            "CLOTH" => "CLOTH",
+            "SOFT" => "SOFT",
+            "HDELTA" => "HDELTA",
             _ => "ZLIB",
         };
         // tolerate old 11 col cache rows and newer 10 col ones
@@ -4186,6 +4209,7 @@ fn kind_search_words(kind: &str) -> &'static str {
         "PSIN" => "resource pso",
         "ANIM" => "animation anim clip",
         "RSC9" => "resource",
+        "HAIR" | "CLOTH" | "SOFT" | "HDELTA" => pedphys::search_words(kind),
         "DAT" => "audio sound metadata",
         "ZLIB" => "binary data",
         _ => "",
@@ -4210,6 +4234,7 @@ fn kind_color(kind: &str) -> Color32 {
         "PSIN" => Color32::from_rgb(210, 120, 255),
         "ANIM" => Color32::from_rgb(100, 225, 195),
         "RSC9" => Color32::from_rgb(120, 185, 255),
+        "HAIR" | "CLOTH" | "SOFT" | "HDELTA" => pedphys::kind_color(kind),
         _ => Color32::from_rgb(145, 152, 168),
     }
 }
@@ -4403,6 +4428,9 @@ fn format_hex(data: &[u8]) -> String {
 
 fn read_entry_bytes(e: &RpfEntry) -> std::io::Result<Vec<u8>> {
     use flate2::read::ZlibDecoder;
+    if pedphys::is_kind(e.kind) {
+        return pedphys::resource_bytes(&e.source_rpf, e.offset);
+    }
     let mut f = File::open(&e.source_rpf)?;
     if !e.chunks.is_empty() {
         let mut combined = Vec::new();
@@ -4531,6 +4559,21 @@ fn probe_rage9_page(
     // reject mid resource virtual chunks that start directly with a grmgeometry struct
     if u64::from_le_bytes(probe_out[0x60..0x68].try_into().ok()?) == 0x1601 {
         return None;
+    }
+    // Ped physics: hair grooms, cloth, soft bodies, head deltas (unnamed resources)
+    let whole = if olen < probe_out.len() { olen } else { usize::MAX };
+    if let Some(pp) = pedphys::probe(&probe_out[..olen], whole, off + p as u64) {
+        return Some(RpfEntry {
+            source_rpf: path.to_path_buf(),
+            rpf_name: rname.to_string(),
+            name: pp.name,
+            kind: pp.kind,
+            offset: off + p as u64,
+            comp_size: probe_dec.total_in(),
+            raw_size: olen as u64,
+            tracks: pp.count,
+            chunks: Vec::new(),
+        });
     }
     // 1. CNavMesh tile (version 0x00010015)
     let ver = u32::from_le_bytes(probe_out[0x14..0x18].try_into().ok()?);
@@ -4767,7 +4810,11 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
         let mut jumped = false;
         while pos + 44 <= read_n {
             if let Some(entry) = probe_rage9_page(buf, pos, read_n, off, path, &rname, &mut probe_dec, &mut probe_out) {
+                let packed = pedphys::is_kind(entry.kind);
                 found.push(entry);
+                if packed {
+                    found.extend(pedphys::packed_followers(buf, pos + 0x10, 8 << 20, off, path, &rname));
+                }
                 pos += 0x1000;
                 continue;
             }
@@ -4929,6 +4976,7 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
     if rname.eq_ignore_ascii_case("audio.rpf") {
         enrich_audio_rpf_entries(path, sz, &mut found);
     }
+    pedphys::name_head_deltas(&mut found);
 
     Ok((hdr_info, found))
 }
@@ -5323,6 +5371,7 @@ impl eframe::App for Rpf9App {
                 (Category::Xml, "Configs (XML)", c[8]),
                 (Category::Resources, "Anim / PSO / RSC9", c[9]),
                 (Category::Binary, "Binary", c[10]),
+                (Category::PedPhysics, "Hair & Cloth", c[11]),
             ] {
                 if has_entries && cat != Category::All && count == 0 {
                     continue;
@@ -5633,6 +5682,8 @@ impl eframe::App for Rpf9App {
                             });
                         });
                 }
+            } else if let Some(view) = self.pedphys_view.as_mut() {
+                view.ui(ui);
             } else if !self.textures.is_empty() {
                 self.render_texture_viewer(ui);
             } else if self.mesh3d.is_some() {
