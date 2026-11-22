@@ -16,6 +16,7 @@ mod model3d;
 mod rdna2;
 mod tex;
 mod vehicle_variations;
+mod bench;
 use std::collections::HashSet;
 use model3d::{
     Mesh3D, decode_rage9_model_from_rpf, decode_rage9_model_from_rpf_lod, extract_0drpz_mesh, extract_rage9_model_name,
@@ -2377,7 +2378,7 @@ impl Rpf9App {
     fn rebuild_view(&mut self, key: (u64, String, Category, String, bool, bool)) {
         let st = self.state.lock().unwrap();
         if self.hay_ver != st.ver || self.hay_audio_named != self.audio_named {
-            self.hay = st.entries.iter().map(|e| format!("{}|{}|{}|{}", e.name, display_entry_name(e, false), e.rpf_name, e.kind).to_lowercase()).collect();
+            self.hay = build_hay(&st.entries);
             self.cached_rpf_names = st.rpf_names.clone();
             self.hay_ver = st.ver;
             self.hay_audio_named = self.audio_named;
@@ -2403,15 +2404,13 @@ impl Rpf9App {
         let (inc, exc): (Vec<&str>, Vec<&str>) = q.split_whitespace().partition(|t| !t.starts_with('-'));
         let exc: Vec<&str> = exc.iter().map(|t| &t[1..]).filter(|t| !t.is_empty()).collect();
         let all_rpf = self.selected_rpf == "All RPFs";
-        let mut view: Vec<usize> = st
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(i, e)| {
-                let cat_ok = match self.category {
+        let (entries, hay, category, vehicles_only, selected_rpf) = (&st.entries, &self.hay, &self.category, self.vehicles_only, &self.selected_rpf);
+        let mut view: Vec<usize> = par_filter(entries.len().min(hay.len()), |i| {
+                let e = &entries[i];
+                let cat_ok = match category {
                     Category::All => true,
                     Category::Vehicles => e.kind == "VEH",
-                    Category::Models => e.kind == "VEH" || (!self.vehicles_only && e.kind == "MODEL"),
+                    Category::Models => e.kind == "VEH" || (!vehicles_only && e.kind == "MODEL"),
                     Category::Textures => e.kind == "TXD" || e.kind == "TTPF" || e.kind == "HMAP",
                     Category::Ui => e.kind == "RBF0" || e.kind == "GFX" || e.kind == "GXT",
                     Category::NavMesh => e.kind == "NAVM",
@@ -2421,23 +2420,21 @@ impl Rpf9App {
                     Category::Resources => matches!(e.kind, "PSIN" | "ANIM" | "RSC9" | "META7A"),
                     Category::Binary => e.kind == "ZLIB",
                 };
-                let h = &self.hay[*i];
+                let h = &hay[i];
                 cat_ok
-                    && (all_rpf || e.rpf_name == self.selected_rpf)
+                    && (all_rpf || e.rpf_name == *selected_rpf)
                     && inc.iter().all(|t| h.contains(t))
                     && !exc.iter().any(|t| h.contains(t))
-            })
-            .map(|(i, _)| i)
-            .collect();
+            });
         match self.sort_mode {
             SortMode::Relevance => {
                 if let Some(first) = inc.first() {
-                    view.sort_by_key(|&i| (!self.hay[i].starts_with(first), self.hay[i].len()));
+                    view.sort_unstable_by_key(|&i| (!self.hay[i].starts_with(first), self.hay[i].len(), i));
                 }
             }
-            SortMode::SizeDesc => view.sort_by_key(|&i| std::cmp::Reverse(st.entries[i].raw_size)),
-            SortMode::SizeAsc => view.sort_by_key(|&i| st.entries[i].raw_size),
-            SortMode::Name => view.sort_by(|&a, &b| self.hay[a].cmp(&self.hay[b])),
+            SortMode::SizeDesc => view.sort_unstable_by_key(|&i| (std::cmp::Reverse(st.entries[i].raw_size), i)),
+            SortMode::SizeAsc => view.sort_unstable_by_key(|&i| (st.entries[i].raw_size, i)),
+            SortMode::Name => view.sort_unstable_by(|&a, &b| self.hay[a].cmp(&self.hay[b]).then(a.cmp(&b))),
         }
         drop(st);
         self.view = view;
@@ -2474,21 +2471,18 @@ impl Rpf9App {
         let ver = self.state.lock().unwrap().ver;
         if self.mv_ver != ver {
             let st = self.state.lock().unwrap();
-            let mut entries = Vec::new();
             let mut counts = [0usize; 10];
-            let mut video_count = 0usize;
-            for (idx, e) in st.entries.iter().enumerate() {
-                if !matches!(e.kind, "MODEL" | "VEH" | "NAVM") {
-                    video_count += usize::from(e.kind == "BK2");
-                    continue;
-                }
-                let cat = classify_model_cat(e.kind, &e.name);
-                if cat != ModelCat::NavMesh {
+            let video_count = st.entries.iter().filter(|e| e.kind == "BK2").count();
+            let models = par_filter(st.entries.len(), |i| matches!(st.entries[i].kind, "MODEL" | "VEH" | "NAVM"));
+            let entries: Vec<(usize, ModelCat, String)> = par_map(&models, |&idx| {
+                let e = &st.entries[idx];
+                (idx, classify_model_cat(e.kind, &e.name), format!("{}|{}", e.name, e.rpf_name).to_ascii_lowercase())
+            });
+            for (_, cat, _) in &entries {
+                if *cat != ModelCat::NavMesh {
                     counts[0] += 1;
                 }
-                counts[model_cat_idx(cat)] += 1;
-                let hay = format!("{}|{}", e.name, e.rpf_name).to_ascii_lowercase();
-                entries.push((idx, cat, hay));
+                counts[model_cat_idx(*cat)] += 1;
             }
             drop(st);
             self.mv_entries = entries;
@@ -2507,17 +2501,15 @@ impl Rpf9App {
         let q = key.2.to_ascii_lowercase();
         let (inc, exc): (Vec<&str>, Vec<&str>) = q.split_whitespace().partition(|t| !t.starts_with('-'));
         let exc: Vec<&str> = exc.iter().map(|t| &t[1..]).filter(|t| !t.is_empty()).collect();
-        let mut view: Vec<usize> = self
-            .mv_entries
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, cat, hay))| {
-                let cat_ok = match self.mv_cat {
+        let (mv_entries, mv_cat, hide_lods) = (&self.mv_entries, self.mv_cat, self.mv_hide_lods);
+        let mut view: Vec<usize> = par_filter(mv_entries.len(), |i| {
+                let (_, cat, hay) = &mv_entries[i];
+                let cat_ok = match mv_cat {
                     ModelCat::All => *cat != ModelCat::NavMesh,
                     other => *cat == other,
                 };
-                let lod_ok = !self.mv_hide_lods
-                    || self.mv_cat == ModelCat::NavMesh
+                let lod_ok = !hide_lods
+                    || mv_cat == ModelCat::NavMesh
                     || (!hay.contains("_slod")
                         && !hay.contains("_lod.")
                         && !hay.contains("_lod_")
@@ -2531,21 +2523,19 @@ impl Rpf9App {
                     && lod_ok
                     && inc.iter().all(|t| hay.contains(t))
                     && !exc.iter().any(|t| hay.contains(t))
-            })
-            .map(|(i, _)| i)
-            .collect();
+            });
         {
             let st = self.state.lock().unwrap();
             let size = |mi: usize| st.entries.get(self.mv_entries[mi].0).map_or(0, |e| e.raw_size);
             match self.sort_mode {
                 SortMode::Relevance => {
                     if let Some(first) = inc.first() {
-                        view.sort_by_key(|&i| (!self.mv_entries[i].2.starts_with(first), self.mv_entries[i].2.len()));
+                        view.sort_unstable_by_key(|&i| (!self.mv_entries[i].2.starts_with(first), self.mv_entries[i].2.len(), i));
                     }
                 }
-                SortMode::SizeDesc => view.sort_by_key(|&i| std::cmp::Reverse(size(i))),
-                SortMode::SizeAsc => view.sort_by_key(|&i| size(i)),
-                SortMode::Name => view.sort_by(|&a, &b| self.mv_entries[a].2.cmp(&self.mv_entries[b].2)),
+                SortMode::SizeDesc => view.sort_unstable_by_key(|&i| (std::cmp::Reverse(size(i)), i)),
+                SortMode::SizeAsc => view.sort_unstable_by_key(|&i| (size(i), i)),
+                SortMode::Name => view.sort_unstable_by(|&a, &b| self.mv_entries[a].2.cmp(&self.mv_entries[b].2).then(a.cmp(&b))),
             }
         }
         self.mv_view = view;
@@ -3768,81 +3758,131 @@ fn load_ui_state(app: &mut Rpf9App) {
 }
 
 fn load_disk_cache() -> HashMap<String, Vec<RpfEntry>> {
+    cache_file_path().map(|p| load_disk_cache_from(&p)).unwrap_or_default()
+}
+
+fn load_disk_cache_from(p: &Path) -> HashMap<String, Vec<RpfEntry>> {
     let mut map: HashMap<String, Vec<RpfEntry>> = HashMap::new();
-    let Some(p) = cache_file_path() else { return map };
-    let Ok(f) = File::open(p) else { return map };
-    for line in BufReader::new(f).lines().map_while(Result::ok) {
-        let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() < 9 { continue; }
-        let kind: &'static str = match cols[4] {
-            "VEH" => "VEH",
-            "MODEL" => "MODEL",
-            "TXD" => "TXD",
-            "TTPF" => "TTPF",
-            "RBF0" => "RBF0",
-            "GFX" => "GFX",
-            "GXT" => "GXT",
-            "NAVM" => "NAVM",
-            "BK2" => "BK2",
-            "AWC" => "AWC",
-            "XML" => "XML",
-            "DAT" => "DAT",
-            "HMAP" => "HMAP",
-            "PSIN" => "PSIN",
-            "ANIM" => "ANIM",
-            "RSC9" => "RSC9",
-            "META7A" => "META7A",
-            _ => "ZLIB",
-        };
-        // tolerate old 11 col cache rows and newer 10 col ones
-        let tracks_col = if cols.len() >= 11 { 9 } else { 8 };
-        let chunks_col = tracks_col + 1;
-        let chunks = if cols.len() > chunks_col && !cols[chunks_col].is_empty() {
-            cols[chunks_col].split(';').filter_map(|pair| {
-                let mut it = pair.split(',');
-                Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
-            }).collect()
-        } else {
-            Vec::new()
-        };
-        map.entry(cols[0].to_string()).or_default().push(RpfEntry {
-            source_rpf: PathBuf::from(cols[1]),
-            rpf_name: cols[2].to_string(),
-            name: cols[3].to_string(),
-            kind,
-            offset: cols[5].parse().unwrap_or(0),
-            comp_size: cols[6].parse().unwrap_or(0),
-            raw_size: cols[7].parse().unwrap_or(0),
-            tracks: cols[tracks_col].parse().unwrap_or(0),
-            chunks,
-        });
+    let Ok(bytes) = fs::read(p) else { return map };
+    let text = String::from_utf8_lossy(&bytes);
+    let lines: Vec<&str> = text.lines().collect();
+    for row in par_map(&lines, |l| parse_cache_row(l)).into_iter().flatten() {
+        let (key, e) = row;
+        match map.get_mut(key) {
+            Some(v) => v.push(e),
+            None => {
+                map.insert(key.to_string(), vec![e]);
+            }
+        }
     }
     map
 }
 
+fn parse_cache_row(line: &str) -> Option<(&str, RpfEntry)> {
+    let mut cols = [""; 12];
+    let mut n = 0;
+    for c in line.split('\t') {
+        if n == cols.len() {
+            break;
+        }
+        cols[n] = c;
+        n += 1;
+    }
+    if n < 9 {
+        return None;
+    }
+    let kind: &'static str = match cols[4] {
+        "VEH" => "VEH",
+        "MODEL" => "MODEL",
+        "TXD" => "TXD",
+        "TTPF" => "TTPF",
+        "RBF0" => "RBF0",
+        "GFX" => "GFX",
+        "GXT" => "GXT",
+        "NAVM" => "NAVM",
+        "BK2" => "BK2",
+        "AWC" => "AWC",
+        "XML" => "XML",
+        "DAT" => "DAT",
+        "HMAP" => "HMAP",
+        "PSIN" => "PSIN",
+        "ANIM" => "ANIM",
+        "RSC9" => "RSC9",
+        "META7A" => "META7A",
+        _ => "ZLIB",
+    };
+    // tolerate old 11 col cache rows and newer 10 col ones
+    let tracks_col = if n >= 11 { 9 } else { 8 };
+    let chunks_col = tracks_col + 1;
+    let chunks = if n > chunks_col && !cols[chunks_col].is_empty() {
+        cols[chunks_col].split(';').filter_map(|pair| {
+            let mut it = pair.split(',');
+            Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+        }).collect()
+    } else {
+        Vec::new()
+    };
+    Some((cols[0], RpfEntry {
+        source_rpf: PathBuf::from(cols[1]),
+        rpf_name: cols[2].to_string(),
+        name: cols[3].to_string(),
+        kind,
+        offset: cols[5].parse().unwrap_or(0),
+        comp_size: cols[6].parse().unwrap_or(0),
+        raw_size: cols[7].parse().unwrap_or(0),
+        tracks: cols[tracks_col].parse().unwrap_or(0),
+        chunks,
+    }))
+}
+
 // atomic write via tmp file so ctrl c never corrupts the cahce
 fn save_disk_cache(map: &HashMap<String, Vec<RpfEntry>>) {
-    let Some(p) = cache_file_path() else { return };
+    if let Some(p) = cache_file_path() {
+        save_disk_cache_to(map, &p);
+    }
+}
+
+fn save_disk_cache_to(map: &HashMap<String, Vec<RpfEntry>>, p: &Path) {
     if let Some(parent) = p.parent() {
         let _ = fs::create_dir_all(parent);
     }
     let tmp = p.with_extension("tmp");
     let Ok(f) = File::create(&tmp) else { return };
     let mut w = BufWriter::new(f);
-    for (key, entries) in map {
-        for e in entries {
-            let chunks_s: String = e.chunks.iter().map(|(a, b)| format!("{a},{b}")).collect::<Vec<_>>().join(";");
-            let _ = writeln!(
-                w,
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                key, e.source_rpf.display(), e.rpf_name, e.name, e.kind,
-                e.offset, e.comp_size, e.raw_size, e.tracks, chunks_s
-            );
-        }
-    }
-    if w.flush().is_ok() {
+    // rows are formatted on all cores in blocks then written in order
+    let rows: Vec<(&str, &RpfEntry)> = map.iter().flat_map(|(k, v)| v.iter().map(move |e| (k.as_str(), e))).collect();
+    let per = rows.len().div_ceil(std::thread::available_parallelism().map_or(1, |n| n.get())).max(8192);
+    let blocks: Vec<Vec<u8>> = std::thread::scope(|s| {
+        let parts: Vec<_> = rows
+            .chunks(per)
+            .map(|c| {
+                s.spawn(move || {
+                    let mut b = Vec::with_capacity(c.len() * 200);
+                    for (key, e) in c {
+                        let _ = write!(
+                            b,
+                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t",
+                            key, e.source_rpf.display(), e.rpf_name, e.name, e.kind,
+                            e.offset, e.comp_size, e.raw_size, e.tracks
+                        );
+                        for (j, (a, z)) in e.chunks.iter().enumerate() {
+                            let _ = write!(b, "{}{a},{z}", if j > 0 { ";" } else { "" });
+                        }
+                        b.push(b'\n');
+                    }
+                    b
+                })
+            })
+            .collect();
+        parts.into_iter().map(|p| p.join().unwrap_or_default()).collect()
+    });
+    // a failed write must never replace the good cache with a cut one
+    if blocks.iter().all(|b| w.write_all(b).is_ok()) && w.flush().is_ok() {
         drop(w);
-        let _ = fs::rename(&tmp, &p);
+        let _ = fs::rename(&tmp, p);
+    } else {
+        drop(w);
+        let _ = fs::remove_file(&tmp);
     }
 }
 
@@ -4397,6 +4437,67 @@ fn probe_rage9_page(
     })
 }
 
+// runs probe_rage9_page on every 4kb page of buf on all cores, slot i holds the page at i * 0x1000
+fn probe_pages(buf: &[u8], read_n: usize, off: u64, path: &Path, rname: &str) -> Vec<Option<RpfEntry>> {
+    use std::sync::atomic::AtomicUsize;
+    const PAGES_PER_JOB: usize = 64;
+    let pages = if read_n >= 44 { (read_n - 44) / 0x1000 + 1 } else { 0 };
+    let mut out: Vec<Option<RpfEntry>> = (0..pages).map(|_| None).collect();
+    let next = AtomicUsize::new(0);
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get()).min(pages.div_ceil(PAGES_PER_JOB)).max(1);
+    let found: Vec<Vec<(usize, RpfEntry)>> = std::thread::scope(|s| {
+        let workers: Vec<_> = (0..cores)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut dec = Decompress::new(true);
+                    let mut scratch = vec![0u8; 32768];
+                    let mut hits = Vec::new();
+                    loop {
+                        let job = next.fetch_add(1, Ordering::Relaxed) * PAGES_PER_JOB;
+                        if job >= pages {
+                            return hits;
+                        }
+                        for i in job..(job + PAGES_PER_JOB).min(pages) {
+                            if let Some(e) = probe_rage9_page(buf, i * 0x1000, read_n, off, path, rname, &mut dec, &mut scratch) {
+                                hits.push((i, e));
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        workers.into_iter().map(|w| w.join().unwrap_or_default()).collect()
+    });
+    for (i, e) in found.into_iter().flatten() {
+        out[i] = Some(e);
+    }
+    out
+}
+
+type ChunkReader = (std::sync::mpsc::Sender<u64>, std::sync::mpsc::Receiver<(u64, std::io::Result<Vec<u8>>)>);
+
+// reads 16mb chunks on its own thread one request ahead so the disk never waits for the probes
+// send an offset, receive (offset, bytes); an empty chunk means end of file
+fn spawn_chunk_reader(path: &Path) -> std::io::Result<ChunkReader> {
+    let mut f = File::open(path)?;
+    let (req_tx, req_rx) = std::sync::mpsc::channel::<u64>();
+    let (res_tx, res_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for at in req_rx {
+            let res = f.seek(SeekFrom::Start(at)).and_then(|_| {
+                let mut b = vec![0u8; 16 * 1024 * 1024];
+                let n = f.read(&mut b)?;
+                b.truncate(n);
+                Ok(b)
+            });
+            if res_tx.send((at, res)).is_err() {
+                return;
+            }
+        }
+    });
+    Ok((req_tx, res_rx))
+}
+
 // single 16mb sequntial stream avoids hdd seek thrash while indexing vehicles
 fn scan_levels_vehicle_zone(levels_rpf: &PathBuf, live_state: Option<&Arc<Mutex<ScanState>>>) -> Vec<RpfEntry> {
     let sz = fs::metadata(levels_rpf).map(|m| m.len()).unwrap_or(0);
@@ -4404,23 +4505,21 @@ fn scan_levels_vehicle_zone(levels_rpf: &PathBuf, live_state: Option<&Arc<Mutex<
     let total_len = sz.saturating_sub(start_off);
     if total_len == 0 { return Vec::new(); }
     let rname = levels_rpf.file_name().unwrap_or_default().to_string_lossy().into_owned();
-    let Ok(mut f) = File::open(levels_rpf) else { return Vec::new() };
-    if f.seek(SeekFrom::Start(start_off)).is_err() { return Vec::new(); }
+    let Ok((req, chunks)) = spawn_chunk_reader(levels_rpf) else { return Vec::new() };
 
     let mut all_entries: Vec<RpfEntry> = Vec::new();
     let mut local_batch: Vec<RpfEntry> = Vec::with_capacity(32);
-    let mut buf = vec![0u8; 16 * 1024 * 1024];
-    let mut probe_dec = Decompress::new(true);
-    let mut probe_out = vec![0u8; 32768];
     let mut off = start_off;
     let mut last_pct = 999u64;
+    let _ = req.send(off);
 
     while off < sz {
-        let Ok(n) = f.read(&mut buf) else { break };
+        let Ok((_, Ok(buf))) = chunks.recv() else { break };
+        let n = buf.len();
         if n == 0 { break; }
-        let mut pos = 0usize;
-        while pos + 44 <= n {
-            if let Some(entry) = probe_rage9_page(&buf, pos, n, off, levels_rpf, &rname, &mut probe_dec, &mut probe_out) {
+        let _ = req.send(off + n as u64);
+        for entry in probe_pages(&buf, n, off, levels_rpf, &rname).into_iter().flatten() {
+            {
                 local_batch.push(entry);
                 if local_batch.len() >= 15 {
                     if let Some(st) = live_state {
@@ -4431,7 +4530,6 @@ fn scan_levels_vehicle_zone(levels_rpf: &PathBuf, live_state: Option<&Arc<Mutex<
                     all_entries.append(&mut local_batch);
                 }
             }
-            pos += 0x1000;
         }
         off += n as u64;
         if let Some(st) = live_state {
@@ -4512,14 +4610,19 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
     };
     let mut found = Vec::new();
     let mut off = 0u64;
-    let mut buf = if whole.is_some() { Vec::new() } else { vec![0u8; 16 * 1024 * 1024] };
     let mut probe_dec = Decompress::new(true);
     let mut probe_out = vec![0u8; 32768];
     let mut bk2_idx = 0usize;
     let mut awc_idx = 0usize;
     let mut last_ui_mb = 0u64;
-    let mut need_seek = true;
     let scan_limit = if rname.eq_ignore_ascii_case("levels.rpf") && sz > VEH_ZONE_OFF { VEH_ZONE_OFF } else { sz };
+    // a page probe reads the same bytes whatever offset the whole-file slice starts at, so one pass covers every page
+    let mut whole_pages = whole.as_ref().map(|w| probe_pages(w, w.len(), 0, path, &rname)).unwrap_or_default();
+    let reader = if whole.is_none() { Some(spawn_chunk_reader(path)?) } else { None };
+    let mut chunk: Vec<u8>;
+    if let Some((req, _)) = &reader {
+        let _ = req.send(0);
+    }
 
     while off < scan_limit {
         if let Some(st) = progress_state {
@@ -4530,23 +4633,45 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
             }
         }
         let read_n;
+        let mut chunk_pages = Vec::new();
         let buf: &[u8] = if let Some(w) = &whole {
             let s = &w[(off as usize).min(w.len())..];
             read_n = s.len();
             s
         } else {
-            if need_seek {
-                f.seek(SeekFrom::Start(off))?;
-                need_seek = false;
+            let (req, chunks) = reader.as_ref().expect("reader exists without whole");
+            loop {
+                let (at, res) = chunks.recv().map_err(|_| std::io::Error::other("reader thread stopped"))?;
+                // a read queued before a jump is stale, the jump target was requested right after it
+                if at == off {
+                    chunk = res?;
+                    break;
+                }
             }
-            read_n = f.read(&mut buf)?;
-            &buf[..read_n]
+            read_n = chunk.len();
+            if read_n > 0 {
+                let _ = req.send(off + read_n as u64);
+                chunk_pages = probe_pages(&chunk, read_n, off, path, &rname);
+            }
+            &chunk
         };
         if read_n == 0 { break; }
         let mut pos = 0usize;
         let mut jumped = false;
         while pos + 44 <= read_n {
-            if let Some(entry) = probe_rage9_page(buf, pos, read_n, off, path, &rname, &mut probe_dec, &mut probe_out) {
+            let abs = off as usize + pos;
+            let pre = if whole.is_some() && abs.is_multiple_of(0x1000) {
+                whole_pages.get_mut(abs / 0x1000).map(Option::take)
+            } else if whole.is_none() && pos.is_multiple_of(0x1000) {
+                chunk_pages.get_mut(pos / 0x1000).map(Option::take)
+            } else {
+                None
+            };
+            let probed = match pre {
+                Some(p) => p,
+                None => probe_rage9_page(buf, pos, read_n, off, path, &rname, &mut probe_dec, &mut probe_out),
+            };
+            if let Some(entry) = probed {
                 found.push(entry);
                 pos += 0x1000;
                 continue;
@@ -4594,7 +4719,9 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
                     if next_page > off + read_n as u64 {
                         off = next_page;
                         jumped = true;
-                        need_seek = true;
+                        if let Some((req, _)) = &reader {
+                            let _ = req.send(off);
+                        }
                         break;
                     } else {
                         pos = (next_page - off) as usize;
@@ -4705,6 +4832,61 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
     }
 
     Ok((hdr_info, found))
+}
+
+// lowercase search text per entry, index matches entries
+fn build_hay(entries: &[RpfEntry]) -> Vec<String> {
+    par_map(entries, |e| {
+        let shown = display_entry_name(e, false);
+        let mut h = String::with_capacity(e.name.len() + shown.len() + e.rpf_name.len() + e.kind.len() + 3);
+        for (i, part) in [e.name.as_str(), &shown, &e.rpf_name, e.kind].into_iter().enumerate() {
+            if i > 0 {
+                h.push('|');
+            }
+            h.push_str(part);
+        }
+        if h.is_ascii() {
+            h.make_ascii_lowercase();
+            h
+        } else {
+            h.to_lowercase()
+        }
+    })
+}
+
+// indices in 0..n that pass keep, in order, checked on all cores
+fn par_filter(n: usize, keep: impl Fn(usize) -> bool + Sync) -> Vec<usize> {
+    let cores = std::thread::available_parallelism().map_or(1, |c| c.get());
+    let per = n.div_ceil(cores).max(16384);
+    if per >= n {
+        return (0..n).filter(|&i| keep(i)).collect();
+    }
+    let keep = &keep;
+    std::thread::scope(|s| {
+        let parts: Vec<_> = (0..n)
+            .step_by(per)
+            .map(|a| s.spawn(move || (a..(a + per).min(n)).filter(|&i| keep(i)).collect::<Vec<_>>()))
+            .collect();
+        parts.into_iter().flat_map(|p| p.join().expect("par_filter worker panicked")).collect()
+    })
+}
+
+// order keeping map over all cores for the big per entry passes
+fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let per = items.len().div_ceil(cores).max(4096);
+    if per >= items.len() {
+        return items.iter().map(f).collect();
+    }
+    let f = &f;
+    std::thread::scope(|s| {
+        let parts: Vec<_> = items.chunks(per).map(|c| s.spawn(move || c.iter().map(f).collect::<Vec<R>>())).collect();
+        let mut out = Vec::with_capacity(items.len());
+        for p in parts {
+            out.extend(p.join().expect("par_map worker panicked"));
+        }
+        out
+    })
 }
 
 fn display_entry_name(e: &RpfEntry, audio_named: bool) -> std::borrow::Cow<'_, str> {
@@ -5775,6 +5957,10 @@ fn main() -> eframe::Result<()> {
             eprintln!("{error}");
             std::process::exit(1);
         }
+        return Ok(());
+    }
+    if args.len() >= 3 && args[1] == "--bench" {
+        bench::run(Path::new(&args[2]), args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3), args.get(4).map_or("", String::as_str));
         return Ok(());
     }
     if args.len() >= 3 && args[1] == "--probe-maps" {

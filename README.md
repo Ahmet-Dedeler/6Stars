@@ -62,6 +62,37 @@
 
 ---
 
+## What's New (v1.5.0) — Speed Release
+
+Every hot path was timed on a real GTA VI build (Ryzen 5 3600XT, 16 GB RAM, game on a 7200 rpm HDD), then made faster without changing a single result. Best of 3 runs, warm files, same machine, back to back:
+
+| Task | v1.4.8 | v1.5.0 | Faster |
+|---|---:|---:|---:|
+| Load scan index at startup (1.32M entries) | 1671 ms | 640 ms | **2.6x** |
+| Build search index | 687 ms | 62 ms | **11x** |
+| Search query (`adder`) | 54.5 ms | 12.4 ms | **4.4x** |
+| Search query (`tex_ bc7 -mip`) | 61.4 ms | 11.9 ms | **5.2x** |
+| Save scan index | 4227 ms | 509 ms | **8.3x** |
+| Open 40 texture dictionaries (textures.rpf) | 15428 ms | 5980 ms | **2.6x** |
+| Decode 60 TTPF textures | 9.8 ms | 5.1 ms | **1.9x** |
+| Scan data.rpf (459 MB) | 4517 ms | 1887 ms | **2.4x** |
+| Scan shaders.rpf (393 MB) | 1347 ms | 945 ms | **1.4x** |
+| Scan script.rpf | 34.5 ms | 19.8 ms | **1.7x** |
+| Scan common.rpf | 82.2 ms | 49.6 ms | **1.7x** |
+| Scan packs.rpf (4.5 GB, disk bound) | 40.4 s | 33.3 s | **1.2x** |
+
+**Proof the output is identical:** the benchmark prints a checksum of every scan result, every decoded pixel and the whole search index. All of them match between v1.4.8 and v1.5.0, and a save then reload of the scan index gives back the same data. Full raw output: [`docs/bench/v1.4.8_vs_v1.5.0.txt`](docs/bench/v1.4.8_vs_v1.5.0.txt).
+
+**Run it yourself:** `PercyStar.exe --bench "<game folder>" [runs] [filter]` (filter is a comma list such as `cache,txd,data.rpf`).
+
+What changed:
+- **BC1 / BC2 / BC3 / BC4 / BC5 / BC6H / BC7 decoding uses every CPU core** (image split into bands of block rows). BC7 was 80% of texture dictionary load time.
+- **zlib now uses the `zlib-rs` backend** (pure Rust, faster inflate) for all archive reads.
+- **Archive scanning probes every 4 KB page on all cores** and reads the next 16 MB chunk on its own thread while the current one is probed, so the disk never waits. Same for the levels.rpf vehicle index.
+- **Scan index (`scan_cache_v9.tsv`) loads and saves on all cores**; a failed save no longer replaces a good cache with a cut one.
+- **Search index, filtering and the Model Viewer list are built on all cores**; sorting skips the merge buffer while keeping the exact same order.
+- **Verified Test Suite**: `98 passed; 0 failed` (`cargo test --release`).
+
 ## What's New (v1.4.8)
 
 - **Stale Decode & World Streamer Reliability (PR #43, `@asm512`)**:

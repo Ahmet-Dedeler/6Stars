@@ -307,29 +307,62 @@ pub fn premultiplied_for_egui(pixels: &[Color32]) -> Vec<Color32> {
         .collect()
 }
 
+// splits a 4x4 block image into bands of whole block rows and decodes the bands on all cores
+// decode gets the band's blocks, the band height in pixels and the band's slice of the output
+fn par_block_rows<T: Send>(
+    lin: &[u8],
+    w: usize,
+    h: usize,
+    block_bytes: usize,
+    out: &mut [T],
+    decode: impl Fn(&[u8], usize, &mut [T]) -> Option<()> + Sync,
+) -> Option<()> {
+    let (bw, bh) = (w.div_ceil(4), h.div_ceil(4));
+    let need = bw.checked_mul(bh)?.checked_mul(block_bytes)?;
+    if w == 0 || lin.len() < need || out.len() < w * h {
+        return None;
+    }
+    let (lin, out) = (&lin[..need], &mut out[..w * h]);
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    // small images are not worth a thread
+    let rows = bh.div_ceil(cores).max(32);
+    if rows >= bh {
+        return decode(lin, h, out);
+    }
+    let decode = &decode;
+    std::thread::scope(|s| {
+        let bands: Vec<_> = lin
+            .chunks(rows * bw * block_bytes)
+            .zip(out.chunks_mut(rows * 4 * w))
+            .map(|(d, o)| s.spawn(move || decode(d, o.len() / w, o)))
+            .collect();
+        // join every band before answering so none outlives the borrow
+        bands.into_iter().map(|b| b.join().ok().flatten()).fold(Some(()), |a, b| a.and(b))
+    })
+}
+
 // walks 4x4 blocks row major put writes texel 0 to 15 of the current block cropping at the texture edge
 fn for_each_block(
     lin: &[u8],
     w: usize,
     h: usize,
     block_bytes: usize,
-    mut decode: impl FnMut(&[u8], &mut dyn FnMut(usize, Color32)),
+    decode: impl Fn(&[u8], &mut dyn FnMut(usize, Color32)) + Sync,
     pixels: &mut [Color32],
 ) -> Option<()> {
-    let (bw, bh) = (w.div_ceil(4), h.div_ceil(4));
-    if lin.len() < bw.checked_mul(bh)?.checked_mul(block_bytes)? || pixels.len() < w * h {
-        return None;
-    }
-    for (bi, blk) in lin.chunks_exact(block_bytes).take(bw * bh).enumerate() {
-        let (bx, by) = ((bi % bw) * 4, (bi / bw) * 4);
-        decode(blk, &mut |i, c| {
-            let (x, y) = (bx + (i & 3), by + (i >> 2));
-            if x < w && y < h {
-                pixels[y * w + x] = c;
-            }
-        });
-    }
-    Some(())
+    par_block_rows(lin, w, h, block_bytes, pixels, |lin, h, pixels| {
+        let bw = w.div_ceil(4);
+        for (bi, blk) in lin.chunks_exact(block_bytes).enumerate() {
+            let (bx, by) = ((bi % bw) * 4, (bi / bw) * 4);
+            decode(blk, &mut |i, c| {
+                let (x, y) = (bx + (i & 3), by + (i >> 2));
+                if x < w && y < h {
+                    pixels[y * w + x] = c;
+                }
+            });
+        }
+        Some(())
+    })
 }
 
 // color block of bc2 and bc3 always four colors bc1 switches to three colors plus black when c0 <= c1
@@ -423,7 +456,7 @@ pub fn decode_linear_to_rgba(lin: &[u8], w: usize, h: usize, dxgi: u8) -> Option
     if matches!(dxgi, 71 | 72 | 95 | 96 | 98 | 99) {
         let mut out_u32 = vec![0u32; w * h];
         let res = match dxgi {
-            71 | 72 => texture2ddecoder::decode_bc1a(lin, w, h, &mut out_u32),
+            71 | 72 => par_block_rows(lin, w, h, 8, &mut out_u32, |d, bh, o| texture2ddecoder::decode_bc1a(d, w, bh, o).ok()),
             95 | 96 => {
                 // Work around texture2ddecoder 0.1.2 bug: BC6H mode 15 (0x0F, endpoint_bits=16)
                 // overflows `1i16 << 16` in debug builds. Convert mode-15 blocks to mode-3 (0x03)
@@ -434,16 +467,18 @@ pub fn decode_linear_to_rgba(lin: &[u8], w: usize, h: usize, dxgi: u8) -> Option
                         blk[0] = (blk[0] & !0x1F) | 0x03;
                     }
                 }
-                if dxgi == 95 {
-                    texture2ddecoder::decode_bc6_unsigned(&safe, w, h, &mut out_u32)
-                } else {
-                    texture2ddecoder::decode_bc6_signed(&safe, w, h, &mut out_u32)
-                }
+                par_block_rows(&safe, w, h, 16, &mut out_u32, |d, bh, o| {
+                    if dxgi == 95 {
+                        texture2ddecoder::decode_bc6_unsigned(d, w, bh, o).ok()
+                    } else {
+                        texture2ddecoder::decode_bc6_signed(d, w, bh, o).ok()
+                    }
+                })
             }
-            98 | 99 => texture2ddecoder::decode_bc7(lin, w, h, &mut out_u32),
+            98 | 99 => par_block_rows(lin, w, h, 16, &mut out_u32, |d, bh, o| texture2ddecoder::decode_bc7(d, w, bh, o).ok()),
             _ => unreachable!(),
         };
-        res.ok()?;
+        res?;
         let mut pixels = Vec::with_capacity(w * h);
         for px in out_u32 {
             // texture2ddecoder packs u32 as 0xAARRGGBB (BGRA little-endian)
