@@ -9,7 +9,8 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-v1.4.7-FFA81C?style=flat-square" alt="Version" />
+  <img src="https://img.shields.io/badge/Version-v1.5.1-FFA81C?style=flat-square" alt="Version" />
+  <a href="https://github.com/sponsors/rpatty-dev"><img src="https://img.shields.io/badge/Sponsor-%E2%99%A5%20Support%20Development-ea4aaa?style=flat-square&logo=githubsponsors" alt="Sponsor" /></a>
   <img src="https://img.shields.io/badge/Rust-1.89%2B-orange?style=flat-square&logo=rust" alt="Rust" />
   <img src="https://img.shields.io/badge/Shaders-RDNA2%20GFX10.3%20%E2%86%92%20HLSL%20%2F%20SPIR--V-FF4FA3?style=flat-square" alt="Shaders" />
   <img src="https://img.shields.io/badge/Textures-100%25%20DXGI%20%2B%20RDNA2%204KB%2F64KB-48D2FF?style=flat-square" alt="Textures" />
