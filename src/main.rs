@@ -781,6 +781,7 @@ struct Rpf9App {
     audio_named: bool,
     multi_selected: HashSet<usize>,
     multi_anchor: Option<usize>,
+    marquee_start: Option<egui::Pos2>,
     // cachd ui list so huge scans never re filter or clone evry fram
     view: Vec<usize>,
     view_key: Option<(u64, String, Category, String, bool, bool)>,
@@ -979,6 +980,7 @@ impl Rpf9App {
             audio_named: true,
             multi_selected: HashSet::new(),
             multi_anchor: None,
+            marquee_start: None,
             view: Vec::new(),
             view_key: None,
             hay: Vec::new(),
@@ -5095,18 +5097,19 @@ impl eframe::App for Rpf9App {
             });
             let mut clicked: Option<(usize, bool, bool)> = None;
             let mut copied_msg: Option<String> = None;
+            let mut row_rects: Vec<(usize, f32, f32)> = Vec::new();
             let scroll_to_sel = std::mem::take(&mut self.explorer_scroll_to_sel);
             // rows must be exactly row_h tall or show_rows miscomputes total height
             const ROW_H: f32 = 20.0;
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, ROW_H, self.view.len(), |ui, range| {
+            let scroll_resp = egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, ROW_H, self.view.len(), |ui, range| {
                 let rows: Vec<(usize, RpfEntry)> = {
                     let st = self.state.lock().unwrap();
                     self.view[range].iter().filter_map(|&i| st.entries.get(i).map(|e| (i, e.clone()))).collect()
                 };
                 for (idx, e) in &rows {
                     let w = ui.available_width();
-                    ui.allocate_ui_with_layout(egui::vec2(w, ROW_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    let row_alloc = ui.allocate_ui_with_layout(egui::vec2(w, ROW_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.set_height(ROW_H);
                         ui.label(RichText::new(format!("{:<4}", e.kind)).strong().size(11.5).color(kind_color(e.kind)));
                         let sz_s = format_size(e.raw_size);
@@ -5155,8 +5158,41 @@ impl eframe::App for Rpf9App {
                             copied_msg = Some(msg);
                         }
                     });
+                    row_rects.push((*idx, row_alloc.response.rect.min.y, row_alloc.response.rect.max.y));
                 }
             });
+            // Marquee drag selection in Explorer list (#38)
+            let list_rect = scroll_resp.inner_rect;
+            let (p_down, p_pos, ctrl_held) = ctx.input(|i| (i.pointer.primary_down(), i.pointer.interact_pos(), i.modifiers.command));
+            if p_down {
+                if let Some(pos) = p_pos {
+                    if self.marquee_start.is_none() && list_rect.contains(pos) {
+                        self.marquee_start = Some(pos);
+                    }
+                    if let Some(start) = self.marquee_start {
+                        if start.distance(pos) > 5.0 {
+                            let drag_rect = egui::Rect::from_two_pos(start, pos).intersect(list_rect);
+                            ui.painter().rect(
+                                drag_rect,
+                                2.0,
+                                Color32::from_rgba_unmultiplied(120, 210, 255, 40),
+                                egui::Stroke::new(1.0_f32, Color32::from_rgb(120, 210, 255)),
+                                egui::StrokeKind::Inside,
+                            );
+                            if !ctrl_held {
+                                self.multi_selected.clear();
+                            }
+                            for &(idx, y0, y1) in &row_rects {
+                                if y1 >= drag_rect.min.y && y0 <= drag_rect.max.y {
+                                    self.multi_selected.insert(idx);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                self.marquee_start = None;
+            }
             if let Some(msg) = copied_msg {
                 self.state.lock().unwrap().status = msg;
             }
