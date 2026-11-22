@@ -1283,7 +1283,7 @@ impl GpuWorldApp {
     fn sample_terrain_z(&self, x: f32, y: f32) -> f32 {
         let Some(ref t) = self.terrain_ref else { return 0.0 };
         let u = ((x - t.bmin[0]) / (t.bmax[0] - t.bmin[0]).max(1.0)).clamp(0.0, 1.0);
-        let v = ((y - t.bmin[1]) / (t.bmax[1] - t.bmin[1]).max(1.0)).clamp(0.0, 1.0);
+        let v = (1.0 - (y - t.bmin[1]) / (t.bmax[1] - t.bmin[1]).max(1.0)).clamp(0.0, 1.0);
         let ix = ((u * (t.w.saturating_sub(1)) as f32) as usize).min(t.w - 1);
         let iy = ((v * (t.h.saturating_sub(1)) as f32) as usize).min(t.h - 1);
         let h = t.heights[iy * t.w + ix] as f32 / 255.0;
@@ -1748,4 +1748,33 @@ fn pollster_block_on<F: std::future::Future>(fut: F) -> F::Output {
         }
         std::thread::yield_now();
     }
+}
+
+#[cfg(test)]
+mod terrain_sampling_tests {
+    use super::*;
+    #[test]
+    fn camera_keeps_configured_start_and_samples_north_to_south() {
+        let cfg = WorldLaunchConfig {
+            terrain: Some(Arc::new(WorldMapData {
+                w: 2,
+                h: 2,
+                bmin: [-10.0, -10.0, 0.0],
+                bmax: [10.0, 10.0, 255.0],
+                heights: vec![10, 10, 200, 200],
+                tex: None,
+            })),
+            batches: vec![],
+            levels_rpf: None,
+            map_count: 1,
+            start_pos: [-127.276, -1855.924, 24.0],
+        };
+        let (_, rx) = mpsc::sync_channel(16);
+        let start = Vec3::from_array(cfg.start_pos);
+        let app = GpuWorldApp::new(cfg, rx, Arc::new(std::sync::Mutex::new((start, 1))));
+        assert_eq!(app.cam_pos, start);
+        assert!((app.sample_terrain_z(0.0, 10.0) - 10.0).abs() < 0.001);
+        assert!((app.sample_terrain_z(0.0, -10.0) - 200.0).abs() < 0.001);
+    }
+
 }
