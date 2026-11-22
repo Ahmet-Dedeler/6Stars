@@ -1,3 +1,4 @@
+#[cfg(windows)]
 use std::ffi::CString;
 use std::path::Path;
 
@@ -10,6 +11,7 @@ pub struct BinkInfo {
     pub fps_div: u32,
 }
 
+#[cfg(any(windows, test))]
 pub fn validate_bink_prefix(words: &[u32; 7]) -> Option<BinkInfo> {
     let [w, h, frames, _cur, _last, fps_num, fps_div] = *words;
     if (1..=16384).contains(&w) && (1..=16384).contains(&h) && frames > 0 {
