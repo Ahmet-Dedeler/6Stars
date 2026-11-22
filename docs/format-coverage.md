@@ -15,6 +15,7 @@ What Percy6Stars can show for each kind of entry its scanner recognizes. Coverag
 | RBF0 | Every sampled resource decoded to XML. |
 | BK2 video | `KB2n` and `KB2j` revisions play in the preview panel with the packaged decoder. |
 | XML | Nearly every sample passed the UTF-8 check. |
+| Hair grooms, cloth, soft bodies, head deltas | Decoded in full by a separate check (`pedphys_packs`, below) on one character pack: all 20,010 grooms (5.57 M guide strands, every system and graphics byte typed), 13,067 cloth and soft bodies (edge indices all in range) and 6,758 head deltas, 0 decode errors. Grooms show as strands and can be put on a head; cloth as particles and constraints. A head delta applies to its base head only when a head drawable of the same class in the archive matches it, since that is how its vertex order is recovered. |
 | Scaleform GFx | Symbol and metadata inspection, not an interactive Flash preview. |
 
 The shader tab inspects supported RDNA2 PSO caches separately. The archive scan doesn't inventory every container entry, and it skips files that aren't archives. Encrypted data is never read or decrypted, so it isn't covered.
@@ -37,6 +38,9 @@ All of these are opt-in and read only files you point them at.
 # lower-mip fallback across the .ttpf stores in a folder
 PERCYSTAR_DUMP=/path/to/your/archives PERCYSTAR_TTPF_ALL=1 \
   cargo test --release ttpf_lower_mip_fallback -- --ignored --nocapture
+
+# every hair groom, cloth, soft body and head delta in a character pack, with groom byte coverage
+PERCYSTAR_PACKS_RPF=/path/to/packs.rpf cargo test --release pedphys_packs -- --ignored --nocapture
 
 # decoder sampling over your Percy6Stars scan cache
 PERCYSTAR_AUDIT=1 PERCYSTAR_AUDIT_N=65 cargo test --release format_audit -- --ignored --nocapture

@@ -17,6 +17,46 @@ pub enum ShadeMode {
     Wireframe,
 }
 
+/// Line and point geometry for the 3D view, in the same model space as the mesh (Z-up,
+/// metres): hair guide strands, cloth particles and constraints. Drawn with a depth test,
+/// so it hides behind a head it is overlaid on. Fork addition (Percy6Stars).
+#[derive(Clone, Default)]
+pub struct LineOverlay {
+    pub points: Vec<[f32; 3]>,
+    /// One colour per point; a segment takes the colour of its first point unless
+    /// `segment_colors` gives it one.
+    pub colors: Vec<Color32>,
+    pub segments: Vec<[u32; 2]>,
+    pub segment_colors: Vec<Color32>,
+    /// Also draw every point as a dot of `dot_px` pixels (cloth particles).
+    pub dot_px: f32,
+    /// Shown in the viewer header when the mesh has no triangles of its own.
+    pub summary: String,
+}
+
+impl LineOverlay {
+    /// Axis-aligned bounds of the points, or `None` when empty.
+    pub fn bounds(&self) -> Option<([f32; 3], [f32; 3])> {
+        bounds_of(self.points.iter())
+    }
+}
+
+pub(crate) fn bounds_of<'a>(pts: impl Iterator<Item = &'a [f32; 3]>) -> Option<([f32; 3], [f32; 3])> {
+    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+    let mut any = false;
+    for p in pts {
+        if !p.iter().all(|x| x.is_finite()) {
+            continue;
+        }
+        any = true;
+        for k in 0..3 {
+            lo[k] = lo[k].min(p[k]);
+            hi[k] = hi[k].max(p[k]);
+        }
+    }
+    any.then_some((lo, hi))
+}
+
 #[derive(Clone)]
 pub struct Texture2D {
     pub w: usize,
@@ -155,6 +195,9 @@ const DEFAULT_PITCH: f32 = 0.38;
 
 #[derive(Clone)]
 pub struct Mesh3D {
+    /// Line and point geometry drawn with the triangles (hair strands, cloth constraints).
+    pub overlay: Option<LineOverlay>,
+    overlay_proj: Vec<[f32; 3]>,
     pub name: String,
     pub verts: Vec<[f32; 3]>,
     pub uvs: Vec<[f32; 2]>,
@@ -351,6 +394,8 @@ impl Mesh3D {
         }
 
         Self {
+            overlay: None,
+            overlay_proj: Vec::new(),
             name,
             verts,
             uvs,
@@ -399,6 +444,27 @@ impl Mesh3D {
             dirty: true,
             last_dragging: false,
         }
+    }
+
+    /// A mesh made only of line/point geometry (hair strands, cloth), framed on it.
+    pub fn from_lines(name: String, overlay: LineOverlay) -> Self {
+        let mut m = Self::from_parts(name, Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), None, String::new(), 0, 0, "Lines".into());
+        m.overlay = Some(overlay);
+        m.frame_all();
+        m
+    }
+
+    /// Re-centres the orbit on the triangles and the overlay together.
+    pub fn frame_all(&mut self) {
+        let ov = self.overlay.as_ref().map(|o| o.points.as_slice()).unwrap_or(&[]);
+        let Some((lo, hi)) = bounds_of(self.verts.iter().chain(ov.iter())) else { return };
+        let c = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5, (lo[2] + hi[2]) * 0.5];
+        let r2 = self.verts.iter().chain(ov.iter()).filter(|p| p.iter().all(|x| x.is_finite())).fold(0.0f32, |m, p| {
+            m.max((p[0] - c[0]).powi(2) + (p[1] - c[1]).powi(2) + (p[2] - c[2]).powi(2))
+        });
+        self.center = c;
+        self.radius = r2.sqrt().max(1e-3);
+        self.dirty = true;
     }
 
     /// Triangle range currently shown (the active part, or everything).
@@ -551,6 +617,16 @@ impl Mesh3D {
                 } else {
                     writeln!(w, "f {a} {b} {c}")?;
                 }
+            }
+        }
+        // line geometry (hair strands, cloth constraints) as OBJ polylines
+        if let Some(ov) = self.overlay.as_ref().filter(|o| !o.points.is_empty()) {
+            writeln!(w, "o lines")?;
+            for v in &ov.points {
+                writeln!(w, "v {:.6} {:.6} {:.6}", v[0] - shift[0], v[1] - shift[1], v[2] - shift[2])?;
+            }
+            for sgm in &ov.segments {
+                writeln!(w, "l {} {}", next + sgm[0], next + sgm[1])?;
             }
         }
         Ok(())
@@ -770,6 +846,25 @@ pub fn read_virtual_from_file(f: &mut File, file_off: u64) -> Result<(Vec<u8>, u
         next_off = nxt;
     }
     Ok((v, next_off, p_cnt))
+}
+
+/// Reads a whole RAGE 9 resource: its system (virtual) pages and its graphics (physical)
+/// pages, each concatenated in stream order. Graphics pages may run past the buffers they
+/// hold (page padding); callers trim by the buffer sizes their descriptors give.
+pub fn read_resource_from_file(rpf_path: &Path, file_off: u64) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let mut f = File::open(rpf_path).map_err(|e| format!("Open error: {e}"))?;
+    let (v, mut next_off, p_cnt) = read_virtual_from_file(&mut f, file_off)?;
+    let mut p = Vec::new();
+    for page in 0..p_cnt {
+        // a declared page that isn't there is a truncated resource, not a smaller one
+        let Some(zoff) = find_next_zlib(&mut f, next_off).map_err(|e| e.to_string())? else {
+            return Err(format!("Graphics page {} of {p_cnt} is missing (archive ends or is cut short)", page + 1));
+        };
+        let (chunk, nxt) = decompress_zlib_at(&mut f, zoff, 64 * 1024 * 1024).map_err(|e| e.to_string())?;
+        p.extend_from_slice(&chunk);
+        next_off = nxt;
+    }
+    Ok((v, p))
 }
 
 // finds dr ft dd modle string in virtual buffr (also checks drawable +0xa8 name ptr!)
@@ -2417,6 +2512,8 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
         }
     }
 
+    draw_overlay(mesh, w, h, ctr, [sy, cy, sp, cp], [cx, cy_s, scale, persp_k]);
+
     if mesh.els_enabled && !mesh.els_points.is_empty() {
         let glow_radius = ((w.min(h) as f32) * 0.014).clamp(5.0, 18.0);
         let core_radius = (glow_radius * 0.28).max(2.0);
@@ -2466,6 +2563,54 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                             t * t * 0.42
                         };
                         add_preview_pixel(&mut mesh.color_buf[py * w + px], color, strength);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Projects and draws `mesh.overlay` (strands, cloth edges and particles) with the same
+/// camera as the triangles. `rot` = [sin yaw, cos yaw, sin pitch, cos pitch];
+/// `cam` = [screen cx, screen cy, scale, perspective k].
+fn draw_overlay(mesh: &mut Mesh3D, w: usize, h: usize, ctr: [f32; 3], rot: [f32; 4], cam: [f32; 4]) {
+    let Some(ov) = mesh.overlay.as_ref() else { return };
+    let [sy, cy, sp, cp] = rot;
+    let [cx, cy_s, scale, persp_k] = cam;
+    mesh.overlay_proj.clear();
+    mesh.overlay_proj.extend(ov.points.iter().map(|v| {
+        let (x, y, z) = (v[0] - ctr[0], v[1] - ctr[1], v[2] - ctr[2]);
+        let x1 = x * cy - y * sy;
+        let y1 = x * sy + y * cy;
+        let y2 = -y1 * cp + z * sp;
+        let z2 = z * cp + y1 * sp;
+        let persp = 1.0 / (1.0 - (y2 * persp_k).clamp(-0.65, 0.65));
+        [cx + x1 * scale * persp, cy_s - z2 * scale * persp, y2]
+    }));
+    // strands sit on the scalp: a small bias keeps them from z-fighting the skin
+    let z_bias = if mesh.tris.is_empty() { 0.0 } else { mesh.radius * 0.004 };
+    let fallback = Color32::from_rgb(252, 175, 23);
+    for (si, sgm) in ov.segments.iter().enumerate() {
+        let (a, b) = (sgm[0] as usize, sgm[1] as usize);
+        let (Some(&p0), Some(&p1)) = (mesh.overlay_proj.get(a), mesh.overlay_proj.get(b)) else { continue };
+        let col = ov.segment_colors.get(si).or(ov.colors.get(a)).copied().unwrap_or(fallback);
+        draw_line_z(&mut mesh.color_buf, &mut mesh.z_buf, w, h, p0, p1, col, z_bias);
+    }
+    if ov.dot_px > 0.0 {
+        let r = (ov.dot_px * 0.5).max(0.5) as i32;
+        for (i, p) in mesh.overlay_proj.iter().enumerate() {
+            let col = ov.colors.get(i).copied().unwrap_or(fallback);
+            let (xi, yi) = (p[0] as i32, p[1] as i32);
+            for py in yi - r..=yi + r {
+                for px in xi - r..=xi + r {
+                    if px < 0 || py < 0 || px as usize >= w || py as usize >= h {
+                        continue;
+                    }
+                    let idx = py as usize * w + px as usize;
+                    let z = p[2] + z_bias + mesh.radius * 0.002;
+                    if z >= mesh.z_buf[idx] {
+                        mesh.z_buf[idx] = z;
+                        mesh.color_buf[idx] = col;
                     }
                 }
             }
@@ -2551,24 +2696,26 @@ pub fn part_picker(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
 }
 
 pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
+    let line_only = mesh.tris.is_empty() && mesh.overlay.is_some();
     ui.horizontal_wrapped(|ui| {
         let bone_s = if mesh.bone_count > 0 { format!("  ·  {} bones", mesh.bone_count) } else { String::new() };
-        ui.label(
-            RichText::new(format!(
+        let head = match mesh.overlay.as_ref().filter(|_| line_only) {
+            Some(ov) => format!("{}  ·  {}", mesh.name, ov.summary),
+            None => format!(
                 "{}  ·  {} verts  ·  {} tris  ·  {} geoms / {} meshlets ({}){}",
                 mesh.name, mesh.verts.len(), mesh.tris.len(), mesh.geom_count, mesh.meshlet_count, mesh.lod_label, bone_s
-            ))
-            .strong()
-            .color(Color32::from_rgb(252, 175, 23)),
-        );
+            ),
+        };
+        ui.label(RichText::new(head).strong().color(Color32::from_rgb(252, 175, 23)));
         part_picker(ui, mesh);
         ui.add_space(6.0);
-        for (mode, label) in [
+        let modes: &[(ShadeMode, &str)] = if line_only { &[] } else { &[
             (ShadeMode::Textured, "Textured/Mat"),
             (ShadeMode::Solid, "Clay Solid"),
             (ShadeMode::SolidWire, "Solid+Wire"),
             (ShadeMode::Wireframe, "Wire"),
-        ] {
+        ] };
+        for &(mode, label) in modes {
             if ui.selectable_label(mesh.shade_mode == mode, label).clicked() {
                 mesh.shade_mode = mode;
                 mesh.dirty = true;
@@ -2578,7 +2725,7 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
             mesh.auto_spin = !mesh.auto_spin;
             mesh.dirty = true;
         }
-        if ui.button("Load Texture...").clicked() {
+        if !line_only && ui.button("Load Texture...").clicked() {
             if let Some(tp) = rfd::FileDialog::new().add_filter("Textures", &["png", "bmp"]).pick_file() {
                 if let Ok(img) = image::open(&tp) {
                     let rgba = img.to_rgba8();
@@ -2733,7 +2880,7 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
     }
     mesh.last_dragging = dragging;
 
-    let heavy = mesh.visible_tris().len() > 25_000;
+    let heavy = mesh.visible_tris().len() > 25_000 || mesh.overlay.as_ref().is_some_and(|o| o.segments.len() > 80_000);
     let ppp = ui.ctx().pixels_per_point();
     let res_scale = ppp * if dragging && heavy { 0.55 } else { 1.0 };
     let target_w = ((rect.width() * res_scale) as usize).clamp(160, 1920);
@@ -2908,6 +3055,37 @@ mod tests {
         Arc::get_mut(m.geom_materials[0].texture.as_mut().unwrap()).unwrap().pixels[0] = Color32::RED;
         rasterize_mesh(&mut m, 100, 100);
         assert!(m.color_buf[center].r() > 0 && m.z_buf[center] > 0.0, "the wire still writes depth");
+    }
+
+    #[test]
+    fn line_overlay_draws_with_depth_test() {
+        // a vertical strand alone, then the same strand behind an opaque quad
+        let ov = LineOverlay {
+            points: vec![[0.0, 0.0, -0.5], [0.0, 0.0, 0.5]],
+            colors: vec![Color32::RED; 2],
+            segments: vec![[0, 1]],
+            ..Default::default()
+        };
+        let mut m = Mesh3D::from_lines("strand".into(), ov.clone());
+        m.yaw = 0.0;
+        m.pitch = 0.0;
+        rasterize_mesh(&mut m, 100, 100);
+        let red = m.color_buf.iter().filter(|c| c.r() == 255 && c.g() == 0).count();
+        assert!(red >= 40, "the strand should cover most of the column ({red} px)");
+        assert!((m.radius - 0.5).abs() < 1e-3, "framed on the overlay");
+
+        // quad in the x/z plane, nearer the camera than the strand
+        let verts = vec![[-1.0, -0.2, -1.0], [1.0, -0.2, -1.0], [1.0, -0.2, 1.0], [-1.0, -0.2, 1.0]];
+        let mut q = Mesh3D::from_parts("quad".into(), verts, Vec::new(), vec![[0, 1, 2], [0, 2, 3]], vec![0, 0], Vec::new(), None, String::new(), 1, 0, String::new());
+        q.overlay = Some(ov);
+        q.shade_mode = ShadeMode::Solid;
+        for (yaw, hidden) in [(0.0f32, true), (std::f32::consts::PI, false)] {
+            q.yaw = yaw;
+            q.pitch = 0.0;
+            rasterize_mesh(&mut q, 100, 100);
+            let red = q.color_buf.iter().filter(|c| c.r() == 255 && c.g() == 0).count();
+            assert_eq!(red == 0, hidden, "yaw {yaw}: {red} red px");
+        }
     }
 
     #[test]

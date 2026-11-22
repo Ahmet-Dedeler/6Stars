@@ -1095,9 +1095,30 @@ pub fn render_awc_audio_view(
                         });
                     });
 
-                if frame_resp.response.interact(Sense::click()).clicked() {
+                let row = frame_resp.response.interact(Sense::click());
+                if row.clicked() {
                     clicked_track = Some(i);
                 }
+                // Percy6Stars: copy stream names and details for pasting elsewhere
+                row.context_menu(|ui| {
+                    let line = |t: &LoadedWavTrack| format!("{} · stream {} · {:.2}s · {} Hz · {} ch", t.name, t.stream_idx, t.duration_secs, t.sample_rate, t.channels);
+                    if ui.button("Copy Stream Name").clicked() {
+                        ui.ctx().copy_text(t.name.clone());
+                        ui.close_menu();
+                    }
+                    if ui.button("Copy Stream Details").clicked() {
+                        ui.ctx().copy_text(line(t));
+                        ui.close_menu();
+                    }
+                    if ui.button(format!("Copy All {} Stream Names", player.tracks.len())).clicked() {
+                        ui.ctx().copy_text(player.tracks.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join("\n"));
+                        ui.close_menu();
+                    }
+                    if ui.button("Copy All Stream Details").clicked() {
+                        ui.ctx().copy_text(player.tracks.iter().map(line).collect::<Vec<_>>().join("\n"));
+                        ui.close_menu();
+                    }
+                });
                 ui.add_space(2.0);
             }
         });

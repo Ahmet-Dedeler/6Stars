@@ -21,6 +21,7 @@ mod sgd5;
 mod world_gpu;
 mod worldmap;
 mod model3d;
+mod pedphys;
 mod rdna2;
 mod tex;
 mod ttpf_tile;
@@ -28,6 +29,12 @@ mod vehicle_variations;
 #[cfg(target_os = "macos")]
 mod mac_open;
 mod video_clip;
+// copy actions, AI context, related files (context menus everywhere)
+mod context_copy;
+mod context_ui;
+mod relations;
+#[cfg(test)]
+mod context_capture;
 #[cfg(test)]
 mod audit_tests;
 #[cfg(test)]
@@ -403,6 +410,7 @@ enum Category {
     Xml,
     Resources,
     Binary,
+    PedPhysics,
 }
 
 const MODEL_TEX_TIP: &str = "Open every texture this model's materials use as flat images for inspection and export";
@@ -736,7 +744,9 @@ struct Rpf9App {
     hay: Vec<String>,
     hay_ver: u64,
     hay_audio_named: bool,
-    counts: [usize; 11],
+    counts: [usize; 12],
+    /// Preview of a hair groom, cloth, soft body or head delta entry.
+    pedphys_view: Option<pedphys::PedPhysView>,
     cached_rpf_names: Vec<String>,
     last_rebuild: Instant,
     update: Arc<Mutex<UpdateState>>,
@@ -806,6 +816,8 @@ struct Rpf9App {
     sgd5_search: String,
     sgd5_selected: Option<usize>,
     sgd5_cached_text: (Option<(usize, usize, ShaderViewMode)>, String),
+    /// context menus, copy toasts and the Related files panel (src/context_ui.rs)
+    ctx_ui: context_ui::ContextUi,
 }
 
 fn sgd5_stage(stage: &str) -> ShaderStage {
@@ -945,7 +957,8 @@ impl Rpf9App {
             hay: Vec::new(),
             hay_ver: u64::MAX,
             hay_audio_named: true,
-            counts: [0; 11],
+            counts: [0; 12],
+            pedphys_view: None,
             cached_rpf_names: Vec::new(),
             last_rebuild: Instant::now(),
             update: Arc::new(Mutex::new(UpdateState::default())),
@@ -1004,6 +1017,7 @@ impl Rpf9App {
             sgd5_search: String::new(),
             sgd5_selected: None,
             sgd5_cached_text: (None, String::new()),
+            ctx_ui: Default::default(),
         };
         load_ui_state(&mut app);
         spawn_update_check(Arc::clone(&app.update), cc.egui_ctx.clone());
@@ -1186,6 +1200,7 @@ impl Rpf9App {
         self.lod_keep_cam = None;
         self.preview.clear();
         self.mesh3d = None;
+        self.pedphys_view = None;
         self.show_3d = false;
         self.anim_dur = 0.0;
         self.anim_playing = false;
@@ -2240,6 +2255,12 @@ impl Rpf9App {
             return;
         }
 
+        if pedphys::is_kind(e.kind) {
+            let st = self.state.lock().unwrap();
+            self.pedphys_view = Some(pedphys::PedPhysView::open(&e, &st.entries));
+            return;
+        }
+
         if e.kind == "NAVM" {
             let media = Arc::clone(&self.media);
             {
@@ -2454,10 +2475,11 @@ impl Rpf9App {
             self.cached_rpf_names = st.rpf_names.clone();
             self.hay_ver = st.ver;
             self.hay_audio_named = self.audio_named;
-            let mut c = [0usize; 11];
+            let mut c = [0usize; 12];
             for e in &st.entries {
                 c[0] += 1;
                 c[match e.kind {
+                    k if pedphys::is_kind(k) => 11,
                     "VEH" => 1,
                     "MODEL" => 2,
                     "TXD" | "TTPF" | "HMAP" => 3,
@@ -2493,6 +2515,7 @@ impl Rpf9App {
                     Category::Xml => e.kind == "XML",
                     Category::Resources => matches!(e.kind, "PSIN" | "ANIM" | "RSC9" | "META7A"),
                     Category::Binary => e.kind == "ZLIB",
+                    Category::PedPhysics => pedphys::is_kind(e.kind),
                 };
                 let h = &self.hay[*i];
                 cat_ok
@@ -2812,7 +2835,6 @@ impl Rpf9App {
                 ui.separator();
 
                 const ROW_H: f32 = 22.0;
-                let mut copied_msg: Option<String> = None;
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                 egui::ScrollArea::vertical()
                     .id_salt("mv_list_scroll")
@@ -2839,15 +2861,10 @@ impl Rpf9App {
                                 if resp.clicked() {
                                     to_select = Some(*eidx);
                                 }
-                                if let Some(msg) = entry_context_menu(&resp, e) {
-                                    copied_msg = Some(msg);
-                                }
+                                context_ui::attach_entry_menu(&resp, &mut self.ctx_ui, &self.state, *eidx, Vec::new);
                             });
                         }
                     });
-                if let Some(msg) = copied_msg {
-                    self.state.lock().unwrap().status = msg;
-                }
             });
         }
 
@@ -2864,7 +2881,8 @@ impl Rpf9App {
             self.show_3d = true;
         }
 
-        egui::CentralPanel::default()
+        self.related_side_panel(ctx);
+        let preview = egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(Color32::from_rgb(13, 9, 21)).inner_margin(12.0))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -2894,6 +2912,7 @@ impl Rpf9App {
                                 self.open_obj_path(&p);
                             }
                         }
+                        self.context_toolbar(ui);
                     });
                 });
                 ui.separator();
@@ -2967,7 +2986,7 @@ impl Rpf9App {
                 } else {
                     ui.centered_and_justified(|ui| {
                         ui.vertical_centered(|ui| {
-                            ui.label(RichText::new("6STARS 3D MODEL VIEWER").size(20.0).strong().color(Color32::from_rgb(255, 168, 28)));
+                            ui.label(RichText::new("PERCY6STARS 3D MODEL VIEWER").size(20.0).strong().color(Color32::from_rgb(255, 168, 28)));
                             ui.add_space(6.0);
                             if self.mv_view.is_empty() {
                                 ui.label(
@@ -2998,6 +3017,7 @@ impl Rpf9App {
                     });
                 }
             });
+        self.preview_context_hook(ctx, preview.response.rect);
     }
 
     fn load_ps09_path(&mut self, path: &Path) {
@@ -3775,6 +3795,10 @@ impl Rpf9App {
                         ok += 1;
                     }
                 }
+            } else if pedphys::is_kind(e.kind) {
+                if pedphys::export_entry(&e, &out_dir, self.is_folder).is_ok() {
+                    ok += 1;
+                }
             } else if e.kind == "RBF0" {
                 if let Ok(data) = read_entry_bytes(&e) {
                     let xml = decode_rbf0(&data).unwrap_or_else(|| String::from_utf8_lossy(&data).into_owned());
@@ -3816,8 +3840,9 @@ pub(crate) fn app_data_dir() -> Option<PathBuf> {
 }
 
 pub(crate) fn cache_file_path() -> Option<PathBuf> {
-    // v9 scanner rejects metadata and mid resource chunks that v8 listed as model entries
-    app_data_dir().map(|d| d.join("scan_cache_v10.tsv"))
+    // v9 scanner rejects metadata and mid resource chunks that v8 listed as model entries;
+    // v11 lists hair grooms, cloth, soft bodies and head deltas as their own kinds
+    app_data_dir().map(|d| d.join("scan_cache_v11.tsv"))
 }
 
 pub(crate) fn load_last_folder() -> Option<PathBuf> {
@@ -3833,10 +3858,10 @@ fn save_last_folder(folder: &Path) {
     }
 }
 
-const CATS: [Category; 11] = [
+const CATS: [Category; 12] = [
     Category::All, Category::Vehicles, Category::Models, Category::Textures,
     Category::Ui, Category::NavMesh, Category::Videos, Category::Audio,
-    Category::Xml, Category::Resources, Category::Binary,
+    Category::Xml, Category::Resources, Category::Binary, Category::PedPhysics,
 ];
 
 fn save_ui_state(app: &Rpf9App) {
@@ -3891,6 +3916,10 @@ fn load_disk_cache_from(p: &Path) -> HashMap<String, Vec<RpfEntry>> {
             "ANIM" => "ANIM",
             "RSC9" => "RSC9",
             "META7A" => "META7A",
+            "HAIR" => "HAIR",
+            "CLOTH" => "CLOTH",
+            "SOFT" => "SOFT",
+            "HDELTA" => "HDELTA",
             _ => "ZLIB",
         };
         // tolerate old 11 col cache rows and newer 10 col ones
@@ -4186,6 +4215,7 @@ fn kind_search_words(kind: &str) -> &'static str {
         "PSIN" => "resource pso",
         "ANIM" => "animation anim clip",
         "RSC9" => "resource",
+        "HAIR" | "CLOTH" | "SOFT" | "HDELTA" => pedphys::search_words(kind),
         "DAT" => "audio sound metadata",
         "ZLIB" => "binary data",
         _ => "",
@@ -4210,6 +4240,7 @@ fn kind_color(kind: &str) -> Color32 {
         "PSIN" => Color32::from_rgb(210, 120, 255),
         "ANIM" => Color32::from_rgb(100, 225, 195),
         "RSC9" => Color32::from_rgb(120, 185, 255),
+        "HAIR" | "CLOTH" | "SOFT" | "HDELTA" => pedphys::kind_color(kind),
         _ => Color32::from_rgb(145, 152, 168),
     }
 }
@@ -4335,44 +4366,6 @@ fn apply_multi_select(
     }
 }
 
-fn entry_context_menu(resp: &egui::Response, e: &RpfEntry) -> Option<String> {
-    let mut copied = None;
-    resp.context_menu(|ui| {
-        if ui.button("Copy File Name").clicked() {
-            ui.ctx().copy_text(e.name.clone());
-            copied = Some(format!("Copied name: {}", e.name));
-            ui.close_menu();
-        }
-        let rel = format!("{} / {}", e.rpf_name, e.name);
-        if ui.button("Copy Archive / File Path").clicked() {
-            ui.ctx().copy_text(rel.clone());
-            copied = Some(format!("Copied: {rel}"));
-            ui.close_menu();
-        }
-        let full = e.source_rpf.display().to_string();
-        if ui.button("Copy Source Archive Path").clicked() {
-            ui.ctx().copy_text(full.clone());
-            copied = Some(format!("Copied archive path: {full}"));
-            ui.close_menu();
-        }
-        if let Some(dir) = e.source_rpf.parent() {
-            let dir_s = dir.display().to_string();
-            if ui.button("Copy Directory Path").clicked() {
-                ui.ctx().copy_text(dir_s.clone());
-                copied = Some(format!("Copied directory: {dir_s}"));
-                ui.close_menu();
-            }
-        }
-        let loc = format!("{} @ 0x{:08x} ({})", e.rpf_name, e.offset, e.name);
-        if ui.button("Copy Offset Location").clicked() {
-            ui.ctx().copy_text(loc.clone());
-            copied = Some(format!("Copied: {loc}"));
-            ui.close_menu();
-        }
-    });
-    copied
-}
-
 fn format_size(bytes: u64) -> String {
     let b = bytes as f64;
     if b >= 1_073_741_824.0 {
@@ -4403,6 +4396,9 @@ fn format_hex(data: &[u8]) -> String {
 
 fn read_entry_bytes(e: &RpfEntry) -> std::io::Result<Vec<u8>> {
     use flate2::read::ZlibDecoder;
+    if pedphys::is_kind(e.kind) {
+        return pedphys::resource_bytes(&e.source_rpf, e.offset);
+    }
     let mut f = File::open(&e.source_rpf)?;
     if !e.chunks.is_empty() {
         let mut combined = Vec::new();
@@ -4531,6 +4527,21 @@ fn probe_rage9_page(
     // reject mid resource virtual chunks that start directly with a grmgeometry struct
     if u64::from_le_bytes(probe_out[0x60..0x68].try_into().ok()?) == 0x1601 {
         return None;
+    }
+    // Ped physics: hair grooms, cloth, soft bodies, head deltas (unnamed resources)
+    let whole = if olen < probe_out.len() { olen } else { usize::MAX };
+    if let Some(pp) = pedphys::probe(&probe_out[..olen], whole, off + p as u64) {
+        return Some(RpfEntry {
+            source_rpf: path.to_path_buf(),
+            rpf_name: rname.to_string(),
+            name: pp.name,
+            kind: pp.kind,
+            offset: off + p as u64,
+            comp_size: probe_dec.total_in(),
+            raw_size: olen as u64,
+            tracks: pp.count,
+            chunks: Vec::new(),
+        });
     }
     // 1. CNavMesh tile (version 0x00010015)
     let ver = u32::from_le_bytes(probe_out[0x14..0x18].try_into().ok()?);
@@ -4767,7 +4778,31 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
         let mut jumped = false;
         while pos + 44 <= read_n {
             if let Some(entry) = probe_rage9_page(buf, pos, read_n, off, path, &rname, &mut probe_dec, &mut probe_out) {
+                let packed = pedphys::is_kind(entry.kind);
                 found.push(entry);
+                if packed {
+                    const WALK: usize = 8 << 20;
+                    let group = off + pos as u64;
+                    let (more, mut resume) = pedphys::walk_packed(buf, pedphys::WalkStart::After(pos + 0x10), WALK, off, path, &rname);
+                    found.extend(more);
+                    // big archives are read in windows: a group that runs past this one is
+                    // walked on from the file (a stream bigger than the window stops it)
+                    let mut last = None;
+                    while let Some((at, how)) = resume.filter(|_| whole.is_none()) {
+                        let walked = (at - group) as usize;
+                        if at >= sz || walked >= WALK || last == Some(at) {
+                            break;
+                        }
+                        last = Some(at);
+                        let mut win = Vec::with_capacity(16 << 20);
+                        f.seek(SeekFrom::Start(at))?;
+                        (&mut f).take(16 << 20).read_to_end(&mut win)?;
+                        let (more, r) = pedphys::walk_packed(&win, how, WALK - walked, at, path, &rname);
+                        found.extend(more);
+                        resume = r;
+                        need_seek = true;
+                    }
+                }
                 pos += 0x1000;
                 continue;
             }
@@ -4929,6 +4964,7 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
     if rname.eq_ignore_ascii_case("audio.rpf") {
         enrich_audio_rpf_entries(path, sz, &mut found);
     }
+    pedphys::name_head_deltas(&mut found);
 
     Ok((hdr_info, found))
 }
@@ -5038,6 +5074,7 @@ impl eframe::App for Rpf9App {
         }
         self.poll_bink_player(ctx);
         self.poll_sgd5_cache();
+        self.context_tick(ctx);
         if let Some(pick) = self.lod_pick.take() {
             self.apply_lod_pick(pick);
         }
@@ -5128,7 +5165,7 @@ impl eframe::App for Rpf9App {
                     ui.image((tex.id(), egui::vec2(28.0, 28.0)));
                 }
                 ui.add_space(6.0);
-                ui.label(RichText::new("6STARS").size(17.0).strong().color(Color32::from_rgb(255, 168, 28)));
+                ui.label(RichText::new("PERCY6STARS").size(17.0).strong().color(Color32::from_rgb(255, 168, 28)));
                 ui.label(RichText::new("RPF9").size(13.0).strong().color(Color32::from_rgb(255, 72, 165)));
                 ui.label(RichText::new(format!("v{APP_VERSION}")).size(11.5).color(Color32::from_rgb(165, 145, 195)));
                 ui.add_space(10.0);
@@ -5231,7 +5268,7 @@ impl eframe::App for Rpf9App {
                             self.export_entries(&targets);
                         }
                     }
-                    let copy_shortcut = !ctx.wants_keyboard_input() && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::C));
+                    let copy_shortcut = !ctx.wants_keyboard_input() && ui.input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::C));
                     if ui.button("Copy Path").on_hover_text("Copy selected file path(s) — Ctrl+C or Ctrl+Click/Shift+Click for multi-select").clicked() || copy_shortcut {
                         let targets = self.ordered_selected_indices();
                         if !targets.is_empty() {
@@ -5323,6 +5360,7 @@ impl eframe::App for Rpf9App {
                 (Category::Xml, "Configs (XML)", c[8]),
                 (Category::Resources, "Anim / PSO / RSC9", c[9]),
                 (Category::Binary, "Binary", c[10]),
+                (Category::PedPhysics, "Hair & Cloth", c[11]),
             ] {
                 if has_entries && cat != Category::All && count == 0 {
                     continue;
@@ -5440,10 +5478,12 @@ impl eframe::App for Rpf9App {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     sort_combo(ui, "explorer_sort_combo", &mut self.sort_mode);
+                    self.context_toolbar(ui);
                 });
             });
             if texture_view && self.grid_view {
-                let (state, view, is_folder) = (&self.state, &self.view, self.is_folder);
+                let (state, view, is_folder, multi) = (&self.state, &self.view, self.is_folder, &self.multi_selected);
+                let cu = &mut self.ctx_ui;
                 let picked = self.gallery.grid_ui(
                     ui,
                     view.len(),
@@ -5467,6 +5507,7 @@ impl eframe::App for Rpf9App {
                             .collect()
                     },
                     |idx| view.iter().position(|&i| i == idx),
+                    |resp, idx| context_ui::attach_entry_menu(resp, cu, state, idx, || context_ui::ordered_selection(view, multi)),
                 );
                 if let Some(i) = picked {
                     self.select_entry(i);
@@ -5474,7 +5515,6 @@ impl eframe::App for Rpf9App {
                 return;
             }
             let mut clicked: Option<(usize, bool, bool)> = None;
-            let mut copied_msg: Option<String> = None;
             let mut row_rects: Vec<(usize, f32, f32)> = Vec::new();
             let scroll_to_sel = std::mem::take(&mut self.explorer_scroll_to_sel);
             // rows must be exactly row_h tall or show_rows miscomputes total height
@@ -5506,35 +5546,8 @@ impl eframe::App for Rpf9App {
                             let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
                             clicked = Some((*idx, ctrl, shift));
                         }
-                        if self.multi_selected.len() > 1 && self.multi_selected.contains(idx) {
-                            let targets = self.ordered_selected_indices();
-                            resp.context_menu(|ui| {
-                                let n = targets.len();
-                                if ui.button(format!("Copy {n} File Names")).clicked() {
-                                    let st = self.state.lock().unwrap();
-                                    let refs: Vec<&RpfEntry> = targets.iter().filter_map(|&i| st.entries.get(i)).collect();
-                                    ui.ctx().copy_text(format_multi_copy(&refs, 0));
-                                    copied_msg = Some(format!("Copied {n} file names"));
-                                    ui.close_menu();
-                                }
-                                if ui.button(format!("Copy {n} Archive / File Paths")).clicked() {
-                                    let st = self.state.lock().unwrap();
-                                    let refs: Vec<&RpfEntry> = targets.iter().filter_map(|&i| st.entries.get(i)).collect();
-                                    ui.ctx().copy_text(format_multi_copy(&refs, 1));
-                                    copied_msg = Some(format!("Copied {n} paths"));
-                                    ui.close_menu();
-                                }
-                                if ui.button(format!("Copy {n} Offset Locations")).clicked() {
-                                    let st = self.state.lock().unwrap();
-                                    let refs: Vec<&RpfEntry> = targets.iter().filter_map(|&i| st.entries.get(i)).collect();
-                                    ui.ctx().copy_text(format_multi_copy(&refs, 2));
-                                    copied_msg = Some(format!("Copied {n} locations"));
-                                    ui.close_menu();
-                                }
-                            });
-                        } else if let Some(msg) = entry_context_menu(&resp, e) {
-                            copied_msg = Some(msg);
-                        }
+                        let (view, multi) = (&self.view, &self.multi_selected);
+                        context_ui::attach_entry_menu(&resp, &mut self.ctx_ui, &self.state, *idx, || context_ui::ordered_selection(view, multi));
                     });
                     row_rects.push((*idx, row_alloc.response.rect.min.y, row_alloc.response.rect.max.y));
                 }
@@ -5571,9 +5584,6 @@ impl eframe::App for Rpf9App {
             } else {
                 self.marquee_start = None;
             }
-            if let Some(msg) = copied_msg {
-                self.state.lock().unwrap().status = msg;
-            }
             if let Some((i, ctrl, shift)) = clicked {
                 apply_multi_select(&self.view, &mut self.multi_selected, &mut self.multi_anchor, i, ctrl, shift);
                 if !ctrl && !shift {
@@ -5584,7 +5594,8 @@ impl eframe::App for Rpf9App {
             }
         });
 
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::from_rgb(14, 10, 22)).inner_margin(12.0)).show(ctx, |ui| {
+        self.related_side_panel(ctx);
+        let preview = egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::from_rgb(14, 10, 22)).inner_margin(12.0)).show(ctx, |ui| {
             #[cfg(target_os = "macos")]
             if let Some(be) = self.bink_embed.as_mut() {
                 be.ui(ui, &mut self.bink_volume, &mut self.bink_loop);
@@ -5633,6 +5644,8 @@ impl eframe::App for Rpf9App {
                             });
                         });
                 }
+            } else if let Some(view) = self.pedphys_view.as_mut() {
+                view.ui(ui);
             } else if !self.textures.is_empty() {
                 self.render_texture_viewer(ui);
             } else if self.mesh3d.is_some() {
@@ -5688,6 +5701,7 @@ impl eframe::App for Rpf9App {
                 });
             }
         });
+        self.preview_context_hook(ctx, preview.response.rect);
         } // end Explorer tab
 
         let (show_upd, upd_avail, upd_inst, upd_status) = {

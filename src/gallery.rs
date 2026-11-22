@@ -258,6 +258,8 @@ impl Gallery {
         selected: Option<usize>,
         items: impl Fn(std::ops::Range<usize>) -> Vec<(usize, Option<ThumbKey>, String)>,
         position_of: impl Fn(usize) -> Option<usize>,
+        // right-click menu for a tile (the shared entry menu in context_ui)
+        mut menu: impl FnMut(&egui::Response, usize),
     ) -> Option<usize> {
         let ctx = ui.ctx().clone();
         self.frame += 1;
@@ -364,6 +366,7 @@ impl Gallery {
                         if resp.clicked() {
                             clicked = Some(*idx);
                         }
+                        menu(&resp, *idx);
                         resp.on_hover_text(RichText::new(label.clone()));
                     }
                 });
