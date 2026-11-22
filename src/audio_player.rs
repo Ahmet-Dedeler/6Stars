@@ -422,6 +422,12 @@ mod backend {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct AudioBankContext {
+    pub pack_name: String,
+    pub used_by: Vec<String>,
+}
+
 pub struct AudioPlayerState {
     pub tracks: Vec<LoadedWavTrack>,
     pub awc_bytes: Option<Arc<Vec<u8>>>,
@@ -434,6 +440,8 @@ pub struct AudioPlayerState {
     pub auto_advance: bool,
     pub loop_track: bool,
     pub filter: String,
+    pub bank_ctx: Option<AudioBankContext>,
+    pub requested_search: Option<String>,
     pub status_msg: String,
     pub error: Option<String>,
     pub decoding_idx: Option<usize>,
@@ -458,6 +466,8 @@ impl Default for AudioPlayerState {
             auto_advance: true,
             loop_track: false,
             filter: String::new(),
+            bank_ctx: None,
+            requested_search: None,
             status_msg: String::new(),
             error: None,
             decoding_idx: None,
@@ -484,6 +494,7 @@ impl AudioPlayerState {
         self.active_idx = None;
         self.active_samples = Arc::new(Vec::new());
         self.filter.clear();
+        self.bank_ctx = None;
         self.status_msg.clear();
         self.error = None;
         self.decoding_idx = None;
@@ -729,6 +740,9 @@ pub fn render_awc_audio_view(
             );
         });
     });
+    if let Some(ref bctx) = player.bank_ctx {
+        let _ = bctx;
+    }
     ui.add_space(4.0);
     ui.separator();
 
