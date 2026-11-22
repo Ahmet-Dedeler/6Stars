@@ -770,7 +770,11 @@ impl Rpf9App {
                         );
                         (rels, note)
                     }
-                    Err(err) => (Vec::new(), format!("Shader textures not resolved: {err}")),
+                    Err(err) => {
+                        // Keep the raw error for the log; show a plain sentence in the panel.
+                        eprintln!("related: shader texture lookup failed: {err}");
+                        (Vec::new(), "Couldn't read this model's shader textures, so texture links aren't shown.".to_string())
+                    }
                 };
                 done.lock().unwrap().push(Done::Textures { entry: sel, rels, note });
                 ctx.request_repaint();

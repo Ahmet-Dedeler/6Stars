@@ -2986,7 +2986,7 @@ impl Rpf9App {
                 } else {
                     ui.centered_and_justified(|ui| {
                         ui.vertical_centered(|ui| {
-                            ui.label(RichText::new("6STARS 3D MODEL VIEWER").size(20.0).strong().color(Color32::from_rgb(255, 168, 28)));
+                            ui.label(RichText::new("PERCY6STARS 3D MODEL VIEWER").size(20.0).strong().color(Color32::from_rgb(255, 168, 28)));
                             ui.add_space(6.0);
                             if self.mv_view.is_empty() {
                                 ui.label(
@@ -5145,7 +5145,7 @@ impl eframe::App for Rpf9App {
                     ui.image((tex.id(), egui::vec2(28.0, 28.0)));
                 }
                 ui.add_space(6.0);
-                ui.label(RichText::new("6STARS").size(17.0).strong().color(Color32::from_rgb(255, 168, 28)));
+                ui.label(RichText::new("PERCY6STARS").size(17.0).strong().color(Color32::from_rgb(255, 168, 28)));
                 ui.label(RichText::new("RPF9").size(13.0).strong().color(Color32::from_rgb(255, 72, 165)));
                 ui.label(RichText::new(format!("v{APP_VERSION}")).size(11.5).color(Color32::from_rgb(165, 145, 195)));
                 ui.add_space(10.0);
