@@ -3988,6 +3988,8 @@ fn setup_style(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 
     // neon sunset theme matching dusk purple magenta and golden amber
+    // the palette is dark only so the windows light mode must not switch egui to its light style
+    ctx.set_theme(egui::Theme::Dark);
     let mut vis = egui::Visuals::dark();
     vis.panel_fill = Color32::from_rgb(18, 12, 28);
     vis.window_fill = Color32::from_rgb(24, 16, 36);
@@ -6185,6 +6187,18 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         panic!("media job never finished");
+    }
+
+    #[test]
+    fn style_stays_dark_when_the_system_theme_is_light() {
+        let ctx = egui::Context::default();
+        setup_style(&ctx);
+        let input = egui::RawInput { system_theme: Some(egui::Theme::Light), ..Default::default() };
+        let _ = ctx.run(input, |ctx| {
+            let visuals = ctx.style().visuals.clone();
+            assert!(visuals.dark_mode);
+            assert_eq!(visuals.panel_fill, Color32::from_rgb(18, 12, 28));
+        });
     }
 
     #[test]
