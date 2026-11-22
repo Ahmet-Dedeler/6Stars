@@ -200,11 +200,11 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -
                     continue;
                 }
                 let q_raw = Quat::from_xyzw(e.rot[0], e.rot[1], e.rot[2], e.rot[3]);
-                // RAGE CEntityDef stores inverse rotation; conjugate maps local -> world space
+                // e.rot is already conjugated to world space in mapdata.rs
                 let q = if !q_raw.is_finite() || q_raw.length_squared() < 1e-6 {
                     Quat::IDENTITY
                 } else {
-                    q_raw.conjugate().normalize()
+                    q_raw.normalize()
                 };
                 if !ix.models.contains_key(&e.archetype_hash) {
                     if p.distance_squared(start) <= 2200.0 * 2200.0 && box_insts.len() < 12_000 {
