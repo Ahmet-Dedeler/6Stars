@@ -69,7 +69,8 @@
   - Removed dead code: unused `play_wav_async` (Windows + Unix), unused `parse_sgd5`, and the never-sent `Sgd5Count` world-stream message and its empty title-bar label.
   - Applied mechanical lint cleanups across 13 modules (`div_ceil`, `is_multiple_of`, `as_chunks`, range checks, simplified `map_or`), with no behaviour change.
   - Test module in `src/main.rs` moved to the end of the file.
-- **Verified Test Suite**: `66 passed; 0 failed` (`cargo test`).
+- **Explorer Marquee Scroll Lock (#41, `src/main.rs`)**: Locks vertical scrolling on the Explorer list while a marquee drag selection is active (`Escape` or pointer release restores scrolling immediately).
+- **Verified Test Suite**: `96 passed; 0 failed` (`cargo test`).
 
 ## Model Viewer & Export Quality
 
@@ -226,6 +227,7 @@ Optional external tools are only loaded from trusted locations: `binkplay.exe` n
 
 - **Original Creator:** [@rpatty-dev](https://github.com/rpatty-dev) (`@rpatty`)
 - **Code & Research Contributors:**
+  - [@Pokeralho](https://github.com/Pokeralho) (`Luis F.`, PR #42) — Smooth-shaded trilinear visibility-buffer 3D model renderer (`raster.rs`, `shading.rs`, `texture.rs`), OBJ+MTL+PNG & binary glTF 2.0 (`.glb`) export (`export.rs`), straight-alpha & BC2/BC3/BC4/BC5 decoder fixes, CLI/drag-and-drop path opening, Linux build fix, parser/updater security hardening, and headless viewport/siren tests.
   - [@clayeon](https://github.com/clayeon) (PR #34) — Emergency lights with siren sequencer timing, modular fragment/roofbar composition, and `packs.rpf` `0x7a` authored vehicle configurations.
   - [@worstgirlinamerica](https://github.com/worstgirlinamerica) (PRs #30, #31, #32, #33) — `scripts/build_linux.sh`, AWC superblock directory & stereo channel fix in `awc_extract.py`, `cfg(windows)` gating, and explicit `f32` literal fix.
   - [@Xyzstk](https://github.com/Xyzstk) (PRs #8, #29) — `SGD5` shader-group parser, `DXBC`/`FSSM` extraction, and reflection resource naming.
