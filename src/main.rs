@@ -129,10 +129,7 @@ pub fn find_binkplay() -> PathBuf {
             candidates.push(dir.join("tools").join("binkplay.exe"));
         }
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("binkplay.exe"));
-        candidates.push(cwd.join("tools").join("binkplay.exe"));
-    }
+    // never the working directory it may be an untrusted dump folder
     if let Some(path_os) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path_os) {
             candidates.push(dir.join("binkplay.exe"));
@@ -305,7 +302,7 @@ fn is_map_zone_prefix(p0: &str) -> bool {
 }
 
 fn match_known_stem(p0: &str, stems: &[&str]) -> bool {
-    stems.contains(&p0) || (p0.len() > 4 && stems.contains(&&p0[1..]))
+    stems.contains(&p0) || (p0.len() > 4 && p0.get(1..).is_some_and(|rest| stems.contains(&rest)))
 }
 
 fn classify_model_cat(kind: &str, name: &str) -> ModelCat {
@@ -617,6 +614,39 @@ fn parse_semver(s: &str) -> Option<(u32, u32, u32)> {
     Some((maj, min, pat))
 }
 
+// archive entry names become file names so path separators and reserved characters are neutralized
+// a name can then never leave the folder it is joined onto
+fn safe_file_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
+        .collect();
+    let cleaned = cleaned.trim().trim_end_matches('.').to_string();
+    if cleaned.is_empty() || cleaned.chars().all(|c| c == '.') {
+        return "unnamed".into();
+    }
+    cleaned
+}
+
+// release page of a version built from the pinned repository url
+fn release_page_url(ver: &str) -> String {
+    format!("{REPO_RELEASES_URL}/tag/v{ver}")
+}
+
+// opens an https url in the default browser without going through a shell
+fn open_url(url: &str) {
+    if !url.starts_with("https://") {
+        return;
+    }
+    let _ = if cfg!(windows) {
+        silent_cmd("explorer.exe").arg(url).spawn()
+    } else if cfg!(target_os = "macos") {
+        Command::new("open").arg(url).spawn()
+    } else {
+        Command::new("xdg-open").arg(url).spawn()
+    };
+}
+
 fn silent_cmd(prog: &str) -> Command {
     #[cfg(windows)]
     {
@@ -638,7 +668,8 @@ fn spawn_update_check(upd: Arc<Mutex<UpdateState>>, ctx: egui::Context) {
     std::thread::spawn(move || {
         let (curl, null) = if cfg!(windows) { ("curl.exe", "NUL") } else { ("curl", "/dev/null") };
         let out = silent_cmd(curl)
-            .args(["-fsSL", "-o", null, "-w", "%{url_effective}", &format!("{REPO_RELEASES_URL}/latest")])
+            .args(["-fsSL", "--proto", "=https", "--proto-redir", "=https", "--max-time", "20"])
+            .args(["-o", null, "-w", "%{url_effective}", &format!("{REPO_RELEASES_URL}/latest")])
             .output();
         let mut found = None;
         if let Ok(res) = out {
@@ -647,8 +678,9 @@ fn spawn_update_check(upd: Arc<Mutex<UpdateState>>, ctx: egui::Context) {
                 if let Some((_, tag)) = eff.rsplit_once("/tag/") {
                     if let (Some(rem), Some(cur)) = (parse_semver(tag), parse_semver(APP_VERSION)) {
                         if rem > cur {
-                            let ver = tag.trim_start_matches(['v', 'V']).to_string();
-                            found = Some((ver, eff));
+                            // only the parsed numbers reach urls and file names never the raw tag text
+                            let ver = format!("{}.{}.{}", rem.0, rem.1, rem.2);
+                            found = Some((ver.clone(), release_page_url(&ver)));
                         }
                     }
                 }
@@ -674,13 +706,19 @@ fn spawn_install_update(ver: String, upd: Arc<Mutex<UpdateState>>, ctx: egui::Co
     ctx.request_repaint();
     std::thread::spawn(move || {
         let res: Result<(), String> = (|| {
+            let ver = parse_semver(&ver).map(|(a, b, c)| format!("{a}.{b}.{c}")).ok_or("bad version")?;
             let tmp = std::env::temp_dir().join("percystar_self_update");
-            let _ = fs::remove_dir_all(&tmp);
+            // a leftover binary from an earlier attempt must never be the one that gets installed
+            if tmp.exists() {
+                fs::remove_dir_all(&tmp).map_err(|e| format!("Cannot clear update folder: {e}"))?;
+            }
             fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
             let zip_p = tmp.join("update.zip");
             let dl_url = format!("{REPO_RELEASES_URL}/download/v{ver}/PercyStar_v{ver}_Win64.zip");
             let dl = silent_cmd("curl.exe")
-                .args(["-fsSL", "-o", zip_p.to_str().ok_or("bad zip path")?, &dl_url])
+                .args(["-fsSL", "--proto", "=https", "--proto-redir", "=https", "--max-time", "900", "-o"])
+                .arg(&zip_p)
+                .arg(&dl_url)
                 .output()
                 .map_err(|e| format!("curl error: {e}"))?;
             if !dl.status.success() {
@@ -692,13 +730,12 @@ fn spawn_install_update(ver: String, upd: Arc<Mutex<UpdateState>>, ctx: egui::Co
                 g.status = format!("Extracting v{ver}...");
             }
             ctx.request_repaint();
-            let ps_arg = format!(
-                "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
-                zip_p.display(),
-                tmp.display()
-            );
+            // paths travel through the environment so a quote in the profile name cannot end the command
             let ex = silent_cmd("powershell")
-                .args(["-NoProfile", "-Command", &ps_arg])
+                .args(["-NoProfile", "-NonInteractive", "-Command"])
+                .arg("Expand-Archive -LiteralPath $env:PERCY_ZIP -DestinationPath $env:PERCY_DST -Force")
+                .env("PERCY_ZIP", &zip_p)
+                .env("PERCY_DST", &tmp)
                 .output()
                 .map_err(|e| format!("Expand error: {e}"))?;
             if !ex.status.success() {
@@ -715,7 +752,9 @@ fn spawn_install_update(ver: String, upd: Arc<Mutex<UpdateState>>, ctx: egui::Co
             let old_exe = cur_exe.with_extension("exe.old");
             let _ = fs::remove_file(&old_exe);
             fs::rename(&cur_exe, &old_exe).map_err(|e| format!("Rename failed: {e}"))?;
-            if let Err(e) = fs::copy(&new_exe, &cur_exe) {
+            // install the bytes that were checked not whatever is on disk by now
+            if let Err(e) = fs::write(&cur_exe, &head) {
+                let _ = fs::remove_file(&cur_exe);
                 let _ = fs::rename(&old_exe, &cur_exe);
                 return Err(format!("Replace failed: {e}"));
             }
@@ -921,7 +960,7 @@ fn sgd5_stage_color(stage: &str) -> Color32 {
 }
 
 impl Rpf9App {
-    fn new(cc: &eframe::CreationContext<'_>, logo_rgba: Option<(Vec<u8>, u32, u32)>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, logo_rgba: Option<(Vec<u8>, u32, u32)>, startup: Option<PathBuf>) -> Self {
         setup_style(&cc.egui_ctx);
         let logo_tex = logo_rgba.map(|(raw, w, h)| {
             let ci = ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &raw);
@@ -1029,12 +1068,34 @@ impl Rpf9App {
         };
         load_ui_state(&mut app);
         spawn_update_check(Arc::clone(&app.update), cc.egui_ctx.clone());
-        if let Some(last) = load_last_folder() {
+        // a path on the command line (open with, drag onto the exe) wins over the last folder
+        if let Some(path) = startup {
+            app.open_any_path(path);
+        } else if let Some(last) = load_last_folder() {
             if last.is_dir() {
                 app.start_folder_scan(last);
             }
         }
         app
+    }
+
+    // opens a game folder an archive an obj model or a ps09 shader cache by what the path is
+    fn open_any_path(&mut self, p: PathBuf) {
+        if p.is_dir() {
+            self.start_folder_scan(p);
+            return;
+        }
+        let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
+        if ext.eq_ignore_ascii_case("obj") {
+            self.tab = AppTab::Explorer;
+            self.open_obj_path(&p);
+        } else if ext.eq_ignore_ascii_case("ps09") {
+            self.reset_selection();
+            self.tab = AppTab::Shaders;
+            self.load_ps09_path(&p);
+        } else {
+            self.start_single_scan(p);
+        }
     }
 
     fn ordered_selected_indices(&self) -> Vec<usize> {
@@ -2012,8 +2073,9 @@ impl Rpf9App {
         if need_upload {
             self.tex_view_key = view_key;
             let cur = &self.textures[self.tex_sel];
+            // decoded texels are straight egui wants them premultiplied
             let pixels = if view_key == (tex::TexChannel::Rgba, false) {
-                cur.pixels.clone()
+                tex::premultiplied_for_egui(&cur.pixels)
             } else {
                 tex::channel_view(&cur.pixels, view_key.0, view_key.1)
             };
@@ -2197,11 +2259,15 @@ impl Rpf9App {
         }
 
         if e.kind == "BK2" {
-            let tmp = std::env::temp_dir().join("rpf9_preview_bk2");
+            // per process folder and only our own clips are removed
+            let tmp = std::env::temp_dir().join(format!("percystar_preview_bk2_{}", std::process::id()));
             let _ = fs::create_dir_all(&tmp);
             if let Ok(rd) = fs::read_dir(&tmp) {
                 for old in rd.flatten() {
-                    let _ = fs::remove_file(old.path());
+                    let is_clip = old.file_name().to_string_lossy().starts_with("clip_") && old.path().extension().is_some_and(|x| x == "bk2");
+                    if is_clip && old.file_type().is_ok_and(|t| t.is_file()) {
+                        let _ = fs::remove_file(old.path());
+                    }
                 }
             }
             // bump seq name so windows file locks never block switching vids
@@ -3567,14 +3633,14 @@ impl Rpf9App {
         for e in entries {
             if e.kind == "MODEL" || e.kind == "VEH" {
                 if let Ok(mesh) = decode_rage9_model_from_rpf(&e.source_rpf, e.offset, &e.name) {
-                    let fname = format!("{}.obj", e.name.replace('#', ""));
+                    let fname = format!("{}.obj", safe_file_name(&e.name.replace('#', "")));
                     if mesh.export_obj(&out_dir.join(fname)).is_ok() {
                         ok += 1;
                     }
                 }
             } else if e.kind == "NAVM" {
                 if let Ok(mesh) = decode_navmesh_from_rpf(&e.source_rpf, e.offset, &e.name) {
-                    let fname = format!("{}.obj", e.name.replace('#', ""));
+                    let fname = format!("{}.obj", safe_file_name(&e.name.replace('#', "")));
                     if mesh.export_obj(&out_dir.join(fname)).is_ok() {
                         ok += 1;
                     }
@@ -3590,21 +3656,21 @@ impl Rpf9App {
                 }
             } else if e.kind == "TTPF" {
                 if let Ok(t) = decode_ttpf_texture(&e.source_rpf, e.tracks as usize) {
-                    if export_texture_png(&t, &out_dir.join(format!("{}.png", t.name))).is_ok() {
+                    if export_texture_png(&t, &out_dir.join(format!("{}.png", safe_file_name(&t.name)))).is_ok() {
                         ok += 1;
                     }
                 }
             } else if e.kind == "RBF0" {
                 if let Ok(data) = read_entry_bytes(&e) {
                     let xml = decode_rbf0(&data).unwrap_or_else(|| String::from_utf8_lossy(&data).into_owned());
-                    let fname = format!("{}.xml", e.name.trim_end_matches(".rbf"));
+                    let fname = format!("{}.xml", safe_file_name(e.name.trim_end_matches(".rbf")));
                     if fs::write(out_dir.join(fname), xml).is_ok() {
                         ok += 1;
                     }
                 }
             } else if let Ok(data) = read_entry_bytes(&e) {
                 let fname = if self.is_folder { format!("{}_{}", e.rpf_name.trim_end_matches(".rpf"), e.name) } else { e.name.clone() };
-                if fs::write(out_dir.join(fname), &data).is_ok() {
+                if fs::write(out_dir.join(safe_file_name(&fname)), &data).is_ok() {
                     ok += 1;
                 }
             }
@@ -4400,7 +4466,8 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
         let start = if doff >= 0x40 && (doff as u64) < sz { doff } else { 0x40 };
         (start, format!("{magic}  ·  {sz} B  ·  {ecnt} entries  ·  data@0x{start:x}  ·  names={nlen}B"))
     } else {
-        let hdr_hex: String = hdr[4..n.min(16)].iter().map(|b| format!("{b:02x}")).collect();
+        // files shorter than the magic have nothing to show
+        let hdr_hex: String = hdr.get(4..n.min(16)).unwrap_or(&[]).iter().map(|b| format!("{b:02x}")).collect();
         (0x40usize, format!("{magic}  ·  {sz} B  ·  {hdr_hex}"))
     };
     if let Some(st) = progress_state {
@@ -4682,6 +4749,10 @@ fn enrich_audio_rpf_entries(audio_rpf: &PathBuf, total_sz: u64, entries: &mut Ve
 
 impl eframe::App for Rpf9App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // a file or folder dropped onto the window opens like open file
+        if let Some(path) = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone())) {
+            self.open_any_path(path);
+        }
         self.poll_sgd5_cache();
         if let Some(pick) = self.lod_pick.take() {
             self.apply_lod_pick(pick);
@@ -4845,15 +4916,10 @@ impl eframe::App for Rpf9App {
                         .add_filter("OBJ models / PS09 shaders", &["obj", "ps09"])
                         .pick_file()
                     {
-                        let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
-                        if ext.eq_ignore_ascii_case("obj") {
+                        if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("obj")) {
                             self.open_obj_path(&p);
-                        } else if ext.eq_ignore_ascii_case("ps09") {
-                            self.reset_selection();
-                            self.tab = AppTab::Shaders;
-                            self.load_ps09_path(&p);
                         } else {
-                            self.start_single_scan(p);
+                            self.open_any_path(p);
                         }
                     }
                 }
@@ -5301,7 +5367,7 @@ impl eframe::App for Rpf9App {
                             self.anim_time = t;
                             let next = anim::build_stickman_mesh(&self.anim_name, t, self.anim_dur, self.anim_tracks, self.anim_seed);
                             mesh.verts = next.verts;
-                            mesh.dirty = true;
+                            mesh.invalidate_normals();
                         }
                     }
                     if let Some(pick) = lod_switch_ui(ui, mesh, &self.lod_siblings, self.selected) {
@@ -5316,7 +5382,7 @@ impl eframe::App for Rpf9App {
                     self.anim_time = (self.anim_time + dt) % self.anim_dur.max(0.1);
                     let next = anim::build_stickman_mesh(&self.anim_name, self.anim_time, self.anim_dur, self.anim_tracks, self.anim_seed);
                     mesh.verts = next.verts;
-                    mesh.dirty = true;
+                    mesh.invalidate_normals();
                     ctx.request_repaint();
                 }
                 self.show_3d = toggle_3d;
@@ -5366,11 +5432,7 @@ impl eframe::App for Rpf9App {
                                 spawn_install_update(new_ver.clone(), Arc::clone(&self.update), ctx.clone());
                             }
                             if ui.button("View Release").clicked() {
-                                let _ = if cfg!(windows) {
-                                    silent_cmd("cmd").args(["/C", "start", "", rel_url]).spawn()
-                                } else {
-                                    Command::new("open").arg(rel_url).spawn()
-                                };
+                                open_url(rel_url);
                             }
                             if ui.add_enabled(!upd_inst, egui::Button::new("Later")).clicked() {
                                 self.update.lock().unwrap().show_modal = false;
@@ -5426,7 +5488,7 @@ fn export_models_cli(rpf_path: &PathBuf, out_dir: &PathBuf, filter: &str, vehicl
     for (idx, (key, off, name)) in list.iter().enumerate() {
         if let Ok(mesh) = decode_rage9_model_from_rpf(rpf_path, *off, name) {
             let fname = if vehicles_only { format!("{key}.obj") } else { format!("{}.obj", name.replace('#', "").replace('.', "_")) };
-            if mesh.export_obj(&out_dir.join(fname)).is_ok() {
+            if mesh.export_obj(&out_dir.join(safe_file_name(&fname))).is_ok() {
                 ok += 1;
                 if ok <= 25 || ok.is_multiple_of(50) {
                     eprintln!("  [{}/{}] {} ({} v, {} f)", idx + 1, list.len(), key, mesh.verts.len(), mesh.tris.len());
@@ -5451,7 +5513,7 @@ fn dump_textures_cli(src_path: &PathBuf, out_dir: &PathBuf, limit: usize) {
         for d in ix.descs.iter().take(n) {
             match decode_ttpf_texture(src_path, d.idx) {
                 Ok(tx) => {
-                    if export_texture_png(&tx, &out_dir.join(format!("{}.png", tx.name))).is_ok() {
+                    if export_texture_png(&tx, &out_dir.join(format!("{}.png", safe_file_name(&tx.name)))).is_ok() {
                         ok += 1;
                     }
                 }
@@ -5701,8 +5763,15 @@ fn main() -> eframe::Result<()> {
         let bk2 = PathBuf::from(&args[2]);
         let out_dir = PathBuf::from(&args[3]);
         let max_f = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(30);
-        let dll = bk2.parent().map(|d| d.join("bink2w64.dll")).filter(|p| p.exists())
-            .unwrap_or_else(|| PathBuf::from("bink2w64.dll"));
+        // never from the folder of the input clip or by bare name both let a planted dll run
+        let dll = std::env::var_os("BINK2_DLL")
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("bink2w64.dll"))))
+            .filter(|p| p.is_absolute() && p.is_file());
+        let Some(dll) = dll else {
+            eprintln!("BK2 decode error: bink2w64.dll not found next to PercyStar (or set BINK2_DLL to its full path)");
+            return Ok(());
+        };
         match bink2::decode_bk2_to_pngs(&dll, &bk2, &out_dir, max_f) {
             Ok((info, n)) => println!("Decoded {n} frames ({}x{}) to {}", info.width, info.height, out_dir.display()),
             Err(e) => eprintln!("BK2 decode error: {e}"),
@@ -5782,7 +5851,9 @@ fn main() -> eframe::Result<()> {
     }
     let opts = eframe::NativeOptions { viewport: vb, ..Default::default() };
     let title = format!("PercyStar v{APP_VERSION}");
-    eframe::run_native(&title, opts, Box::new(move |cc| Ok(Box::new(Rpf9App::new(cc, logo_rgba)))))
+    // percystar <path> opens a folder archive model or shader cache directly
+    let startup = args.get(1).filter(|a| !a.starts_with("--")).map(PathBuf::from).filter(|p| p.exists());
+    eframe::run_native(&title, opts, Box::new(move |cc| Ok(Box::new(Rpf9App::new(cc, logo_rgba, startup)))))
 }
 
 #[cfg(test)]
@@ -5890,6 +5961,31 @@ mod tests {
         assert!(parse_semver("1.1.0") > parse_semver("1.0.99"));
         assert!(parse_semver("v1.0.3") == parse_semver("1.0.3"));
         assert!(parse_semver("bad").is_none());
+        // tag suffixes never reach a url the release page is rebuilt from the numbers
+        let (a, b, c) = parse_semver("v9.9.9-x&calc.exe").unwrap();
+        assert_eq!(release_page_url(&format!("{a}.{b}.{c}")), format!("{REPO_RELEASES_URL}/tag/v9.9.9"));
+    }
+
+    #[test]
+    fn exported_names_cannot_leave_the_output_folder() {
+        let out = Path::new("/out");
+        for bad in ["..\\..\\evil", "../../evil", "/etc/passwd", "C:\\Windows\\x", "..", ".", "", "a\u{0}b", "con?.obj", "trail. "] {
+            let name = safe_file_name(bad);
+            let joined = out.join(&name);
+            assert_eq!(joined.parent(), Some(out), "{bad:?} -> {name:?}");
+            assert!(!name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', ':']), "{bad:?} -> {name:?}");
+        }
+        // ordinary archive names are untouched
+        for ok in ["banshee_hi.ft", "nav_256_256_(0,0).ynv", "cheetah2.#ft", "a b-c_d.png"] {
+            assert_eq!(safe_file_name(ok), ok);
+        }
+    }
+
+    #[test]
+    fn non_ascii_model_names_classify_without_panicking() {
+        let _ = classify_model_cat("MODEL", "\u{e9}t\u{e9}_car.#dr");
+        assert!(!match_known_stem("\u{e9}abcd", &["abcd"]));
+        assert!(match_known_stem("xabcd", &["abcd"]));
     }
 
     /// PERCYSTAR_PACKS_RPF=<packs.rpf> cargo test packs_vehicle_table_is_schema_not_animation -- --nocapture

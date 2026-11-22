@@ -205,7 +205,8 @@ fn parse_lsch(lsch: &[u8]) -> Vec<PsinStruct> {
     }
     let mut structs = Vec::with_capacity(hdrs.len());
     for (hash, flags, size, fcnt) in hdrs {
-        let mut fields = Vec::with_capacity(fcnt);
+        // field count is a file value never reserve more than the remaining descriptors
+        let mut fields = Vec::with_capacity(fcnt.min(lsch.len().saturating_sub(off) / 16));
         for _ in 0..fcnt {
             if off + 16 > lsch.len() {
                 break;
