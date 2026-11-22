@@ -13,7 +13,6 @@
 use eframe::egui::{self, Color32, ColorImage, RichText, TextureHandle, TextureOptions};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
@@ -49,7 +48,6 @@ pub struct BinkNative {
     title: String,
     tx: Sender<Cmd>,
     shared: Arc<Mutex<Shared>>,
-    thread: Option<JoinHandle<()>>,
     tex: Option<TextureHandle>,
     last_seq: u64,
     status: NativeStatus,
@@ -64,7 +62,9 @@ impl BinkNative {
         let shared = Arc::new(Mutex::new(Shared::default()));
         let (tx, rx) = mpsc::channel();
         let (sh, ctx) = (Arc::clone(&shared), ctx.clone());
-        let thread = std::thread::Builder::new()
+        // The thread is detached: it owns the clip folder and removes it when it ends, so closing
+        // the panel never waits for it (it may still be reading a large clip).
+        std::thread::Builder::new()
             .name("bink2-decode".into())
             .spawn(move || {
                 let res = std::fs::read(dir.path().join("clip.bk2"))
@@ -77,7 +77,7 @@ impl BinkNative {
                 ctx.request_repaint();
             })
             .map_err(|e| format!("Start video decoder: {e}"))?;
-        Ok(Self { title, tx, shared, thread: Some(thread), tex: None, last_seq: 0, status: NativeStatus::default(), scrub: None })
+        Ok(Self { title, tx, shared, tex: None, last_seq: 0, status: NativeStatus::default(), scrub: None })
     }
 
     /// Uploads a new frame if the decoder published one. Returns (exited, error).
@@ -173,11 +173,10 @@ impl BinkNative {
 }
 
 impl Drop for BinkNative {
+    /// Tells the decoder thread to stop without waiting for it: it checks for Quit between frames
+    /// (and during seeks), and a read in progress finishes on its own.
     fn drop(&mut self) {
         self.send(Cmd::Quit);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
     }
 }
 
@@ -425,6 +424,10 @@ mod tests {
         let src = Path::new(&src);
         let clip = copy_clip(src, 0, src.metadata().unwrap().len(), &AtomicBool::new(false)).unwrap();
         let ctx = egui::Context::default();
+        // closing right after opening (while the clip is still being read) must not wait for it
+        let t = Instant::now();
+        drop(BinkNative::spawn(&ctx, copy_clip(src, 0, src.metadata().unwrap().len(), &AtomicBool::new(false)).unwrap(), "test".into(), true).unwrap());
+        assert!(t.elapsed() < Duration::from_millis(100), "closing while loading took {:?}", t.elapsed());
         let mut p = BinkNative::spawn(&ctx, clip, "test".into(), true).unwrap();
         let wait = |p: &mut BinkNative, ms: u64| {
             let t = Instant::now();
