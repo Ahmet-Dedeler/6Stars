@@ -28,6 +28,12 @@ mod vehicle_variations;
 #[cfg(target_os = "macos")]
 mod mac_open;
 mod video_clip;
+// copy actions, AI context, related files (context menus everywhere)
+mod context_copy;
+mod context_ui;
+mod relations;
+#[cfg(test)]
+mod context_capture;
 #[cfg(test)]
 mod audit_tests;
 #[cfg(test)]
@@ -806,6 +812,8 @@ struct Rpf9App {
     sgd5_search: String,
     sgd5_selected: Option<usize>,
     sgd5_cached_text: (Option<(usize, usize, ShaderViewMode)>, String),
+    /// context menus, copy toasts and the Related files panel (src/context_ui.rs)
+    ctx_ui: context_ui::ContextUi,
 }
 
 fn sgd5_stage(stage: &str) -> ShaderStage {
@@ -1004,6 +1012,7 @@ impl Rpf9App {
             sgd5_search: String::new(),
             sgd5_selected: None,
             sgd5_cached_text: (None, String::new()),
+            ctx_ui: Default::default(),
         };
         load_ui_state(&mut app);
         spawn_update_check(Arc::clone(&app.update), cc.egui_ctx.clone());
@@ -2812,7 +2821,6 @@ impl Rpf9App {
                 ui.separator();
 
                 const ROW_H: f32 = 22.0;
-                let mut copied_msg: Option<String> = None;
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                 egui::ScrollArea::vertical()
                     .id_salt("mv_list_scroll")
@@ -2839,15 +2847,10 @@ impl Rpf9App {
                                 if resp.clicked() {
                                     to_select = Some(*eidx);
                                 }
-                                if let Some(msg) = entry_context_menu(&resp, e) {
-                                    copied_msg = Some(msg);
-                                }
+                                context_ui::attach_entry_menu(&resp, &mut self.ctx_ui, &self.state, *eidx, Vec::new);
                             });
                         }
                     });
-                if let Some(msg) = copied_msg {
-                    self.state.lock().unwrap().status = msg;
-                }
             });
         }
 
@@ -2864,7 +2867,8 @@ impl Rpf9App {
             self.show_3d = true;
         }
 
-        egui::CentralPanel::default()
+        self.related_side_panel(ctx);
+        let preview = egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(Color32::from_rgb(13, 9, 21)).inner_margin(12.0))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -2894,6 +2898,7 @@ impl Rpf9App {
                                 self.open_obj_path(&p);
                             }
                         }
+                        self.context_toolbar(ui);
                     });
                 });
                 ui.separator();
@@ -2998,6 +3003,7 @@ impl Rpf9App {
                     });
                 }
             });
+        self.preview_context_hook(ctx, preview.response.rect);
     }
 
     fn load_ps09_path(&mut self, path: &Path) {
@@ -4335,44 +4341,6 @@ fn apply_multi_select(
     }
 }
 
-fn entry_context_menu(resp: &egui::Response, e: &RpfEntry) -> Option<String> {
-    let mut copied = None;
-    resp.context_menu(|ui| {
-        if ui.button("Copy File Name").clicked() {
-            ui.ctx().copy_text(e.name.clone());
-            copied = Some(format!("Copied name: {}", e.name));
-            ui.close_menu();
-        }
-        let rel = format!("{} / {}", e.rpf_name, e.name);
-        if ui.button("Copy Archive / File Path").clicked() {
-            ui.ctx().copy_text(rel.clone());
-            copied = Some(format!("Copied: {rel}"));
-            ui.close_menu();
-        }
-        let full = e.source_rpf.display().to_string();
-        if ui.button("Copy Source Archive Path").clicked() {
-            ui.ctx().copy_text(full.clone());
-            copied = Some(format!("Copied archive path: {full}"));
-            ui.close_menu();
-        }
-        if let Some(dir) = e.source_rpf.parent() {
-            let dir_s = dir.display().to_string();
-            if ui.button("Copy Directory Path").clicked() {
-                ui.ctx().copy_text(dir_s.clone());
-                copied = Some(format!("Copied directory: {dir_s}"));
-                ui.close_menu();
-            }
-        }
-        let loc = format!("{} @ 0x{:08x} ({})", e.rpf_name, e.offset, e.name);
-        if ui.button("Copy Offset Location").clicked() {
-            ui.ctx().copy_text(loc.clone());
-            copied = Some(format!("Copied: {loc}"));
-            ui.close_menu();
-        }
-    });
-    copied
-}
-
 fn format_size(bytes: u64) -> String {
     let b = bytes as f64;
     if b >= 1_073_741_824.0 {
@@ -5038,6 +5006,7 @@ impl eframe::App for Rpf9App {
         }
         self.poll_bink_player(ctx);
         self.poll_sgd5_cache();
+        self.context_tick(ctx);
         if let Some(pick) = self.lod_pick.take() {
             self.apply_lod_pick(pick);
         }
@@ -5231,7 +5200,7 @@ impl eframe::App for Rpf9App {
                             self.export_entries(&targets);
                         }
                     }
-                    let copy_shortcut = !ctx.wants_keyboard_input() && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::C));
+                    let copy_shortcut = !ctx.wants_keyboard_input() && ui.input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::C));
                     if ui.button("Copy Path").on_hover_text("Copy selected file path(s) — Ctrl+C or Ctrl+Click/Shift+Click for multi-select").clicked() || copy_shortcut {
                         let targets = self.ordered_selected_indices();
                         if !targets.is_empty() {
@@ -5440,10 +5409,12 @@ impl eframe::App for Rpf9App {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     sort_combo(ui, "explorer_sort_combo", &mut self.sort_mode);
+                    self.context_toolbar(ui);
                 });
             });
             if texture_view && self.grid_view {
-                let (state, view, is_folder) = (&self.state, &self.view, self.is_folder);
+                let (state, view, is_folder, multi) = (&self.state, &self.view, self.is_folder, &self.multi_selected);
+                let cu = &mut self.ctx_ui;
                 let picked = self.gallery.grid_ui(
                     ui,
                     view.len(),
@@ -5467,6 +5438,7 @@ impl eframe::App for Rpf9App {
                             .collect()
                     },
                     |idx| view.iter().position(|&i| i == idx),
+                    |resp, idx| context_ui::attach_entry_menu(resp, cu, state, idx, || context_ui::ordered_selection(view, multi)),
                 );
                 if let Some(i) = picked {
                     self.select_entry(i);
@@ -5474,7 +5446,6 @@ impl eframe::App for Rpf9App {
                 return;
             }
             let mut clicked: Option<(usize, bool, bool)> = None;
-            let mut copied_msg: Option<String> = None;
             let mut row_rects: Vec<(usize, f32, f32)> = Vec::new();
             let scroll_to_sel = std::mem::take(&mut self.explorer_scroll_to_sel);
             // rows must be exactly row_h tall or show_rows miscomputes total height
@@ -5506,35 +5477,8 @@ impl eframe::App for Rpf9App {
                             let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
                             clicked = Some((*idx, ctrl, shift));
                         }
-                        if self.multi_selected.len() > 1 && self.multi_selected.contains(idx) {
-                            let targets = self.ordered_selected_indices();
-                            resp.context_menu(|ui| {
-                                let n = targets.len();
-                                if ui.button(format!("Copy {n} File Names")).clicked() {
-                                    let st = self.state.lock().unwrap();
-                                    let refs: Vec<&RpfEntry> = targets.iter().filter_map(|&i| st.entries.get(i)).collect();
-                                    ui.ctx().copy_text(format_multi_copy(&refs, 0));
-                                    copied_msg = Some(format!("Copied {n} file names"));
-                                    ui.close_menu();
-                                }
-                                if ui.button(format!("Copy {n} Archive / File Paths")).clicked() {
-                                    let st = self.state.lock().unwrap();
-                                    let refs: Vec<&RpfEntry> = targets.iter().filter_map(|&i| st.entries.get(i)).collect();
-                                    ui.ctx().copy_text(format_multi_copy(&refs, 1));
-                                    copied_msg = Some(format!("Copied {n} paths"));
-                                    ui.close_menu();
-                                }
-                                if ui.button(format!("Copy {n} Offset Locations")).clicked() {
-                                    let st = self.state.lock().unwrap();
-                                    let refs: Vec<&RpfEntry> = targets.iter().filter_map(|&i| st.entries.get(i)).collect();
-                                    ui.ctx().copy_text(format_multi_copy(&refs, 2));
-                                    copied_msg = Some(format!("Copied {n} locations"));
-                                    ui.close_menu();
-                                }
-                            });
-                        } else if let Some(msg) = entry_context_menu(&resp, e) {
-                            copied_msg = Some(msg);
-                        }
+                        let (view, multi) = (&self.view, &self.multi_selected);
+                        context_ui::attach_entry_menu(&resp, &mut self.ctx_ui, &self.state, *idx, || context_ui::ordered_selection(view, multi));
                     });
                     row_rects.push((*idx, row_alloc.response.rect.min.y, row_alloc.response.rect.max.y));
                 }
@@ -5571,9 +5515,6 @@ impl eframe::App for Rpf9App {
             } else {
                 self.marquee_start = None;
             }
-            if let Some(msg) = copied_msg {
-                self.state.lock().unwrap().status = msg;
-            }
             if let Some((i, ctrl, shift)) = clicked {
                 apply_multi_select(&self.view, &mut self.multi_selected, &mut self.multi_anchor, i, ctrl, shift);
                 if !ctrl && !shift {
@@ -5584,7 +5525,8 @@ impl eframe::App for Rpf9App {
             }
         });
 
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::from_rgb(14, 10, 22)).inner_margin(12.0)).show(ctx, |ui| {
+        self.related_side_panel(ctx);
+        let preview = egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::from_rgb(14, 10, 22)).inner_margin(12.0)).show(ctx, |ui| {
             #[cfg(target_os = "macos")]
             if let Some(be) = self.bink_embed.as_mut() {
                 be.ui(ui, &mut self.bink_volume, &mut self.bink_loop);
@@ -5688,6 +5630,7 @@ impl eframe::App for Rpf9App {
                 });
             }
         });
+        self.preview_context_hook(ctx, preview.response.rect);
         } // end Explorer tab
 
         let (show_upd, upd_avail, upd_inst, upd_status) = {
