@@ -867,6 +867,9 @@ pub fn ttpf_read_virtual(path: &Path, ix: &TtpfIndex, off: u64, len: usize) -> R
             out
         } else if ch.len() as u64 == vl {
             ch
+        } else if codec == 1 && vl % 8 == 0 {
+            bcpack::decode::bc1_chunk(&ch, vl as usize)
+                .map_err(|e| format!("BCPack BC1 decode error: {e:?}"))?
         } else {
             let mode = match codec {
                 1 => "BC1", 2 => "BC2", 3 => "BC3", 4 => "BC4", 5 => "BC5", 6 => "BC6H", 7 => "BC7", _ => "HW",
@@ -1552,4 +1555,67 @@ mod mhiu_tests {
         assert_eq!(px[0], Color32::TRANSPARENT);
         assert_eq!(px[1], Color32::BLACK);
     }
+
+    #[test]
+    fn bcpack_bc1_chunk_decodes_synthetic_stream() {
+        let blocks = 256;
+        let (mut stream, expected) = bcpack::encode::synthetic_bc1(7, blocks, 100);
+        stream.resize(stream.len().next_multiple_of(256), 0);
+        let decoded = bcpack::decode::bc1_chunk(&stream, blocks * 8).expect("synthetic BC1");
+        assert_eq!(decoded, expected);
+        assert!(bcpack::decode::bc1_chunk(&[0xA5; 4096], blocks * 8).is_err());
+    }
+
+    #[test]
+    fn channel_view_isolates_and_rebuilds_normal_z() {
+        let px = [Color32::from_rgba_unmultiplied(128, 128, 0, 255)];
+        let rgb = channel_view(&px, TexChannel::Rgb, true);
+        assert!(rgb[0].b() >= 254);
+        assert_eq!(channel_view(&px, TexChannel::R, false)[0], Color32::from_rgb(128, 128, 128));
+        assert_eq!(channel_view(&px, TexChannel::A, false)[0], Color32::from_rgb(255, 255, 255));
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum TexChannel {
+    #[default]
+    Rgba,
+    Rgb,
+    R,
+    G,
+    B,
+    A,
+}
+
+impl TexChannel {
+    pub const ALL: [(TexChannel, &'static str); 6] = [
+        (TexChannel::Rgba, "RGBA"),
+        (TexChannel::Rgb, "RGB"),
+        (TexChannel::R, "R"),
+        (TexChannel::G, "G"),
+        (TexChannel::B, "B"),
+        (TexChannel::A, "A"),
+    ];
+}
+
+pub fn channel_view(pixels: &[Color32], channel: TexChannel, rebuild_z: bool) -> Vec<Color32> {
+    let mut out = Vec::with_capacity(pixels.len());
+    for p in pixels {
+        let [r, g, mut b, a] = p.to_srgba_unmultiplied();
+        if rebuild_z {
+            let x = r as f32 * (1.0 / 127.5) - 1.0;
+            let y = g as f32 * (1.0 / 127.5) - 1.0;
+            let z = (1.0 - x * x - y * y).max(0.0).sqrt();
+            b = (z * 127.5 + 127.5).round() as u8;
+        }
+        out.push(match channel {
+            TexChannel::Rgba => Color32::from_rgba_unmultiplied(r, g, b, a),
+            TexChannel::Rgb => Color32::from_rgb(r, g, b),
+            TexChannel::R => Color32::from_rgb(r, r, r),
+            TexChannel::G => Color32::from_rgb(g, g, g),
+            TexChannel::B => Color32::from_rgb(b, b, b),
+            TexChannel::A => Color32::from_rgb(a, a, a),
+        });
+    }
+    out
 }

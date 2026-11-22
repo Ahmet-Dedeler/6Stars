@@ -773,6 +773,9 @@ struct Rpf9App {
     tex_sel: usize,
     tex_handle: Option<(usize, TextureHandle)>,
     tex_zoom: f32,
+    tex_channel: tex::TexChannel,
+    tex_rebuild_z: bool,
+    tex_view_key: (tex::TexChannel, bool),
     vehicles_only: bool,
     audio_named: bool,
     // cachd ui list so huge scans never re filter or clone evry fram
@@ -966,6 +969,9 @@ impl Rpf9App {
             tex_sel: 0,
             tex_handle: None,
             tex_zoom: 1.0,
+            tex_channel: tex::TexChannel::Rgba,
+            tex_rebuild_z: false,
+            tex_view_key: (tex::TexChannel::Rgba, false),
             vehicles_only: false,
             audio_named: true,
             view: Vec::new(),
@@ -1976,11 +1982,31 @@ impl Rpf9App {
                 });
             });
         }
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Channels:").size(11.0).color(Color32::from_rgb(150, 145, 175)));
+            for (ch, lbl) in tex::TexChannel::ALL {
+                if ui.selectable_label(self.tex_channel == ch, lbl).clicked() {
+                    self.tex_channel = ch;
+                }
+            }
+            ui.separator();
+            ui.checkbox(&mut self.tex_rebuild_z, "Normal: rebuild Z").on_hover_text(
+                "Recomputes blue Z = sqrt(1 - x^2 - y^2) from R/G for two-channel normal maps",
+            );
+        });
         ui.separator();
-        let need_upload = self.tex_handle.as_ref().map(|(idx, _)| *idx != self.tex_sel).unwrap_or(true);
+        let view_key = (self.tex_channel, self.tex_rebuild_z);
+        let need_upload = self.tex_view_key != view_key
+            || self.tex_handle.as_ref().map(|(idx, _)| *idx != self.tex_sel).unwrap_or(true);
         if need_upload {
+            self.tex_view_key = view_key;
             let cur = &self.textures[self.tex_sel];
-            let ci = ColorImage { size: [cur.w, cur.h], pixels: cur.pixels.clone() };
+            let pixels = if view_key == (tex::TexChannel::Rgba, false) {
+                cur.pixels.clone()
+            } else {
+                tex::channel_view(&cur.pixels, view_key.0, view_key.1)
+            };
+            let ci = ColorImage { size: [cur.w, cur.h], pixels };
             let h = ui.ctx().load_texture(format!("percystar_tex_{}", self.tex_sel), ci, TextureOptions::LINEAR);
             self.tex_handle = Some((self.tex_sel, h));
         }
