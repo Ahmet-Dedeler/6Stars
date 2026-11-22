@@ -275,48 +275,56 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -
                 let _ = tx.send(WorldStreamMsg::TotalArchetypes(loaded.len() + batch_list.len()));
                 let groups = Arc::new(batch_list);
                 let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let workers = std::thread::available_parallelism().map(|n| (n.get() / 2).clamp(3, 6)).unwrap_or(3);
                 // a camera move stops the batch early and whatever was not reached is queued again
-                let finished = Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
-                std::thread::scope(|s| {
-                    for _ in 0..3 {
-                        let groups = Arc::clone(&groups);
-                        let cursor = Arc::clone(&cursor);
-                        let finished = Arc::clone(&finished);
-                        let tx = tx.clone();
-                        let lp = lp.clone();
-                        let cam_track_bg = Arc::clone(&cam_track_bg);
-                        s.spawn(move || loop {
-                            // the viewer shows these at 128 pixels so larger mips are never read
-                            crate::tex::set_thread_texture_cap(128);
-                            if cam_track_bg.lock().unwrap().1 != last_gen {
-                                break;
-                            }
-                            let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if i >= groups.len() {
-                                break;
-                            }
-                            let (h, moff, ref insts) = groups[i];
-                            if let Ok(mesh) = crate::model3d::decode_rage9_model_from_rpf(&lp, moff, &format!("arch_{h:08x}")) {
-                                let lo = mesh.name.to_ascii_lowercase();
-                                if !(lo.ends_with("_shadow") || lo.ends_with("_pxy") || lo.ends_with("_lit_proxy"))
-                                    && tx.send(WorldStreamMsg::Batch(WorldBatchInput { mesh, instances: insts.clone() })).is_err() {
+                let mut finished_count = 0usize;
+                let worker_done: Vec<Vec<u32>> = std::thread::scope(|s| {
+                    let handles: Vec<_> = (0..workers)
+                        .map(|_| {
+                            let groups = Arc::clone(&groups);
+                            let cursor = Arc::clone(&cursor);
+                            let tx = tx.clone();
+                            let lp = lp.clone();
+                            let cam_track_bg = Arc::clone(&cam_track_bg);
+                            s.spawn(move || {
+                                // the viewer shows these at 128 pixels so larger mips are never read
+                                crate::tex::set_thread_texture_cap(128);
+                                let mut local_done = Vec::new();
+                                loop {
+                                    if cam_track_bg.lock().unwrap().1 != last_gen {
                                         break;
                                     }
-                            }
-                            finished.lock().unwrap().push(h);
-                            if tx.send(WorldStreamMsg::ArchetypeDone).is_err() {
-                                break;
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(1));
-                        });
-                    }
+                                    let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if i >= groups.len() {
+                                        break;
+                                    }
+                                    let (h, moff, ref insts) = groups[i];
+                                    if let Ok(mesh) = crate::model3d::decode_rage9_model_from_rpf(&lp, moff, &format!("arch_{h:08x}")) {
+                                        let lo = mesh.name.to_ascii_lowercase();
+                                        if !(lo.ends_with("_shadow") || lo.ends_with("_pxy") || lo.ends_with("_lit_proxy"))
+                                            && tx.send(WorldStreamMsg::Batch(WorldBatchInput { mesh, instances: insts.clone() })).is_err() {
+                                                break;
+                                            }
+                                    }
+                                    local_done.push(h);
+                                    if tx.send(WorldStreamMsg::ArchetypeDone).is_err() {
+                                        break;
+                                    }
+                                }
+                                local_done
+                            })
+                        })
+                        .collect();
+                    handles.into_iter().map(|h| h.join().unwrap_or_default()).collect()
                 });
-                let finished = std::mem::take(&mut *finished.lock().unwrap());
-                if finished.len() < groups.len() {
+                for chunk in worker_done {
+                    finished_count += chunk.len();
+                    loaded.extend(chunk);
+                }
+                if finished_count < groups.len() {
                     // let the next pass run even if the camera has stopped moving again
                     last_gen = 0;
                 }
-                loaded.extend(finished);
                 let _ = tx.send(WorldStreamMsg::TotalArchetypes(loaded.len()));
             }
         });
@@ -1336,6 +1344,8 @@ struct GpuWorldApp {
     menu_open: bool,
     show_models: bool,
     show_boxes: bool,
+    show_water: bool,
+    draw_radius: f32,
     fog_density: f32,
     exposure: f32,
     keys: [bool; 9], // W A S D Q E Shift Space Ctrl
@@ -1371,6 +1381,8 @@ impl GpuWorldApp {
             menu_open: true,
             show_models: true,
             show_boxes: false,
+            show_water: true,
+            draw_radius: 6000.0,
             fog_density: 0.70,
             exposure: 1.0,
             keys: [false; 9],
@@ -1499,13 +1511,14 @@ impl ApplicationHandler for GpuWorldApp {
                         KeyCode::KeyA => self.keys[1] = down,
                         KeyCode::KeyS => self.keys[2] = down,
                         KeyCode::KeyD => self.keys[3] = down,
-                        KeyCode::KeyQ => self.keys[4] = down,
+                        KeyCode::KeyQ | KeyCode::KeyC => self.keys[4] = down,
                         KeyCode::KeyE => self.keys[5] = down,
                         KeyCode::ShiftLeft | KeyCode::ShiftRight => self.keys[6] = down,
                         KeyCode::Space => self.keys[7] = down,
                         KeyCode::ControlLeft | KeyCode::ControlRight => self.keys[8] = down,
                         KeyCode::Home | KeyCode::F1 if down => self.menu_open = !self.menu_open,
                         KeyCode::KeyB if down => self.show_boxes = !self.show_boxes,
+                        KeyCode::KeyV if down => self.show_water = !self.show_water,
                         KeyCode::F6 if down => self.auto_sun = !self.auto_sun,
                         KeyCode::KeyR if down => self.rt_on = !self.rt_on,
                         KeyCode::KeyG if down => {
@@ -1692,7 +1705,7 @@ impl ApplicationHandler for GpuWorldApp {
                     rp.draw(0..3, 0..1);
 
                     // Smoke checks must not mistake the ocean plane for loaded geometry.
-                    if self.smoke_frames.is_none() {
+                    if self.smoke_frames.is_none() && self.show_water {
                         rp.set_pipeline(&g.water_pipeline);
                         rp.draw(0..6, 0..1);
                     }
@@ -1712,7 +1725,8 @@ impl ApplicationHandler for GpuWorldApp {
                                 continue;
                             }
                             let d2 = to_b.length_squared();
-                            let max_d = if b.obj_radius > 35.0 { 6500.0 } else if b.obj_radius < 2.0 { 450.0 } else { 3200.0 };
+                            let base_d: f32 = if b.obj_radius > 35.0 { 6500.0 } else if b.obj_radius < 2.0 { 450.0 } else { 3200.0 };
+                            let max_d = base_d.min(self.draw_radius).max(if b.obj_radius > 35.0 { self.draw_radius } else { 450.0 });
                             if d2 > (max_d + b.bound_radius).powi(2) {
                                 continue;
                             }
@@ -1781,11 +1795,28 @@ impl ApplicationHandler for GpuWorldApp {
                             );
                             ui.separator();
                             ui.add(eframe::egui::Slider::new(&mut self.time_h, 0.0..=24.0).text("Time of Day (h)"));
+                            ui.horizontal(|ui| {
+                                for (lbl, h) in [("Dawn", 6.2), ("Noon", 12.5), ("Golden", 18.0), ("Night", 23.0)] {
+                                    if ui.small_button(lbl).clicked() {
+                                        self.time_h = h;
+                                        self.auto_sun = false;
+                                    }
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Radius:");
+                                for (lbl, r) in [("700m", 700.0), ("1.5km", 1500.0), ("3km", 3000.0), ("6km", 6000.0), ("16km", 16000.0)] {
+                                    if ui.selectable_label((self.draw_radius - r).abs() < 1.0, lbl).clicked() {
+                                        self.draw_radius = r;
+                                    }
+                                }
+                            });
                             ui.add(eframe::egui::Slider::new(&mut self.fog_density, 0.0..=2.0).text("Fog Density"));
                             ui.add(eframe::egui::Slider::new(&mut self.exposure, 0.3..=2.2).text("Exposure"));
                             ui.horizontal(|ui| {
                                 ui.checkbox(&mut self.auto_sun, "Auto Sun (F6)");
                                 ui.checkbox(&mut self.rt_on, "RT Shadows (R)");
+                                ui.checkbox(&mut self.show_water, "Water (V)");
                             });
                             ui.horizontal(|ui| {
                                 ui.checkbox(&mut self.show_models, "Real Models");

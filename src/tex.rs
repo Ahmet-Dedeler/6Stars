@@ -961,9 +961,10 @@ const MAX_BCPACK_CHUNK: u64 = 256 << 20;
 // neighbouring textures and the small mips of one texture share chunks
 const CHUNK_CACHE_SLOTS: usize = 12;
 const CHUNK_CACHE_MAX_LEN: usize = 4 << 20;
-type ChunkCache = std::collections::VecDeque<(std::path::PathBuf, u64, std::rc::Rc<Vec<u8>>)>;
+type ChunkCache = std::collections::VecDeque<(std::rc::Rc<std::path::PathBuf>, u64, std::rc::Rc<Vec<u8>>)>;
 thread_local! {
     static CHUNK_CACHE: std::cell::RefCell<ChunkCache> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+    static LAST_TTPF_FILE: std::cell::RefCell<Option<(std::rc::Rc<std::path::PathBuf>, File)>> = const { std::cell::RefCell::new(None) };
     // largest texture edge model decodes on this thread ask for, zero keeps full size
     static TEX_DIM_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -981,24 +982,33 @@ pub fn ttpf_read_virtual(path: &Path, ix: &TtpfIndex, off: u64, len: usize) -> R
     if off >= stream_end || len > MAX_TEXTURE_BYTES {
         return Err("Texture data lies outside the RDS5 stream".into());
     }
-    let mut f: Option<File> = None;
     let mut out_buf = vec![0u8; len];
     let mut covered = 0usize;
     let mut dec = Decompress::new(true);
+    let mut path_rc: Option<std::rc::Rc<std::path::PathBuf>> = None;
     let first = ix.chunks.partition_point(|c| c.2 + c.3 <= off);
     for &(cs, ce, vs, vl, codec) in &ix.chunks[first..] {
         if vs >= end { break; }
-        let cached = CHUNK_CACHE.with(|c| c.borrow().iter().find(|e| e.1 == cs && e.0 == path).map(|e| e.2.clone()));
+        let cached = CHUNK_CACHE.with(|c| c.borrow().iter().find(|e| e.1 == cs && e.0.as_path() == path).map(|e| e.2.clone()));
         let data = match cached {
             Some(hit) => hit,
             None => {
-                let file = match &mut f {
-                    Some(file) => file,
-                    None => f.insert(File::open(path).map_err(|e| e.to_string())?),
-                };
                 let mut ch = vec![0u8; (ce - cs) as usize];
-                file.seek(SeekFrom::Start(cs)).map_err(|e| e.to_string())?;
-                file.read_exact(&mut ch).map_err(|e| e.to_string())?;
+                LAST_TTPF_FILE.with(|slot| -> Result<(), String> {
+                    let mut guard = slot.borrow_mut();
+                    let need_open = guard.as_ref().is_none_or(|(p, _)| p.as_path() != path);
+                    if need_open {
+                        let file = File::open(path).map_err(|e| e.to_string())?;
+                        let rc = path_rc.get_or_insert_with(|| std::rc::Rc::new(path.to_path_buf())).clone();
+                        *guard = Some((rc, file));
+                    }
+                    let (rc, file) = guard.as_mut().unwrap();
+                    if path_rc.is_none() {
+                        path_rc = Some(rc.clone());
+                    }
+                    file.seek(SeekFrom::Start(cs)).map_err(|e| e.to_string())?;
+                    file.read_exact(&mut ch).map_err(|e| e.to_string())
+                })?;
                 let out = if is_zlib_head(&ch) {
                     // deflate cannot expand more than about 1032 times
                     let mut out = Vec::with_capacity((vl as usize).min(ch.len().saturating_mul(1032).saturating_add(64)));
@@ -1017,12 +1027,13 @@ pub fn ttpf_read_virtual(path: &Path, ix: &TtpfIndex, off: u64, len: usize) -> R
                 };
                 let out = std::rc::Rc::new(out);
                 if out.len() <= CHUNK_CACHE_MAX_LEN {
+                    let rc = path_rc.get_or_insert_with(|| std::rc::Rc::new(path.to_path_buf())).clone();
                     CHUNK_CACHE.with(|c| {
                         let mut c = c.borrow_mut();
                         if c.len() >= CHUNK_CACHE_SLOTS {
                             c.pop_front();
                         }
-                        c.push_back((path.to_path_buf(), cs, out.clone()));
+                        c.push_back((rc, cs, out.clone()));
                     });
                 }
                 out
