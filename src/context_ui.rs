@@ -60,7 +60,9 @@ enum Done {
     Copy { text: String, toast: String },
     Toast(String, ToastKind),
     Index(Arc<RelationIndex>),
-    Textures { entry: usize, rels: Vec<Related>, note: String },
+    /// A background index build found the scan had moved on; another is started next frame.
+    IndexSkipped,
+    Textures { entry: usize, index_ver: u64, rels: Vec<Related>, note: String },
 }
 
 /// Related files for one entry, as shown in the panel.
@@ -405,6 +407,11 @@ fn summarize(e: &RpfEntry, full: bool, meta: Option<&crate::dat::ResolvedAwcMeta
         }
         "ANIM" => Decoded::Anim { clips: e.tracks },
         "NAVM" => Decoded::Navmesh { polys: e.tracks },
+        k if crate::pedphys::is_kind(k) && full => match crate::pedphys::context_facts(e) {
+            Ok((what, facts)) => Decoded::PedPhysics { what: what.into(), facts },
+            Err(err) => Decoded::Unavailable(err),
+        },
+        k if crate::pedphys::is_kind(k) => Decoded::Unavailable(format!("{}; decoded only for selections of up to 4", crate::pedphys::kind_label(k))),
         "XML" if full => match read_entry_bytes(e) {
             Ok(b) => {
                 let s = String::from_utf8_lossy(&b);
@@ -429,23 +436,40 @@ struct JobInput {
     cut: usize,
 }
 
-fn related_lines(state: &Arc<Mutex<ScanState>>, rels: &[Related]) -> Vec<RelatedLine> {
+/// Shown when a rescan changes the entry list while a job runs: the positions it holds would
+/// now name other files, so it stops instead.
+const SCAN_CHANGED: &str = "The file list changed while this ran (a scan is updating it). Try again in a moment.";
+
+/// Runs `f` under the scan lock if the scan is still at version `ver`. Entry positions (the
+/// selection, relation indexes) are only meaningful within the version they came from.
+fn at_ver<R>(state: &Arc<Mutex<ScanState>>, ver: u64, f: impl FnOnce(&ScanState) -> R) -> Option<R> {
     let st = state.lock().unwrap();
-    rels.iter()
-        .filter_map(|r| {
-            st.entries.get(r.entry).map(|o| RelatedLine { path: cc::full_path(o), kind: o.kind, why: format!("{}: {}", r.rule.title().to_lowercase(), r.why) })
-        })
-        .collect()
+    (st.ver == ver).then(|| f(&st))
 }
 
-/// Returns the relation index for the current scan, building it if needed (on this
-/// thread, holding the scan lock for the build).
-fn index_for(state: &Arc<Mutex<ScanState>>, have: Option<Arc<RelationIndex>>) -> Arc<RelationIndex> {
+fn related_lines(state: &Arc<Mutex<ScanState>>, ver: u64, rels: &[Related]) -> Option<Vec<RelatedLine>> {
+    at_ver(state, ver, |st| {
+        rels.iter()
+            .filter_map(|r| {
+                st.entries.get(r.entry).map(|o| RelatedLine { path: cc::full_path(o), kind: o.kind, why: format!("{}: {}", r.rule.title().to_lowercase(), r.why) })
+            })
+            .collect()
+    })
+}
+
+/// Returns the relation index for scan version `ver`, reusing `have` when it matches and
+/// otherwise building it (on this thread, holding the scan lock for the build). `None` when the
+/// scan has moved past `ver`: an index of another version must never be queried with these
+/// entries, since its positions would point at other files or past the end.
+fn index_for(state: &Arc<Mutex<ScanState>>, have: Option<Arc<RelationIndex>>, ver: u64) -> Option<Arc<RelationIndex>> {
     let st = state.lock().unwrap();
-    if let Some(ix) = have.filter(|ix| ix.ver == st.ver || st.scanning) {
-        return ix;
+    if st.ver != ver {
+        return None;
     }
-    Arc::new(RelationIndex::build(&st.entries, &st.audio_bank_meta, st.ver))
+    if let Some(ix) = have.filter(|ix| ix.ver == ver) {
+        return Some(ix);
+    }
+    Some(Arc::new(RelationIndex::build(&st.entries, &st.audio_bank_meta, ver)))
 }
 
 impl Rpf9App {
@@ -462,8 +486,9 @@ impl Rpf9App {
                     self.ctx_ui.index_building = false;
                     self.ctx_ui.index = Some(ix);
                 }
-                Done::Textures { entry, rels, note } => {
-                    if let Some(v) = self.ctx_ui.related.as_mut().filter(|v| v.entry == entry) {
+                Done::IndexSkipped => self.ctx_ui.index_building = false,
+                Done::Textures { entry, index_ver, rels, note } => {
+                    if let Some(v) = self.ctx_ui.related.as_mut().filter(|v| v.entry == entry && v.index_ver == index_ver) {
                         v.textures = Some(rels);
                         v.texture_note = note;
                     }
@@ -574,11 +599,11 @@ impl Rpf9App {
     fn spawn_context_job(&mut self, ctx: &egui::Context, mut targets: Vec<usize>, json: bool, head: bool) {
         let cut = targets.len().saturating_sub(MAX_CONTEXT_ASSETS);
         targets.truncate(MAX_CONTEXT_ASSETS);
-        let (entries, meta) = {
+        let (entries, meta, ver) = {
             let st = self.state.lock().unwrap();
             let entries: Vec<(usize, RpfEntry)> = targets.iter().filter_map(|&i| st.entries.get(i).map(|e| (i, e.clone()))).collect();
             let meta = entries.iter().filter_map(|(_, e)| st.audio_bank_meta.get(&e.offset).map(|m| (e.offset, m.clone()))).collect();
-            (entries, meta)
+            (entries, meta, st.ver)
         };
         if entries.is_empty() {
             return;
@@ -605,7 +630,11 @@ impl Rpf9App {
         let have = self.ctx_ui.index.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let ix = index_for(&state, have);
+            let changed = || {
+                done.lock().unwrap().push(Done::Toast(SCAN_CHANGED.into(), ToastKind::Error));
+                ctx.request_repaint();
+            };
+            let Some(ix) = index_for(&state, have, ver) else { return changed() };
             done.lock().unwrap().push(Done::Index(Arc::clone(&ix)));
             let full = input.entries.len() <= MAX_DECODED_ASSETS;
             let mut assets = Vec::with_capacity(input.entries.len());
@@ -641,14 +670,11 @@ impl Rpf9App {
                         (live, _) => live,
                     };
                 }
-                let rels = {
-                    let st = state.lock().unwrap();
-                    ix.find(&st.entries, &st.audio_bank_meta, *i)
-                };
-                let mut rels = rels;
+                let Some(mut rels) = at_ver(&state, ver, |st| ix.find(&st.entries, &st.audio_bank_meta, *i)) else { return changed() };
                 relations::merge(&mut rels, ix.texture_relations(&tex_refs), *i);
                 relations::merge(&mut rels, input.extra.get(i).cloned().unwrap_or_default(), *i);
-                a.related = Some(related_lines(&state, &rels));
+                let Some(lines) = related_lines(&state, ver, &rels) else { return changed() };
+                a.related = Some(lines);
                 a.decoded = decoded;
                 assets.push(a);
             }
@@ -666,6 +692,7 @@ impl Rpf9App {
     /// Related paths to the clipboard, or (with `out`) everything extracted into one folder.
     fn spawn_related_job(&mut self, ctx: &egui::Context, idx: usize, out: Option<PathBuf>) {
         let state = Arc::clone(&self.state);
+        let ver = state.lock().unwrap().ver;
         let done = Arc::clone(&self.ctx_ui.done);
         let have = self.ctx_ui.index.clone();
         let mut extra = self.live_vehicle_config(idx);
@@ -677,11 +704,14 @@ impl Rpf9App {
             self.ctx_ui.toast("Extracting related files…", ToastKind::Info);
         }
         std::thread::spawn(move || {
-            let ix = index_for(&state, have);
+            let changed = || {
+                done.lock().unwrap().push(Done::Toast(SCAN_CHANGED.into(), ToastKind::Error));
+                ctx.request_repaint();
+            };
+            let Some(ix) = index_for(&state, have, ver) else { return changed() };
             done.lock().unwrap().push(Done::Index(Arc::clone(&ix)));
-            let (main, mut rels) = {
-                let st = state.lock().unwrap();
-                (st.entries.get(idx).cloned(), ix.find(&st.entries, &st.audio_bank_meta, idx))
+            let Some((main, mut rels)) = at_ver(&state, ver, |st| (st.entries.get(idx).cloned(), ix.find(&st.entries, &st.audio_bank_meta, idx))) else {
+                return changed();
             };
             let Some(main) = main else { return };
             if matches!(main.kind, "MODEL" | "VEH") {
@@ -693,11 +723,13 @@ impl Rpf9App {
                 relations::merge(&mut rels, ix.texture_relations(&refs), idx);
             }
             relations::merge(&mut rels, extra, idx);
-            let items: Vec<(RpfEntry, Option<Related>)> = {
-                let st = state.lock().unwrap();
+            // resolved in the same scan version as the lookup (the shader read above ran unlocked)
+            let Some(items) = at_ver(&state, ver, |st| {
                 std::iter::once((main.clone(), None))
                     .chain(rels.iter().filter_map(|r| st.entries.get(r.entry).map(|e| (e.clone(), Some(r.clone())))))
-                    .collect()
+                    .collect::<Vec<(RpfEntry, Option<Related>)>>()
+            }) else {
+                return changed();
             };
             match out {
                 None => {
@@ -710,7 +742,7 @@ impl Rpf9App {
                 }
                 Some(dir) => {
                     let msg = match extract_bundle(&dir, &items) {
-                        Ok((n, folder)) => (format!("Extracted {n} files to {}", folder.display()), ToastKind::Ok),
+                        Ok(x) => x.toast(),
                         Err(err) => (format!("Extract failed: {err}"), ToastKind::Error),
                     };
                     done.lock().unwrap().push(Done::Toast(msg.0, msg.1));
@@ -737,19 +769,32 @@ impl Rpf9App {
             let done = Arc::clone(&self.ctx_ui.done);
             let ctx = ctx.clone();
             std::thread::spawn(move || {
-                let ix = index_for(&state, None);
-                done.lock().unwrap().push(Done::Index(ix));
+                // the scan moved on before the build: the next frame asks again
+                if let Some(ix) = index_for(&state, None, ver) {
+                    done.lock().unwrap().push(Done::Index(ix));
+                } else {
+                    done.lock().unwrap().push(Done::IndexSkipped);
+                }
                 ctx.request_repaint();
             });
         }
         let Some(ix) = self.ctx_ui.index.clone() else { return };
+        if ix.ver != ver {
+            // an index of another scan version can't be used with these entries (its positions
+            // would name other files); show nothing until the matching one is built
+            if self.ctx_ui.related.as_ref().is_some_and(|v| v.index_ver != ver) {
+                self.ctx_ui.related = None;
+            }
+            return;
+        }
         if self.ctx_ui.related.as_ref().is_some_and(|v| v.entry == sel && v.index_ver == ix.ver) {
             return;
         }
-        let (list, model) = {
-            let st = self.state.lock().unwrap();
+        let Some((list, model)) = at_ver(&self.state, ix.ver, |st| {
             let model = st.entries.get(sel).filter(|e| matches!(e.kind, "MODEL" | "VEH")).cloned();
             (ix.find(&st.entries, &st.audio_bank_meta, sel), model)
+        }) else {
+            return;
         };
         let mut list = list;
         relations::merge(&mut list, self.live_vehicle_config(sel), sel);
@@ -776,7 +821,7 @@ impl Rpf9App {
                         (Vec::new(), "Couldn't read this model's shader textures, so texture links aren't shown.".to_string())
                     }
                 };
-                done.lock().unwrap().push(Done::Textures { entry: sel, rels, note });
+                done.lock().unwrap().push(Done::Textures { entry: sel, index_ver: ix2.ver, rels, note });
                 ctx.request_repaint();
             });
             None
@@ -1039,51 +1084,98 @@ fn safe_file_name(s: &str) -> String {
     s.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') { c } else { '_' }).collect()
 }
 
+/// What [`extract_bundle`] wrote.
+struct Extracted {
+    folder: PathBuf,
+    /// Files written in full.
+    written: usize,
+    /// Entries that failed (decode or write), or that were written only in part (a TXD with
+    /// some textures missing). Each has an `"error"` in the manifest.
+    failed: Vec<String>,
+}
+
+impl Extracted {
+    fn toast(&self) -> (String, ToastKind) {
+        let at = self.folder.display();
+        match (self.written, self.failed.len()) {
+            (n, 0) => (format!("Extracted {n} files to {at}"), ToastKind::Ok),
+            (0, f) => (format!("Extract failed for all {f} files (see manifest.json in {at})"), ToastKind::Error),
+            (n, f) => (
+                format!("Extracted {n} files to {at}; {f} failed or are incomplete: {} (manifest.json says why)", self.failed.join(", ")),
+                ToastKind::Error,
+            ),
+        }
+    }
+}
+
 /// Writes the main entry and its related files into `<dir>/<stem>_related/` with a
-/// manifest.json that records where each file came from and why it was included.
-fn extract_bundle(dir: &Path, items: &[(RpfEntry, Option<Related>)]) -> Result<(usize, PathBuf), String> {
+/// manifest.json that records where each file came from, why it was included, and any error.
+/// Files that were written are kept when others fail.
+fn extract_bundle(dir: &Path, items: &[(RpfEntry, Option<Related>)]) -> Result<Extracted, String> {
     let main = &items.first().ok_or("nothing to extract")?.0;
     let folder = dir.join(format!("{}_related", safe_file_name(&cc::raw_stem(&main.name))));
     fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
     let mut written = 0usize;
+    let mut failed = Vec::new();
     let mut rows = Vec::new();
     for (n, (e, rel)) in items.iter().enumerate() {
         let base = format!("{n:02}_{}", safe_file_name(&e.name.replace('#', "")));
-        let (file, err) = match e.kind {
+        // the file (or folder) written, and an error if the entry failed or is incomplete
+        let (file, err): (Option<String>, Option<String>) = match e.kind {
             "MODEL" | "VEH" => match crate::decode_rage9_model_from_rpf(&e.source_rpf, e.offset, &e.name) {
                 Ok(m) => {
                     let f = format!("{base}.obj");
-                    (m.export_obj(&folder.join(&f)).map(|_| f).ok(), None)
+                    match m.export_obj(&folder.join(&f)) {
+                        Ok(()) => (Some(f), None),
+                        Err(err) => (None, Some(format!("write failed: {err}"))),
+                    }
                 }
                 Err(err) => (None, Some(err)),
             },
             "TTPF" => match crate::tex::decode_ttpf_texture(&e.source_rpf, e.tracks as usize) {
                 Ok(t) => {
                     let f = format!("{base}.png");
-                    (crate::tex::export_texture_png(&t, &folder.join(&f)).map(|_| f).ok(), None)
+                    match crate::tex::export_texture_png(&t, &folder.join(&f)) {
+                        Ok(()) => (Some(f), None),
+                        Err(err) => (None, Some(format!("write failed: {err}"))),
+                    }
                 }
                 Err(err) => (None, Some(err)),
             },
             "TXD" => match crate::tex::decode_txd_from_rpf(&e.source_rpf, e.offset) {
                 Ok(texs) => {
                     let sub = format!("{base}_textures");
-                    let _ = fs::create_dir_all(folder.join(&sub));
-                    for t in &texs {
-                        let _ = crate::tex::export_texture_png(t, &folder.join(&sub).join(format!("{}.png", safe_file_name(&t.name))));
+                    match fs::create_dir_all(folder.join(&sub)) {
+                        Err(err) => (None, Some(format!("write failed: {err}"))),
+                        Ok(()) => {
+                            let errs: Vec<String> = texs
+                                .iter()
+                                .filter_map(|t| {
+                                    let name = format!("{}.png", safe_file_name(&t.name));
+                                    crate::tex::export_texture_png(t, &folder.join(&sub).join(&name)).err().map(|err| format!("{name}: {err}"))
+                                })
+                                .collect();
+                            match errs.len() {
+                                0 => (Some(sub), None),
+                                k if k == texs.len() => (None, Some(format!("no textures written: {}", errs[0]))),
+                                k => (Some(sub), Some(format!("{k} of {} textures not written: {}", texs.len(), errs.join("; ")))),
+                            }
+                        }
                     }
-                    (Some(sub), None)
                 }
                 Err(err) => (None, Some(err)),
             },
             _ => match read_entry_bytes(e) {
-                Ok(b) => {
-                    let f = base.clone();
-                    (fs::write(folder.join(&f), b).map(|_| f).ok(), None)
-                }
+                Ok(b) => match fs::write(folder.join(&base), b) {
+                    Ok(()) => (Some(base.clone()), None),
+                    Err(err) => (None, Some(format!("write failed: {err}"))),
+                },
                 Err(err) => (None, Some(err.to_string())),
             },
         };
-        if file.is_some() {
+        if err.is_some() {
+            failed.push(e.name.clone());
+        } else if file.is_some() {
             written += 1;
         }
         let mut fields = vec![
@@ -1112,7 +1204,7 @@ fn extract_bundle(dir: &Path, items: &[(RpfEntry, Option<Related>)]) -> Result<(
         rows.join(",\n")
     );
     fs::write(folder.join("manifest.json"), manifest).map_err(|e| e.to_string())?;
-    Ok((written, folder))
+    Ok(Extracted { folder, written, failed })
 }
 
 #[cfg(test)]
@@ -1143,12 +1235,24 @@ mod tests {
             chunks: Vec::new(),
         };
         let rel = Related { entry: 1, rule: Rule::SameStem, why: "x".into() };
-        let (n, folder) = extract_bundle(dir.path(), &[(e.clone(), None), (e, Some(rel))]).unwrap();
-        assert_eq!(n, 2);
+        let x = extract_bundle(dir.path(), &[(e.clone(), None), (e.clone(), Some(rel.clone()))]).unwrap();
+        assert_eq!((x.written, x.failed.len()), (2, 0));
+        assert!(x.toast().1 == ToastKind::Ok);
+        let folder = x.folder;
         assert_eq!(fs::read(folder.join("00_notes_1.bin")).unwrap(), b"world");
         let m = fs::read_to_string(folder.join("manifest.json")).unwrap();
         assert!(m.contains("\"selected\":\"plain.rpf/notes #1.bin\""));
         assert!(m.contains("\"role\":\"selected\""));
         assert!(m.contains("\"rule\":\"Same name, other kinds\""));
+
+        // a file that can't be written is reported, not counted, and the others are kept
+        fs::remove_file(folder.join("01_notes_1.bin")).unwrap();
+        fs::create_dir(folder.join("01_notes_1.bin")).unwrap();
+        let x = extract_bundle(dir.path(), &[(e.clone(), None), (e, Some(rel))]).unwrap();
+        assert_eq!((x.written, x.failed.len()), (1, 1));
+        assert!(x.toast().1 == ToastKind::Error);
+        assert_eq!(fs::read(folder.join("00_notes_1.bin")).unwrap(), b"world");
+        let m = fs::read_to_string(folder.join("manifest.json")).unwrap();
+        assert!(m.contains("\"file\":null") && m.contains("\"error\":\"write failed"));
     }
 }

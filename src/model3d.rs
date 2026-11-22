@@ -855,8 +855,11 @@ pub fn read_resource_from_file(rpf_path: &Path, file_off: u64) -> Result<(Vec<u8
     let mut f = File::open(rpf_path).map_err(|e| format!("Open error: {e}"))?;
     let (v, mut next_off, p_cnt) = read_virtual_from_file(&mut f, file_off)?;
     let mut p = Vec::new();
-    for _ in 0..p_cnt {
-        let Some(zoff) = find_next_zlib(&mut f, next_off).map_err(|e| e.to_string())? else { break };
+    for page in 0..p_cnt {
+        // a declared page that isn't there is a truncated resource, not a smaller one
+        let Some(zoff) = find_next_zlib(&mut f, next_off).map_err(|e| e.to_string())? else {
+            return Err(format!("Graphics page {} of {p_cnt} is missing (archive ends or is cut short)", page + 1));
+        };
         let (chunk, nxt) = decompress_zlib_at(&mut f, zoff, 64 * 1024 * 1024).map_err(|e| e.to_string())?;
         p.extend_from_slice(&chunk);
         next_off = nxt;

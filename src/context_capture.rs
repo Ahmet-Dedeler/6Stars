@@ -112,10 +112,10 @@ fn context_capture() {
         return;
     };
     fs::create_dir_all(&out).unwrap();
-    let home = out.join("home");
-    let _ = fs::remove_dir_all(&home);
-    fs::create_dir_all(&home).unwrap();
-    std::env::set_var("HOME", &home);
+    // a fresh sandbox HOME so the real app data is never read or written (and nothing under
+    // the output directory is deleted)
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("HOME", home.path());
     let logo = image::load_from_memory(include_bytes!("../assets/logo.png")).ok().map(|img| {
         let rgba = img.to_rgba8();
         (rgba.as_raw().to_vec(), rgba.width(), rgba.height())

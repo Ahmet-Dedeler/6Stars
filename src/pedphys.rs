@@ -243,18 +243,64 @@ pub fn probe(sys: &[u8], whole_len: usize, off: u64) -> Option<Probe> {
 /// that starts on a page (the page scan sees those), at anything that isn't a zlib stream, or
 /// after `max_walk` bytes.
 pub fn packed_followers(buf: &[u8], first: usize, max_walk: usize, file_off: u64, path: &Path, rname: &str) -> Vec<RpfEntry> {
+    walk_packed(buf, WalkStart::After(first), max_walk, file_off, path, rname).0
+}
+
+/// Where [`walk_packed`] starts.
+#[derive(Clone, Copy)]
+pub enum WalkStart {
+    /// At a recognised resource's zlib stream: skip it and probe the ones behind it.
+    After(usize),
+    /// Where an earlier walk ran out of its buffer: find the next stream from here and probe it.
+    Resume(usize),
+}
+
+/// [`packed_followers`] that also says when the walk ran out of `buf` in the middle of a group
+/// (the second value: the file offset to resume from with [`WalkStart::Resume`]). The scanner
+/// reads big archives in windows, so a group near a window's end carries on in the next one.
+pub fn walk_packed(buf: &[u8], start: WalkStart, max_walk: usize, file_off: u64, path: &Path, rname: &str) -> (Vec<RpfEntry>, Option<u64>) {
     use flate2::{Decompress, FlushDecompress, Status};
+    enum Next {
+        At(usize),
+        Stop,
+        OutOfBuf,
+    }
+    // next stream after `pos`: 16-byte aligned in the file (a resumed window can start
+    // anywhere), after zero padding
+    let next = |pos: usize| -> Next {
+        let mut n = pos + ((16 - ((file_off + pos as u64) % 16) as usize) % 16);
+        let pad_end = (n + 0x1000).min(buf.len());
+        while n + 16 <= pad_end && buf[n..n + 16].iter().all(|&b| b == 0) {
+            n += 16;
+        }
+        if n + 16 > buf.len() {
+            return Next::OutOfBuf;
+        }
+        let on_page = (file_off + n as u64) & 0xFFF == 0x10;
+        if on_page || !model3d::is_zlib_head(&buf[n..]) {
+            return Next::Stop;
+        }
+        Next::At(n)
+    };
     let mut out = Vec::new();
+    let (first, mut s, mut probe_s) = match start {
+        WalkStart::After(f) => (f, f, false),
+        WalkStart::Resume(p) => match next(p) {
+            Next::At(n) => (p, n, true),
+            Next::Stop => return (out, None),
+            Next::OutOfBuf => return (out, Some(file_off + p as u64)),
+        },
+    };
     let mut dec = Decompress::new(true);
     let mut sink = vec![0u8; 1 << 16];
     let mut head = Vec::new();
-    let mut s = first;
-    let limit = (first + max_walk).min(buf.len());
+    let limit = first + max_walk;
     while s < limit {
         // inflate the stream at `s` to find where it ends, keeping its first 32 KiB
         dec.reset(true);
         head.clear();
         let mut pos = s;
+        let mut ran_out = false;
         let ended = loop {
             let (bi, bo) = (dec.total_in(), dec.total_out());
             let Ok(st) = dec.decompress(&buf[pos..], &mut sink, FlushDecompress::None) else {
@@ -268,14 +314,19 @@ pub fn packed_followers(buf: &[u8], first: usize, max_walk: usize, file_off: u64
             if st == Status::StreamEnd {
                 break true;
             }
-            if (cin == 0 && cout == 0) || pos >= buf.len() {
+            if pos >= buf.len() {
+                ran_out = true;
+                break false;
+            }
+            if cin == 0 && cout == 0 {
                 break false;
             }
         };
         if !ended {
-            break;
+            // a stream cut off by the end of the window is walked again from its start
+            return (out, ran_out.then_some(file_off + s as u64));
         }
-        if s != first {
+        if probe_s {
             let whole = dec.total_out() as usize;
             if let Some(p) = probe(&head, whole, file_off + s as u64) {
                 out.push(RpfEntry {
@@ -291,19 +342,16 @@ pub fn packed_followers(buf: &[u8], first: usize, max_walk: usize, file_off: u64
                 });
             }
         }
-        // next stream: 16-byte aligned, after zero padding
-        let mut n = (pos + 15) & !15;
-        let pad_end = (n + 0x1000).min(buf.len());
-        while n + 16 <= pad_end && buf[n..n + 16].iter().all(|&b| b == 0) {
-            n += 16;
+        match next(pos) {
+            Next::At(n) => {
+                s = n;
+                probe_s = true;
+            }
+            Next::Stop => break,
+            Next::OutOfBuf => return (out, Some(file_off + pos as u64)),
         }
-        let on_page = (file_off + n as u64) & 0xFFF == 0x10;
-        if on_page || n + 3 > buf.len() || !model3d::is_zlib_head(&buf[n..]) {
-            break;
-        }
-        s = n;
     }
-    out
+    (out, None)
 }
 
 /// `lod0`..`lod3` from a head delta's vertex count.
@@ -1126,8 +1174,10 @@ fn safe_file_stem(name: &str) -> String {
 }
 
 /// Batch export of one entry into `dir`: grooms and cloth as `.glb` line geometry, head deltas
-/// as their raw resource bytes. Returns the written file.
-pub fn export_entry(e: &RpfEntry, dir: &Path) -> Result<PathBuf, String> {
+/// as their raw resource bytes. With `per_archive` (a folder of archives is open) the archive
+/// name leads the file name, since resources in two archives can get the same generated name.
+/// Returns the written file.
+pub fn export_entry(e: &RpfEntry, dir: &Path, per_archive: bool) -> Result<PathBuf, String> {
     let (sys, gfx) = read_resource(&e.source_rpf, e.offset)?;
     let stem = safe_file_stem(&e.name);
     let (file, bytes) = match e.kind {
@@ -1139,9 +1189,69 @@ pub fn export_entry(e: &RpfEntry, dir: &Path) -> Result<PathBuf, String> {
             (e.name.clone(), b)
         }
     };
+    let file = if per_archive {
+        format!("{}_{file}", safe_file_stem(&e.rpf_name))
+    } else {
+        file
+    };
     let p = dir.join(file);
     std::fs::write(&p, bytes).map_err(|err| err.to_string())?;
     Ok(p)
+}
+
+/// What the decoder found, for the copied AI context: a short description of the resource and
+/// its facts (counts, bones, sizes), in the same terms as the preview panel.
+pub fn context_facts(e: &RpfEntry) -> Result<(&'static str, Vec<String>), String> {
+    let (sys, gfx) = read_resource(&e.source_rpf, e.offset)?;
+    let names = |hs: &mut dyn Iterator<Item = u32>| {
+        let all: Vec<String> = hs.map(hash_label).collect();
+        let more = all.len().saturating_sub(8);
+        let shown = all[..all.len().min(8)].join(", ");
+        if more > 0 { format!("{shown} (+{more} more)") } else { shown }
+    };
+    match e.kind {
+        "HAIR" => {
+            let g = decode_groom(&sys, &gfx)?;
+            let mut f = vec![
+                format!("{} guide strands x {} points", g.strands, g.points_per_strand),
+                format!("{} root triangles", g.root_tris.len()),
+            ];
+            if !g.bones.is_empty() {
+                f.push(format!("follows bone(s) {}", names(&mut g.bones.iter().copied())));
+            }
+            if let Some((lo, hi)) = g.bounds() {
+                f.push(format!(
+                    "bounds {:.3}..{:.3} x {:.3}..{:.3} x {:.3}..{:.3} m (Z up)",
+                    lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]
+                ));
+            }
+            f.push(format!("graphics buffer {} bytes", g.buffer_bytes));
+            Ok(("strand hair groom", f))
+        }
+        "CLOTH" | "SOFT" => {
+            let c = decode_cloth(&sys)?;
+            let mut f = vec![
+                format!("{} particles, {} edges", c.particles.len(), c.edges.len()),
+                format!("{} of {} edges at their rest length in the stored pose", c.rest_matches, c.edges.len()),
+            ];
+            if !c.names.is_empty() {
+                f.push(format!("names {}", c.names.join(", ")));
+            }
+            Ok((if c.soft { "verlet soft body" } else { "verlet cloth" }, f))
+        }
+        _ => {
+            let d = decode_head_delta(&sys, &gfx)?;
+            let lod = d.lod().map_or_else(|| "unknown LOD".to_string(), |l| format!("LOD {l}"));
+            Ok((
+                "head identity delta",
+                vec![
+                    format!("{} vertex offsets ({lod})", d.deltas.len()),
+                    format!("largest offset {:.2} mm", d.max_len() * 1000.0),
+                    format!("base head {}", hash_label(d.base_hash)),
+                ],
+            ))
+        }
+    }
 }
 
 /// Decode used by the format audit (`src/audit_tests.rs`).
@@ -1224,62 +1334,23 @@ pub struct AppliedDelta {
     pub max_error: f32,
 }
 
-/// Applies `delta` to the `base` head. The deltas are stored in a vertex order of their own,
-/// so the order is recovered from a head drawable of the same class: for each candidate head,
-/// the head minus base offsets (vertices paired by UV and position) must equal the deltas as a
-/// set. The best match under 50 µm fixes the order, and the base plus the re-ordered deltas is
-/// the result.
-pub fn apply_head_delta(
-    delta: &HeadDelta,
-    base: &Mesh3D,
-    candidates: &mut dyn Iterator<Item = (String, Mesh3D)>,
-    progress: &dyn Fn(&str),
-) -> Result<AppliedDelta, String> {
-    let v = delta.deltas.len();
-    let br = geometry_with_verts(base, v).ok_or_else(|| format!("base head has no {v}-vertex geometry"))?;
-    let (bp, buv) = (&base.verts[br.clone()], &base.uvs[br.clone()]);
-    let want = sorted_lengths(&delta.deltas);
-    let mut best: Option<(f32, String, Vec<[f32; 3]>)> = None;
-    for (name, head) in candidates {
-        progress(&name);
-        let Some(hr) = geometry_with_verts(&head, v) else { continue };
-        let (hp, huv) = (&head.verts[hr.clone()], &head.uvs[hr.clone()]);
-        let Some(pair) = pair_by_uv((bp, buv), (hp, huv)) else { continue };
-        let offs: Vec<[f32; 3]> = pair
-            .iter()
-            .zip(bp)
-            .map(|(&j, b)| [hp[j][0] - b[0], hp[j][1] - b[1], hp[j][2] - b[2]])
-            .collect();
-        let got = sorted_lengths(&offs);
-        let sig_err = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
-        if sig_err < 5e-5 && best.as_ref().is_none_or(|b| sig_err < b.0) {
-            best = Some((sig_err, name, offs));
-        }
+/// Puts each delta on the vertex whose offset it equals: a one-to-one assignment where every
+/// delta lands within `tol` metres of its offset. Returns the vertex for each delta and the worst
+/// error, or `None` if any delta has no free offset that close (a grid on the offsets keeps this
+/// linear; the cell is `tol`, so the 3×3×3 neighbourhood covers it).
+fn assign_deltas(deltas: &[[f32; 3]], offs: &[[f32; 3]], tol: f32) -> Option<(Vec<usize>, f32)> {
+    if deltas.len() != offs.len() {
+        return None;
     }
-    let Some((_, name, offs)) = best else {
-        return Err(
-            "No head drawable of this class matches the delta (some heads aren't in the archive), so its vertex order can't be recovered."
-                .into(),
-        );
-    };
-    // the deltas equal these offsets as a set; put each delta on the base vertex whose
-    // offset it equals (a grid on the offsets keeps this linear)
-    let cell = 2e-5f32;
-    let ck = |d: [f32; 3]| {
-        (
-            (d[0] / cell).round() as i64,
-            (d[1] / cell).round() as i64,
-            (d[2] / cell).round() as i64,
-        )
-    };
+    let ck = |d: [f32; 3]| ((d[0] / tol).round() as i64, (d[1] / tol).round() as i64, (d[2] / tol).round() as i64);
     let mut grid: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
     for (j, &o) in offs.iter().enumerate() {
         grid.entry(ck(o)).or_default().push(j);
     }
-    let mut used = vec![false; v];
-    let mut applied = bp.to_vec();
-    let mut max_error = 0.0f32;
-    for d in &delta.deltas {
+    let mut used = vec![false; offs.len()];
+    let mut slot = Vec::with_capacity(deltas.len());
+    let mut max_e2 = 0.0f32;
+    for d in deltas {
         let c = ck(*d);
         let mut best: Option<(f32, usize)> = None;
         for dx in -1..=1 {
@@ -1298,17 +1369,62 @@ pub fn apply_head_delta(
                 }
             }
         }
-        if let Some((e, j)) = best {
-            used[j] = true;
-            max_error = max_error.max(e.sqrt());
-            applied[j] = [bp[j][0] + d[0], bp[j][1] + d[1], bp[j][2] + d[2]];
+        let (e, j) = best.filter(|b| b.0 <= tol * tol)?;
+        used[j] = true;
+        max_e2 = max_e2.max(e);
+        slot.push(j);
+    }
+    Some((slot, max_e2.sqrt()))
+}
+
+/// Applies `delta` to the `base` head. The deltas are stored in a vertex order of their own,
+/// so the order is recovered from a head drawable of the same class: for each candidate head,
+/// the head minus base offsets (vertices paired by UV and position) must equal the deltas as a
+/// set, every delta matching its own offset within 50 µm. The sorted offset lengths are a cheap
+/// prefilter; the best full match fixes the order, and the base plus the re-ordered deltas is
+/// the result.
+pub fn apply_head_delta(
+    delta: &HeadDelta,
+    base: &Mesh3D,
+    candidates: &mut dyn Iterator<Item = (String, Mesh3D)>,
+    progress: &dyn Fn(&str),
+) -> Result<AppliedDelta, String> {
+    const TOL: f32 = 5e-5;
+    let v = delta.deltas.len();
+    let br = geometry_with_verts(base, v).ok_or_else(|| format!("base head has no {v}-vertex geometry"))?;
+    let (bp, buv) = (&base.verts[br.clone()], &base.uvs[br.clone()]);
+    let want = sorted_lengths(&delta.deltas);
+    let mut best: Option<(f32, String, Vec<usize>)> = None;
+    for (name, head) in candidates {
+        progress(&name);
+        let Some(hr) = geometry_with_verts(&head, v) else { continue };
+        let (hp, huv) = (&head.verts[hr.clone()], &head.uvs[hr.clone()]);
+        let Some(pair) = pair_by_uv((bp, buv), (hp, huv)) else { continue };
+        let offs: Vec<[f32; 3]> = pair
+            .iter()
+            .zip(bp)
+            .map(|(&j, b)| [hp[j][0] - b[0], hp[j][1] - b[1], hp[j][2] - b[2]])
+            .collect();
+        let got = sorted_lengths(&offs);
+        let sig_err = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        if sig_err >= TOL {
+            continue;
+        }
+        // equal lengths aren't enough (a mirrored head has them too): every vector must match
+        let Some((slot, err)) = assign_deltas(&delta.deltas, &offs, TOL) else { continue };
+        if best.as_ref().is_none_or(|b| err < b.0) {
+            best = Some((err, name, slot));
         }
     }
-    // offsets that equal no delta exactly (quantisation) keep the head's own value
-    for j in 0..v {
-        if !used[j] {
-            applied[j] = [bp[j][0] + offs[j][0], bp[j][1] + offs[j][1], bp[j][2] + offs[j][2]];
-        }
+    let Some((max_error, name, slot)) = best else {
+        return Err(
+            "No head drawable of this class matches the delta (some heads aren't in the archive), so its vertex order can't be recovered."
+                .into(),
+        );
+    };
+    let mut applied = bp.to_vec();
+    for (d, &j) in delta.deltas.iter().zip(&slot) {
+        applied[j] = [bp[j][0] + d[0], bp[j][1] + d[1], bp[j][2] + d[2]];
     }
     let mut mesh = base.clone();
     mesh.verts[br.clone()].copy_from_slice(&applied);
@@ -2156,6 +2272,19 @@ mod tests {
         let f = packed_followers(&page, 16, 1 << 20, 0x5000, Path::new("x.rpf"), "x.rpf");
         assert_eq!(f.len(), 1, "{:?}", f.iter().map(|e| &e.name).collect::<Vec<_>>());
         assert_eq!((f[0].kind, f[0].offset), ("CLOTH", 0x5000 + cloth_at as u64));
+
+        // the scanner's read window ends inside the cloth stream, or inside the padding before
+        // it: the walk says where to resume, and resuming there finds the cloth
+        for cut in [cloth_at + 8, cloth_at - 8] {
+            let (f, resume) = walk_packed(&page[..cut], WalkStart::After(16), 1 << 20, 0x5000, Path::new("x.rpf"), "x.rpf");
+            assert!(f.is_empty());
+            let at = resume.expect("walk stopped at the window's end") as usize - 0x5000;
+            // (the padding after the cloth runs to this test page's end, so that walk asks to
+            // resume too; in a file the next stream starts a page and ends it)
+            let (f, _) = walk_packed(&page[at..], WalkStart::Resume(0), 1 << 20, 0x5000 + at as u64, Path::new("x.rpf"), "x.rpf");
+            assert_eq!(f.len(), 1);
+            assert_eq!((f[0].kind, f[0].offset), ("CLOTH", 0x5000 + cloth_at as u64));
+        }
     }
 
     #[test]
@@ -2322,6 +2451,12 @@ mod tests {
                 assert!((a.mesh.verts[i][c] - want[c]).abs() < 1e-6, "vertex {i}");
             }
         }
+
+        // a head whose offsets are the deltas mirrored in X has the same lengths, but no
+        // vector matches, so it must not be taken as the delta's head
+        let mirror = grid_head(n, |i| [-off(i)[0], off(i)[1], off(i)[2]], &head_order);
+        let mut cands = vec![("mirror".to_string(), mirror)].into_iter();
+        assert!(apply_head_delta(&delta, &base, &mut cands, &|_| {}).is_err());
     }
 
     // ------------------------------------------------------------ data-gated
@@ -2468,11 +2603,10 @@ mod tests {
         };
         let Some(entries) = packs_entries() else { return };
         std::fs::create_dir_all(&out).unwrap();
-        // sandbox HOME so the real app data is never read or written
-        let home = out.join("home");
-        let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(&home).unwrap();
-        std::env::set_var("HOME", &home);
+        // a fresh sandbox HOME so the real app data is never read or written (and nothing
+        // under the output directory is deleted)
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", home.path());
 
         let pick = |kind: &str, ok: &dyn Fn(&RpfEntry) -> bool| {
             let name = std::env::var(format!("SIXSTARS_PEDPHYS_{kind}")).ok();

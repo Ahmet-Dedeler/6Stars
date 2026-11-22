@@ -172,6 +172,12 @@ pub enum Decoded {
         lines: usize,
         first_line: String,
     },
+    /// Ped physics resource from packs.rpf (hair groom, cloth, soft body, head delta): what it
+    /// is and the decoder's facts.
+    PedPhysics {
+        what: String,
+        facts: Vec<String>,
+    },
     /// Not decoded, with the reason (e.g. "select the entry to decode it").
     Unavailable(String),
 }
@@ -271,6 +277,7 @@ impl Decoded {
             }
             Decoded::Anim { clips } => format!("clip dictionary · {clips} clip(s)"),
             Decoded::Navmesh { polys } => format!("navmesh tile · {polys} polygons"),
+            Decoded::PedPhysics { what, facts } => std::iter::once(what.as_str()).chain(facts.iter().map(String::as_str)).collect::<Vec<_>>().join(" · "),
             Decoded::Text { bytes, lines, first_line } => {
                 format!("text · {bytes} bytes · {lines} line(s) · first line: {}", clip(first_line, 100))
             }

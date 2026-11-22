@@ -3796,7 +3796,7 @@ impl Rpf9App {
                     }
                 }
             } else if pedphys::is_kind(e.kind) {
-                if pedphys::export_entry(&e, &out_dir).is_ok() {
+                if pedphys::export_entry(&e, &out_dir, self.is_folder).is_ok() {
                     ok += 1;
                 }
             } else if e.kind == "RBF0" {
@@ -4781,7 +4781,27 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
                 let packed = pedphys::is_kind(entry.kind);
                 found.push(entry);
                 if packed {
-                    found.extend(pedphys::packed_followers(buf, pos + 0x10, 8 << 20, off, path, &rname));
+                    const WALK: usize = 8 << 20;
+                    let group = off + pos as u64;
+                    let (more, mut resume) = pedphys::walk_packed(buf, pedphys::WalkStart::After(pos + 0x10), WALK, off, path, &rname);
+                    found.extend(more);
+                    // big archives are read in windows: a group that runs past this one is
+                    // walked on from the file (a stream bigger than the window stops it)
+                    let mut last = None;
+                    while let Some(at) = resume.filter(|_| whole.is_none()) {
+                        let walked = (at - group) as usize;
+                        if at >= sz || walked >= WALK || last == Some(at) {
+                            break;
+                        }
+                        last = Some(at);
+                        let mut win = Vec::with_capacity(16 << 20);
+                        f.seek(SeekFrom::Start(at))?;
+                        (&mut f).take(16 << 20).read_to_end(&mut win)?;
+                        let (more, r) = pedphys::walk_packed(&win, pedphys::WalkStart::Resume(0), WALK - walked, at, path, &rname);
+                        found.extend(more);
+                        resume = r;
+                        need_seek = true;
+                    }
                 }
                 pos += 0x1000;
                 continue;
