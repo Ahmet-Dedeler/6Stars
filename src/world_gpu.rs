@@ -243,7 +243,6 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -
 
             let mut loaded = std::collections::HashSet::<u32>::new();
             let mut last_gen = 0u64;
-            let mut total_sent = 0usize;
             loop {
                 let (cam_p, cur_gen) = *cam_track_bg.lock().unwrap();
                 if cur_gen == last_gen {
@@ -264,28 +263,31 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -
                     continue;
                 }
                 nearby.sort_by(|a, b| a.1.total_cmp(&b.1));
-                let take_n = nearby.len().min(if total_sent == 0 { 1200 } else { 500 });
+                let take_n = nearby.len().min(if loaded.is_empty() { 1200 } else { 500 });
                 let batch_list: Vec<(u32, u64, Vec<(Vec3, Quat, Vec3, [f32; 4])>)> = nearby
                     .into_iter()
                     .take(take_n)
                     .map(|(idx, _)| {
                         let (h, moff, _, ref insts) = all_groups[idx];
-                        loaded.insert(h);
                         (h, moff, insts.clone())
                     })
                     .collect();
-                total_sent += batch_list.len();
-                let _ = tx.send(WorldStreamMsg::TotalArchetypes(total_sent));
+                let _ = tx.send(WorldStreamMsg::TotalArchetypes(loaded.len() + batch_list.len()));
                 let groups = Arc::new(batch_list);
                 let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                // a camera move stops the batch early and whatever was not reached is queued again
+                let finished = Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
                 std::thread::scope(|s| {
                     for _ in 0..3 {
                         let groups = Arc::clone(&groups);
                         let cursor = Arc::clone(&cursor);
+                        let finished = Arc::clone(&finished);
                         let tx = tx.clone();
                         let lp = lp.clone();
                         let cam_track_bg = Arc::clone(&cam_track_bg);
                         s.spawn(move || loop {
+                            // the viewer shows these at 128 pixels so larger mips are never read
+                            crate::tex::set_thread_texture_cap(128);
                             if cam_track_bg.lock().unwrap().1 != last_gen {
                                 break;
                             }
@@ -301,6 +303,7 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -
                                         break;
                                     }
                             }
+                            finished.lock().unwrap().push(h);
                             if tx.send(WorldStreamMsg::ArchetypeDone).is_err() {
                                 break;
                             }
@@ -308,6 +311,13 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -
                         });
                     }
                 });
+                let finished = std::mem::take(&mut *finished.lock().unwrap());
+                if finished.len() < groups.len() {
+                    // let the next pass run even if the camera has stopped moving again
+                    last_gen = 0;
+                }
+                loaded.extend(finished);
+                let _ = tx.send(WorldStreamMsg::TotalArchetypes(loaded.len()));
             }
         });
     }
@@ -612,10 +622,13 @@ struct GpuMeshBatch {
     inst_buf: wgpu::Buffer,
     index_count: u32,
     index_format: wgpu::IndexFormat,
+    inst_first: u32,
     inst_count: u32,
     tex_bind_group: wgpu::BindGroup,
     bound_center: Vec3,
     bound_radius: f32,
+    // radius of one placed copy, decides draw distance and shadow casting
+    obj_radius: f32,
     is_box: bool,
     is_terrain: bool,
 }
@@ -653,6 +666,9 @@ struct GpuState {
     tex_bytes: usize,
     geom_bytes: usize,
     vram_oom: bool,
+    // texture bind groups by pixel buffer address with the textures kept alive behind them
+    tex_uploads: HashMap<usize, wgpu::BindGroup>,
+    tex_keep: Vec<Arc<crate::model3d::Texture2D>>,
     frame_idx: u64,
     start_instant: Instant,
     has_hw_rt: bool,
@@ -1089,6 +1105,8 @@ impl GpuState {
             tex_bytes: 0,
             geom_bytes: 0,
             vram_oom: false,
+            tex_uploads: HashMap::new(),
+            tex_keep: Vec::new(),
             frame_idx: 0,
             start_instant: Instant::now(),
             has_hw_rt,
@@ -1135,8 +1153,12 @@ impl GpuState {
         }
 
         let normals = compute_smooth_normals(&b.mesh);
-        let insts: Vec<GpuInstance> = b
-            .instances
+        // placements of one model can span the whole map, sorting them by cell lets each cell be culled on its own
+        const CELL: f32 = 1024.0;
+        let cell_of = |p: Vec3| ((p.x / CELL).floor() as i32, (p.y / CELL).floor() as i32, (p.z / CELL).floor() as i32);
+        let mut placed = b.instances.clone();
+        placed.sort_by_key(|i| cell_of(i.0));
+        let insts: Vec<GpuInstance> = placed
             .iter()
             .map(|&(pos, rot, scale, col)| GpuInstance::from_mat4(Mat4::from_scale_rotation_translation(scale, rot, pos), col))
             .collect();
@@ -1210,46 +1232,69 @@ impl GpuState {
         }
         let local_center = (lmin + lmax) * 0.5;
         let local_rad = ((lmax - lmin) * 0.5).length();
-        let mut wmin = Vec3::splat(f32::MAX);
-        let mut wmax = Vec3::splat(f32::MIN);
-        for &(pos, rot, scale, _) in &b.instances {
-            let c = pos + rot * (local_center * scale);
-            let r = local_rad * scale.abs().max_element();
-            wmin = wmin.min(c - Vec3::splat(r));
-            wmax = wmax.max(c + Vec3::splat(r));
+        // one entry per run of placements in the same cell: first instance, count, bounds, largest copy
+        let mut cells: Vec<(u32, u32, Vec3, f32, f32)> = Vec::new();
+        let mut start = 0usize;
+        while start < placed.len() {
+            let key = cell_of(placed[start].0);
+            let mut end = start;
+            let mut wmin = Vec3::splat(f32::MAX);
+            let mut wmax = Vec3::splat(f32::MIN);
+            let mut obj_radius = 0.0f32;
+            while end < placed.len() && cell_of(placed[end].0) == key {
+                let (pos, rot, scale, _) = placed[end];
+                let c = pos + rot * (local_center * scale);
+                let r = local_rad * scale.abs().max_element();
+                wmin = wmin.min(c - Vec3::splat(r));
+                wmax = wmax.max(c + Vec3::splat(r));
+                obj_radius = obj_radius.max(r);
+                end += 1;
+            }
+            cells.push((start as u32, (end - start) as u32, (wmin + wmax) * 0.5, ((wmax - wmin) * 0.5).length().max(1.0), obj_radius.max(1.0)));
+            start = end;
         }
-        let bound_center = (wmin + wmax) * 0.5;
-        let bound_radius = ((wmax - wmin) * 0.5).length().max(1.0);
 
         for (g, index_count, ib) in ibs {
-            let tex_bg = if self.tex_bytes < 512 * 1024 * 1024 {
-                b.mesh
-                    .texture
-                    .as_ref()
-                    .or_else(|| b.mesh.geom_materials.get(g as usize).and_then(|m| m.texture.as_deref()))
-                    .map(|t| {
-                        let (bg, bytes) = upload_texture(&self.device, &self.queue, &self.tex_bgl, &self.tex_samp, t, 128);
-                        self.tex_bytes += bytes;
-                        bg
-                    })
-                    .unwrap_or_else(|| self.white_bg.clone())
-            } else {
-                self.white_bg.clone()
+            let shared = if b.mesh.texture.is_some() { None } else { b.mesh.geom_materials.get(g as usize).and_then(|m| m.texture.clone()) };
+            let tex = b.mesh.texture.as_ref().or(shared.as_deref());
+            let tex_bg = match tex {
+                Some(t) if self.tex_bytes < 512 * 1024 * 1024 => {
+                    // materials that share a decoded texture share one upload
+                    let key = t.pixels.as_ptr() as usize;
+                    match self.tex_uploads.get(&key).filter(|_| shared.is_some()) {
+                        Some(bg) => bg.clone(),
+                        None => {
+                            let (bg, bytes) = upload_texture(&self.device, &self.queue, &self.tex_bgl, &self.tex_samp, t, 128);
+                            self.tex_bytes += bytes;
+                            if let Some(keep) = shared.clone() {
+                                // holding the texture keeps its address from being reused by another one
+                                self.tex_keep.push(keep);
+                                self.tex_uploads.insert(key, bg.clone());
+                            }
+                            bg
+                        }
+                    }
+                }
+                _ => self.white_bg.clone(),
             };
 
-            self.batches.push(GpuMeshBatch {
-                vb: vb.clone(),
-                ib,
-                inst_buf: inst_buf.clone(),
-                index_count,
-                index_format: idx_fmt,
-                inst_count: insts.len() as u32,
-                tex_bind_group: tex_bg,
-                bound_center,
-                bound_radius,
-                is_box: b.mesh.name == "__placeholder_boxes__",
-                is_terrain,
-            });
+            for &(inst_first, inst_count, bound_center, bound_radius, obj_radius) in &cells {
+                self.batches.push(GpuMeshBatch {
+                    vb: vb.clone(),
+                    ib: ib.clone(),
+                    inst_buf: inst_buf.clone(),
+                    index_count,
+                    index_format: idx_fmt,
+                    inst_first,
+                    inst_count,
+                    tex_bind_group: tex_bg.clone(),
+                    bound_center,
+                    bound_radius,
+                    obj_radius,
+                    is_box: b.mesh.name == "__placeholder_boxes__",
+                    is_terrain,
+                });
+            }
         }
 
         self.geom_bytes += est_geom_bytes;
@@ -1610,7 +1655,7 @@ impl ApplicationHandler for GpuWorldApp {
                     rp.set_pipeline(&g.shadow_pipeline);
                     rp.set_bind_group(0, &g.uniform_bg, &[]);
                     for b in &g.batches {
-                        if b.bound_radius < 3.0 {
+                        if b.obj_radius < 3.0 {
                             continue;
                         }
                         if b.bound_radius < 5000.0 && (b.bound_center - light_target).length_squared() > (1200.0 + b.bound_radius).powi(2) {
@@ -1620,7 +1665,7 @@ impl ApplicationHandler for GpuWorldApp {
                         rp.set_vertex_buffer(0, b.vb.slice(..));
                         rp.set_vertex_buffer(1, b.inst_buf.slice(..));
                         rp.set_index_buffer(b.ib.slice(..), b.index_format);
-                        rp.draw_indexed(0..b.index_count, 0, 0..b.inst_count);
+                        rp.draw_indexed(0..b.index_count, 0, b.inst_first..b.inst_first + b.inst_count);
                     }
                 }
 
@@ -1667,12 +1712,12 @@ impl ApplicationHandler for GpuWorldApp {
                                 continue;
                             }
                             let d2 = to_b.length_squared();
-                            let max_d = if b.bound_radius > 35.0 { 6500.0 } else if b.bound_radius < 2.0 { 450.0 } else { 3200.0 };
+                            let max_d = if b.obj_radius > 35.0 { 6500.0 } else if b.obj_radius < 2.0 { 450.0 } else { 3200.0 };
                             if d2 > (max_d + b.bound_radius).powi(2) {
                                 continue;
                             }
                             drawn += 1;
-                            if drawn > 1400 {
+                            if drawn > 6000 {
                                 break;
                             }
                         }
@@ -1680,7 +1725,7 @@ impl ApplicationHandler for GpuWorldApp {
                         rp.set_vertex_buffer(0, b.vb.slice(..));
                         rp.set_vertex_buffer(1, b.inst_buf.slice(..));
                         rp.set_index_buffer(b.ib.slice(..), b.index_format);
-                        rp.draw_indexed(0..b.index_count, 0, 0..b.inst_count);
+                        rp.draw_indexed(0..b.index_count, 0, b.inst_first..b.inst_first + b.inst_count);
                     }
 
                     rp.set_pipeline(&g.minimap_pipeline);

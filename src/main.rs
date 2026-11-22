@@ -41,6 +41,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -557,6 +558,8 @@ struct ScanState {
 #[derive(Default)]
 struct MediaState {
     loading: bool,
+    // bumped whenever the selection changes so a decode that finishes late is dropped
+    job: u64,
     status: String,
     loaded_tracks: Option<(Vec<audio_player::LoadedWavTrack>, Arc<Vec<u8>>)>,
     loaded_bank_ctx: Option<audio_player::AudioBankContext>,
@@ -846,6 +849,8 @@ struct Rpf9App {
     tex_from_model: bool,
     // camera yaw pitch zoom pan carried across a lod switch
     lod_keep_cam: Option<[f32; 5]>,
+    export_busy: Arc<AtomicBool>,
+    export_cancel: Arc<AtomicBool>,
     mv_drawer_open: bool,
     mv_entries: Vec<(usize, ModelCat, String)>,
     mv_counts: [usize; 10],
@@ -1036,6 +1041,8 @@ impl Rpf9App {
             tex_pick: false,
             tex_from_model: false,
             lod_keep_cam: None,
+            export_busy: Arc::new(AtomicBool::new(false)),
+            export_cancel: Arc::new(AtomicBool::new(false)),
             mv_drawer_open: true,
             mv_entries: Vec::new(),
             mv_counts: [0; 10],
@@ -1156,6 +1163,7 @@ impl Rpf9App {
         self.audio_player.clear_all();
         self.stop_bink_player();
         let mut m = self.media.lock().unwrap();
+        m.job += 1;
         m.loaded_tracks = None;
         m.status.clear();
         m.loading = false;
@@ -1472,7 +1480,7 @@ impl Rpf9App {
                                     let mut c = cache_arc.lock().unwrap();
                                     c.insert(key.clone(), new_entries);
                                     let mut ls = last_save.lock().unwrap();
-                                    if ls.elapsed() > Duration::from_secs(5) {
+                                    if ls.elapsed() > Duration::from_secs(45) {
                                         save_disk_cache(&c);
                                         *ls = Instant::now();
                                     }
@@ -1760,35 +1768,30 @@ impl Rpf9App {
     }
 
     fn spawn_model_decode(&self, e: &RpfEntry, lod: usize) {
-        let media = Arc::clone(&self.media);
-        {
-            let mut m = media.lock().unwrap();
-            m.loading = true;
-            m.status = format!("Decoding RAGE9 meshlets: {}...", e.name);
-        }
         let src = e.source_rpf.clone();
         let off = e.offset;
         let nm = e.name.clone();
-        std::thread::spawn(move || {
-            match decode_rage9_model_from_rpf_lod(&src, off, &nm, lod) {
-                Ok(mut mesh) => {
-                    // the viewer also applies normal maps unless the model binds an unusually large set
-                    let normals = mesh.tex_layers.iter().filter(|l| l.kind == model3d::TexLayerKind::Normal).count();
-                    if (1..=64).contains(&normals) {
-                        mesh.set_tex_layers(|l| l.default_on || l.kind == model3d::TexLayerKind::Normal);
-                    }
-                    let mut m = media.lock().unwrap();
-                    m.loading = false;
+        spawn_media_job(
+            &self.media,
+            format!("Decoding RAGE9 meshlets: {}...", e.name),
+            true,
+            move |_| {
+                let mut mesh = decode_rage9_model_from_rpf_lod(&src, off, &nm, lod).map_err(|err| format!("Model decode error ({nm}): {err}"))?;
+                // the viewer also applies normal maps unless the model binds an unusually large set
+                let normals = mesh.tex_layers.iter().filter(|l| l.kind == model3d::TexLayerKind::Normal).count();
+                if (1..=64).contains(&normals) {
+                    mesh.set_tex_layers(|l| l.default_on || l.kind == model3d::TexLayerKind::Normal);
+                }
+                Ok(mesh)
+            },
+            |m, res| match res {
+                Ok(mesh) => {
                     m.status.clear();
                     m.loaded_mesh = Some(mesh);
                 }
-                Err(err) => {
-                    let mut m = media.lock().unwrap();
-                    m.loading = false;
-                    m.status = format!("Model decode error ({nm}): {err}");
-                }
-            }
-        });
+                Err(err) => m.status = err,
+            },
+        );
     }
 
     fn vehicle_parts_ui(&mut self, ui: &mut egui::Ui) {
@@ -2097,19 +2100,18 @@ impl Rpf9App {
     // lists and decodes every pooled texture the selected model binds in its shaders
     fn load_model_textures(&mut self) {
         let Some(e) = self.model_entry.and_then(|i| self.state.lock().unwrap().entries.get(i).cloned()) else { return };
-        let media = Arc::clone(&self.media);
-        {
-            let mut m = media.lock().unwrap();
-            m.loading = true;
-            m.status = format!("Resolving textures of {}...", e.name);
-        }
-        std::thread::spawn(move || {
-            let res = model3d::list_model_texture_refs(&e.source_rpf, e.offset).and_then(|refs| {
+        let name = e.name.clone();
+        spawn_media_job(
+            &self.media,
+            format!("Resolving textures of {}...", e.name),
+            false,
+            move |progress| {
+                let refs = model3d::list_model_texture_refs(&e.source_rpf, e.offset)?;
                 let total = refs.len();
                 let pooled: Vec<_> = refs.iter().filter(|r| r.hit.is_some()).collect();
                 let mut texs = Vec::with_capacity(pooled.len());
                 for (i, r) in pooled.iter().enumerate() {
-                    media.lock().unwrap().status = format!("Decoding textures of {} ({}/{})...", e.name, i + 1, pooled.len());
+                    progress(format!("Decoding textures of {} ({}/{})...", e.name, i + 1, pooled.len()));
                     let Some(hit) = &r.hit else { continue };
                     if let Ok(mut t) = decode_ttpf_texture(&hit.path, hit.tex_idx) {
                         let pool = hit.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -2127,17 +2129,15 @@ impl Rpf9App {
                     total - pooled.len()
                 );
                 Ok((texs, note))
-            });
-            let mut m = media.lock().unwrap();
-            m.loading = false;
-            match res {
+            },
+            move |m, res| match res {
                 Ok(v) => {
                     m.status.clear();
                     m.loaded_model_textures = Some(v);
                 }
-                Err(err) => m.status = format!("Model textures ({}): {err}", e.name),
-            }
-        });
+                Err(err) => m.status = format!("Model textures ({name}): {err}"),
+            },
+        );
     }
 
     // switches the viewed model to another detail file or in file lod level keeping the camera
@@ -2175,86 +2175,51 @@ impl Rpf9App {
         }
 
         if e.kind == "NAVM" {
-            let media = Arc::clone(&self.media);
-            {
-                let mut m = media.lock().unwrap();
-                m.loading = true;
-                m.status = format!("Decoding CNavMesh tile: {}...", e.name);
-            }
-            let src = e.source_rpf.clone();
-            let off = e.offset;
-            let nm = e.name.clone();
-            std::thread::spawn(move || {
-                match decode_navmesh_from_rpf(&src, off, &nm) {
+            let (src, off, nm) = (e.source_rpf.clone(), e.offset, e.name.clone());
+            spawn_media_job(
+                &self.media,
+                format!("Decoding CNavMesh tile: {}...", e.name),
+                true,
+                move |_| decode_navmesh_from_rpf(&src, off, &nm).map_err(|err| format!("NavMesh decode error ({nm}): {err}")),
+                |m, res| match res {
                     Ok(mesh) => {
-                        let mut m = media.lock().unwrap();
-                        m.loading = false;
                         m.status.clear();
                         m.loaded_mesh = Some(mesh);
                     }
-                    Err(err) => {
-                        let mut m = media.lock().unwrap();
-                        m.loading = false;
-                        m.status = format!("NavMesh decode error ({nm}): {err}");
-                    }
-                }
-            });
+                    Err(err) => m.status = err,
+                },
+            );
             return;
         }
 
-        if e.kind == "TXD" {
-            let media = Arc::clone(&self.media);
-            {
-                let mut m = media.lock().unwrap();
-                m.loading = true;
-                m.status = format!("Deswizzling Xbox Scarlett TXD: {}...", e.name);
-            }
-            let src = e.source_rpf.clone();
-            let off = e.offset;
-            let nm = e.name.clone();
-            std::thread::spawn(move || {
-                match decode_txd_from_rpf(&src, off) {
+        if e.kind == "TXD" || e.kind == "TTPF" {
+            let (src, off, nm) = (e.source_rpf.clone(), e.offset, e.name.clone());
+            let tidx = e.tracks as usize;
+            let is_txd = e.kind == "TXD";
+            let status = if is_txd {
+                format!("Deswizzling Xbox Scarlett TXD: {}...", e.name)
+            } else {
+                format!("Decoding RDS5/ETPF texture: {}...", e.name)
+            };
+            spawn_media_job(
+                &self.media,
+                status,
+                true,
+                move |_| {
+                    if is_txd {
+                        decode_txd_from_rpf(&src, off).map_err(|err| format!("TXD decode error ({nm}): {err}"))
+                    } else {
+                        decode_ttpf_texture(&src, tidx).map(|t| vec![t]).map_err(|err| format!("TTPF decode error ({nm}): {err}"))
+                    }
+                },
+                |m, res| match res {
                     Ok(texs) => {
-                        let mut m = media.lock().unwrap();
-                        m.loading = false;
                         m.status.clear();
                         m.loaded_textures = Some(texs);
                     }
-                    Err(err) => {
-                        let mut m = media.lock().unwrap();
-                        m.loading = false;
-                        m.status = format!("TXD decode error ({nm}): {err}");
-                    }
-                }
-            });
-            return;
-        }
-
-        if e.kind == "TTPF" {
-            let media = Arc::clone(&self.media);
-            {
-                let mut m = media.lock().unwrap();
-                m.loading = true;
-                m.status = format!("Decoding RDS5/ETPF texture: {}...", e.name);
-            }
-            let src = e.source_rpf.clone();
-            let tidx = e.tracks as usize;
-            let nm = e.name.clone();
-            std::thread::spawn(move || {
-                match decode_ttpf_texture(&src, tidx) {
-                    Ok(tex) => {
-                        let mut m = media.lock().unwrap();
-                        m.loading = false;
-                        m.status.clear();
-                        m.loaded_textures = Some(vec![tex]);
-                    }
-                    Err(err) => {
-                        let mut m = media.lock().unwrap();
-                        m.loading = false;
-                        m.status = format!("TTPF decode error ({nm}): {err}");
-                    }
-                }
-            });
+                    Err(err) => m.status = err,
+                },
+            );
             return;
         }
 
@@ -2316,14 +2281,23 @@ impl Rpf9App {
             } else {
                 None
             };
-            let media = Arc::clone(&self.media);
-            {
-                let mut m = media.lock().unwrap();
-                m.loading = true;
-                m.loaded_bank_ctx = bank_ctx;
-                m.status = format!("Decoding {} Opus streams...", e.name);
-            }
-            std::thread::spawn(move || decode_awc_for_player(&e, &media));
+            self.media.lock().unwrap().loaded_bank_ctx = bank_ctx;
+            spawn_media_job(
+                &self.media,
+                format!("Decoding {} Opus streams...", e.name),
+                true,
+                move |progress| Ok::<_, String>(decode_awc_for_player(&e, progress)),
+                |m, res| match res {
+                    Ok((status, tracks)) => {
+                        m.status = status;
+                        m.loaded_tracks = tracks;
+                    }
+                    Err(err) => {
+                        m.status = format!("Decoded 0 playable .wav stream(s) natively — {err}");
+                        m.loaded_tracks = None;
+                    }
+                },
+            );
         } else {
             match read_entry_bytes(&e) {
                 Ok(data) => {
@@ -3629,8 +3603,25 @@ impl Rpf9App {
             let st = self.state.lock().unwrap();
             indices.iter().filter_map(|&i| st.entries.get(i).cloned()).collect()
         };
+        if self.export_busy.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.export_cancel.store(false, Ordering::SeqCst);
+        let (busy, cancel) = (Arc::clone(&self.export_busy), Arc::clone(&self.export_cancel));
+        let state = Arc::clone(&self.state);
+        let is_folder = self.is_folder;
+        std::thread::spawn(move || {
+        let total = entries.len();
         let mut ok = 0usize;
-        for e in entries {
+        let mut last_note = Instant::now();
+        for (n, e) in entries.into_iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            if last_note.elapsed() > Duration::from_millis(200) {
+                last_note = Instant::now();
+                state.lock().unwrap().status = format!("Exporting {}/{total}: {}", n + 1, e.name);
+            }
             if e.kind == "MODEL" || e.kind == "VEH" {
                 if let Ok(mesh) = decode_rage9_model_from_rpf(&e.source_rpf, e.offset, &e.name) {
                     let fname = format!("{}.obj", safe_file_name(&e.name.replace('#', "")));
@@ -3669,14 +3660,55 @@ impl Rpf9App {
                     }
                 }
             } else if let Ok(data) = read_entry_bytes(&e) {
-                let fname = if self.is_folder { format!("{}_{}", e.rpf_name.trim_end_matches(".rpf"), e.name) } else { e.name.clone() };
+                let fname = if is_folder { format!("{}_{}", e.rpf_name.trim_end_matches(".rpf"), e.name) } else { e.name.clone() };
                 if fs::write(out_dir.join(safe_file_name(&fname)), &data).is_ok() {
                     ok += 1;
                 }
             }
         }
-        self.state.lock().unwrap().status = format!("Exported {ok} file(s) to {}", out_dir.display());
+        let stopped = if cancel.load(Ordering::Relaxed) { " (cancelled)" } else { "" };
+        state.lock().unwrap().status = format!("Exported {ok} file(s) to {}{stopped}", out_dir.display());
+        busy.store(false, Ordering::SeqCst);
+        });
     }
+}
+
+// runs a selection decode off the ui thread
+// the result is dropped when a newer job started meanwhile and a panicking decoder still clears the spinner
+fn spawn_media_job<T: 'static>(
+    media: &Arc<Mutex<MediaState>>,
+    status: String,
+    fresh: bool,
+    work: impl FnOnce(&(dyn Fn(String) + Sync)) -> Result<T, String> + Send + 'static,
+    done: impl FnOnce(&mut MediaState, Result<T, String>) + Send + 'static,
+) {
+    let job = {
+        let mut m = media.lock().unwrap();
+        if fresh {
+            m.job += 1;
+        }
+        m.loading = true;
+        m.status = status;
+        m.job
+    };
+    let media = Arc::clone(media);
+    std::thread::spawn(move || {
+        let progress = |text: String| {
+            if let Ok(mut m) = media.try_lock() {
+                if m.job == job {
+                    m.status = text;
+                }
+            }
+        };
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&progress)))
+            .unwrap_or_else(|_| Err("decoder panicked".into()));
+        let mut m = media.lock().unwrap_or_else(|p| p.into_inner());
+        if m.job != job {
+            return;
+        }
+        m.loading = false;
+        done(&mut m, res);
+    });
 }
 
 fn app_data_dir() -> Option<PathBuf> {
@@ -3831,16 +3863,15 @@ fn collect_rpfs(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn decode_awc_for_player(e: &RpfEntry, media: &Arc<Mutex<MediaState>>) {
+type AwcPlayerTracks = Option<(Vec<audio_player::LoadedWavTrack>, Arc<Vec<u8>>)>;
+
+// status line and decoded tracks of one awc entry for the audio player
+fn decode_awc_for_player(e: &RpfEntry, progress: &(dyn Fn(String) + Sync)) -> (String, AwcPlayerTracks) {
     match read_entry_bytes(e) {
         Ok(bytes) => {
             let res = awc::decode_awc_bytes_in_memory(&bytes, "stream", |done, total| {
-                if let Ok(mut m) = media.try_lock() {
-                    m.status = format!("Scanning AWC waveforms ({done}/{total})...");
-                }
+                progress(format!("Scanning AWC waveforms ({done}/{total})..."));
             });
-            let mut m = media.lock().unwrap();
-            m.loading = false;
             if res.tracks.is_empty() {
                 let mut lines = vec![
                     format!("Decoded 0 playable .wav stream(s) natively — {}", res.summary),
@@ -3850,22 +3881,18 @@ fn decode_awc_for_player(e: &RpfEntry, media: &Arc<Mutex<MediaState>>) {
                     ),
                 ];
                 lines.extend(res.details);
-                m.status = lines.join("\n");
-                m.loaded_tracks = None;
+                (lines.join("\n"), None)
             } else {
-                m.status = format!("Decoded {} playable .wav stream(s) natively", res.tracks.len());
-                m.loaded_tracks = Some((res.tracks, Arc::new(bytes)));
+                (format!("Decoded {} playable .wav stream(s) natively", res.tracks.len()), Some((res.tracks, Arc::new(bytes))))
             }
         }
-        Err(err) => {
-            let mut m = media.lock().unwrap();
-            m.loading = false;
-            m.status = format!(
+        Err(err) => (
+            format!(
                 "Decoded 0 playable .wav stream(s) natively — Read error: {err}\nEntry: {} (comp={}, raw={}, offset=0x{:X}, RPF: {})",
                 e.name, e.comp_size, e.raw_size, e.offset, e.rpf_name
-            );
-            m.loaded_tracks = None;
-        }
+            ),
+            None,
+        ),
     }
 }
 
@@ -4939,12 +4966,18 @@ impl eframe::App for Rpf9App {
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Export All").clicked() {
+                    let exporting = self.export_busy.load(Ordering::Relaxed);
+                    if exporting {
+                        if ui.button("Cancel Export").clicked() {
+                            self.export_cancel.store(true, Ordering::SeqCst);
+                        }
+                        ctx.request_repaint_after(Duration::from_millis(200));
+                    } else if ui.button("Export All").clicked() {
                         let n = self.state.lock().unwrap().entries.len();
                         let all: Vec<usize> = (0..n).collect();
                         self.export_entries(&all);
                     }
-                    if ui.button("Export Selected").clicked() {
+                    if !exporting && ui.button("Export Selected").clicked() {
                         let targets = self.ordered_selected_indices();
                         if !targets.is_empty() {
                             self.export_entries(&targets);
@@ -5859,6 +5892,32 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wait_idle(media: &Arc<Mutex<MediaState>>) {
+        for _ in 0..400 {
+            if !media.lock().unwrap_or_else(|p| p.into_inner()).loading {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("media job never finished");
+    }
+
+    #[test]
+    fn media_jobs_drop_stale_results_and_survive_panics() {
+        let media = Arc::new(Mutex::new(MediaState::default()));
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        spawn_media_job(&media, "slow".into(), true, move |_| { let _ = held.recv(); Ok(1u32) }, |m, _| m.status = "old".into());
+        spawn_media_job(&media, "fast".into(), true, |_| Ok(2u32), |m, _| m.status = "new".into());
+        wait_idle(&media);
+        release.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(media.lock().unwrap().status, "new");
+
+        spawn_media_job(&media, "boom".into(), true, |_| -> Result<u32, String> { panic!("decoder bug") }, |m, res| m.status = res.unwrap_err());
+        wait_idle(&media);
+        assert_eq!(media.lock().unwrap().status, "decoder panicked");
+    }
 
     #[test]
     fn model_sidebar_width_stays_stable_across_frames() {
