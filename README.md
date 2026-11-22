@@ -227,6 +227,18 @@ BCPack BC3 to BC7 textures (BC1 decodes), rigging and animation, and full materi
 
 ---
 
+## Related projects
+
+- [awesome-gta6-reverse-engineering](https://github.com/Ahmet-Dedeler/awesome-gta6-reverse-engineering): every open-source GTA VI reverse engineering project in one list
+- [bcpack-rs](https://github.com/Ahmet-Dedeler/bcpack-rs): clean-room decoder for Xbox Series BCPack textures
+- [rage9-re](https://github.com/Ahmet-Dedeler/rage9-re): `script.rpf` and `anim.rpf` decoder with glTF export
+- [bink-player-mac](https://github.com/Ahmet-Dedeler/bink-player-mac): Bink 2 (`.bk2`) video player for macOS
+- [weather-study](https://github.com/Ahmet-Dedeler/weather-study): WebGL2 weather and timecycle visualizer
+
+Questions, previews and format research: [join the Discord](https://discord.gg/reADpA6Cd).
+
+---
+
 ## Legal Notice
 
 Percy6Stars is an independent archive viewer for **unencrypted files that you supply**. Please read this before using it.
