@@ -1611,7 +1611,7 @@ impl ApplicationHandler for GpuWorldApp {
                         let mut vis = eframe::egui::Visuals::dark();
                         vis.window_fill = eframe::egui::Color32::from_rgba_premultiplied(20, 13, 31, 238);
                         vis.panel_fill = eframe::egui::Color32::from_rgb(20, 13, 31);
-                        vis.window_stroke = eframe::egui::Stroke::new(1.2, eframe::egui::Color32::from_rgb(255, 72, 165));
+                        vis.window_stroke = eframe::egui::Stroke::new(1.2_f32, eframe::egui::Color32::from_rgb(255, 72, 165));
                         vis.widgets.inactive.bg_fill = eframe::egui::Color32::from_rgb(36, 22, 54);
                         vis.widgets.hovered.bg_fill = eframe::egui::Color32::from_rgb(56, 32, 82);
                         vis.widgets.active.bg_fill = eframe::egui::Color32::from_rgb(255, 168, 28);
