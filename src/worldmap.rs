@@ -145,23 +145,23 @@ impl WorldMapData {
         )
     }
 
-    // build downsampled 3d terrain mesh (z-up, scaled 1:100 for smooth orbiting)
+    // Build terrain in game units, using upstream's small ground offset.
     pub fn build_world_terrain_mesh(&self, step: usize) -> Mesh3D {
-        let mut m = self.build_terrain_mesh_with_tex(step, 2048);
+        let mut m = self.build_terrain_mesh_with_tex(step, 2048, 1.0);
         for v in &mut m.verts {
-            v[0] *= 100.0;
-            v[1] *= 100.0;
-            v[2] = v[2] * 25.0 - 1.0;
+            v[2] -= 1.0;
         }
+        m.center[2] -= 1.0;
         m.name = "mhiu_world_terrain".into();
         m
     }
 
     pub fn build_terrain_mesh(&self, step: usize) -> Mesh3D {
-        self.build_terrain_mesh_with_tex(step.max(4), 512)
+        // Uniform 1:100 scaling keeps the embedded preview's slopes true to life.
+        self.build_terrain_mesh_with_tex(step.max(4), 512, 0.01)
     }
 
-    fn build_terrain_mesh_with_tex(&self, step: usize, max_tex: usize) -> Mesh3D {
+    fn build_terrain_mesh_with_tex(&self, step: usize, max_tex: usize, scale: f32) -> Mesh3D {
         let step = step.max(2);
         let gw = (self.w + step - 1) / step;
         let gh = (self.h + step - 1) / step;
@@ -174,7 +174,7 @@ impl WorldMapData {
                 let px = (gx * step).min(self.w - 1);
                 let wx = self.bmin[0] + (px as f32 / self.w as f32) * (self.bmax[0] - self.bmin[0]);
                 let wz = self.elevation_m(px, py).max(0.0);
-                verts.push([wx * 0.01, wy * 0.01, wz * 0.04]);
+                verts.push([wx * scale, wy * scale, wz * scale]);
                 uvs.push([px as f32 / self.w as f32, py as f32 / self.h as f32]);
             }
         }
@@ -555,6 +555,28 @@ mod tests {
         assert!((map.elevation_m(px, py) - 130.0).abs() < 0.001);
     }
 
+    #[test]
+    fn terrain_preview_uses_uniform_scale_and_gpu_world_keeps_full_height() {
+        let mut map = asymmetric_map();
+        map.bmin = [0.0; 3];
+        map.bmax = [800.0, 800.0, 255.0];
+        map.heights.fill(0);
+        map.heights[4] = 100;
+        let preview = map.build_terrain_mesh(4);
+        let world = map.build_world_terrain_mesh(4);
+        let run = preview.verts[1][0] - preview.verts[0][0];
+        let rise = preview.verts[1][2] - preview.verts[0][2];
+        assert!((rise / run - 0.25).abs() < 0.001, "100m rise over 400m must retain its slope");
+        assert!((world.verts[1][2] - 99.0).abs() < 0.001);
+        for (p, w) in preview.verts.iter().zip(&world.verts) {
+            assert!((p[0] * 100.0 - w[0]).abs() < 0.001);
+            assert!((p[1] * 100.0 - w[1]).abs() < 0.001);
+            assert!((p[2] * 100.0 - 1.0 - w[2]).abs() < 0.001);
+        }
+        for (p, w) in preview.normals.iter().zip(&world.normals) {
+            assert!(p.iter().zip(w).map(|(a, b)| a * b).sum::<f32>() > 0.9999);
+        }
+    }
 
 
     #[test]
