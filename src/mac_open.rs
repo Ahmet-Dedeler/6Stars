@@ -1,4 +1,8 @@
+// Percy6Stars by Ahmet Dedeler (https://github.com/Ahmet-Dedeler, https://ahmetdedeler.com)
+// Fork of PercyStar by rpatty-dev (https://github.com/rpatty-dev/PercyStar).
+// Source: https://github.com/Ahmet-Dedeler/Percy6Stars
 // SPDX-License-Identifier: MIT
+// If you copy or port this file, keep this header (MIT notice); a README credit is appreciated.
 // Copyright (c) 2026 Ahmet Dedeler
 
 //! Files opened from Finder on macOS: double-click, "Open With", or a drop on the Dock icon.

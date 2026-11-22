@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# Percy6Stars by Ahmet Dedeler (https://github.com/Ahmet-Dedeler, https://ahmetdedeler.com)
+# Fork of PercyStar by rpatty-dev (https://github.com/rpatty-dev/PercyStar).
+# Source: https://github.com/Ahmet-Dedeler/Percy6Stars
+# License: PercyStar Non-Commercial Attribution & Copyleft License v1.2 (see LICENSE)
+# If you copy, vendor or port this file, keep this header and credit both projects in your README.
+#
 # Packages just the decoder and MIT-licensed frame bridge for local Mac builds.
 set -euo pipefail
 

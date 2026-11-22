@@ -64,3 +64,18 @@ When we added video previews, searching for "video" still found nothing. This ch
 - Upstream sync: `rpatty-dev/PercyStar` is merged into the fork with a real merge (not cherry-picks), keeping both histories. Keep our decoders where they measure better and note the measurement in the commit.
 - Use SixNG (GPLv3) to read up on formats, not as a source of code to copy into this repo.
 - Other PercyStar forks share upstream's license, so their code can be merged with credit (asm512's LOD switching, GamingChelsea's audio catalog). Their open upstream PRs may land upstream later; expect the next upstream sync to touch the same code. asm512's per-texture material layers (rpatty-dev/PercyStar#19) were not taken because they replace our material resolver.
+
+## Reusing this code
+
+Files written for this fork start with the Percy6Stars credit header (see `src/gallery.rs`). Files from upstream PercyStar keep upstream's headers; don't add ours to them.
+
+When vendoring, copying or porting code from this repo into another project:
+
+- Keep the header at the top of each file (author, source link, license). Don't strip it in a port to another language either; carry it over as a comment.
+- **PercyStar-licensed code** (most files): follow `LICENSE` in full. In short: non-commercial only, the same license, "Percy" in both the repository and application names, and credit to rpatty-dev with a link to https://github.com/rpatty-dev/PercyStar. Credit Percy6Stars as well, for example `Percy6Stars by Ahmet Dedeler (https://github.com/Ahmet-Dedeler/Percy6Stars)`.
+- **Files marked `SPDX-License-Identifier: MIT`** (e.g. `src/video_clip.rs`, `src/mac_open.rs`): MIT terms only (`LICENSE-MIT`). Keep the copyright and permission notice; PercyStar's conditions don't apply. A README credit is appreciated but not required.
+- This repo builds an app, not a library crate, so copy or port the files rather than adding it as a Cargo dependency.
+
+---
+
+Ahmet Dedeler · [github.com/Ahmet-Dedeler](https://github.com/Ahmet-Dedeler) · [ahmetdedeler.com](https://ahmetdedeler.com)

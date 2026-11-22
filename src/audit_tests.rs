@@ -1,3 +1,8 @@
+// Percy6Stars by Ahmet Dedeler (https://github.com/Ahmet-Dedeler, https://ahmetdedeler.com)
+// Fork of PercyStar by rpatty-dev (https://github.com/rpatty-dev/PercyStar).
+// Source: https://github.com/Ahmet-Dedeler/Percy6Stars
+// License: PercyStar Non-Commercial Attribution & Copyleft License v1.2 (see LICENSE)
+// If you copy, vendor or port this file, keep this header and credit both projects in your README.
 //! Opt-in format coverage audit over a scan of your own archives.
 //!
 //! Samples entries of every kind from the Percy6Stars scan cache and runs the same decoder the
