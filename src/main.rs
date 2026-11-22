@@ -5056,6 +5056,14 @@ impl eframe::App for Rpf9App {
                 ui.label(RichText::new("PERCYSTAR").size(17.0).strong().color(Color32::from_rgb(255, 168, 28)));
                 ui.label(RichText::new("RPF9").size(13.0).strong().color(Color32::from_rgb(255, 72, 165)));
                 ui.label(RichText::new(format!("v{APP_VERSION}")).size(11.5).color(Color32::from_rgb(165, 145, 195)));
+                if ui
+                    .add(egui::Button::new(RichText::new("♥ Sponsor").size(11.0).color(Color32::from_rgb(155, 135, 185))).frame(false))
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text("Optional: support ongoing R&D on GitHub Sponsors")
+                    .clicked()
+                {
+                    ctx.open_url(egui::OpenUrl::new_tab("https://github.com/sponsors/rpatty-dev"));
+                }
                 ui.add_space(10.0);
                 // Top-level mode tabs: Explorer | Model Viewer | World Map | Shaders (RDNA2)
                 for (tab_id, label) in [
