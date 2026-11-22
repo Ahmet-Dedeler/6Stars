@@ -13,6 +13,7 @@ mod vertex_stream;
 
 pub use shading::NormalSource;
 pub use texture::Texture2D;
+#[cfg(test)]
 use raster::rasterize_mesh;
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -2402,6 +2403,38 @@ mod showcase_tests {
         assert!(m.color_buf == plain, "rendering must be deterministic");
     }
 
+
+    // cargo test --release viewer_frame_times -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn viewer_frame_times() {
+        let mut m = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        // one million triangle textured sphere
+        grid(&mut m, 1000, 500, 0, |u, v| {
+            let (th, ph) = (u * std::f32::consts::TAU, v * std::f32::consts::PI);
+            ([ph.sin() * th.cos(), ph.sin() * th.sin(), ph.cos()], [u * 8.0, v * 4.0])
+        });
+        let mut dense = Mesh3D::from_parts("dense".into(), m.0, m.1, m.2, m.3, vec![], None, String::new(), 1, 0, String::new());
+        dense.normal_source = NormalSource::SharedVertices;
+        let px = (0..256 * 256).map(|i| if ((i % 256) / 16 + (i / 256) / 16) % 2 == 0 { Color32::from_rgb(230, 120, 40) } else { Color32::WHITE }).collect();
+        dense.geom_materials = vec![GeomMaterial { texture: Some(Arc::new(tex(256, 256, px))), ..Default::default() }];
+        let started = std::time::Instant::now();
+        let _ = dense.corner_normals();
+        eprintln!("normals for {} triangles {:.0} ms", dense.tris.len(), started.elapsed().as_secs_f32() * 1000.0);
+        for (name, mesh) in [("showcase", &mut showcase()), ("1M tris", &mut dense)] {
+            for (w, h) in [(1280usize, 720usize), (1920, 1200)] {
+                for scale in [1.0, raster::idle_supersampling(w, h)] {
+                    let _ = raster::render_image(mesh, w, h, scale);
+                    let started = std::time::Instant::now();
+                    for _ in 0..3 {
+                        mesh.yaw += 0.05;
+                        let _ = raster::render_image(mesh, w, h, scale);
+                    }
+                    eprintln!("{name} {w}x{h} scale {scale:.2}: {:.1} ms", started.elapsed().as_secs_f32() * 1000.0 / 3.0);
+                }
+            }
+        }
+    }
 
     // shared edges are drawn exactly once so glass does not double blend along its diagonal
     #[test]

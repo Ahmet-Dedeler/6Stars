@@ -2012,8 +2012,9 @@ impl Rpf9App {
         if need_upload {
             self.tex_view_key = view_key;
             let cur = &self.textures[self.tex_sel];
+            // decoded texels are straight egui wants them premultiplied
             let pixels = if view_key == (tex::TexChannel::Rgba, false) {
-                cur.pixels.clone()
+                tex::premultiplied_for_egui(&cur.pixels)
             } else {
                 tex::channel_view(&cur.pixels, view_key.0, view_key.1)
             };
@@ -5285,7 +5286,7 @@ impl eframe::App for Rpf9App {
                             self.anim_time = t;
                             let next = anim::build_stickman_mesh(&self.anim_name, t, self.anim_dur, self.anim_tracks, self.anim_seed);
                             mesh.verts = next.verts;
-                            mesh.dirty = true;
+                            mesh.invalidate_normals();
                         }
                     }
                     if let Some(pick) = lod_switch_ui(ui, mesh, &self.lod_siblings, self.selected) {
@@ -5300,7 +5301,7 @@ impl eframe::App for Rpf9App {
                     self.anim_time = (self.anim_time + dt) % self.anim_dur.max(0.1);
                     let next = anim::build_stickman_mesh(&self.anim_name, self.anim_time, self.anim_dur, self.anim_tracks, self.anim_seed);
                     mesh.verts = next.verts;
-                    mesh.dirty = true;
+                    mesh.invalidate_normals();
                     ctx.request_repaint();
                 }
                 self.show_3d = toggle_3d;

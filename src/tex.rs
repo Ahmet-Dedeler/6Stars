@@ -42,6 +42,7 @@ pub struct DecodedTexture {
     pub mips: u8,
     pub dxgi: u8,
     pub fmt_name: &'static str,
+    // straight non premultiplied rgba kept raw see premultiplied_for_egui
     pub pixels: Vec<Color32>,
     pub raw_dds_payload: Vec<u8>,
 }
@@ -289,14 +290,140 @@ fn tonemap_u8(v: f32) -> u8 {
     (m.powf(1.0 / 2.2) * 255.0).clamp(0.0, 255.0) as u8
 }
 
+// stores straight rgba bytes untouched color32 constructors that take unmultiplied input would premultiply
+#[inline]
+fn straight(r: u8, g: u8, b: u8, a: u8) -> Color32 {
+    Color32::from_rgba_premultiplied(r, g, b, a)
+}
+
+// egui wants premultiplied texels decoded textures are straight
+pub fn premultiplied_for_egui(pixels: &[Color32]) -> Vec<Color32> {
+    pixels
+        .iter()
+        .map(|c| {
+            let [r, g, b, a] = c.to_array();
+            if a == 255 { *c } else { Color32::from_rgba_unmultiplied(r, g, b, a) }
+        })
+        .collect()
+}
+
+// walks 4x4 blocks row major put writes texel 0 to 15 of the current block cropping at the texture edge
+fn for_each_block(
+    lin: &[u8],
+    w: usize,
+    h: usize,
+    block_bytes: usize,
+    mut decode: impl FnMut(&[u8], &mut dyn FnMut(usize, Color32)),
+    pixels: &mut [Color32],
+) -> Option<()> {
+    let (bw, bh) = (w.div_ceil(4), h.div_ceil(4));
+    if lin.len() < bw.checked_mul(bh)?.checked_mul(block_bytes)? || pixels.len() < w * h {
+        return None;
+    }
+    for (bi, blk) in lin.chunks_exact(block_bytes).take(bw * bh).enumerate() {
+        let (bx, by) = ((bi % bw) * 4, (bi / bw) * 4);
+        decode(blk, &mut |i, c| {
+            let (x, y) = (bx + (i & 3), by + (i >> 2));
+            if x < w && y < h {
+                pixels[y * w + x] = c;
+            }
+        });
+    }
+    Some(())
+}
+
+// color block of bc2 and bc3 always four colors bc1 switches to three colors plus black when c0 <= c1
+fn color_block4(blk: &[u8]) -> [[u8; 3]; 16] {
+    let expand = |q: u16| {
+        let (r, g, b) = ((q >> 11) & 31, (q >> 5) & 63, q & 31);
+        [((r << 3) | (r >> 2)) as u16, ((g << 2) | (g >> 4)) as u16, ((b << 3) | (b >> 2)) as u16]
+    };
+    let (c0, c1) = (expand(u16::from_le_bytes([blk[0], blk[1]])), expand(u16::from_le_bytes([blk[2], blk[3]])));
+    let pal: [[u8; 3]; 4] = [
+        c0.map(|v| v as u8),
+        c1.map(|v| v as u8),
+        std::array::from_fn(|k| ((c0[k] * 2 + c1[k]) / 3) as u8),
+        std::array::from_fn(|k| ((c0[k] + c1[k] * 2) / 3) as u8),
+    ];
+    let idx = u32::from_le_bytes([blk[4], blk[5], blk[6], blk[7]]);
+    std::array::from_fn(|i| pal[((idx >> (2 * i)) & 3) as usize])
+}
+
+// single channel block of bc3 alpha bc4 and bc5 as bytes signed blocks map minus one to 0 and plus one to 255
+fn channel_block(blk: &[u8], signed: bool) -> [u8; 16] {
+    let mut pal = [0u8; 8];
+    if signed {
+        // snorm endpoints compare signed and minus 128 means minus 127
+        let (e0, e1) = ((blk[0] as i8).max(-127), (blk[1] as i8).max(-127));
+        let (f0, f1) = (e0 as f32 / 127.0, e1 as f32 / 127.0);
+        let mut v = [f0, f1, 0.0, 0.0, 0.0, 0.0, -1.0, 1.0];
+        let steps = if e0 > e1 { 7 } else { 5 };
+        for i in 1..steps {
+            v[i + 1] = (f0 * (steps - i) as f32 + f1 * i as f32) / steps as f32;
+        }
+        pal = v.map(|f| ((f * 0.5 + 0.5) * 255.0 + 0.5) as u8);
+    } else {
+        let (e0, e1) = (blk[0] as u16, blk[1] as u16);
+        pal[0] = blk[0];
+        pal[1] = blk[1];
+        let steps = if e0 > e1 { 7 } else { 5 };
+        for i in 1..steps {
+            pal[i as usize + 1] = ((e0 * (steps - i) + e1 * i) / steps) as u8;
+        }
+        if steps == 5 {
+            pal[6] = 0;
+            pal[7] = 255;
+        }
+    }
+    let bits = u64::from_le_bytes(blk[..8].try_into().unwrap()) >> 16;
+    std::array::from_fn(|i| pal[((bits >> (3 * i)) & 7) as usize])
+}
+
+// decodes to straight non premultiplied srgb rgba stored raw in the color32 container
+// see premultiplied_for_egui before handing the result to egui
 pub fn decode_linear_to_rgba(lin: &[u8], w: usize, h: usize, dxgi: u8) -> Option<Vec<Color32>> {
-    if matches!(dxgi, 71 | 72 | 77 | 78 | 80 | 81 | 83 | 84 | 95 | 96 | 98 | 99) {
+    if matches!(dxgi, 74 | 75 | 77 | 78) {
+        // bc2 explicit 4 bit alpha bc3 interpolated alpha both followed by a four color block
+        let mut pixels = vec![Color32::TRANSPARENT; w * h];
+        for_each_block(lin, w, h, 16, |blk, put| {
+            let rgb = color_block4(&blk[8..16]);
+            let alpha = if dxgi <= 75 {
+                let bits = u64::from_le_bytes(blk[..8].try_into().unwrap());
+                std::array::from_fn(|i| ((bits >> (4 * i)) & 0xF) as u8 * 17)
+            } else {
+                channel_block(&blk[..8], false)
+            };
+            for i in 0..16 {
+                put(i, straight(rgb[i][0], rgb[i][1], rgb[i][2], alpha[i]));
+            }
+        }, &mut pixels)?;
+        return Some(pixels);
+    }
+    if matches!(dxgi, 80 | 81 | 83 | 84) {
+        // one or two channel blocks signed formats keep the unorm byte layout the callers expect
+        let (signed, two) = (matches!(dxgi, 81 | 84), dxgi >= 83);
+        let mut pixels = vec![Color32::BLACK; w * h];
+        for_each_block(lin, w, h, if two { 16 } else { 8 }, |blk, put| {
+            let r = channel_block(&blk[..8], signed);
+            if !two {
+                for i in 0..16 {
+                    put(i, Color32::from_gray(r[i]));
+                }
+                return;
+            }
+            let g = channel_block(&blk[8..16], signed);
+            for i in 0..16 {
+                let (nx, ny) = (r[i] as f32 / 127.5 - 1.0, g[i] as f32 / 127.5 - 1.0);
+                let nz = (1.0 - nx * nx - ny * ny).max(0.0).sqrt();
+                put(i, Color32::from_rgb(r[i], g[i], ((nz * 0.5 + 0.5) * 255.0 + 0.5) as u8));
+            }
+        }, &mut pixels)?;
+        return Some(pixels);
+    }
+    if matches!(dxgi, 71 | 72 | 95 | 96 | 98 | 99) {
         let mut out_u32 = vec![0u32; w * h];
         let res = match dxgi {
             71 | 72 => texture2ddecoder::decode_bc1a(lin, w, h, &mut out_u32),
-            77 | 78 => texture2ddecoder::decode_bc3(lin, w, h, &mut out_u32),
-            80 | 81 => texture2ddecoder::decode_bc4(lin, w, h, &mut out_u32),
-            83 | 84 => texture2ddecoder::decode_bc5(lin, w, h, &mut out_u32),
             95 | 96 => {
                 // Work around texture2ddecoder 0.1.2 bug: BC6H mode 15 (0x0F, endpoint_bits=16)
                 // overflows `1i16 << 16` in debug builds. Convert mode-15 blocks to mode-3 (0x03)
@@ -318,62 +445,13 @@ pub fn decode_linear_to_rgba(lin: &[u8], w: usize, h: usize, dxgi: u8) -> Option
         };
         res.ok()?;
         let mut pixels = Vec::with_capacity(w * h);
-        if matches!(dxgi, 80 | 81 | 83 | 84) {
-            for px in out_u32 {
-                let r = ((px >> 16) & 0xFF) as u8;
-                let g = ((px >> 8) & 0xFF) as u8;
-                pixels.push(if dxgi <= 81 {
-                    Color32::from_gray(r)
-                } else {
-                    let (nx, ny) = (r as f32 / 127.5 - 1.0, g as f32 / 127.5 - 1.0);
-                    let nz = (1.0 - nx * nx - ny * ny).max(0.0).sqrt();
-                    Color32::from_rgb(r, g, ((nz * 0.5 + 0.5) * 255.0) as u8)
-                });
-            }
-            return Some(pixels);
-        }
         for px in out_u32 {
             // texture2ddecoder packs u32 as 0xAARRGGBB (BGRA little-endian)
             let b = (px & 0xFF) as u8;
             let g = ((px >> 8) & 0xFF) as u8;
             let r = ((px >> 16) & 0xFF) as u8;
             let a = ((px >> 24) & 0xFF) as u8;
-            pixels.push(Color32::from_rgba_unmultiplied(r, g, b, a));
-        }
-        return Some(pixels);
-    }
-    if matches!(dxgi, 74 | 75) {
-        // BC2 = 8-byte 4-bit explicit alpha + 8-byte BC1 color per 4x4 block
-        let bw = w.div_ceil(4);
-        let bh = h.div_ceil(4);
-        if lin.len() < bw * bh * 16 { return None; }
-        let mut bc1_only = Vec::with_capacity(bw * bh * 8);
-        for b in 0..bw * bh {
-            bc1_only.extend_from_slice(&lin[b * 16 + 8..b * 16 + 16]);
-        }
-        let mut out_u32 = vec![0u32; w * h];
-        texture2ddecoder::decode_bc1(&bc1_only, w, h, &mut out_u32).ok()?;
-        let mut pixels = vec![Color32::TRANSPARENT; w * h];
-        for by in 0..bh {
-            for bx in 0..bw {
-                let abits = ru64(lin, (by * bw + bx) * 16);
-                for py in 0..4 {
-                    let y = by * 4 + py;
-                    if y >= h { continue; }
-                    for px in 0..4 {
-                        let x = bx * 4 + px;
-                        if x >= w { continue; }
-                        let c = out_u32[y * w + x];
-                        let a4 = ((abits >> (4 * (py * 4 + px))) & 0xF) as u8;
-                        pixels[y * w + x] = Color32::from_rgba_unmultiplied(
-                            ((c >> 16) & 0xFF) as u8,
-                            ((c >> 8) & 0xFF) as u8,
-                            (c & 0xFF) as u8,
-                            a4 | (a4 << 4),
-                        );
-                    }
-                }
-            }
+            pixels.push(straight(r, g, b, a));
         }
         return Some(pixels);
     }
@@ -385,14 +463,14 @@ pub fn decode_linear_to_rgba(lin: &[u8], w: usize, h: usize, dxgi: u8) -> Option
                 let r = tonemap_u8(f16_to_f32(ru16(px, 0)));
                 let g = tonemap_u8(f16_to_f32(ru16(px, 2)));
                 let b = tonemap_u8(f16_to_f32(ru16(px, 4)));
-                let _a = (f16_to_f32(ru16(px, 6)).clamp(0.0, 1.0) * 255.0) as u8;
-                pixels.push(Color32::from_rgba_unmultiplied(r, g, b, 255));
+                // the alpha of this float format is not coverage upstream forces it opaque
+                pixels.push(straight(r, g, b, 255));
             }
         }
         11 => {
             if lin.len() < w * h * 8 { return None; }
             for px in lin[..w * h * 8].as_chunks::<8>().0 {
-                pixels.push(Color32::from_rgba_unmultiplied(px[1], px[3], px[5], px[7]));
+                pixels.push(straight(px[1], px[3], px[5], px[7]));
             }
         }
         24 => {
@@ -403,13 +481,13 @@ pub fn decode_linear_to_rgba(lin: &[u8], w: usize, h: usize, dxgi: u8) -> Option
                 let g = (((v >> 10) & 0x3FF) >> 2) as u8;
                 let b = (((v >> 20) & 0x3FF) >> 2) as u8;
                 let a = (((v >> 30) & 3) * 85) as u8;
-                pixels.push(Color32::from_rgba_unmultiplied(r, g, b, a));
+                pixels.push(straight(r, g, b, a));
             }
         }
         28 | 29 => {
             if lin.len() < w * h * 4 { return None; }
             for px in lin[..w * h * 4].as_chunks::<4>().0 {
-                pixels.push(Color32::from_rgba_unmultiplied(px[0], px[1], px[2], px[3]));
+                pixels.push(straight(px[0], px[1], px[2], px[3]));
             }
         }
         34 => {
@@ -430,7 +508,7 @@ pub fn decode_linear_to_rgba(lin: &[u8], w: usize, h: usize, dxgi: u8) -> Option
         87 | 91 => {
             if lin.len() < w * h * 4 { return None; }
             for px in lin[..w * h * 4].as_chunks::<4>().0 {
-                pixels.push(Color32::from_rgba_unmultiplied(px[2], px[1], px[0], px[3]));
+                pixels.push(straight(px[2], px[1], px[0], px[3]));
             }
         }
         49 => {
@@ -498,8 +576,9 @@ pub fn build_dds_dx10(w: usize, h: usize, dxgi: u8, lin: &[u8]) -> Vec<u8> {
 
 pub fn export_texture_png(tex: &DecodedTexture, path: &Path) -> Result<(), String> {
     let mut rgba = Vec::with_capacity(tex.w * tex.h * 4);
+    // pixels are already straight
     for c in &tex.pixels {
-        rgba.extend_from_slice(&c.to_srgba_unmultiplied());
+        rgba.extend_from_slice(&c.to_array());
     }
     image::save_buffer(path, &rgba, tex.w as u32, tex.h as u32, image::ColorType::Rgba8)
         .map_err(|e| format!("PNG save error: {e}"))
@@ -597,7 +676,7 @@ pub fn to_model_tex(t: DecodedTexture) -> Texture2D {
     if t.dxgi == 65 {
         // texture browser shows a8 as grayscale models use it as opacity
         for c in &mut pixels {
-            *c = Color32::from_white_alpha(c.r());
+            *c = straight(255, 255, 255, c.r());
         }
     }
     Texture2D::new(t.w, t.h, pixels)
@@ -996,7 +1075,8 @@ impl TtpfHashHit {
 
     #[inline]
     pub fn is_normal_format(&self) -> bool {
-        matches!(self.dxgi, 80 | 81 | 83 | 84)
+        // bc5 only single channel bc4 holds masks and heights
+        matches!(self.dxgi, 83 | 84)
     }
 }
 
@@ -1557,6 +1637,88 @@ mod mhiu_tests {
     }
 
     #[test]
+    fn bc3_color_block_is_always_four_color() {
+        // flat block c0 == c1 with every index 3 bc1 rules would decode it black
+        let mut blk = vec![255u8; 8];
+        blk.extend_from_slice(&0xF800u16.to_le_bytes());
+        blk.extend_from_slice(&0xF800u16.to_le_bytes());
+        blk.extend_from_slice(&[0xFF; 4]);
+        for dxgi in [77u8, 74] {
+            let px = decode_linear_to_rgba(&blk, 4, 4, dxgi).unwrap();
+            assert!(px.iter().all(|c| c.to_array() == [255, 0, 0, 255]), "dxgi {dxgi}: {:?}", px[0].to_array());
+        }
+        // c0 < c1 interpolates at thirds instead of the bc1 half mix and black
+        let mut blk = vec![255u8; 8];
+        blk.extend_from_slice(&0x0000u16.to_le_bytes());
+        blk.extend_from_slice(&0xFFFFu16.to_le_bytes());
+        blk.extend_from_slice(&[0b1110_0100, 0, 0, 0]);
+        let px = decode_linear_to_rgba(&blk, 4, 4, 77).unwrap();
+        let reds: Vec<u8> = px[..4].iter().map(|c| c.r()).collect();
+        assert_eq!(reds, [0, 255, 85, 170]);
+        // cropped sizes and short input
+        assert_eq!(decode_linear_to_rgba(&blk, 3, 2, 77).unwrap().len(), 6);
+        assert!(decode_linear_to_rgba(&blk[..15], 4, 4, 77).is_none());
+    }
+
+    #[test]
+    fn alpha_as_data_keeps_the_color_and_exports_unchanged() {
+        // bc3 texel with alpha zero and a strong color
+        let mut blk = vec![0u8; 8];
+        blk.extend_from_slice(&0x07E0u16.to_le_bytes());
+        blk.extend_from_slice(&0x07E0u16.to_le_bytes());
+        blk.extend_from_slice(&[0; 4]);
+        let px = decode_linear_to_rgba(&blk, 4, 4, 77).unwrap();
+        assert_eq!(px[0].to_array(), [0, 255, 0, 0], "color survives zero alpha");
+        let rgba8 = decode_linear_to_rgba(&[200, 100, 50, 3], 1, 1, 28).unwrap();
+        assert_eq!(rgba8[0].to_array(), [200, 100, 50, 3]);
+        // egui gets premultiplied texels opaque ones untouched
+        let up = premultiplied_for_egui(&[rgba8[0], px[0], Color32::from_rgb(9, 8, 7)]);
+        assert_eq!(up[1], Color32::TRANSPARENT);
+        assert_eq!(up[2], Color32::from_rgb(9, 8, 7));
+        assert_eq!(up[0], Color32::from_rgba_unmultiplied(200, 100, 50, 3));
+        // a8 becomes straight white with the value as coverage
+        let a8 = to_model_tex(DecodedTexture { name: String::new(), w: 1, h: 1, mips: 1, dxgi: 65, fmt_name: "A8", pixels: vec![Color32::from_gray(40)], raw_dds_payload: Vec::new() });
+        assert_eq!(a8.pixels[0].to_array(), [255, 255, 255, 40]);
+    }
+
+    #[test]
+    fn signed_bc4_and_bc5_decode_as_snorm() {
+        // endpoints plus one and minus one index 0 and 1
+        let blk = [0x7Fu8, 0x81, 0b0000_1000, 0, 0, 0, 0, 0];
+        let signed = channel_block(&blk, true);
+        assert_eq!((signed[0], signed[1]), (255, 0));
+        // read as unorm the same bytes are 127 and 129 which is what the old path produced
+        let unsigned = channel_block(&blk, false);
+        assert_eq!((unsigned[0], unsigned[1]), (127, 129));
+        // minus 128 clamps to minus one and e0 <= e1 selects the six value palette with the two extremes
+        let blk6 = [0x80u8, 0x00, 0b1111_0000, 0b0000_0011, 0, 0, 0, 0];
+        let v = channel_block(&blk6, true);
+        assert_eq!((v[0], v[1], v[2]), (0, 0, 255), "indices 0 6 7 1 -> {:?}", &v[..4]);
+        assert_eq!(v[3], 128, "zero maps to the middle");
+        // flat tangent space normal 0 0 1 through bc5 snorm
+        let flat = [0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let px = decode_linear_to_rgba(&flat, 4, 4, 84).unwrap();
+        assert_eq!(px[0].to_array(), [128, 128, 255, 255]);
+        // unorm bc4 matches the reference decoder
+        let mut reference = vec![0u32; 16];
+        let ublk = [200u8, 40, 0x88, 0xC6, 0xFA, 0x53, 0x1D, 0x77];
+        texture2ddecoder::decode_bc4(&ublk, 4, 4, &mut reference).unwrap();
+        let ours = decode_linear_to_rgba(&ublk, 4, 4, 80).unwrap();
+        for (o, r) in ours.iter().zip(&reference) {
+            assert_eq!(o.r() as u32, (r >> 16) & 0xFF);
+        }
+        let ublk2 = [40u8, 200, 0x88, 0xC6, 0xFA, 0x53, 0x1D, 0x77];
+        texture2ddecoder::decode_bc4(&ublk2, 4, 4, &mut reference).unwrap();
+        let ours = decode_linear_to_rgba(&ublk2, 4, 4, 80).unwrap();
+        for (o, r) in ours.iter().zip(&reference) {
+            assert_eq!(o.r() as u32, (r >> 16) & 0xFF);
+        }
+        // bc4 masks are not normal maps
+        let hit = |dxgi| TtpfHashHit { path: std::path::PathBuf::new(), tex_idx: 0, w: 4, h: 4, dxgi };
+        assert!(hit(83).is_normal_format() && hit(84).is_normal_format() && !hit(80).is_normal_format() && !hit(81).is_normal_format());
+    }
+
+    #[test]
     fn bc1_preserves_one_bit_transparency() {
         let px = decode_linear_to_rgba(&[0, 0, 255, 255, 3, 0, 0, 0], 4, 4, 72).unwrap();
         assert_eq!(px[0], Color32::TRANSPARENT);
@@ -1580,6 +1742,10 @@ mod mhiu_tests {
         assert!(rgb[0].b() >= 254);
         assert_eq!(channel_view(&px, TexChannel::R, false)[0], Color32::from_rgb(128, 128, 128));
         assert_eq!(channel_view(&px, TexChannel::A, false)[0], Color32::from_rgb(255, 255, 255));
+        // a straight texel with zero alpha keeps its color in the channel views
+        let hidden = [Color32::from_rgba_premultiplied(200, 40, 10, 0)];
+        assert_eq!(channel_view(&hidden, TexChannel::Rgb, false)[0], Color32::from_rgb(200, 40, 10));
+        assert_eq!(channel_view(&hidden, TexChannel::Rgba, false)[0], Color32::TRANSPARENT);
     }
 }
 
@@ -1608,7 +1774,8 @@ impl TexChannel {
 pub fn channel_view(pixels: &[Color32], channel: TexChannel, rebuild_z: bool) -> Vec<Color32> {
     let mut out = Vec::with_capacity(pixels.len());
     for p in pixels {
-        let [r, g, mut b, a] = p.to_srgba_unmultiplied();
+        // texels are stored straight the output is premultiplied for egui
+        let [r, g, mut b, a] = p.to_array();
         if rebuild_z {
             let x = r as f32 * (1.0 / 127.5) - 1.0;
             let y = g as f32 * (1.0 / 127.5) - 1.0;
