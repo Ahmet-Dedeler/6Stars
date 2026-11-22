@@ -584,6 +584,9 @@ pub fn export_texture_png(tex: &DecodedTexture, path: &Path) -> Result<(), Strin
         .map_err(|e| format!("PNG save error: {e}"))
 }
 
+// decoded pixels one texture dictionary may produce
+const MAX_TXD_PIXELS: usize = 1 << 28;
+
 /// Extract ALL textures from a pgDictionary<grcTexture> inside virtual `v` + physical `p`.
 pub fn extract_txd_textures(v: &[u8], p: &[u8], dict_off: usize) -> Vec<DecodedTexture> {
     if dict_off + 0x3a > v.len() { return Vec::new(); }
@@ -610,7 +613,7 @@ pub fn extract_txd_textures(v: &[u8], p: &[u8], dict_off: usize) -> Vec<DecodedT
             if no + 8 < v.len() && v[no..no + 8] == [0u8; 8] {
                 no += 8;
             }
-            if let Some(rel) = v[no..].iter().position(|&b| b == 0) {
+            if let Some(rel) = v.get(no..).and_then(|t| t.iter().position(|&b| b == 0)) {
                 if rel > 0 && rel < 128 {
                     let s = String::from_utf8_lossy(&v[no..no + rel]).into_owned();
                     if s.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
@@ -631,6 +634,7 @@ pub fn extract_txd_textures(v: &[u8], p: &[u8], dict_off: usize) -> Vec<DecodedT
     }
 
     let mut out = Vec::new();
+    let mut decoded_px = 0usize;
     for (poff, name, w, h, dxgi, swiz, mips) in raw_list {
         let Some((fmt_name, is_bc, bpe)) = dxgi_info(dxgi) else { continue };
         let alloc_end = next_map.get(&poff).copied().unwrap_or(p.len());
@@ -642,11 +646,16 @@ pub fn extract_txd_textures(v: &[u8], p: &[u8], dict_off: usize) -> Vec<DecodedT
             poff
         };
         if mip0_off >= p.len() { continue; }
+        // many entries may point at the same data stop before a crafted dictionary exhausts memory
+        decoded_px = decoded_px.saturating_add(w.saturating_mul(h));
+        if decoded_px > MAX_TXD_PIXELS { break; }
         let slice_end = (mip0_off + mip0_sz).min(p.len());
         let lin = if swiz == 0 {
             let ew = if is_bc { w.div_ceil(4) } else { w }.max(1);
             let eh = if is_bc { h.div_ceil(4) } else { h }.max(1);
             let need = ew * eh * bpe;
+            // an entry with no pixel data behind it would decode to a blank image
+            if p.len() - mip0_off < need.min(bpe * 16) { continue; }
             let mut b = vec![0u8; need];
             let n = (p.len() - mip0_off).min(need);
             b[..n].copy_from_slice(&p[mip0_off..mip0_off + n]);
@@ -796,7 +805,7 @@ pub fn probe_txd_header(c0: &[u8]) -> Option<(String, usize)> {
     let mut first_nm = format!("txd_{i_cnt}tex");
     if let Some(mut no) = vptr(ru64(c0, tp + 0x30)) {
         if no + 8 < c0.len() && c0[no..no + 8] == [0u8; 8] { no += 8; }
-        if let Some(rel) = c0[no..].iter().position(|&b| b == 0) {
+        if let Some(rel) = c0.get(no..).and_then(|t| t.iter().position(|&b| b == 0)) {
             if (2..96).contains(&rel) {
                 let s = String::from_utf8_lossy(&c0[no..no + rel]).into_owned();
                 if s.chars().all(|c| c.is_ascii_graphic()) {
@@ -844,6 +853,10 @@ pub fn scan_ttpf_descriptors(path: &Path) -> Result<(String, Vec<TtpfTexMeta>), 
         return Err(format!("Missing ETPF header at 0x{etpf_off:x}"));
     }
     let tex_count = ru32(&ehdr, 8) as usize;
+    // the record table has to fit in the file before it is allocated
+    if (tex_count as u64).saturating_mul(16) > sz.saturating_sub(etpf_off) {
+        return Err(format!("ETPF texture count {tex_count} exceeds the file size"));
+    }
     let mut recs = vec![0u8; tex_count * 16];
     f.read_exact(&mut recs).map_err(|e| e.to_string())?;
 
@@ -902,6 +915,10 @@ pub fn ttpf_index(path: &Path) -> Result<std::sync::Arc<TtpfIndex>, String> {
     f.read_exact(&mut hdr).map_err(|e| e.to_string())?;
     let n_chunks = ru32(&hdr, 4) as usize;
     let etpf_off = ru32(&hdr, 16) as u64 * 0x100;
+    let file_len = f.metadata().map_err(|e| e.to_string())?.len();
+    if (n_chunks as u64).saturating_mul(8) > file_len {
+        return Err(format!("RDS5 chunk count {n_chunks} exceeds the file size"));
+    }
     let mut tbl = vec![0u8; n_chunks * 8];
     f.read_exact(&mut tbl).map_err(|e| e.to_string())?;
 
@@ -914,7 +931,8 @@ pub fn ttpf_index(path: &Path) -> Result<std::sync::Arc<TtpfIndex>, String> {
         let next_codec = ((lo >> 26) & 0xF) as u8;
         let r = (lo >> 30) as u64;
         let vend = (hi & 0x000F_FFFF) as u64 * 0x4000 + r * 0x1000;
-        if cend > prev_c && vend > vstart {
+        // a chunk that ends past the file cannot be read and would only size a huge buffer
+        if cend > prev_c && vend > vstart && cend <= file_len {
             chunks.push((prev_c, cend, vstart, vend - vstart, cur_codec));
             vstart = vend;
         }
@@ -934,9 +952,19 @@ fn bcpack_bc1_chunk(stored: &[u8], virt_len: u64) -> Result<Vec<u8>, String> {
         .map_err(|e| e.to_string())
 }
 
+// 16384 square at 16 bytes per texel
+const MAX_TEXTURE_BYTES: usize = 1 << 32;
+// the decoded size of a bcpack chunk comes from the chunk table and sizes the output buffer
+const MAX_BCPACK_CHUNK: u64 = 256 << 20;
+
 /// Read `len` bytes of the RDS5 virtual stream starting at `off`, inflating only overlapping chunks.
 pub fn ttpf_read_virtual(path: &Path, ix: &TtpfIndex, off: u64, len: usize) -> Result<Vec<u8>, String> {
-    let end = off + len as u64;
+    let end = off.checked_add(len as u64).ok_or("Texture range overflows")?;
+    // nothing to read when the range starts past the stream and no texture is larger than this
+    let stream_end = ix.chunks.last().map_or(0, |c| c.2 + c.3);
+    if off >= stream_end || len > MAX_TEXTURE_BYTES {
+        return Err("Texture data lies outside the RDS5 stream".into());
+    }
     let mut f = File::open(path).map_err(|e| e.to_string())?;
     let mut out_buf = vec![0u8; len];
     let mut covered = 0usize;
@@ -948,13 +976,14 @@ pub fn ttpf_read_virtual(path: &Path, ix: &TtpfIndex, off: u64, len: usize) -> R
         f.seek(SeekFrom::Start(cs)).map_err(|e| e.to_string())?;
         f.read_exact(&mut ch).map_err(|e| e.to_string())?;
         let data = if is_zlib_head(&ch) {
-            let mut out = Vec::with_capacity(vl as usize);
+            // deflate cannot expand more than about 1032 times
+            let mut out = Vec::with_capacity((vl as usize).min(ch.len().saturating_mul(1032).saturating_add(64)));
             dec.reset(true);
             let _ = dec.decompress_vec(&ch, &mut out, FlushDecompress::Finish); // partial output is still usable
             out
         } else if ch.len() as u64 == vl {
             ch
-        } else if codec == 1 && vl % 8 == 0 {
+        } else if codec == 1 && vl % 8 == 0 && vl <= MAX_BCPACK_CHUNK {
             bcpack_bc1_chunk(&ch, vl)?
         } else {
             let mode = match codec {
@@ -1216,6 +1245,8 @@ pub fn decode_ttpf_texture_cached(hit: &TtpfHashHit, hash64: u64) -> Option<std:
 // RBF0 (GTA 6 fwui UIObject) -> Readable XML Decoder
 // =============================================================================
 
+const RBF0_MAX_DEPTH: usize = 256;
+
 pub fn decode_rbf0(data: &[u8]) -> Option<String> {
     if data.len() < 8 || &data[..4] != b"RBF0" { return None; }
     let mut pos = 4usize;
@@ -1290,6 +1321,8 @@ pub fn decode_rbf0(data: &[u8]) -> Option<String> {
             0x00 => {
                 if pos + 6 > n { break; }
                 pos += 6;
+                // closing re-indents every child so runaway nesting costs quadratic time and memory
+                if stack.len() >= RBF0_MAX_DEPTH { return None; }
                 stack.push((name, Vec::new(), Vec::new()));
             }
             0x10 => {
@@ -1481,11 +1514,13 @@ pub fn decode_navmesh_from_rpf(rpf_path: &Path, file_off: u64, fallback_name: &s
     let i_blks = read_split_blocks(0x80).ok_or("Missing index split array")?;
     let p_blks = read_split_blocks(0x98).ok_or("Missing poly split array")?;
 
+    // indices are 16 bit so more vertices can never be referenced overlapping blocks stop here
     let mut verts = Vec::new();
-    for (boff, cnt) in v_blks {
+    'verts: for (boff, cnt) in v_blks {
         for i in 0..cnt {
             let o = boff + i * 6;
             if o + 6 > v.len() { break; }
+            if verts.len() >= 65536 { break 'verts; }
             let vx = min_v[0] + (ru16(&v, o) as f32 / 65535.0) * ext[0];
             let vy = min_v[1] + (ru16(&v, o + 2) as f32 / 65535.0) * ext[1];
             let vz = min_v[2] + (ru16(&v, o + 4) as f32 / 65535.0) * ext[2];
@@ -1494,10 +1529,12 @@ pub fn decode_navmesh_from_rpf(rpf_path: &Path, file_off: u64, fallback_name: &s
     }
 
     let mut indices = Vec::new();
-    for (boff, cnt) in i_blks {
+    'indices: for (boff, cnt) in i_blks {
         for i in 0..cnt {
             let o = boff + i * 2;
             if o + 2 > v.len() { break; }
+            // more indices than the buffer has bytes means the blocks overlap
+            if indices.len() >= v.len() { break 'indices; }
             indices.push(ru16(&v, o) as u32);
         }
     }
@@ -1716,6 +1753,23 @@ mod mhiu_tests {
         // bc4 masks are not normal maps
         let hit = |dxgi| TtpfHashHit { path: std::path::PathBuf::new(), tex_idx: 0, w: 4, h: 4, dxgi };
         assert!(hit(83).is_normal_format() && hit(84).is_normal_format() && !hit(80).is_normal_format() && !hit(81).is_normal_format());
+    }
+
+    #[test]
+    fn rbf0_nesting_is_bounded() {
+        // descriptor 0 named a opened once then thousands of nested opens of it
+        let mut data = b"RBF0".to_vec();
+        data.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, b'a']);
+        data.extend_from_slice(&[0u8; 6]);
+        let shallow = decode_rbf0(&data).expect("one open element decodes");
+        assert!(shallow.contains("<a"), "{shallow}");
+        for _ in 0..20_000 {
+            data.extend_from_slice(&[0x00, 0x00]);
+            data.extend_from_slice(&[0u8; 6]);
+        }
+        let started = std::time::Instant::now();
+        assert!(decode_rbf0(&data).is_none(), "runaway nesting is rejected");
+        assert!(started.elapsed().as_secs() < 2);
     }
 
     #[test]
