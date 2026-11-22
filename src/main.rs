@@ -20,8 +20,8 @@ use model3d::{
     probe_large_rage9_model_in_buf, render_mesh3d_viewport,
 };
 use rdna2::{
-    Ps09Cache, Ps09ShaderEntry, ShaderStage, format_gfx103_disasm, format_spirv_abi_summary,
-    lift_to_hlsl, lift_to_spirv,
+    Ps09Cache, Ps09ResourceName, Ps09ShaderEntry, ShaderStage, format_gfx103_disasm,
+    format_spirv_abi_summary, lift_to_hlsl, lift_to_spirv,
 };
 use tex::{
     DecodedTexture, build_dds_dx10, decode_0drpz_text, decode_mhiu_heightmap, decode_navmesh_from_rpf,
@@ -753,7 +753,44 @@ fn sgd5_stage(stage: &str) -> ShaderStage {
     }
 }
 
-fn sgd5_ps09_entry(shader: &sgd5::Sgd5Shader, fssm: &dxbc::FssmShader) -> Ps09ShaderEntry {
+fn sgd5_resource_declaration(resource_type: u16) -> Option<&'static str> {
+    match resource_type {
+        0x0102 => Some("Texture2D<float4>"),
+        0x0142 => Some("Texture2DArray<float4>"),
+        0x0202 => Some("TextureCube<float4>"),
+        0x0302 => Some("Texture3D<float4>"),
+        0x0401 => Some("Buffer<float4>"),
+        0x0405 => Some("StructuredBuffer<uint>"),
+        0x0407 => Some("ByteAddressBuffer"),
+        0x0423 => Some("SamplerState"),
+        0x0430 => Some("cbuffer"),
+        _ => None,
+    }
+}
+
+fn sgd5_resource_names(file: &sgd5::Sgd5File, shader: &sgd5::Sgd5Shader) -> Vec<Ps09ResourceName> {
+    shader.reflection_records.iter().filter_map(|record| {
+        let declaration = sgd5_resource_declaration(record.resource_type)?;
+        let register_prefix = match record.resource_type {
+            0x0423 => "s",
+            0x0430 => "b",
+            _ => "t",
+        };
+        let name = record
+            .name
+            .clone()
+            .or_else(|| file.resolve_name(record.name_hash).map(|name| name.to_string()))
+            ;
+        Some(Ps09ResourceName {
+            declaration: declaration.to_string(),
+            register: format!("{register_prefix}{}", record.slot),
+            name,
+            hash: record.name_hash,
+        })
+    }).collect()
+}
+
+fn sgd5_ps09_entry(file: &sgd5::Sgd5File, shader: &sgd5::Sgd5Shader, fssm: &dxbc::FssmShader) -> Ps09ShaderEntry {
     Ps09ShaderEntry {
         index: shader.index,
         code_offset: u32::try_from(fssm.code_offset).unwrap_or(0),
@@ -763,7 +800,9 @@ fn sgd5_ps09_entry(shader: &sgd5::Sgd5Shader, fssm: &dxbc::FssmShader) -> Ps09Sh
         rsrc1: None,
         rsrc2: None,
         bindings: Vec::new(),
-        pso_hash: shader.hash,
+        resource_names: sgd5_resource_names(file, shader),
+        pso_hash: 0,
+        sga_hash: Some(shader.sga_hash),
         has_rt: false,
         has_ngg: false,
         insn_count: u32::try_from(rdna2::decode_gfx103(fssm.code(), 4000).len()).unwrap_or(0),
@@ -2270,7 +2309,7 @@ impl Rpf9App {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.sgd5_search)
                             .desired_width(f32::INFINITY)
-                            .hint_text("Filter SGD5 shaders by name, hash, or stage..."),
+                            .hint_text("Filter SGD5 shaders by name, SGA hash, or stage..."),
                     );
                     let query = self.sgd5_search.trim().to_ascii_lowercase();
                     let filtered: Vec<usize> = group
@@ -2282,7 +2321,10 @@ impl Rpf9App {
                                 .map_or(true, |stage| shader.stage == stage)
                                 && (query.is_empty()
                                     || shader.name.to_ascii_lowercase().contains(&query)
-                                    || format!("0x{:016x}", shader.hash).contains(&query))
+                                    || format!("0x{:016x}", shader.sga_hash).contains(&query)
+                                    || group.effect_names_for_shader(shader.stage, shader.index)
+                                        .iter()
+                                        .any(|name| name.to_ascii_lowercase().contains(&query)))
                         })
                         .map(|(index, _)| index)
                         .collect();
@@ -2294,12 +2336,15 @@ impl Rpf9App {
                                 let shader = &group.shaders[index];
                                 let selected = self.sgd5_selected == Some(index);
                                 let color = sgd5_stage_color(shader.stage);
+                                let effects = group.effect_names_for_shader(shader.stage, shader.index);
                                 let label = format!(
-                                    "[{}] #{:05} {} {:5}B",
+                                    "[{}] #{:05} {} {:5}B{}",
                                     shader.stage,
                                     shader.index,
                                     shader.name,
-                                    shader.uncompressed_size
+                                    shader.uncompressed_size,
+                                    if effects.is_empty() { String::new() }
+                                    else { format!(" · {}", effects.join(", ")) }
                                 );
                                 let button = egui::Button::new(
                                     RichText::new(label)
@@ -2488,12 +2533,14 @@ impl Rpf9App {
                 if let Some(files) = self.sgd5_cache.clone() {
                     let group_index = self.sgd5_group.min(files.len() - 1);
                     if let Some(shader_index) = self.sgd5_selected {
-                        if let Some(shader) = files[group_index].shaders.get(shader_index) {
-                            match sgd5::decompress_shader(&files[group_index], shader) {
+                        let file = &files[group_index];
+                        if let Some(shader) = file.shaders.get(shader_index) {
+                            let effect_names = file.effect_names_for_shader(shader.stage, shader.index);
+                            match sgd5::decompress_shader(file, shader) {
                                 Ok(blob) => match dxbc::extract_fssm(&blob) {
                                     Ok(fssm) => {
                                         let code = fssm.code().to_vec();
-                                        let entry = sgd5_ps09_entry(shader, &fssm);
+                                        let entry = sgd5_ps09_entry(file, shader, &fssm);
                                         let stem = format!(
                                             "sgd5_{:05}_{}_{}",
                                             shader.index,
@@ -2513,6 +2560,13 @@ impl Rpf9App {
                                                 .size(13.0)
                                                 .color(Color32::from_rgb(255, 168, 28)),
                                             );
+                                            if !effect_names.is_empty() {
+                                                ui.label(
+                                                    RichText::new(format!("Effects: {}", effect_names.join(", ")))
+                                                        .size(11.0)
+                                                        .color(Color32::from_rgb(120, 220, 255)),
+                                                );
+                                            }
                                             ui.separator();
                                             for (mode, label) in [
                                                 (ShaderViewMode::Asm, "GFX10.3 ASM"),
@@ -4432,11 +4486,12 @@ mod tests {
             wave_size: 32,
             compressed_size: 8,
             uncompressed_size: 8,
-            hash: 0x0123_4567_89ab_cdef,
+            sga_hash: 0x0123_4567_89ab_cdef,
             register_count: 8,
             cbuffer_count: 1,
             texture_count: 0,
             binary_offset: 0,
+            reflection_records: Vec::new(),
         };
         let mut data = vec![0u8; 0x20];
         data.extend_from_slice(&0xBFA0_0003u32.to_le_bytes());
@@ -4446,10 +4501,33 @@ mod tests {
             code_size: 8,
             data,
         };
-        let entry = sgd5_ps09_entry(&shader, &fssm);
+        let entry = sgd5_ps09_entry(
+            &sgd5::Sgd5File {
+                data: Vec::new(),
+                group_hash: 0,
+                descriptors: Vec::new(),
+                shared_reflection: sgd5::Sgd5SharedReflection {
+                    size: 0,
+                    referenced_count: 0,
+                    extra_count: 0,
+                    reserved: 0,
+                    records: Vec::new(),
+                },
+                shaders: vec![shader.clone()],
+                declared_effect_count: 0,
+                effect_count: 0,
+                trailer_flags: 0,
+                trailer_reserved: [0; 6],
+                effects: Vec::new(),
+                hash_names: Default::default(),
+                effect_shader_map: Default::default(),
+            },
+            &shader,
+            &fssm,
+        );
 
         assert_eq!(entry.stage, ShaderStage::Vertex);
-        assert_eq!(entry.pso_hash, shader.hash);
+        assert_eq!(entry.sga_hash, Some(shader.sga_hash));
         assert_eq!(entry.insn_count, 2);
         assert!(lift_to_hlsl(&entry, fssm.code()).contains("VSMain"));
         assert_eq!(

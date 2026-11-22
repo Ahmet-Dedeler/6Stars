@@ -45,6 +45,14 @@ pub struct ResourceBinding {
 }
 
 #[derive(Clone, Debug)]
+pub struct Ps09ResourceName {
+    pub declaration: String,
+    pub register: String,
+    pub name: Option<String>,
+    pub hash: u32,
+}
+
+#[derive(Clone, Debug)]
 pub struct Ps09ShaderEntry {
     pub index: u32,
     pub code_offset: u32,
@@ -54,7 +62,9 @@ pub struct Ps09ShaderEntry {
     pub rsrc1: Option<u32>,
     pub rsrc2: Option<u32>,
     pub bindings: Vec<ResourceBinding>,
+    pub resource_names: Vec<Ps09ResourceName>,
     pub pso_hash: u64,
+    pub sga_hash: Option<u64>,
     pub has_rt: bool,
     pub has_ngg: bool,
     pub insn_count: u32,
@@ -377,7 +387,9 @@ impl Ps09Cache {
                 rsrc1: r1,
                 rsrc2: r2,
                 bindings,
+                resource_names: Vec::new(),
                 pso_hash,
+                sga_hash: None,
                 has_rt,
                 has_ngg,
                 insn_count,
@@ -937,7 +949,7 @@ pub fn format_gfx103_disasm(entry: &Ps09ShaderEntry, code: &[u8]) -> String {
          ; Shader #{idx} | Stage: {st} | PSO Hash: 0x{h:016X} | Size: {sz} bytes ({ic} insns)",
         idx = entry.index,
         st = entry.stage.tag(),
-        h = entry.pso_hash,
+        h = entry.sga_hash.unwrap_or(entry.pso_hash),
         sz = entry.code_size,
         ic = insns.len()
     );
@@ -961,6 +973,37 @@ pub fn format_gfx103_disasm(entry: &Ps09ShaderEntry, code: &[u8]) -> String {
             );
         }
     }
+    if !entry.resource_names.is_empty() {
+        let resolved = entry
+            .resource_names
+            .iter()
+            .filter(|resource| resource.name.is_some())
+            .count();
+        let _ = writeln!(
+            s,
+            "; SGD5 Bindings ({} named / {}):",
+            resolved,
+            entry.resource_names.len()
+        );
+        for resource in &entry.resource_names {
+            match &resource.name {
+                Some(name) => {
+                    let _ = writeln!(
+                        s,
+                        ";   {:>10} {} {}",
+                        resource.register, resource.declaration, name
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        s,
+                        ";   {:>10} {} hash=0x{:08x}",
+                        resource.register, resource.declaration, resource.hash
+                    );
+                }
+            }
+        }
+    }
     let _ = writeln!(s, "; =============================================================================\n");
     for ins in &insns {
         let mut hx = String::new();
@@ -981,7 +1024,8 @@ pub fn lift_to_hlsl(entry: &Ps09ShaderEntry, code: &[u8]) -> String {
     let mut s = String::with_capacity(insns.len() * 44 + 1024);
     let _ = writeln!(s, "// ============================================================================");
     let _ = writeln!(s, "// PercyStar Clean-Room GFX10.3 (RDNA2) -> HLSL SM 6.6 Lifted Shader");
-    let _ = writeln!(s, "// Shader #{} | Stage: {} | PSO 0x{:016X}", entry.index, entry.stage.tag(), entry.pso_hash);
+    let hash_kind = if entry.sga_hash.is_some() { "SGA" } else { "PSO" };
+    let _ = writeln!(s, "// Shader #{} | Stage: {} | {hash_kind} 0x{:016X}", entry.index, entry.stage.tag(), entry.sga_hash.unwrap_or(entry.pso_hash));
     if entry.has_rt {
         let _ = writeln!(s, "// Uses RDNA2 Hardware Raytracing (image_bvh64_intersect_ray -> RayQuery)");
     }
@@ -1017,6 +1061,22 @@ pub fn lift_to_hlsl(entry: &Ps09ShaderEntry, code: &[u8]) -> String {
         }
     }
     if !entry.bindings.is_empty() {
+        let _ = writeln!(s);
+    }
+    let named_resources: Vec<_> = entry
+        .resource_names
+        .iter()
+        .filter(|resource| resource.name.is_some())
+        .collect();
+    if !named_resources.is_empty() {
+        for resource in named_resources {
+            let name = resource.name.as_deref().unwrap_or_default();
+            let _ = writeln!(
+                s,
+                "{} {} : register({});",
+                resource.declaration, name, resource.register
+            );
+        }
         let _ = writeln!(s);
     }
 
@@ -1327,7 +1387,8 @@ pub fn format_spirv_abi_summary(entry: &Ps09ShaderEntry, code: &[u8]) -> String 
     let _ = writeln!(s, "=== SPIR-V 1.5 & D3D12.X / RDNA2 SGPR ABI SUMMARY ===");
     let _ = writeln!(s, "Shader Index      : #{}", entry.index);
     let _ = writeln!(s, "Detected Stage    : {} (has_rt={}, has_ngg={})", entry.stage.tag(), entry.has_rt, entry.has_ngg);
-    let _ = writeln!(s, "PSO Hash          : 0x{:016X}", entry.pso_hash);
+    let hash_kind = if entry.sga_hash.is_some() { "SGA Hash" } else { "PSO Hash" };
+    let _ = writeln!(s, "{hash_kind:<17}: 0x{:016X}", entry.sga_hash.unwrap_or(entry.pso_hash));
     let _ = writeln!(s, "Code Offset/Size  : 0x{:08X} / {} bytes ({} GFX10.3 insns)", entry.code_offset, entry.code_size, entry.insn_count);
     let _ = writeln!(s, "Lifted SPIR-V 1.5 : {} bytes ({} words, magic=0x07230203)", spv.len(), words);
     if let Some([x, y, z]) = entry.num_threads {
@@ -1337,6 +1398,37 @@ pub fn format_spirv_abi_summary(entry: &Ps09ShaderEntry, code: &[u8]) -> String 
         let _ = writeln!(s, "COMPUTE_PGM_RSRC1 : 0x{r1:08X} (vgprs_blocks={}, sgprs_blocks={})", r1 & 0x3F, (r1 >> 6) & 0xF);
         let _ = writeln!(s, "COMPUTE_PGM_RSRC2 : 0x{r2:08X} (user_sgpr={}, tgid_x={}, tgid_y={}, tgid_z={})",
             (r2 >> 1) & 0x1F, (r2 >> 7) & 1, (r2 >> 8) & 1, (r2 >> 9) & 1);
+    }
+    if !entry.resource_names.is_empty() {
+        let resolved = entry
+            .resource_names
+            .iter()
+            .filter(|resource| resource.name.is_some())
+            .count();
+        let _ = writeln!(
+            s,
+            "\n--- SGD5 Resource Bindings ({} named / {}) ---",
+            resolved,
+            entry.resource_names.len()
+        );
+        for resource in &entry.resource_names {
+            match &resource.name {
+                Some(name) => {
+                    let _ = writeln!(
+                        s,
+                        "  {:<10} {} {}",
+                        resource.register, resource.declaration, name
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        s,
+                        "  {:<10} {} hash=0x{:08x}",
+                        resource.register, resource.declaration, resource.hash
+                    );
+                }
+            }
+        }
     }
     let _ = writeln!(s, "\n--- PS\\x00\\x09 0x41 USER_DATA Root-Signature Bindings ({}) ---", entry.bindings.len());
     if entry.bindings.is_empty() {
@@ -1398,7 +1490,9 @@ mod tests {
             rsrc1: None,
             rsrc2: None,
             bindings: vec![],
+            resource_names: vec![],
             pso_hash: 0xDEAD_BEEF,
+            sga_hash: None,
             has_rt: false,
             has_ngg: false,
             insn_count: 7,
