@@ -2396,7 +2396,7 @@ mod dictionary_decode_tests {
         let default_textured = textured(&m);
         assert_eq!(default_textured, 19, "default look keeps the 19 textured materials");
         assert!(m.geom_materials.iter().all(|g| g.normal.is_none() && g.overlays.is_empty()));
-        let mut shot = |m: &mut Mesh3D, tag: &str| {
+        let shot = |m: &mut Mesh3D, tag: &str| {
             rasterize_mesh(m, 800, 600);
             if let Some(d) = &out_dir {
                 let _ = fs::create_dir_all(d);

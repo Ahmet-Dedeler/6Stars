@@ -270,7 +270,7 @@ fn read_reflection_record(data: &[u8], offset: usize) -> Result<Sgd5ReflectionRe
 }
 
 fn resolve_hashed_names(strings: &[String]) -> std::collections::HashMap<u32, String> {
-    let mut names = std::collections::HashMap::new();
+    let mut names = std::collections::HashMap::with_capacity(strings.len() * 2);
     for name in strings {
         names.insert(joaat_lower(name), name.clone());
         if !name.starts_with('_') {

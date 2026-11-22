@@ -270,11 +270,11 @@ fn get_dxc_create_instance(
 {
     #[link(name = "kernel32")]
     extern "system" {
-        fn GetProcAddress(library: *mut c_void, name: *const u8) -> *mut c_void;
+        fn GetProcAddress(library: isize, name: *const u8) -> *const c_void;
     }
 
     let name = c"DxcCreateInstance";
-    let address = unsafe { GetProcAddress(library, name.as_ptr() as *const u8) };
+    let address = unsafe { GetProcAddress(library as isize, name.as_ptr() as *const u8) };
     if address.is_null() {
         return Err("dxcompiler.dll does not export DxcCreateInstance".into());
     }
