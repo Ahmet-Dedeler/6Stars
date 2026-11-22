@@ -8,10 +8,12 @@ mod bink2;
 mod boot;
 mod dat;
 mod dxbc;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod bink_dock;
 #[cfg(target_os = "macos")]
 mod bink_embed;
+#[cfg(target_os = "linux")]
+mod bink_native;
 mod gallery;
 mod mapdata;
 mod meta7a;
@@ -700,13 +702,15 @@ struct Rpf9App {
     filter: String,
     logo_tex: Option<TextureHandle>,
     watch_gen: Arc<Mutex<u64>>,
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     bink_dock: Option<bink_dock::BinkDock>,
     #[cfg(target_os = "macos")]
     bink_embed: Option<bink_embed::BinkEmbed>,
+    #[cfg(target_os = "linux")]
+    bink_native: Option<bink_native::BinkNative>,
     bink_pending: Option<(PathBuf, String, video_clip::PendingClip)>,
     bink_volume: f32,
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     bink_muted: bool,
     bink_loop: bool,
     mesh3d: Option<Mesh3D>,
@@ -911,13 +915,15 @@ impl Rpf9App {
             filter: String::new(),
             logo_tex,
             watch_gen: Arc::new(Mutex::new(0)),
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             bink_dock: None,
             #[cfg(target_os = "macos")]
             bink_embed: None,
+            #[cfg(target_os = "linux")]
+            bink_native: None,
             bink_pending: None,
             bink_volume: 0.8,
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             bink_muted: false,
             bink_loop: true,
             mesh3d: None,
@@ -1138,7 +1144,9 @@ impl Rpf9App {
     fn stop_bink_player(&mut self) {
         #[cfg(target_os = "macos")]
         { self.bink_embed = None; }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        { self.bink_native = None; }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         { self.bink_dock = None; }
         if self.bink_pending.take().is_some() {
             let mut m = self.media.lock().unwrap();
@@ -1155,8 +1163,13 @@ impl Rpf9App {
             m.loading = false;
             #[cfg(target_os = "macos")]
             let (target, spawn) = (&mut self.bink_embed, bink_embed::BinkEmbed::spawn_in);
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             let (target, spawn) = (&mut self.bink_dock, bink_dock::BinkDock::spawn);
+            // the in-process decoder needs no helper path and has no audio (so no volume)
+            #[cfg(target_os = "linux")]
+            let (target, spawn) = (&mut self.bink_native, |_: &std::path::Path, dir, title, _volume: f32, looping| {
+                bink_native::BinkNative::spawn(ctx, dir, title, looping)
+            });
             match result.and_then(|dir| spawn(&decoder, dir, title, self.bink_volume, self.bink_loop)) {
                 Ok(player) => {
                     *target = Some(player);
@@ -2328,7 +2341,10 @@ impl Rpf9App {
             let mut m = self.media.lock().unwrap();
             #[cfg(target_os = "macos")]
             let decoder = bink_embed::helper_dir();
-            #[cfg(not(target_os = "macos"))]
+            // decoded in-process by the bink2 crate: always available
+            #[cfg(target_os = "linux")]
+            let decoder = Some(PathBuf::new());
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             let decoder = bink_dock::player_path();
             let Some(decoder) = decoder else {
                 #[cfg(target_os = "macos")]
@@ -5590,7 +5606,12 @@ impl eframe::App for Rpf9App {
                 be.ui(ui, &mut self.bink_volume, &mut self.bink_loop);
                 return;
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(target_os = "linux")]
+            if let Some(player) = self.bink_native.as_mut() {
+                player.ui(ui, &mut self.bink_loop);
+                return;
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             if let Some(player) = self.bink_dock.as_mut() {
                 match player.ui(ui, _frame, &mut self.bink_volume, &mut self.bink_muted, &mut self.bink_loop) {
                     Ok(false) => {}
