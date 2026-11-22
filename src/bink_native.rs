@@ -11,7 +11,7 @@
 //! egui texture. Bink Audio is not decoded yet, so playback is silent.
 
 use eframe::egui::{self, Color32, ColorImage, RichText, TextureHandle, TextureOptions};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -58,19 +58,19 @@ pub struct BinkNative {
 
 impl BinkNative {
     /// Starts decoding `dir/clip.bk2`. `ctx` is used to wake the UI when a frame is ready.
+    /// The clip is read and validated on the decoder thread, so a large clip doesn't stall the UI;
+    /// read and header errors show up in the panel like decode errors.
     pub fn spawn(ctx: &egui::Context, dir: TempDir, title: String, looping: bool) -> Result<Self, String> {
-        let data = std::fs::read(dir.path().join("clip.bk2")).map_err(|e| format!("Read video clip: {e}"))?;
-        // Validate up front so a bad file is reported before the panel switches to the player.
-        let header = bink2_decoder::Container::parse(&data).map_err(|e| format!("Bink 2 header: {e}"))?.header;
-        bink2_decoder::Decoder::new(&header).map_err(|e| format!("Bink 2 decoder: {e}"))?;
         let shared = Arc::new(Mutex::new(Shared::default()));
         let (tx, rx) = mpsc::channel();
         let (sh, ctx) = (Arc::clone(&shared), ctx.clone());
         let thread = std::thread::Builder::new()
             .name("bink2-decode".into())
             .spawn(move || {
-                let _dir = dir; // keep the clip folder until playback ends
-                let res = play(&data, &sh, &ctx, rx, looping);
+                let res = std::fs::read(dir.path().join("clip.bk2"))
+                    .map_err(|e| format!("Read video clip: {e}"))
+                    .and_then(|data| play(&data, &sh, &ctx, rx, looping));
+                drop(dir); // keep the clip folder until playback ends
                 let mut s = sh.lock().unwrap();
                 s.error = res.err();
                 s.exited = true;
@@ -215,6 +215,8 @@ fn play(data: &[u8], sh: &Mutex<Shared>, ctx: &egui::Context, rx: Receiver<Cmd>,
     let mut paused = false;
     let mut clock = Instant::now(); // when frame `next` is due
     let mut show_now = false; // publish the next decoded frame even if late or paused (after a seek)
+    // When decoding can't keep up, late frames are dropped but one is still shown every few periods.
+    let mut last_shown: Option<Instant> = None;
     loop {
         let wait = if show_now {
             Duration::ZERO
@@ -234,12 +236,30 @@ fn play(data: &[u8], sh: &Mutex<Shared>, ctx: &egui::Context, rx: Receiver<Cmd>,
                 clock = Instant::now();
                 sh.lock().unwrap().status.paused = paused;
             }
-            Ok(Cmd::Seek(secs)) => {
-                let target = ((secs * fps).round().max(0.0) as usize).min(n - 1);
-                dec.reset();
-                for i in keyframe_before(&hdr.frames, target)..target {
-                    decode(&file, &mut dec, i)?;
-                }
+            Ok(Cmd::Seek(mut secs)) => {
+                // Rebuilding from the keyframe can take a while on clips with few keyframes, so
+                // keep listening: Quit stops at once and a newer seek replaces this one.
+                let target = 'seek: loop {
+                    let target = ((secs * fps).round().max(0.0) as usize).min(n - 1);
+                    dec.reset();
+                    for i in keyframe_before(&hdr.frames, target)..target {
+                        match rx.try_recv() {
+                            Ok(Cmd::Quit) | Err(TryRecvError::Disconnected) => return Ok(()),
+                            Ok(Cmd::Seek(s)) => {
+                                secs = s;
+                                continue 'seek;
+                            }
+                            Ok(Cmd::Loop(l)) => looping = l,
+                            Ok(Cmd::TogglePause) => {
+                                paused = !paused;
+                                sh.lock().unwrap().status.paused = paused;
+                            }
+                            Err(TryRecvError::Empty) => {}
+                        }
+                        decode(&file, &mut dec, i)?;
+                    }
+                    break target;
+                };
                 next = target;
                 show_now = true;
                 clock = Instant::now();
@@ -259,7 +279,9 @@ fn play(data: &[u8], sh: &Mutex<Shared>, ctx: &egui::Context, rx: Receiver<Cmd>,
                 }
                 let frame = decode(&file, &mut dec, next)?;
                 next += 1;
-                if show_now || Instant::now() <= clock + period {
+                let overdue = last_shown.is_none_or(|t| t.elapsed() >= period * 4);
+                if show_now || overdue || Instant::now() <= clock + period {
+                    last_shown = Some(Instant::now());
                     let img = to_color_image(&frame);
                     let mut s = sh.lock().unwrap();
                     s.seq += 1;
@@ -433,8 +455,17 @@ mod tests {
         wait(&mut p, 600);
         let want = (target * st.fps).round() as u32 + 1;
         assert_eq!(p.status.frame, want, "seek while paused shows the target frame");
+        let seq = p.last_seq;
         p.send(Cmd::TogglePause);
         wait(&mut p, 600);
-        assert!(!p.status.paused && p.status.frame > want, "playback resumes after the seek");
+        // compare publications, not frame numbers: a short looping clip may wrap meanwhile
+        assert!(!p.status.paused && p.last_seq > seq, "playback resumes after the seek");
+        // closing the panel during a long seek (rebuilding from an early keyframe) must not hang
+        p.send(Cmd::Seek(st.frames as f64 / st.fps));
+        std::thread::sleep(Duration::from_millis(20));
+        let t = Instant::now();
+        drop(p);
+        println!("closed during a seek in {:?}", t.elapsed());
+        assert!(t.elapsed() < Duration::from_millis(500), "closing during a seek took {:?}", t.elapsed());
     }
 }

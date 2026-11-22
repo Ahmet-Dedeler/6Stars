@@ -25,7 +25,7 @@ bcpack-rs = { git = "https://github.com/Ahmet-Dedeler/bcpack-rs", rev = "0a887de
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Clean-room Bink 2 video decoder (Apache-2.0), pinned to a reviewed commit.
-bink2_decoder = { package = "bink2", git = "https://github.com/codingkoala/bink2-decoder", rev = "9ec94bfd4682acee7c579084c6de532bba8c9bf7" }
+bink2_decoder = { package = "bink2", git = "https://github.com/codingkoala/bink2-decoder", rev = "277c4702b5ee5731bd3fd2af4f3cec631124b930" }
 
 [target.'cfg(windows)'.dependencies]
 raw-window-handle = "0.6"
