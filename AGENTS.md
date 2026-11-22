@@ -72,9 +72,9 @@ Files written for this fork start with the Percy6Stars credit header (see `src/g
 When vendoring, copying or porting code from this repo into another project:
 
 - Keep the header at the top of each file (author, source link, license). Don't strip it in a port to another language either; carry it over as a comment.
-- Copy the license files (`LICENSE`, plus `LICENSE-MIT` for MIT files) next to the code.
-- Credit the project in the other project's README or credits section, for example: `Percy6Stars by Ahmet Dedeler (https://github.com/Ahmet-Dedeler/Percy6Stars)`. Percy6Stars is a fork of PercyStar by rpatty-dev: its license requires crediting rpatty-dev with a link to https://github.com/rpatty-dev/PercyStar and keeping the same license, so credit both. Files marked `SPDX-License-Identifier: MIT` are MIT.
-- Prefer depending on this repo (git dependency or package) over copying files, so fixes and new formats reach you.
+- **PercyStar-licensed code** (most files): follow `LICENSE` in full. In short: non-commercial only, the same license, "Percy" in both the repository and application names, and credit to rpatty-dev with a link to https://github.com/rpatty-dev/PercyStar. Credit Percy6Stars as well, for example `Percy6Stars by Ahmet Dedeler (https://github.com/Ahmet-Dedeler/Percy6Stars)`.
+- **Files marked `SPDX-License-Identifier: MIT`** (e.g. `src/video_clip.rs`, `src/mac_open.rs`): MIT terms only (`LICENSE-MIT`). Keep the copyright and permission notice; PercyStar's conditions don't apply. A README credit is appreciated but not required.
+- This repo builds an app, not a library crate, so copy or port the files rather than adding it as a Cargo dependency.
 
 ---
 

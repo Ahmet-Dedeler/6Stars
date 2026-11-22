@@ -2,7 +2,7 @@
 // Fork of PercyStar by rpatty-dev (https://github.com/rpatty-dev/PercyStar).
 // Source: https://github.com/Ahmet-Dedeler/Percy6Stars
 // SPDX-License-Identifier: MIT
-// If you copy, vendor or port this file, keep this header and credit both projects in your README.
+// If you copy or port this file, keep this header (MIT notice); a README credit is appreciated.
 // Copyright (c) 2026 Ahmet Dedeler
 
 //! Files opened from Finder on macOS: double-click, "Open With", or a drop on the Dock icon.
