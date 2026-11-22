@@ -16,6 +16,7 @@ mod model3d;
 mod rdna2;
 mod tex;
 mod vehicle_variations;
+use std::collections::HashSet;
 use model3d::{
     Mesh3D, decode_rage9_model_from_rpf, decode_rage9_model_from_rpf_lod, extract_0drpz_mesh, extract_rage9_model_name,
     has_rage9_meshlets, is_vehicle_virtual, is_zlib_head, parse_obj,
@@ -778,6 +779,8 @@ struct Rpf9App {
     tex_view_key: (tex::TexChannel, bool),
     vehicles_only: bool,
     audio_named: bool,
+    multi_selected: HashSet<usize>,
+    multi_anchor: Option<usize>,
     // cachd ui list so huge scans never re filter or clone evry fram
     view: Vec<usize>,
     view_key: Option<(u64, String, Category, String, bool, bool)>,
@@ -974,6 +977,8 @@ impl Rpf9App {
             tex_view_key: (tex::TexChannel::Rgba, false),
             vehicles_only: false,
             audio_named: true,
+            multi_selected: HashSet::new(),
+            multi_anchor: None,
             view: Vec::new(),
             view_key: None,
             hay: Vec::new(),
@@ -1042,6 +1047,24 @@ impl Rpf9App {
             }
         }
         app
+    }
+
+    fn ordered_selected_indices(&self) -> Vec<usize> {
+        if self.multi_selected.is_empty() {
+            return self.selected.into_iter().collect();
+        }
+        let mut out: Vec<usize> = self
+            .view
+            .iter()
+            .copied()
+            .filter(|i| self.multi_selected.contains(i))
+            .collect();
+        if out.is_empty() {
+            if let Some(s) = self.selected {
+                out.push(s);
+            }
+        }
+        out
     }
 
     fn stop_bink_player(&mut self) {
@@ -2210,7 +2233,7 @@ impl Rpf9App {
             }
             let bink_path = find_binkplay();
             match Command::new(&bink_path)
-                .args([bk2_p.to_str().unwrap(), "/NoBorder", "/DrawD3D11", "/L", "/W640", "/H360"])
+                .arg(&bk2_p)
                 .spawn()
             {
                 Ok(child) => {
@@ -3974,6 +3997,52 @@ fn sort_combo(ui: &mut egui::Ui, id: &str, mode: &mut SortMode) {
 }
 
 // right click context menu on file rows to copy name archive path directory or hex offset
+fn format_multi_copy(entries: &[&RpfEntry], mode: u8) -> String {
+    entries
+        .iter()
+        .map(|e| match mode {
+            0 => e.name.clone(),
+            1 => format!("{} / {}", e.rpf_name, e.name),
+            _ => format!("{} @ 0x{:08x} ({})", e.rpf_name, e.offset, e.name),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn apply_multi_select(
+    view: &[usize],
+    multi: &mut HashSet<usize>,
+    anchor: &mut Option<usize>,
+    clicked_idx: usize,
+    ctrl: bool,
+    shift: bool,
+) {
+    if shift {
+        if let Some(anc) = *anchor {
+            if let (Some(a), Some(b)) = (view.iter().position(|&x| x == anc), view.iter().position(|&x| x == clicked_idx)) {
+                if !ctrl {
+                    multi.clear();
+                }
+                let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                for &idx in &view[lo..=hi] {
+                    multi.insert(idx);
+                }
+                return;
+            }
+        }
+    }
+    if ctrl {
+        if !multi.remove(&clicked_idx) {
+            multi.insert(clicked_idx);
+        }
+        *anchor = Some(clicked_idx);
+    } else {
+        multi.clear();
+        multi.insert(clicked_idx);
+        *anchor = Some(clicked_idx);
+    }
+}
+
 fn entry_context_menu(resp: &egui::Response, e: &RpfEntry) -> Option<String> {
     let mut copied = None;
     resp.context_menu(|ui| {
@@ -4822,19 +4891,27 @@ impl eframe::App for Rpf9App {
                         self.export_entries(&all);
                     }
                     if ui.button("Export Selected").clicked() {
-                        if let Some(i) = self.selected {
-                            self.export_entries(&[i]);
+                        let targets = self.ordered_selected_indices();
+                        if !targets.is_empty() {
+                            self.export_entries(&targets);
                         }
                     }
-                    if ui.button("Copy Path").on_hover_text("Copy selected file path (or right-click any row for more copy options)").clicked() {
-                        if let Some(i) = self.selected {
+                    let copy_shortcut = !ctx.wants_keyboard_input() && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::C));
+                    if ui.button("Copy Path").on_hover_text("Copy selected file path(s) — Ctrl+C or Ctrl+Click/Shift+Click for multi-select").clicked() || copy_shortcut {
+                        let targets = self.ordered_selected_indices();
+                        if !targets.is_empty() {
                             let copied = {
                                 let st = self.state.lock().unwrap();
-                                st.entries.get(i).map(|e| format!("{} / {}", e.rpf_name, e.name))
+                                let refs: Vec<&RpfEntry> = targets.iter().filter_map(|&i| st.entries.get(i)).collect();
+                                if refs.is_empty() { None } else { Some((refs.len(), format_multi_copy(&refs, 1))) }
                             };
-                            if let Some(s) = copied {
+                            if let Some((n, s)) = copied {
                                 ui.ctx().copy_text(s.clone());
-                                self.state.lock().unwrap().status = format!("Copied: {s}");
+                                self.state.lock().unwrap().status = if n > 1 {
+                                    format!("Copied {n} paths")
+                                } else {
+                                    format!("Copied: {s}")
+                                };
                             }
                         }
                     }
@@ -5000,13 +5077,23 @@ impl eframe::App for Rpf9App {
                     }
                 }
             }
+            if !ctx.wants_keyboard_input() && !self.view.is_empty() && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::A)) {
+                self.multi_selected = self.view.iter().copied().collect();
+                self.state.lock().unwrap().status = format!("{} entries selected (Ctrl+C to copy)", self.multi_selected.len());
+            }
             ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("{} results", self.view.len())).size(11.0).color(Color32::from_rgb(110, 118, 134)));
+                let n_sel = self.multi_selected.len();
+                let res_lbl = if n_sel > 1 {
+                    format!("{} results ({n_sel} selected)", self.view.len())
+                } else {
+                    format!("{} results", self.view.len())
+                };
+                ui.label(RichText::new(res_lbl).size(11.0).color(Color32::from_rgb(110, 118, 134)));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     sort_combo(ui, "explorer_sort_combo", &mut self.sort_mode);
                 });
             });
-            let mut clicked = None;
+            let mut clicked: Option<(usize, bool, bool)> = None;
             let mut copied_msg: Option<String> = None;
             let scroll_to_sel = std::mem::take(&mut self.explorer_scroll_to_sel);
             // rows must be exactly row_h tall or show_rows miscomputes total height
@@ -5029,15 +5116,42 @@ impl eframe::App for Rpf9App {
                         } else {
                             format!("{}  ({})", dname, sz_s)
                         };
-                        let is_sel = self.selected == Some(*idx);
+                        let is_sel = self.selected == Some(*idx) || self.multi_selected.contains(idx);
                         let resp = ui.selectable_label(is_sel, RichText::new(label).size(12.5));
-                        if is_sel && scroll_to_sel {
+                        if is_sel && scroll_to_sel && self.selected == Some(*idx) {
                             resp.scroll_to_me(Some(egui::Align::Center));
                         }
                         if resp.clicked() {
-                            clicked = Some(*idx);
+                            let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
+                            clicked = Some((*idx, ctrl, shift));
                         }
-                        if let Some(msg) = entry_context_menu(&resp, e) {
+                        if self.multi_selected.len() > 1 && self.multi_selected.contains(idx) {
+                            let targets = self.ordered_selected_indices();
+                            resp.context_menu(|ui| {
+                                let n = targets.len();
+                                if ui.button(format!("Copy {n} File Names")).clicked() {
+                                    let st = self.state.lock().unwrap();
+                                    let refs: Vec<&RpfEntry> = targets.iter().filter_map(|&i| st.entries.get(i)).collect();
+                                    ui.ctx().copy_text(format_multi_copy(&refs, 0));
+                                    copied_msg = Some(format!("Copied {n} file names"));
+                                    ui.close_menu();
+                                }
+                                if ui.button(format!("Copy {n} Archive / File Paths")).clicked() {
+                                    let st = self.state.lock().unwrap();
+                                    let refs: Vec<&RpfEntry> = targets.iter().filter_map(|&i| st.entries.get(i)).collect();
+                                    ui.ctx().copy_text(format_multi_copy(&refs, 1));
+                                    copied_msg = Some(format!("Copied {n} paths"));
+                                    ui.close_menu();
+                                }
+                                if ui.button(format!("Copy {n} Offset Locations")).clicked() {
+                                    let st = self.state.lock().unwrap();
+                                    let refs: Vec<&RpfEntry> = targets.iter().filter_map(|&i| st.entries.get(i)).collect();
+                                    ui.ctx().copy_text(format_multi_copy(&refs, 2));
+                                    copied_msg = Some(format!("Copied {n} locations"));
+                                    ui.close_menu();
+                                }
+                            });
+                        } else if let Some(msg) = entry_context_menu(&resp, e) {
                             copied_msg = Some(msg);
                         }
                     });
@@ -5046,8 +5160,13 @@ impl eframe::App for Rpf9App {
             if let Some(msg) = copied_msg {
                 self.state.lock().unwrap().status = msg;
             }
-            if let Some(i) = clicked {
-                self.select_entry(i);
+            if let Some((i, ctrl, shift)) = clicked {
+                apply_multi_select(&self.view, &mut self.multi_selected, &mut self.multi_anchor, i, ctrl, shift);
+                if !ctrl && !shift {
+                    self.select_entry(i);
+                } else {
+                    self.selected = Some(i);
+                }
             }
         });
 
@@ -5718,6 +5837,73 @@ mod tests {
             let mesh = decode_rage9_model_from_rpf(&packs_rpf, 0x47ab1010, "fallback").expect("decode packs.rpf model");
             assert!(!mesh.verts.is_empty() && !mesh.tris.is_empty());
         }
+    }
+
+    #[test]
+    fn multi_select_click_ctrl_shift_works() {
+        let view = [10usize, 20, 30, 40, 50];
+        let mut multi = HashSet::new();
+        let mut anchor = None;
+
+        // Plain click selects one and sets anchor
+        apply_multi_select(&view, &mut multi, &mut anchor, 20, false, false);
+        assert_eq!(multi, HashSet::from([20]));
+        assert_eq!(anchor, Some(20));
+
+        // Shift+click selects contiguous range in view order (20..=40)
+        apply_multi_select(&view, &mut multi, &mut anchor, 40, false, true);
+        assert_eq!(multi, HashSet::from([20, 30, 40]));
+        assert_eq!(anchor, Some(20));
+
+        // Ctrl+click toggles individual item
+        apply_multi_select(&view, &mut multi, &mut anchor, 30, true, false);
+        assert_eq!(multi, HashSet::from([20, 40]));
+        assert_eq!(anchor, Some(30));
+
+        // Ctrl+click adds another item
+        apply_multi_select(&view, &mut multi, &mut anchor, 10, true, false);
+        assert_eq!(multi, HashSet::from([10, 20, 40]));
+
+        // Plain click resets to single item
+        apply_multi_select(&view, &mut multi, &mut anchor, 50, false, false);
+        assert_eq!(multi, HashSet::from([50]));
+        assert_eq!(anchor, Some(50));
+    }
+
+    #[test]
+    fn multi_copy_formats_multiple_entries() {
+        let e1 = RpfEntry {
+            source_rpf: PathBuf::from("packs.rpf"),
+            rpf_name: "packs.rpf".into(),
+            name: "alpha.#ft".into(),
+            kind: "VEH",
+            offset: 0x1000,
+            comp_size: 64,
+            raw_size: 128,
+            tracks: 0,
+            chunks: vec![],
+        };
+        let e2 = RpfEntry {
+            source_rpf: PathBuf::from("textures.rpf"),
+            rpf_name: "textures.rpf".into(),
+            name: "beta.#td".into(),
+            kind: "TXD",
+            offset: 0x20a0,
+            comp_size: 128,
+            raw_size: 256,
+            tracks: 0,
+            chunks: vec![],
+        };
+        let list = [&e1, &e2];
+        assert_eq!(format_multi_copy(&list, 0), "alpha.#ft\nbeta.#td");
+        assert_eq!(
+            format_multi_copy(&list, 1),
+            "packs.rpf / alpha.#ft\ntextures.rpf / beta.#td"
+        );
+        assert_eq!(
+            format_multi_copy(&list, 2),
+            "packs.rpf @ 0x00001000 (alpha.#ft)\ntextures.rpf @ 0x000020a0 (beta.#td)"
+        );
     }
 }
 
