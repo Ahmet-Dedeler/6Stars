@@ -450,7 +450,7 @@ mod backend {
                 let mut launched = None;
                 for (player, args) in [("pw-play", &[][..]), ("paplay", &[][..]), ("aplay", &["-q"][..])] {
                     match Command::new(player)
-                        .args(*args)
+                        .args(args.iter())
                         .arg(&self.wav_path)
                         .stdin(Stdio::null())
                         .stdout(Stdio::null())
