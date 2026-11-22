@@ -8,7 +8,9 @@ mod dat;
 mod dxbc;
 mod mapdata;
 mod meta7a;
+mod names;
 mod psin;
+mod psin_xml;
 mod rsc9;
 mod sgd5;
 mod world_gpu;
@@ -852,6 +854,8 @@ struct Rpf9App {
     // camera yaw pitch zoom pan carried across a lod switch
     lod_keep_cam: Option<[f32; 5]>,
     export_busy: Arc<AtomicBool>,
+    // the entry on screen is a psin file shown as xml
+    psin_selected: bool,
     export_cancel: Arc<AtomicBool>,
     mv_drawer_open: bool,
     mv_entries: Vec<(usize, ModelCat, String)>,
@@ -1044,6 +1048,7 @@ impl Rpf9App {
             tex_from_model: false,
             lod_keep_cam: None,
             export_busy: Arc::new(AtomicBool::new(false)),
+            psin_selected: false,
             export_cancel: Arc::new(AtomicBool::new(false)),
             mv_drawer_open: true,
             mv_entries: Vec::new(),
@@ -1075,6 +1080,10 @@ impl Rpf9App {
             sgd5_selected: None,
             sgd5_cached_text: (None, String::new()),
         };
+        psin::seed_names();
+        if let Some(dir) = names_dir() {
+            names::load_dir(&dir);
+        }
         load_ui_state(&mut app);
         spawn_update_check(Arc::clone(&app.update), cc.egui_ctx.clone());
         // a path on the command line (open with, drag onto the exe) wins over the last folder
@@ -1151,6 +1160,7 @@ impl Rpf9App {
         self.tex_pick = false;
         self.tex_from_model = false;
         self.lod_keep_cam = None;
+        self.psin_selected = false;
         self.preview.clear();
         self.last_dock_rect = [0; 4];
         self.mesh3d = None;
@@ -2316,7 +2326,14 @@ impl Rpf9App {
                             self.preview = format_hex(&data[..data.len().min(2048)]);
                         }
                     } else if e.kind == "PSIN" {
-                        self.preview = psin::parse_psin(&data);
+                        // typed xml when the schema is readable, the plain dump otherwise
+                        match psin_xml::export_xml(&data, PSIN_PREVIEW_CHARS) {
+                            Ok(xml) => {
+                                self.preview = xml;
+                                self.psin_selected = true;
+                            }
+                            Err(_) => self.preview = psin::parse_psin(&data),
+                        }
                     } else if e.kind == "ANIM" {
                         self.preview = anim::parse_anim_dict(&data);
                         let (dur, trk, seed) = anim::extract_anim_summary(&data);
@@ -3588,6 +3605,130 @@ impl Rpf9App {
     }
 
 
+    // export, edit and name tools for the psin file on screen
+    fn psin_tools_ui(&mut self, ui: &mut egui::Ui) {
+        let complete = !self.preview.contains(PSIN_CUT_MARK);
+        ui.horizontal(|ui| {
+            if ui.button("Export XML…").on_hover_text("Save the whole file as editable XML").clicked() {
+                self.psin_export_xml();
+            }
+            if ui
+                .add_enabled(complete, egui::Button::new("Save edits shown here…"))
+                .on_hover_text("Write the values edited in the text below into a patched copy of the file")
+                .on_disabled_hover_text("The view is cut short for this file: export the XML, edit it, then use Apply XML file")
+                .clicked()
+            {
+                let xml = self.preview.clone();
+                self.psin_apply_xml(xml);
+            }
+            if ui.button("Apply XML file…").on_hover_text("Write the values of an edited XML export into a patched copy of the file").clicked() {
+                if let Some(p) = rfd::FileDialog::new().add_filter("XML", &["xml"]).pick_file() {
+                    match fs::read_to_string(&p) {
+                        Ok(xml) => self.psin_apply_xml(xml),
+                        Err(err) => self.state.lock().unwrap().status = format!("Read error: {err}"),
+                    }
+                }
+            }
+            ui.separator();
+            if ui
+                .button("Recover names")
+                .on_hover_text("Match the hashed names of every metadata file against words found in the open archives and in the names folder")
+                .clicked()
+            {
+                self.recover_names();
+            }
+            ui.label(RichText::new(format!("{} names known", names::len())).size(11.0).color(Color32::from_rgb(150, 160, 180)));
+        });
+    }
+
+    fn selected_entry(&self) -> Option<RpfEntry> {
+        self.selected.and_then(|i| self.state.lock().unwrap().entries.get(i).cloned())
+    }
+
+    fn psin_export_xml(&self) {
+        let Some(e) = self.selected_entry() else { return };
+        let stem = safe_file_name(&e.name);
+        let Some(out) = rfd::FileDialog::new().set_file_name(format!("{stem}.xml")).add_filter("XML", &["xml"]).save_file() else { return };
+        let state = Arc::clone(&self.state);
+        state.lock().unwrap().status = format!("Exporting {} as XML...", e.name);
+        std::thread::spawn(move || {
+            let res = read_entry_bytes(&e)
+                .map_err(|err| err.to_string())
+                .and_then(|data| psin_xml::export_xml(&data, 0))
+                .and_then(|xml| fs::write(&out, xml).map_err(|err| err.to_string()));
+            state.lock().unwrap().status = match res {
+                Ok(()) => format!("Saved {}", out.display()),
+                Err(err) => format!("XML export failed: {err}"),
+            };
+        });
+    }
+
+    // patches a copy of the selected file with the values in the xml and saves it where the user picks
+    fn psin_apply_xml(&self, xml: String) {
+        let Some(e) = self.selected_entry() else { return };
+        let res = read_entry_bytes(&e).map_err(|err| err.to_string()).and_then(|data| psin_xml::apply_xml(&data, &xml));
+        let status = match res {
+            Err(err) => format!("XML not applied: {err}"),
+            Ok(done) if done.changes.is_empty() => "The XML has the same values as the file, nothing to save".to_string(),
+            Ok(done) => {
+                let name = format!("{}.patched.psin", safe_file_name(e.name.trim_end_matches(".psin")));
+                match rfd::FileDialog::new().set_file_name(name).save_file() {
+                    None => "Patched copy not saved".to_string(),
+                    Some(out) => match fs::write(&out, &done.data) {
+                        Ok(()) => format!(
+                            "{} value(s) changed, first: {}. Saved {} (same size as the original, its checksum section is not updated)",
+                            done.changes.len(),
+                            done.changes[0],
+                            out.display()
+                        ),
+                        Err(err) => format!("Write error: {err}"),
+                    },
+                }
+            }
+        };
+        self.state.lock().unwrap().status = status;
+    }
+
+    // looks for the words behind hashed struct, field and enum names in the open archives
+    fn recover_names(&self) {
+        if self.export_busy.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let busy = Arc::clone(&self.export_busy);
+        let state = Arc::clone(&self.state);
+        let entries: Vec<RpfEntry> =
+            state.lock().unwrap().entries.iter().filter(|e| matches!(e.kind, "PSIN" | "XML" | "RBF0" | "DAT" | "GFX" | "ZLIB")).cloned().collect();
+        std::thread::spawn(move || {
+            let mut last_note = Instant::now();
+            let (targets, tokens) = gather_names(&entries, |n| {
+                if last_note.elapsed() > Duration::from_millis(200) {
+                    last_note = Instant::now();
+                    state.lock().unwrap().status = format!("Reading metadata {}/{}...", n + 1, entries.len());
+                }
+            });
+            state.lock().unwrap().status = format!("Matching {} words against the hashed names...", tokens.len());
+            let found = names::recover(&tokens, &targets);
+            names::add(found.exact.iter().map(|f| f.1.as_str()));
+            names::add_built(found.built.iter().map(|f| f.1.as_str()));
+            let all = targets.all();
+            let resolved = all.iter().filter(|h| names::lookup(**h).is_some()).count();
+            let note = match names_dir() {
+                Some(dir) if names::save_list(&dir, names::RECOVERED_FILE, &found.exact).is_ok() && names::save_list(&dir, names::BUILT_FILE, &found.built).is_ok() => {
+                    format!(" Saved in {}; extra word lists (.txt, one name per line) placed there are used too.", dir.display())
+                }
+                _ => String::new(),
+            };
+            state.lock().unwrap().status = format!(
+                "Names: {resolved} of {} hashed names resolved. {} found written out, {} built from word combinations and shown with a ? (about {:.0} of those are chance matches).{note}",
+                all.len(),
+                found.exact.len(),
+                found.built.len(),
+                found.built_noise
+            );
+            busy.store(false, Ordering::SeqCst);
+        });
+    }
+
     fn export_entries(&self, indices: &[usize]) {
         let Some(out_dir) = rfd::FileDialog::new().pick_folder() else { return };
         let entries: Vec<RpfEntry> = {
@@ -3700,6 +3841,41 @@ fn spawn_media_job<T: 'static>(
         m.loading = false;
         done(&mut m, res);
     });
+}
+
+// preview length of a psin shown as xml and the comment the exporter leaves when it stops there
+const PSIN_PREVIEW_CHARS: usize = 200_000;
+const PSIN_CUT_MARK: &str = "<!-- preview cut here";
+
+// hashed names of the metadata entries and every word found in the readable ones
+fn gather_names(entries: &[RpfEntry], mut progress: impl FnMut(usize)) -> (names::NameTargets, HashSet<String>) {
+    let mut targets = names::NameTargets::default();
+    let mut tokens = HashSet::new();
+    for (n, e) in entries.iter().enumerate() {
+        progress(n);
+        names::harvest_tokens(e.name.as_bytes(), &mut tokens);
+        if e.raw_size > 64 << 20 {
+            continue;
+        }
+        let Ok(data) = read_entry_bytes(e) else { continue };
+        if e.kind == "PSIN" {
+            psin_xml::collect_name_targets(&data, &mut targets);
+            psin_xml::collect_strings(&data, &mut tokens);
+        } else {
+            names::harvest_tokens(&data, &mut tokens);
+            if e.kind == "RBF0" {
+                if let Some(xml) = decode_rbf0(&data) {
+                    names::harvest_tokens(xml.as_bytes(), &mut tokens);
+                }
+            }
+        }
+    }
+    (targets, tokens)
+}
+
+// word lists for hashed names live here, one name per line in any txt file
+fn names_dir() -> Option<PathBuf> {
+    app_data_dir().map(|d| d.join("names"))
 }
 
 fn app_data_dir() -> Option<PathBuf> {
@@ -5621,6 +5797,9 @@ impl eframe::App for Rpf9App {
                     });
                 }
             } else {
+                if self.psin_selected {
+                    self.psin_tools_ui(ui);
+                }
                 egui::ScrollArea::both().show(ui, |ui| {
                     ui.add(egui::TextEdit::multiline(&mut self.preview).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY));
                 });
@@ -6178,6 +6357,62 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // name recovery over the small archives of a real dump, prints what it resolves
+    #[test]
+    fn name_recovery_on_real_archives() {
+        let Ok(levels) = std::env::var("PERCYSTAR_LEVELS_RPF") else { return };
+        let Some(root) = Path::new(&levels).parent() else { return };
+        let mut entries = Vec::new();
+        for rpf in ["common.rpf", "script.rpf", "data.rpf"] {
+            let path = root.join(rpf);
+            if !path.exists() {
+                return;
+            }
+            let (_, found) = scan_single_rpf(&path, None).expect("scan");
+            entries.extend(found.into_iter().filter(|e| matches!(e.kind, "PSIN" | "XML" | "RBF0" | "DAT" | "GFX" | "ZLIB")));
+        }
+        psin::seed_names();
+        // extra word lists make the run match what the app does with a filled names folder
+        if let Ok(dir) = std::env::var("PERCYSTAR_NAMES_DIR") {
+            names::load_dir(Path::new(&dir));
+        }
+        let (targets, tokens) = gather_names(&entries, |_| {});
+        let started = Instant::now();
+        let found = names::recover(&tokens, &targets);
+        let all = targets.all();
+        let got: HashSet<u32> = found.exact.iter().chain(&found.built).map(|f| f.0).collect();
+        eprintln!(
+            "recover took {:.1}s: structs {}/{}, fields {}/{}, enum values {}/{}",
+            started.elapsed().as_secs_f32(),
+            targets.structs.iter().filter(|h| got.contains(h)).count(),
+            targets.structs.len(),
+            targets.fields.keys().filter(|h| got.contains(h)).count(),
+            targets.fields.len(),
+            targets.enums.values().flatten().filter(|h| got.contains(h)).count(),
+            targets.enums.values().map(|v| v.len()).sum::<usize>()
+        );
+        if let Ok(out) = std::env::var("PERCYSTAR_NAMES_OUT") {
+            let _ = names::save_list(Path::new(&out), names::RECOVERED_FILE, &found.exact);
+            let _ = names::save_list(Path::new(&out), names::BUILT_FILE, &found.built);
+        }
+        eprintln!(
+            "{} entries, {} words, {} hashed names: {} exact, {} built (noise about {:.0}); structs {} fields {} enum values {}",
+            entries.len(),
+            tokens.len(),
+            all.len(),
+            found.exact.len(),
+            found.built.len(),
+            found.built_noise,
+            targets.structs.len(),
+            targets.fields.len(),
+            targets.enums.values().map(|v| v.len()).sum::<usize>()
+        );
+        let has = |n: &str| found.exact.iter().any(|f| f.1 == n);
+        assert!(has("fMass") && has("fBrakeForce"), "handling names not found");
+        assert!(found.exact.len() > 500 && found.built.len() > 300);
+        assert!(found.built_noise < found.built.len() as f64 * 0.1);
+    }
 
     fn wait_idle(media: &Arc<Mutex<MediaState>>) {
         for _ in 0..400 {
