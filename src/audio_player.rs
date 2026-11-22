@@ -527,6 +527,10 @@ mod backend {
     }
 }
 
+/// The PCM player, for the Linux BK2 player (`bink_native.rs`).
+#[cfg(target_os = "linux")]
+pub(crate) use backend::WaveOutHandle as PcmPlayer;
+
 /// Command-line players tried in order on Linux (PipeWire, PulseAudio, then plain ALSA).
 #[cfg(all(unix, not(target_os = "macos")))]
 const LINUX_PLAYERS: &[(&str, &[&str])] = &[("pw-play", &[]), ("paplay", &[]), ("aplay", &["-q"])];

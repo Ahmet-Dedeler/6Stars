@@ -1167,8 +1167,8 @@ impl Rpf9App {
             let (target, spawn) = (&mut self.bink_dock, bink_dock::BinkDock::spawn);
             // the in-process decoder needs no helper path and has no audio (so no volume)
             #[cfg(target_os = "linux")]
-            let (target, spawn) = (&mut self.bink_native, |_: &std::path::Path, dir, title, _volume: f32, looping| {
-                bink_native::BinkNative::spawn(ctx, dir, title, looping)
+            let (target, spawn) = (&mut self.bink_native, |_: &std::path::Path, dir, title, volume: f32, looping| {
+                bink_native::BinkNative::spawn(ctx, dir, title, volume, looping)
             });
             match result.and_then(|dir| spawn(&decoder, dir, title, self.bink_volume, self.bink_loop)) {
                 Ok(player) => {
@@ -5608,7 +5608,7 @@ impl eframe::App for Rpf9App {
             }
             #[cfg(target_os = "linux")]
             if let Some(player) = self.bink_native.as_mut() {
-                player.ui(ui, &mut self.bink_loop);
+                player.ui(ui, &mut self.bink_volume, &mut self.bink_loop);
                 return;
             }
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]

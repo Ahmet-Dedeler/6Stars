@@ -45,7 +45,7 @@ If this is your first PR, a typo fix is a good place to start. The [contributing
 
 ## What This Fork Adds
 
-- **BK2 video on Apple Silicon, Windows x64 and Linux:** Open **Videos** from the Model Viewer or **Videos (.bk2)** in Explorer, then select a clip to play it. The Mac and Windows build scripts include the decoder, so there's no second app to install. On Windows, click the video and press Space to pause, or use its slider to seek. On Linux, video is decoded in-process by the clean-room [bink2-decoder](https://github.com/codingkoala/bink2-decoder) (no RAD player needed); Bink Audio isn't supported there yet, so Linux playback is silent.
+- **BK2 video on Apple Silicon, Windows x64 and Linux:** Open **Videos** from the Model Viewer or **Videos (.bk2)** in Explorer, then select a clip to play it. The Mac and Windows build scripts include the decoder, so there's no second app to install. On Windows, click the video and press Space to pause, or use its slider to seek. On Linux, video and sound are decoded in-process by the clean-room [bink2-decoder](https://github.com/codingkoala/bink2-decoder) (no RAD player needed); sound plays through `pw-play`, `paplay` or `aplay`, like AWC audio.
 - **AWC audio previews:** Play and seek through individual streams without exporting them first. The decoder also reads multichannel banks and files with extra stream-table headers that upstream can miss.
 - **Better 3D previews:** Drawables in a model dictionary appear separately instead of stacked on top of each other. Fixed rotated meshes and false model entries, added streamed `.ttpf` textures and vehicle paint previews, and added a **Highest detail only** toggle for character and clothing models.
 - **More accurate model colors:** The viewer finds shared textures across packs, binds them to the right materials, and reads both packed and floating-point UVs. If it can't find a usable color texture, it shows that part in gray.
@@ -167,7 +167,7 @@ The demos are recorded from the real app, offscreen, by [`src/demo_capture.rs`](
 - **Folder and single-archive scanning (`.rpf` and `.ttpf`)**
   - Multi-threaded scanning, cached to `scan_cache_v10.tsv` in `%LOCALAPPDATA%\Percy6Stars` (Windows) or `~/Library/Application Support/Percy6Stars` (macOS). An existing PercyStar folder is moved over on first launch.
 - **In-app Bink 2 playback**
-  - The Apple Silicon build includes the decoder and frame bridge. Windows docks RAD's native player for pause and seeking. The Windows loop toggle applies when you next open a video. Linux decodes the video itself with the Apache-2.0 `bink2` crate (video only, no audio yet).
+  - The Apple Silicon build includes the decoder and frame bridge. Windows docks RAD's native player for pause and seeking. The Windows loop toggle applies when you next open a video. Linux decodes video and Bink Audio itself with the Apache-2.0 `bink2` crate.
 - **CLI batch exporters (models, textures, RDNA2 shaders)**
   ```powershell
   Percy6Stars.exe --extract-vehicles "<path-to-archive.rpf>" "<output-dir>"
@@ -236,7 +236,7 @@ BCPack BC3 to BC7 textures (BC1 decodes), rigging and animation, and full materi
 - [bcpack-rs](https://github.com/Ahmet-Dedeler/bcpack-rs): clean-room decoder for Xbox Series BCPack textures
 - [rage9-re](https://github.com/Ahmet-Dedeler/rage9-re): `script.rpf` and `anim.rpf` decoder with glTF export
 - [bink-player-mac](https://github.com/Ahmet-Dedeler/bink-player-mac): Bink 2 (`.bk2`) video player for macOS
-- [bink2-decoder](https://github.com/codingkoala/bink2-decoder): clean-room Bink 2 video decoder in Rust (Apache-2.0), used for BK2 previews on Linux
+- [bink2-decoder](https://github.com/codingkoala/bink2-decoder): clean-room Bink 2 video and Bink Audio decoder in Rust (Apache-2.0), used for BK2 previews on Linux
 - [weather-study](https://github.com/Ahmet-Dedeler/weather-study): WebGL2 weather and timecycle visualizer
 
 Questions, previews and format research: [join the Discord](https://discord.gg/reADpA6Cd).
