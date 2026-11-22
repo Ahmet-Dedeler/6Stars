@@ -2409,6 +2409,66 @@ mod showcase_tests {
         }
     }
 
+    // drives the real viewport code through egui without a window
+    #[test]
+    fn viewport_renders_moving_frames_and_refines_at_rest() {
+        let ctx = egui::Context::default();
+        let mut mesh = showcase();
+        let frame = |mesh: &mut Mesh3D, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 640.0))),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| render_mesh3d_viewport(ui, mesh));
+            });
+        };
+        frame(&mut mesh, vec![]);
+        assert!(mesh.tex.is_some() && mesh.view_refined && !mesh.dirty, "first frame is a resting frame");
+        let (w, h) = mesh.view_size;
+        assert!(w >= 160 && h >= 120 && mesh.frame_cost > 0.0);
+        // resting frames are supersampled the texture on screen has the viewport size
+        assert_eq!(mesh.tex.as_ref().unwrap().size(), [w, h]);
+        assert!(mesh.fb_w > w && mesh.fb_h > h, "resting frame renders more samples than pixels");
+
+        // nothing changed nothing is rendered again
+        let before = mesh.frame_cost;
+        frame(&mut mesh, vec![]);
+        assert_eq!(mesh.frame_cost, before);
+
+        // spinning renders moving frames at an adaptive resolution
+        mesh.auto_spin = true;
+        let yaw = mesh.yaw;
+        frame(&mut mesh, vec![]);
+        assert!(mesh.yaw != yaw && !mesh.view_refined);
+        let moving = (mesh.fb_w, mesh.fb_h);
+        assert!(moving.0 * 2 >= w && moving.0 * 2 <= w * 3, "moving scale stays between one half and one and a half: {moving:?} for {w}x{h}");
+
+        // once motion stops the next frame is refined again
+        mesh.auto_spin = false;
+        frame(&mut mesh, vec![]);
+        assert!(mesh.view_refined && mesh.fb_w > w);
+
+        // dragging orbits the camera
+        let at = egui::pos2(450.0, 400.0);
+        let press = egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() };
+        frame(&mut mesh, vec![egui::Event::PointerMoved(at), press]);
+        let yaw = mesh.yaw;
+        frame(&mut mesh, vec![egui::Event::PointerMoved(at + egui::vec2(60.0, 0.0))]);
+        frame(&mut mesh, vec![egui::Event::PointerMoved(at + egui::vec2(120.0, 10.0))]);
+        assert!(mesh.yaw > yaw, "drag must orbit: {} -> {}", yaw, mesh.yaw);
+        assert!(!mesh.view_refined, "a dragged frame is a moving frame");
+
+        // switching shading modes marks the frame dirty and renders without panicking in every mode
+        for mode in [ShadeMode::Solid, ShadeMode::SolidWire, ShadeMode::Wireframe, ShadeMode::Textured] {
+            mesh.shade_mode = mode;
+            mesh.flat_shading = mode == ShadeMode::Solid;
+            mesh.dirty = true;
+            frame(&mut mesh, vec![]);
+        }
+    }
+
     // shared edges are drawn exactly once so glass does not double blend along its diagonal
     #[test]
     fn shared_edges_are_watertight_and_never_double_blended() {
