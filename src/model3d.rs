@@ -2,10 +2,11 @@ use eframe::egui::{self, Color32, ColorImage, CornerRadius, RichText, TextureHan
 use flate2::{Decompress, FlushDecompress, Status};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
+mod export;
 mod raster;
 mod shading;
 mod texture;
@@ -525,46 +526,6 @@ impl Mesh3D {
         self.invalidate_normals();
         self.set_active_part(None);
         self.apply_tex_layers();
-    }
-
-    // writes visible parts as obj one group per drawable and recenters isolated part
-    pub fn export_obj(&self, path: &Path) -> std::io::Result<()> {
-        let mut w = BufWriter::new(File::create(path)?);
-        writeln!(w, "# PercyStar RAGE9 Model Export: {}", self.name)?;
-        let groups: Vec<(&str, std::ops::Range<usize>)> = match self.active_part.and_then(|i| self.parts.get(i)) {
-            Some(p) => vec![(p.name.as_str(), self.visible_tris())],
-            None if !self.parts.is_empty() => self.parts.iter().map(|p| (p.name.as_str(), p.tris.clone())).collect(),
-            None => vec![(self.name.as_str(), 0..self.tris.len())],
-        };
-        let shift = if self.active_part.is_some() { [self.center[0], self.center[1], 0.0] } else { [0.0; 3] };
-        let has_uv = self.uvs.len() == self.verts.len() && !self.uvs.is_empty();
-        let mut remap = vec![0u32; self.verts.len()];
-        let mut next = 1u32;
-        for (name, range) in groups {
-            writeln!(w, "o {name}")?;
-            let tris = &self.tris[range];
-            for &i in tris.iter().flatten() {
-                let i = i as usize;
-                if remap[i] == 0 {
-                    remap[i] = next;
-                    next += 1;
-                    let v = self.verts[i];
-                    writeln!(w, "v {:.6} {:.6} {:.6}", v[0] - shift[0], v[1] - shift[1], v[2] - shift[2])?;
-                    if has_uv {
-                        writeln!(w, "vt {:.6} {:.6}", self.uvs[i][0], self.uvs[i][1])?;
-                    }
-                }
-            }
-            for t in tris {
-                let (a, b, c) = (remap[t[0] as usize], remap[t[1] as usize], remap[t[2] as usize]);
-                if has_uv {
-                    writeln!(w, "f {a}/{a} {b}/{b} {c}/{c}")?;
-                } else {
-                    writeln!(w, "f {a} {b} {c}")?;
-                }
-            }
-        }
-        Ok(())
     }
 }
 
@@ -1919,10 +1880,22 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
             mesh.pan_y = 0.0;
             mesh.dirty = true;
         }
-        if ui.button("Export .OBJ").clicked() {
+        if ui.button("Export .OBJ").on_hover_text("Wavefront OBJ with smooth normals, a material library and the applied textures as PNG").clicked() {
             let safe_name = mesh.name.replace('#', "");
             if let Some(p) = rfd::FileDialog::new().set_file_name(format!("{safe_name}.obj")).save_file() {
-                let _ = mesh.export_obj(&p);
+                if let Err(e) = mesh.export_obj_with_materials(&p) {
+                    mesh.tex_status = format!("OBJ export failed: {e}");
+                }
+            }
+        }
+        if !mesh.tris.is_empty()
+            && ui.button("Export .GLB").on_hover_text("Binary glTF 2.0 with normals, materials and embedded textures, ready for Blender or any engine").clicked()
+        {
+            let safe_name = mesh.name.replace('#', "");
+            if let Some(p) = rfd::FileDialog::new().add_filter("glTF binary", &["glb"]).set_file_name(format!("{safe_name}.glb")).save_file() {
+                if let Err(e) = mesh.export_glb(&p) {
+                    mesh.tex_status = format!("GLB export failed: {e}");
+                }
             }
         }
         tex_layer_menu(ui, mesh);
