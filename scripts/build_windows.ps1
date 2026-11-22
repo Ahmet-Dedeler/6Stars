@@ -17,6 +17,9 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Could not find the Cargo build directory.' }
     $targetDir = ($metadata | ConvertFrom-Json).target_directory
     Copy-Item -LiteralPath (Join-Path $targetDir "$target\release\Percy6Stars.exe") -Destination $stage.FullName
+    foreach ($doc in 'LICENSE', 'LICENSE-MIT', 'THIRD_PARTY_NOTICES.md') {
+        Copy-Item -LiteralPath (Join-Path $root $doc) -Destination $stage.FullName
+    }
     & (Join-Path $PSScriptRoot 'setup_deps.ps1') -Destination $stage.FullName
     [IO.Directory]::Move($stage.FullName, $destinationPath)
     Write-Host "Built $destinationPath\Percy6Stars.exe"

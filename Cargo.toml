@@ -1,6 +1,6 @@
 [package]
 name = "rpf9_explorer"
-version = "1.9.0"
+version = "1.10.0"
 edition = "2021"
 
 [[bin]]
@@ -20,6 +20,8 @@ glam = "0.29"
 bytemuck = { version = "1.21", features = ["derive"] }
 texture2ddecoder = "0.1.2"
 tempfile = "3"
+# BCPack BC1 decoder (MIT OR Apache-2.0), pinned to a reviewed commit.
+bcpack-rs = { git = "https://github.com/Ahmet-Dedeler/bcpack-rs", rev = "0a887de1edc9c22a425605091f1a8365fdf74dbb", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 raw-window-handle = "0.6"

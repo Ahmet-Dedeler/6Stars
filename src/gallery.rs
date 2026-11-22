@@ -119,7 +119,11 @@ fn decode(job: &Job) -> Result<(ColorImage, bool), String> {
 
 /// Short reason for a tile that can't be shown.
 fn short_reason(err: &str) -> String {
-    if err.contains("BCPack") {
+    if let Some(i) = err.find("BCPack (") {
+        // "BCPack (BC7)" -> "BCPack BC7"
+        let mode = err[i + 8..].split(')').next().unwrap_or("");
+        format!("BCPack {mode}")
+    } else if err.contains("BCPack") {
         "BCPack".into()
     } else if err.contains("Unsupported DXGI") {
         "format".into()
