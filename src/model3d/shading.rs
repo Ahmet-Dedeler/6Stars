@@ -327,8 +327,8 @@ mod tests {
         for source in [NormalSource::SharedVertices, NormalSource::Crease] {
             let cn = corner_normals(&verts, &tris, &fnorm, source);
             for (n, f) in cn.iter().zip(&fnorm) {
-                for c in 0..3 {
-                    assert!(dot(n[c], *f) > 0.9999, "{source:?} rounded a 90 degree edge");
+                for corner in n {
+                    assert!(dot(*corner, *f) > 0.9999, "{source:?} rounded a 90 degree edge");
                 }
             }
         }

@@ -120,17 +120,6 @@ impl Texture2D {
         Self { w, h, pixels, lod_size, mips: OnceLock::new() }
     }
 
-    // nearest texel with repeat addressing
-    #[inline]
-    pub fn sample(&self, u: f32, v: f32) -> Color32 {
-        if self.w == 0 || self.h == 0 {
-            return Color32::WHITE;
-        }
-        let x = ((u.rem_euclid(1.0) * (self.w as f32)) as usize).min(self.w - 1);
-        let y = ((v.rem_euclid(1.0) * (self.h as f32)) as usize).min(self.h - 1);
-        self.pixels[y * self.w + x]
-    }
-
     // true when any texel is not fully opaque
     pub fn has_alpha(&self) -> bool {
         self.pixels.iter().any(|p| p.a() < 255)
@@ -186,8 +175,8 @@ impl Texture2D {
         if self.w == 0 || self.h == 0 {
             return [255.0; 4];
         }
-        // nan lod compares false and stays on the base level
-        if !(lod > 0.01) || (self.w == 1 && self.h == 1) {
+        // a nan lod stays on the base level
+        if lod.is_nan() || lod <= 0.01 || (self.w == 1 && self.h == 1) {
             return bilinear(self.w, self.h, &self.pixels, u, v, alpha_weighted);
         }
         let chain = self.mip_chain();

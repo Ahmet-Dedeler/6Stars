@@ -2234,7 +2234,10 @@ mod showcase_tests {
     }
 
     // appends a parametric surface as an indexed grid the way a gpu vertex buffer stores it
-    fn grid(m: &mut (Vec<[f32; 3]>, Vec<[f32; 2]>, Vec<[u32; 3]>, Vec<u16>), nu: u32, nv: u32, geom: u16, f: impl Fn(f32, f32) -> ([f32; 3], [f32; 2])) {
+    // positions uvs triangles and the geometry id of every triangle
+    type Soup = (Vec<[f32; 3]>, Vec<[f32; 2]>, Vec<[u32; 3]>, Vec<u16>);
+
+    fn grid(m: &mut Soup, nu: u32, nv: u32, geom: u16, f: impl Fn(f32, f32) -> ([f32; 3], [f32; 2])) {
         let base = m.0.len() as u32;
         for j in 0..=nv {
             for i in 0..=nu {
@@ -2296,7 +2299,7 @@ mod showcase_tests {
         let mut mesh = Mesh3D::from_parts("showcase".into(), m.0, m.1, m.2, m.3, vec![], None, String::new(), n_geoms, 0, String::new());
         mesh.normal_source = NormalSource::SharedVertices;
         let checker = |n: usize, cell: usize, a: [u8; 3], b: [u8; 3]| {
-            tex(n, n, (0..n * n).map(|i| if ((i % n) / cell + (i / n) / cell) % 2 == 0 { Color32::from_rgb(a[0], a[1], a[2]) } else { Color32::from_rgb(b[0], b[1], b[2]) }).collect())
+            tex(n, n, (0..n * n).map(|i| if ((i % n) / cell + (i / n) / cell).is_multiple_of(2) { Color32::from_rgb(a[0], a[1], a[2]) } else { Color32::from_rgb(b[0], b[1], b[2]) }).collect())
         };
         // round holes punched into an opaque sheet transparent texels are black like bc1
         let fence = tex(64, 64, (0..64 * 64).map(|i| {

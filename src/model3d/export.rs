@@ -40,7 +40,7 @@ fn encode_png(tex: &Texture2D, keep_alpha: bool) -> std::io::Result<Vec<u8>> {
         (tex.pixels.iter().flat_map(|c| [c.r(), c.g(), c.b()]).collect(), image::ExtendedColorType::Rgb8)
     };
     image::write_buffer_with_format(&mut out, &bytes, tex.w as u32, tex.h as u32, kind, image::ImageFormat::Png)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
     Ok(out.into_inner())
 }
 
@@ -237,7 +237,7 @@ impl Mesh3D {
         let mut material_ids: HashMap<usize, usize> = HashMap::new();
 
         fn push_view(bin: &mut Vec<u8>, views: &mut Vec<String>, data: &[u8], target: Option<u32>) -> usize {
-            while bin.len() % 4 != 0 {
+            while !bin.len().is_multiple_of(4) {
                 bin.push(0);
             }
             let target = target.map(|t| format!(",\"target\":{t}")).unwrap_or_default();
@@ -267,8 +267,7 @@ impl Mesh3D {
                 let (mut pos, mut nrm, mut uv, mut idx): (Vec<f32>, Vec<f32>, Vec<f32>, Vec<u32>) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
                 let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
                 for ti in tri_ids {
-                    for c in 0..3 {
-                        let vi = self.tris[ti][c];
+                    for (c, &vi) in self.tris[ti].iter().enumerate() {
                         let n = if has_n { normals[ti][c] } else { self.normals.get(ti).copied().unwrap_or([0.0, 0.0, 1.0]) };
                         let key = (vi, n.map(|v| (v * 32767.0).round() as i16));
                         let fresh = (pos.len() / 3) as u32;
@@ -367,7 +366,7 @@ impl Mesh3D {
         if meshes.is_empty() {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "mesh has no triangles to export"));
         }
-        while bin.len() % 4 != 0 {
+        while !bin.len().is_multiple_of(4) {
             bin.push(0);
         }
 
@@ -387,7 +386,7 @@ impl Mesh3D {
         json += &format!(",\"accessors\":[{}],\"bufferViews\":[{}]", accessors.join(","), views.join(","));
         json += &format!(",\"buffers\":[{{\"byteLength\":{}}}]}}", bin.len());
         let mut json = json.into_bytes();
-        while json.len() % 4 != 0 {
+        while !json.len().is_multiple_of(4) {
             json.push(b' ');
         }
         let total = 12 + 8 + json.len() + 8 + bin.len();
@@ -475,7 +474,7 @@ mod tests {
         assert_eq!((u32_at(4), u32_at(8)), (2, data.len()));
         let json_len = u32_at(12);
         assert_eq!(&data[16..20], b"JSON");
-        assert_eq!(json_len % 4, 0);
+        assert!(json_len.is_multiple_of(4));
         let json = std::str::from_utf8(&data[20..20 + json_len]).unwrap();
         let bin_at = 20 + json_len;
         let bin_len = u32_at(bin_at);
@@ -507,8 +506,8 @@ mod tests {
         // every buffer view lies inside the binary chunk and is aligned
         for part in json.split("\"byteOffset\":").skip(1) {
             let off: usize = part.split(',').next().unwrap().parse().unwrap();
-            let len: usize = part.split("\"byteLength\":").nth(1).unwrap().split(|c| c == ',' || c == '}').next().unwrap().parse().unwrap();
-            assert!(off % 4 == 0 && off + len <= bin_len);
+            let len: usize = part.split("\"byteLength\":").nth(1).unwrap().split([',', '}']).next().unwrap().parse().unwrap();
+            assert!(off.is_multiple_of(4) && off + len <= bin_len);
         }
         // shadow proxies are skipped and an empty selection is an error instead of an empty file
         let mut hidden = mesh.clone();

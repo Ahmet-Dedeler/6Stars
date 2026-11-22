@@ -960,7 +960,7 @@ fn sgd5_stage_color(stage: &str) -> Color32 {
 }
 
 impl Rpf9App {
-    fn new(cc: &eframe::CreationContext<'_>, logo_rgba: Option<(Vec<u8>, u32, u32)>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, logo_rgba: Option<(Vec<u8>, u32, u32)>, startup: Option<PathBuf>) -> Self {
         setup_style(&cc.egui_ctx);
         let logo_tex = logo_rgba.map(|(raw, w, h)| {
             let ci = ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &raw);
@@ -1068,12 +1068,34 @@ impl Rpf9App {
         };
         load_ui_state(&mut app);
         spawn_update_check(Arc::clone(&app.update), cc.egui_ctx.clone());
-        if let Some(last) = load_last_folder() {
+        // a path on the command line (open with, drag onto the exe) wins over the last folder
+        if let Some(path) = startup {
+            app.open_any_path(path);
+        } else if let Some(last) = load_last_folder() {
             if last.is_dir() {
                 app.start_folder_scan(last);
             }
         }
         app
+    }
+
+    // opens a game folder an archive an obj model or a ps09 shader cache by what the path is
+    fn open_any_path(&mut self, p: PathBuf) {
+        if p.is_dir() {
+            self.start_folder_scan(p);
+            return;
+        }
+        let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
+        if ext.eq_ignore_ascii_case("obj") {
+            self.tab = AppTab::Explorer;
+            self.open_obj_path(&p);
+        } else if ext.eq_ignore_ascii_case("ps09") {
+            self.reset_selection();
+            self.tab = AppTab::Shaders;
+            self.load_ps09_path(&p);
+        } else {
+            self.start_single_scan(p);
+        }
     }
 
     fn ordered_selected_indices(&self) -> Vec<usize> {
@@ -4727,6 +4749,10 @@ fn enrich_audio_rpf_entries(audio_rpf: &PathBuf, total_sz: u64, entries: &mut Ve
 
 impl eframe::App for Rpf9App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // a file or folder dropped onto the window opens like open file
+        if let Some(path) = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone())) {
+            self.open_any_path(path);
+        }
         self.poll_sgd5_cache();
         if let Some(pick) = self.lod_pick.take() {
             self.apply_lod_pick(pick);
@@ -4890,15 +4916,10 @@ impl eframe::App for Rpf9App {
                         .add_filter("OBJ models / PS09 shaders", &["obj", "ps09"])
                         .pick_file()
                     {
-                        let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
-                        if ext.eq_ignore_ascii_case("obj") {
+                        if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("obj")) {
                             self.open_obj_path(&p);
-                        } else if ext.eq_ignore_ascii_case("ps09") {
-                            self.reset_selection();
-                            self.tab = AppTab::Shaders;
-                            self.load_ps09_path(&p);
                         } else {
-                            self.start_single_scan(p);
+                            self.open_any_path(p);
                         }
                     }
                 }
@@ -5814,7 +5835,9 @@ fn main() -> eframe::Result<()> {
     }
     let opts = eframe::NativeOptions { viewport: vb, ..Default::default() };
     let title = format!("PercyStar v{APP_VERSION}");
-    eframe::run_native(&title, opts, Box::new(move |cc| Ok(Box::new(Rpf9App::new(cc, logo_rgba)))))
+    // percystar <path> opens a folder archive model or shader cache directly
+    let startup = args.get(1).filter(|a| !a.starts_with("--")).map(PathBuf::from).filter(|p| p.exists());
+    eframe::run_native(&title, opts, Box::new(move |cc| Ok(Box::new(Rpf9App::new(cc, logo_rgba, startup)))))
 }
 
 #[cfg(test)]
