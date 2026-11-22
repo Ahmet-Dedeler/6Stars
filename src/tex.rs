@@ -957,6 +957,22 @@ const MAX_TEXTURE_BYTES: usize = 1 << 32;
 // the decoded size of a bcpack chunk comes from the chunk table and sizes the output buffer
 const MAX_BCPACK_CHUNK: u64 = 256 << 20;
 
+// decoded chunks last used by this thread keyed by archive and file offset
+// neighbouring textures and the small mips of one texture share chunks
+const CHUNK_CACHE_SLOTS: usize = 12;
+const CHUNK_CACHE_MAX_LEN: usize = 4 << 20;
+type ChunkCache = std::collections::VecDeque<(std::path::PathBuf, u64, std::rc::Rc<Vec<u8>>)>;
+thread_local! {
+    static CHUNK_CACHE: std::cell::RefCell<ChunkCache> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+    // largest texture edge model decodes on this thread ask for, zero keeps full size
+    static TEX_DIM_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// makes model decodes on the calling thread load textures no larger than cap pixels per edge
+pub fn set_thread_texture_cap(cap: usize) {
+    TEX_DIM_CAP.with(|c| c.set(cap));
+}
+
 /// Read `len` bytes of the RDS5 virtual stream starting at `off`, inflating only overlapping chunks.
 pub fn ttpf_read_virtual(path: &Path, ix: &TtpfIndex, off: u64, len: usize) -> Result<Vec<u8>, String> {
     let end = off.checked_add(len as u64).ok_or("Texture range overflows")?;
@@ -965,31 +981,52 @@ pub fn ttpf_read_virtual(path: &Path, ix: &TtpfIndex, off: u64, len: usize) -> R
     if off >= stream_end || len > MAX_TEXTURE_BYTES {
         return Err("Texture data lies outside the RDS5 stream".into());
     }
-    let mut f = File::open(path).map_err(|e| e.to_string())?;
+    let mut f: Option<File> = None;
     let mut out_buf = vec![0u8; len];
     let mut covered = 0usize;
     let mut dec = Decompress::new(true);
     let first = ix.chunks.partition_point(|c| c.2 + c.3 <= off);
     for &(cs, ce, vs, vl, codec) in &ix.chunks[first..] {
         if vs >= end { break; }
-        let mut ch = vec![0u8; (ce - cs) as usize];
-        f.seek(SeekFrom::Start(cs)).map_err(|e| e.to_string())?;
-        f.read_exact(&mut ch).map_err(|e| e.to_string())?;
-        let data = if is_zlib_head(&ch) {
-            // deflate cannot expand more than about 1032 times
-            let mut out = Vec::with_capacity((vl as usize).min(ch.len().saturating_mul(1032).saturating_add(64)));
-            dec.reset(true);
-            let _ = dec.decompress_vec(&ch, &mut out, FlushDecompress::Finish); // partial output is still usable
-            out
-        } else if ch.len() as u64 == vl {
-            ch
-        } else if codec == 1 && vl % 8 == 0 && vl <= MAX_BCPACK_CHUNK {
-            bcpack_bc1_chunk(&ch, vl)?
-        } else {
-            let mode = match codec {
-                1 => "BC1", 2 => "BC2", 3 => "BC3", 4 => "BC4", 5 => "BC5", 6 => "BC6H", 7 => "BC7", _ => "HW",
-            };
-            return Err(format!("Texture uses Xbox Series X hardware BCPack ({mode}) — ASIC-only compression (not decodable on PC)"));
+        let cached = CHUNK_CACHE.with(|c| c.borrow().iter().find(|e| e.1 == cs && e.0 == path).map(|e| e.2.clone()));
+        let data = match cached {
+            Some(hit) => hit,
+            None => {
+                let file = match &mut f {
+                    Some(file) => file,
+                    None => f.insert(File::open(path).map_err(|e| e.to_string())?),
+                };
+                let mut ch = vec![0u8; (ce - cs) as usize];
+                file.seek(SeekFrom::Start(cs)).map_err(|e| e.to_string())?;
+                file.read_exact(&mut ch).map_err(|e| e.to_string())?;
+                let out = if is_zlib_head(&ch) {
+                    // deflate cannot expand more than about 1032 times
+                    let mut out = Vec::with_capacity((vl as usize).min(ch.len().saturating_mul(1032).saturating_add(64)));
+                    dec.reset(true);
+                    let _ = dec.decompress_vec(&ch, &mut out, FlushDecompress::Finish); // partial output is still usable
+                    out
+                } else if ch.len() as u64 == vl {
+                    ch
+                } else if codec == 1 && vl % 8 == 0 && vl <= MAX_BCPACK_CHUNK {
+                    bcpack_bc1_chunk(&ch, vl)?
+                } else {
+                    let mode = match codec {
+                        1 => "BC1", 2 => "BC2", 3 => "BC3", 4 => "BC4", 5 => "BC5", 6 => "BC6H", 7 => "BC7", _ => "HW",
+                    };
+                    return Err(format!("Texture uses Xbox Series X hardware BCPack ({mode}) — ASIC-only compression (not decodable on PC)"));
+                };
+                let out = std::rc::Rc::new(out);
+                if out.len() <= CHUNK_CACHE_MAX_LEN {
+                    CHUNK_CACHE.with(|c| {
+                        let mut c = c.borrow_mut();
+                        if c.len() >= CHUNK_CACHE_SLOTS {
+                            c.pop_front();
+                        }
+                        c.push_back((path.to_path_buf(), cs, out.clone()));
+                    });
+                }
+                out
+            }
         };
         let s0 = vs.max(off);
         let s1 = (vs + data.len() as u64).min(end);
@@ -1006,6 +1043,12 @@ pub fn ttpf_read_virtual(path: &Path, ix: &TtpfIndex, off: u64, len: usize) -> R
 
 /// Decode a single texture by descriptor index from a `.ttpf` archive.
 pub fn decode_ttpf_texture(path: &Path, tex_idx: usize) -> Result<DecodedTexture, String> {
+    decode_ttpf_texture_capped(path, tex_idx, 0)
+}
+
+// like decode_ttpf_texture but no edge exceeds cap pixels when cap is not zero
+// reads a stored mip level directly when the layout allows and shrinks the full decode otherwise
+pub fn decode_ttpf_texture_capped(path: &Path, tex_idx: usize, cap: usize) -> Result<DecodedTexture, String> {
     let ix = ttpf_index(path)?;
     let d = ix.descs.get(tex_idx).ok_or("Texture index out of range")?;
 
@@ -1029,7 +1072,39 @@ pub fn decode_ttpf_texture(path: &Path, tex_idx: usize) -> Result<DecodedTexture
     } else {
         None
     };
+    // edge sizes tiling and padded byte size of a mip level below the base
+    let mip_layout = |mip: u8| {
+        let mw = (d.w >> mip).max(4);
+        let mh = (d.h >> mip).max(4);
+        let m_ew = if is_bc { mw.div_ceil(4) } else { mw }.max(1);
+        let m_eh = if is_bc { mh.div_ceil(4) } else { mh }.max(1);
+        let m_64k = !is_bc && m_ew * m_eh * bpe > 65536;
+        let m_pad = if m_64k { padded_64kb_size(mw, mh, is_bc, bpe) } else { padded_4kb_size(mw, mh, is_bc, bpe) };
+        (mw, mh, m_64k, m_pad)
+    };
+    let mut small = None;
+    // the walk below is only valid when the base level really sits at the tail
+    let tail_ok = |tail: u64| ttpf_read_virtual(path, &ix, tail, 256).is_ok_and(|t| !t.iter().all(|&b| b == t[0]));
+    if let (true, Some(tail)) = (cap > 0 && d.w.max(d.h) > cap, tail_off.filter(|&t| tail_ok(t))) {
+        let mut cursor_end = tail;
+        for mip in 1..=6u8 {
+            let (mw, mh, m_64k, m_pad) = mip_layout(mip);
+            if cursor_end < d.byte_off + (m_pad as u64) {
+                break;
+            }
+            cursor_end -= m_pad as u64;
+            if mw.max(mh) <= cap || mip == 6 {
+                if let Ok(raw) = ttpf_read_virtual(path, &ix, cursor_end, m_pad) {
+                    if !raw.iter().take(256).all(|&b| b == raw[0]) {
+                        small = Some((raw, mw, mh, m_64k, 1u8));
+                    }
+                }
+                break;
+            }
+        }
+    }
     let raw_try = match tail_off {
+        _ if small.is_some() => Err(String::new()),
         Some(off) => {
             match ttpf_read_virtual(path, &ix, off, mip0_padded) {
                 Ok(t) if t.iter().take(256).all(|&b| b == t[0]) => ttpf_read_virtual(path, &ix, d.byte_off, mip0_padded),
@@ -1040,18 +1115,13 @@ pub fn decode_ttpf_texture(path: &Path, tex_idx: usize) -> Result<DecodedTexture
     };
     let (raw_tex, dec_w, dec_h, dec_64k, dec_mips) = match raw_try {
         Ok(raw) => (raw, d.w, d.h, use_64k, if d.has_mips { 2 } else { 1 }),
+        Err(_) if small.is_some() => small.take().unwrap(),
         Err(first_err) if d.has_mips => {
             // reduced mip fallback (credited to @paryzius ttpf-viewer) when mip0 sits in unreadable bcpack/cutoff chunk
             let mut found = None;
             let mut cursor_end = tail_off.unwrap_or(d.byte_off + d.alloc_sz);
             for mip in 1..=6u8 {
-                let mw = (d.w >> mip).max(4);
-                let mh = (d.h >> mip).max(4);
-                let m_ew = if is_bc { mw.div_ceil(4) } else { mw }.max(1);
-                let m_eh = if is_bc { mh.div_ceil(4) } else { mh }.max(1);
-                let m_lin = m_ew * m_eh * bpe;
-                let m_64k = !is_bc && m_lin > 65536;
-                let m_pad = if m_64k { padded_64kb_size(mw, mh, is_bc, bpe) } else { padded_4kb_size(mw, mh, is_bc, bpe) };
+                let (mw, mh, m_64k, m_pad) = mip_layout(mip);
                 if cursor_end < d.byte_off + (m_pad as u64) {
                     break;
                 }
@@ -1072,8 +1142,33 @@ pub fn decode_ttpf_texture(path: &Path, tex_idx: usize) -> Result<DecodedTexture
     } else {
         deswizzle_4kb_d(&raw_tex, dec_w, dec_h, is_bc, bpe)
     };
-    let pixels = decode_linear_to_rgba(&lin, dec_w, dec_h, d.dxgi)
+    let mut pixels = decode_linear_to_rgba(&lin, dec_w, dec_h, d.dxgi)
         .ok_or_else(|| format!("Pixel decode failed for {fmt_name} ({dec_w}x{dec_h})"))?;
+    let (mut dec_w, mut dec_h) = (dec_w, dec_h);
+    if cap > 0 && dec_w.max(dec_h) > cap && pixels.len() >= dec_w * dec_h {
+        let step = dec_w.max(dec_h).div_ceil(cap);
+        let (nw, nh) = ((dec_w / step).max(1), (dec_h / step).max(1));
+        let mut shrunk = Vec::with_capacity(nw * nh);
+        for y in 0..nh {
+            for x in 0..nw {
+                // plain average of the covered block
+                let mut sum = [0u32; 4];
+                let mut n = 0u32;
+                for yy in (y * step)..((y + 1) * step).min(dec_h) {
+                    for xx in (x * step)..((x + 1) * step).min(dec_w) {
+                        let c = pixels[yy * dec_w + xx].to_array();
+                        for k in 0..4 {
+                            sum[k] += c[k] as u32;
+                        }
+                        n += 1;
+                    }
+                }
+                let n = n.max(1);
+                shrunk.push(straight((sum[0] / n) as u8, (sum[1] / n) as u8, (sum[2] / n) as u8, (sum[3] / n) as u8));
+            }
+        }
+        (pixels, dec_w, dec_h) = (shrunk, nw, nh);
+    }
     Ok(DecodedTexture {
         name: format!("tex_{:05}_{}x{}_{fmt_name}", d.idx, dec_w, dec_h),
         w: dec_w,
@@ -1114,8 +1209,9 @@ type TtpfHashIndex = std::sync::Arc<HashMap<u64, TtpfHashHit>>;
 static TTPF_HASH_INDEX: std::sync::OnceLock<std::sync::Mutex<HashMap<std::path::PathBuf, TtpfHashIndex>>> =
     std::sync::OnceLock::new();
 
-// decoded external textures cached by hash cleared past 512 entries
-type TtpfTexCache = HashMap<u64, Option<std::sync::Arc<Texture2D>>>;
+// decoded external textures cached by hash and size cap, emptied once it holds too many bytes
+const TTPF_TEX_CACHE_BYTES: usize = 1 << 30;
+type TtpfTexCache = (HashMap<(u64, usize), Option<std::sync::Arc<Texture2D>>>, usize);
 static TTPF_TEX_CACHE: std::sync::OnceLock<std::sync::Mutex<TtpfTexCache>> = std::sync::OnceLock::new();
 
 fn collect_ttpf_files(dir: &Path, depth: usize, out: &mut Vec<std::path::PathBuf>) {
@@ -1227,17 +1323,22 @@ pub fn ttpf_hash_index_for_rpf(rpf_path: &Path) -> Option<std::sync::Arc<HashMap
 
 pub fn decode_ttpf_texture_cached(hit: &TtpfHashHit, hash64: u64) -> Option<std::sync::Arc<Texture2D>> {
     let cache = TTPF_TEX_CACHE.get_or_init(Default::default);
-    if let Some(entry) = cache.lock().unwrap().get(&hash64) {
+    let cap = TEX_DIM_CAP.with(|c| c.get());
+    if let Some(entry) = cache.lock().unwrap().0.get(&(hash64, cap)) {
         return entry.clone();
     }
-    let decoded = decode_ttpf_texture(&hit.path, hit.tex_idx)
+    let decoded = decode_ttpf_texture_capped(&hit.path, hit.tex_idx, cap)
         .ok()
         .map(|t| std::sync::Arc::new(to_model_tex(t)));
+    let bytes = decoded.as_ref().map_or(0, |t| t.pixels.len() * 4);
     let mut g = cache.lock().unwrap();
-    if g.len() > 512 {
-        g.clear();
+    if g.1 + bytes > TTPF_TEX_CACHE_BYTES || g.0.len() > 8192 {
+        g.0.clear();
+        g.1 = 0;
     }
-    g.insert(hash64, decoded.clone());
+    if g.0.insert((hash64, cap), decoded.clone()).is_none() {
+        g.1 += bytes;
+    }
     decoded
 }
 
@@ -1648,6 +1749,64 @@ pub fn decode_mhiu_heightmap(data: &[u8]) -> Option<DecodedTexture> {
 
 #[cfg(test)]
 mod large_address_tests;
+
+#[cfg(test)]
+mod capped_decode_tests {
+    use super::*;
+
+    // mean absolute rgb difference between the small texture and the full one averaged down to its size
+    fn picture_diff(full: &DecodedTexture, small: &DecodedTexture) -> f32 {
+        let (sx, sy) = (full.w / small.w, full.h / small.h);
+        let mut total = 0.0f64;
+        for y in 0..small.h {
+            for x in 0..small.w {
+                let mut sum = [0.0f64; 3];
+                for yy in 0..sy {
+                    for xx in 0..sx {
+                        let p = full.pixels[(y * sy + yy) * full.w + x * sx + xx];
+                        sum[0] += p.r() as f64;
+                        sum[1] += p.g() as f64;
+                        sum[2] += p.b() as f64;
+                    }
+                }
+                let n = (sx * sy) as f64;
+                let q = small.pixels[y * small.w + x];
+                total += (sum[0] / n - q.r() as f64).abs() + (sum[1] / n - q.g() as f64).abs() + (sum[2] / n - q.b() as f64).abs();
+            }
+        }
+        (total / (small.w * small.h * 3) as f64) as f32
+    }
+
+    // a capped decode reads a stored mip level and must show the same picture as the full one
+    #[test]
+    fn capped_vehicle_textures_match_full_decodes() {
+        let Ok(rpf) = std::env::var("PERCYSTAR_LEVELS_RPF") else { return };
+        let Some(root) = Path::new(&rpf).parent() else { return };
+        let pool = root.join("data").join("ttdb").join("vehicles").join("ttdb_vehicles.ttpf");
+        if !pool.exists() {
+            return;
+        }
+        let ix = ttpf_index(&pool).expect("index");
+        let picks: Vec<usize> = ix.descs.iter().filter(|d| d.has_mips && d.w.max(d.h) >= 512).map(|d| d.idx).step_by(23).take(40).collect();
+        let (mut both, mut close, mut from_mip) = (0usize, 0usize, 0usize);
+        for idx in picks {
+            let (Ok(full), Ok(small)) = (decode_ttpf_texture(&pool, idx), decode_ttpf_texture_capped(&pool, idx, 128)) else { continue };
+            assert!(small.w.max(small.h) <= 128, "texture {idx} came back {}x{}", small.w, small.h);
+            both += 1;
+            from_mip += (small.mips == 1 && full.mips == 2) as usize;
+            let diff = picture_diff(&full, &small);
+            if diff < 12.0 {
+                close += 1;
+            } else {
+                eprintln!("texture {idx} {}x{} differs from its capped decode by {diff:.1} (mips {})", full.w, full.h, small.mips);
+            }
+        }
+        eprintln!("capped decode: {both} compared, {close} close, {from_mip} read from a stored mip");
+        assert!(both >= 10, "only {both} textures decoded both ways");
+        assert_eq!(close, both, "capped decodes differ from the full textures");
+        assert!(from_mip * 2 >= both, "stored mips were used for only {from_mip} of {both}");
+    }
+}
 
 #[cfg(test)]
 mod mhiu_tests {
