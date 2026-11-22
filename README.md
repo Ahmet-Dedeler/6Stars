@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-v1.4.5-FFA81C?style=flat-square" alt="Version" />
+  <img src="https://img.shields.io/badge/Version-v1.4.6-FFA81C?style=flat-square" alt="Version" />
   <img src="https://img.shields.io/badge/Rust-1.85%2B-orange?style=flat-square&logo=rust" alt="Rust" />
   <img src="https://img.shields.io/badge/Shaders-RDNA2%20GFX10.3%20%E2%86%92%20HLSL%20%2F%20SPIR--V-FF4FA3?style=flat-square" alt="Shaders" />
   <img src="https://img.shields.io/badge/Textures-100%25%20DXGI%20%2B%20RDNA2%204KB%2F64KB-48D2FF?style=flat-square" alt="Textures" />
@@ -21,7 +21,7 @@
 </p>
 
 <p align="center">
-  <strong>Latest Release: <a href="https://github.com/rpatty-dev/PercyStar/releases/latest">Download PercyStar v1.4.5 (Win64 + In-App Auto-Updater)</a></strong> · <strong><a href="https://github.com/rpatty-dev/PercyStar/releases/download/v1.0.3/PercyStar_macOS.zip">macOS Universal Build</a></strong><br />
+  <strong>Latest Release: <a href="https://github.com/rpatty-dev/PercyStar/releases/latest">Download PercyStar v1.4.6 (Win64 + In-App Auto-Updater)</a></strong> · <strong><a href="https://github.com/rpatty-dev/PercyStar/releases/download/v1.0.3/PercyStar_macOS.zip">macOS Universal Build</a></strong><br />
   <strong>Companion Scarlett Layer: <a href="https://rpatty-dev.github.io/PercyScarlett/">PercyScarlett (100% SM 6.6 DXIL Proof)</a></strong> · <strong><a href="https://percystar-breakthroughs.vercel.app">Breakthroughs Dashboard</a></strong> · <strong><a href="https://mapnavmeshsite.vercel.app">NavMesh World Map</a></strong><br />
   <sub>Windows users on v1.0.3+ can click the golden <b>★ Update Available</b> pill inside PercyStar for 1-click self-update.</sub>
 </p>
@@ -62,16 +62,17 @@
 
 ---
 
-## What's New (v1.4.5+)
+## What's New (v1.4.6)
 
-- **Explorer Multi-Select & Batch Actions ([#36](https://github.com/rpatty-dev/PercyStar/issues/36), `src/main.rs`)**
-  - `Ctrl+Click` toggles individual rows, `Shift+Click` selects contiguous ranges in view order, and `Ctrl+A` selects all filtered rows.
-  - Top-bar **Export Selected** and **Copy Path** (`Ctrl+C`) operate on all selected entries, with multi-row context menu actions (`Copy N File Names`, `Archive Paths`, `Offset Locations`).
-- **BK2 Docked Player Fix ([#35](https://github.com/rpatty-dev/PercyStar/issues/35), `src/main.rs`)**
-  - Removed unsupported `/NoBorder /DrawD3D11 /L /W640 /H360` flags from docked `binkplay.exe` launches (matching Pop-out; `dock_child_hwnd` handles border removal and Win32 resizing cleanly).
+- **ADAT `u16` & `u32` Stream Table Support ([#37](https://github.com/rpatty-dev/PercyStar/issues/37), `src/awc.rs`)**
+  - `parse_adat_header()` evaluates candidate chunk-table offsets (`16 + sc*4` for `u32`, `16 + sc*2` / 8-byte aligned for `u16`, plus backward fallback) and picks the valid table — fixing multi-hundred-stream banks (`503` streams) that previously showed bogus chunks.
+- **Explorer Marquee Drag Selection ([#38](https://github.com/rpatty-dev/PercyStar/issues/38), `src/main.rs`)**
+  - Click and drag in the Explorer list to draw a selection rectangle across rows (`Ctrl` additive), paired with `Ctrl+Click`, `Shift+Click`, `Ctrl+A`, `Ctrl+C`, batch **Export Selected**, and multi-row context menus.
+- **Breakthroughs PS09 Stage Audit Reconciled ([#39](https://github.com/rpatty-dev/PercyStar/issues/39), `docs/breakthroughs.json`)**
+  - Unified `kpis[0]` to `9,535 PS · 1,343 VS · 3,082 CS · 7,498 NGG · 64 RT` and marked the earlier v1.3.0 raw heuristic split as superseded.
 - **3D World GPU Viewer Optimizations (`src/world_gpu.rs`)**
-  - Automatic **16-bit index buffers (`Uint16`)** when `verts <= 65,535` (halving index VRAM & GPU bandwidth), **time-budgeted upload backpressure** (`6ms` / `8` batches per frame), and **`Ctrl` precision slow-flight** alongside `Shift` boost.
-- **Verified Test Suite**: `65 passed; 0 failed` (`cargo test`).
+  - Automatic **16-bit index buffers (`Uint16`)** when `verts <= 65,535`, **time-budgeted upload backpressure** (`6ms` / `8` batches per frame), and **`Ctrl` precision slow-flight**.
+- **Verified Test Suite**: `66 passed; 0 failed` (`cargo test`).
 
 ## Features & Format Breakthroughs (v1.3.8)
 
