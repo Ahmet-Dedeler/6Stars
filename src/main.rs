@@ -2,6 +2,7 @@
 mod audio_player;
 mod awc;
 mod bink2;
+mod bink2_container;
 mod boot;
 mod dat;
 mod dxbc;
@@ -5916,6 +5917,85 @@ fn extract_sgd5_cli(src: &Path, out_dir: &Path, limit: usize) {
     }
 }
 
+fn decode_audio_cli(rpf_path: &Path, out_dir: &Path, limit: usize) {
+    let _ = fs::create_dir_all(out_dir);
+    let Ok(mut f) = File::open(rpf_path) else {
+        eprintln!("Failed to open {}", rpf_path.display());
+        return;
+    };
+    let sz = f.metadata().map(|m| m.len()).unwrap_or(0).min(2 * 1024 * 1024 * 1024);
+    let mut off = 0u64;
+    let mut buf = vec![0u8; 16 * 1024 * 1024];
+    let mut banks = Vec::new();
+    while off < sz {
+        let Ok(n) = f.read(&mut buf) else { break };
+        if n == 0 { break; }
+        let mut pos = 0usize;
+        while pos + 16 <= n {
+            if &buf[pos..pos + 4] == b"ADAT" {
+                let sc = u32::from_le_bytes([buf[pos + 8], buf[pos + 9], buf[pos + 10], buf[pos + 11]]);
+                let hdr_sz = u32::from_le_bytes([buf[pos + 12], buf[pos + 13], buf[pos + 14], buf[pos + 15]]);
+                if (1..=256).contains(&sc) && (16..=65536).contains(&hdr_sz) {
+                    banks.push((off + pos as u64, sc));
+                    if limit > 0 && banks.len() >= limit { break; }
+                }
+            }
+            pos += 16;
+        }
+        if limit > 0 && banks.len() >= limit { break; }
+        off += n.saturating_sub(64) as u64;
+        let _ = f.seek(SeekFrom::Start(off));
+    }
+    let mut total_wavs = 0usize;
+    let mut bank_data = vec![0u8; 256 * 1024];
+    for (i, &(bank_off, sc)) in banks.iter().enumerate() {
+        let _ = f.seek(SeekFrom::Start(bank_off));
+        let n = f.read(&mut bank_data).unwrap_or(0);
+        let stem = format!("bank_{i:03}_off_{bank_off:08x}_{sc}st");
+        let res = awc::decode_awc_bytes_to_wavs_detailed(&bank_data[..n], out_dir, &stem);
+        total_wavs += res.wavs.len();
+    }
+    println!("Exported {total_wavs} WAV tracks from {} banks -> {}", banks.len(), out_dir.display());
+}
+
+fn decode_navmesh_cli(rpf_path: &Path, out_dir: &Path, limit: usize) {
+    let _ = fs::create_dir_all(out_dir);
+    let Ok(mut f) = File::open(rpf_path) else {
+        eprintln!("Failed to open {}", rpf_path.display());
+        return;
+    };
+    let base_off = 786_010_112u64;
+    let _ = f.seek(SeekFrom::Start(base_off));
+    let mut buf = vec![0u8; 32 * 1024 * 1024];
+    let n = f.read(&mut buf).unwrap_or(0);
+    let mut dec = Decompress::new(true);
+    let mut out = vec![0u8; 32768];
+    let mut ok = 0usize;
+    let mut pos = 0usize;
+    while pos + 32 <= n {
+        if buf[pos] == 0x78 && matches!(buf[pos + 1], 0x01 | 0x5e | 0x9c | 0xda) {
+            dec.reset(true);
+            let _ = dec.decompress(&buf[pos..(pos + 32768).min(n)], &mut out, FlushDecompress::None);
+            if dec.total_out() >= 0xD0 && u32::from_le_bytes([out[0x14], out[0x15], out[0x16], out[0x17]]) == 0x0001_0015 {
+                let midx = u32::from_le_bytes([out[0xC8], out[0xC9], out[0xCA], out[0xCB]]);
+                let nm = if midx < 512 * 512 {
+                    format!("nav_{:03}_{:03}", midx % 512, midx / 512)
+                } else {
+                    format!("nav_dyn_{midx:06x}")
+                };
+                if let Ok(mesh) = tex::decode_navmesh_from_rpf(rpf_path, base_off + pos as u64, &nm) {
+                    if mesh.export_obj(&out_dir.join(format!("{nm}.obj"))).is_ok() {
+                        ok += 1;
+                        if limit > 0 && ok >= limit { break; }
+                    }
+                }
+            }
+        }
+        pos += 16;
+    }
+    println!("Exported {ok} CNavMesh .obj tiles -> {}", out_dir.display());
+}
+
 fn disassemble_dxbc_cli(src: &Path, output: Option<&PathBuf>) {
     match fs::read(src) {
         Ok(data) => {
@@ -6062,6 +6142,16 @@ fn main() -> eframe::Result<()> {
     if args.len() >= 4 && args[1] == "--extract-models" {
         let filt = args.get(4).map(|s| s.as_str()).unwrap_or("");
         export_models_cli(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), filt, false);
+        return Ok(());
+    }
+    if args.len() >= 4 && args[1] == "--decode-audio" {
+        let lim = args.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+        decode_audio_cli(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), lim);
+        return Ok(());
+    }
+    if args.len() >= 4 && args[1] == "--decode-navmesh" {
+        let lim = args.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+        decode_navmesh_cli(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), lim);
         return Ok(());
     }
 

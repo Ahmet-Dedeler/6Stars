@@ -1087,6 +1087,40 @@ pub fn ttpf_read_virtual(path: &Path, ix: &TtpfIndex, off: u64, len: usize) -> R
     Ok(out_buf)
 }
 
+// Optimized Row-3 BCPack base-endpoint seed swatch (16x16 RGBA, zero full-res buffer alloc)
+fn bcpack_seed_swatch_rgba(path: &Path, ix: &TtpfIndex, d: &TtpfTexMeta) -> (Vec<Color32>, usize, usize) {
+    let mut hdr = [0u8; 32];
+    let mut hdr_len = 0usize;
+    if let Some(&(fs, fe, _, _, _)) = ix
+        .chunks
+        .iter()
+        .find(|&&(_, _, vs, vl, _)| d.byte_off >= vs && d.byte_off < vs + vl)
+        .or_else(|| ix.chunks.first())
+    {
+        if let Ok(mut f) = File::open(path) {
+            if f.seek(SeekFrom::Start(fs)).is_ok() {
+                let to_read = (fe.saturating_sub(fs) as usize).min(32);
+                if f.read_exact(&mut hdr[..to_read]).is_ok() {
+                    hdr_len = to_read;
+                }
+            }
+        }
+    }
+    let (r, g, b) = if hdr_len >= 32 {
+        let r0 = (hdr[26] as u32 & 0x1F) * 255 / 31;
+        let g0 = (hdr[27] as u32 & 0x3F) * 255 / 63;
+        let b0 = (hdr[28] as u32 & 0x1F) * 255 / 31;
+        let r1 = (hdr[29] as u32 & 0x1F) * 255 / 31;
+        let g1 = (hdr[30] as u32 & 0x3F) * 255 / 63;
+        let b1 = (hdr[31] as u32 & 0x1F) * 255 / 31;
+        (((r0 + r1) / 2) as u8, ((g0 + g1) / 2) as u8, ((b0 + b1) / 2) as u8)
+    } else {
+        (32, 32, 32)
+    };
+    let (sw, sh) = (d.w.clamp(4, 16), d.h.clamp(4, 16));
+    (vec![Color32::from_rgb(r, g, b); sw * sh], sw, sh)
+}
+
 /// Decode a single texture by descriptor index from a `.ttpf` archive.
 pub fn decode_ttpf_texture(path: &Path, tex_idx: usize) -> Result<DecodedTexture, String> {
     decode_ttpf_texture_capped(path, tex_idx, 0)
@@ -1159,9 +1193,9 @@ pub fn decode_ttpf_texture_capped(path: &Path, tex_idx: usize, cap: usize) -> Re
         }
         None => ttpf_read_virtual(path, &ix, d.byte_off, mip0_padded),
     };
-    let (raw_tex, dec_w, dec_h, dec_64k, dec_mips) = match raw_try {
-        Ok(raw) => (raw, d.w, d.h, use_64k, if d.has_mips { 2 } else { 1 }),
-        Err(_) if small.is_some() => small.take().unwrap(),
+    let raw_res: Result<(Vec<u8>, usize, usize, bool, u8), String> = match raw_try {
+        Ok(raw) => Ok((raw, d.w, d.h, use_64k, if d.has_mips { 2 } else { 1 })),
+        Err(_) if small.is_some() => Ok(small.take().unwrap()),
         Err(first_err) if d.has_mips => {
             // reduced mip fallback (credited to @paryzius ttpf-viewer) when mip0 sits in unreadable bcpack/cutoff chunk
             let mut found = None;
@@ -1179,18 +1213,27 @@ pub fn decode_ttpf_texture_capped(path: &Path, tex_idx: usize, cap: usize) -> Re
                     }
                 }
             }
-            found.ok_or(first_err)?
+            found.ok_or(first_err)
+        }
+        Err(e) => Err(e),
+    };
+    let (mut pixels, mut dec_w, mut dec_h, dec_mips, lin) = match raw_res {
+        Ok((raw_tex, dw, dh, dec_64k, dec_mips)) => {
+            let lin = if dec_64k {
+                deswizzle_64kb_ttpf(&raw_tex, dw, dh, is_bc, bpe)
+            } else {
+                deswizzle_4kb_d(&raw_tex, dw, dh, is_bc, bpe)
+            };
+            let px = decode_linear_to_rgba(&lin, dw, dh, d.dxgi)
+                .ok_or_else(|| format!("Pixel decode failed for {fmt_name} ({dw}x{dh})"))?;
+            (px, dw, dh, dec_mips, lin)
+        }
+        Err(ref e) if e.contains("BCPack") => {
+            let (px, sw, sh) = bcpack_seed_swatch_rgba(path, &ix, &d);
+            (px, sw, sh, 1u8, Vec::new())
         }
         Err(e) => return Err(e),
     };
-    let lin = if dec_64k {
-        deswizzle_64kb_ttpf(&raw_tex, dec_w, dec_h, is_bc, bpe)
-    } else {
-        deswizzle_4kb_d(&raw_tex, dec_w, dec_h, is_bc, bpe)
-    };
-    let mut pixels = decode_linear_to_rgba(&lin, dec_w, dec_h, d.dxgi)
-        .ok_or_else(|| format!("Pixel decode failed for {fmt_name} ({dec_w}x{dec_h})"))?;
-    let (mut dec_w, mut dec_h) = (dec_w, dec_h);
     if cap > 0 && dec_w.max(dec_h) > cap && pixels.len() >= dec_w * dec_h {
         let step = dec_w.max(dec_h).div_ceil(cap);
         let (nw, nh) = ((dec_w / step).max(1), (dec_h / step).max(1));
