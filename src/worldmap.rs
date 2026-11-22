@@ -224,7 +224,7 @@ impl WorldMapData {
                 ));
             }
         }
-        let tex = Some(Texture2D { w: tw, h: th, pixels: tpix });
+        let tex = Some(Texture2D::new(tw, th, tpix));
 
         let tri_geom = vec![0u16; tris.len()];
         let mut m = Mesh3D::from_parts(

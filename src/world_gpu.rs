@@ -1051,7 +1051,7 @@ impl GpuState {
             cache: None,
         });
 
-        let white_tex = Texture2D { w: 1, h: 1, pixels: vec![eframe::egui::Color32::from_rgb(190, 195, 205)] };
+        let white_tex = Texture2D::new(1, 1, vec![eframe::egui::Color32::from_rgb(190, 195, 205)]);
         let (white_bg, _) = upload_texture(&device, &queue, &tex_bgl, &tex_samp, &white_tex, 256);
         let (minimap_bg, _) = upload_texture(&device, &queue, &tex_bgl, &tex_samp, &white_tex, 256);
         let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);

@@ -600,7 +600,7 @@ pub fn to_model_tex(t: DecodedTexture) -> Texture2D {
             *c = Color32::from_white_alpha(c.r());
         }
     }
-    Texture2D { w: t.w, h: t.h, pixels }
+    Texture2D::new(t.w, t.h, pixels)
 }
 
 /// Read RAGE9 resource virtual + physical buffers from RPF at `file_off` and decode all TXD textures.
