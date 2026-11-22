@@ -24,14 +24,6 @@ pub struct Texture2D {
     pub pixels: Vec<Color32>,
 }
 
-#[derive(Clone, Default)]
-pub struct GeomMaterial {
-    pub texture: Option<Arc<Texture2D>>,
-    pub is_vehicle_paint: bool,
-    pass: MaterialPass,
-    auxiliary_pass: bool,
-}
-
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum MaterialPass {
     #[default]
@@ -40,6 +32,88 @@ enum MaterialPass {
     Alpha,
     Decal,
     Glass { texture_alpha: bool },
+}
+
+#[derive(Clone, Default)]
+pub struct GeomMaterial {
+    // surface color texture currently applied first enabled entry of color_layers
+    pub texture: Option<Arc<Texture2D>>,
+    pub is_vehicle_paint: bool,
+    pass: MaterialPass,
+    auxiliary_pass: bool,
+    // tinted opaque vehicle body material shown as car paint while no color texture is applied
+    paint_capable: bool,
+    // indices into mesh tex_layers color candidates in priority order
+    color_layers: Vec<u16>,
+    normal_layers: Vec<u16>,
+    overlay_layers: Vec<u16>,
+    // normal map and multiply overlays currently applied
+    normal: Option<Arc<Texture2D>>,
+    overlays: Vec<Arc<Texture2D>>,
+    /// Colour texture from the drawable's own embedded dictionary (fork addition). It is
+    /// not a pooled layer, so it stays applied whatever the layer toggles say.
+    embedded_color: Option<Arc<Texture2D>>,
+    /// Eyeball shader: the iris texture is composited over a sclera colour.
+    eye: bool,
+}
+
+// how an applied texture layer contributes to the preview
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TexLayerKind {
+    // surface color
+    Color,
+    // tangent space normal map that perturbs the lighting
+    Normal,
+    // dirt dust and mask maps multiplied over the surface
+    Overlay,
+}
+
+// one pooled texture bound by the materials of a mesh that can be switched on or off in the preview
+#[derive(Clone)]
+pub struct TexLayer {
+    pub hash64: u64,
+    pub label: String,
+    pub kind: TexLayerKind,
+    pub w: usize,
+    pub h: usize,
+    // pool file and descriptor index
+    pub source: String,
+    // number of drawn geometries whose material binds it
+    pub mats: usize,
+    pub enabled: bool,
+    // part of the default look
+    pub default_on: bool,
+    hit: crate::tex::TtpfHashHit,
+    tex: Option<Arc<Texture2D>>,
+    failed: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct ElsPoint {
+    pub position: [f32; 3],
+    pub bank: bool,
+    pub slot: u8,
+}
+
+// Decoded from the RAGE 9 Sirens PSO preset (id 3) in data.rpf. As in GTA V,
+// each light consumes one bit per beat, most-significant bit first. GTA VI keeps
+// the 32-step sequencers but stores the carcols-style data in hashed PSO fields.
+const RAGE9_SIREN_BPM: f64 = 500.0;
+const RAGE9_SIREN_MULTIPLES: u64 = 3;
+const RAGE9_SIREN_SEQUENCERS: [u32; 20] = [
+    0xAAAA_AAAA, 0xAA00_AA80, 0x5500_5500, 0x5555_5555,
+    0xAA5A_A954, 0x5555_554A, 0x5555_554A, 0xAA5A_A954,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+fn rage9_siren_lit(slot: u8, phase: u64) -> bool {
+    let Some(&sequencer) = slot.checked_sub(1).and_then(|i| RAGE9_SIREN_SEQUENCERS.get(i as usize)) else {
+        return false;
+    };
+    let subdivisions = RAGE9_SIREN_MULTIPLES * 2;
+    let beat = (phase / subdivisions) % 32;
+    let pulse = phase % subdivisions;
+    sequencer & (1 << (31 - beat)) != 0 && pulse.is_multiple_of(2)
 }
 
 impl GeomMaterial {
@@ -90,8 +164,16 @@ pub struct Mesh3D {
     pub edges: Vec<(u32, u32)>,
     pub texture: Option<Texture2D>,
     pub geom_materials: Vec<GeomMaterial>,
+    // pooled textures bound by the materials toggled from the viewer
+    pub tex_layers: Vec<TexLayer>,
     pub has_paint_geom: bool,
     pub paint_color: [f32; 3],
+    pub has_els: bool,
+    pub els_enabled: bool,
+    pub els_flash: bool,
+    pub els_points: Vec<ElsPoint>,
+    vehicle_attach_points: Vec<(String, [f32; 3])>,
+    els_flash_phase: u64,
     pub tex_status: String,
     pub center: [f32; 3],
     pub radius: f32,
@@ -129,6 +211,88 @@ pub struct Mesh3D {
 }
 
 impl Mesh3D {
+    // rebinds every material to its enabled texture layers decoding newly enabled ones on demand
+    pub fn apply_tex_layers(&mut self) {
+        let mut budget = 384usize;
+        for l in &mut self.tex_layers {
+            if l.enabled && l.tex.is_none() && !l.failed && budget > 0 {
+                budget -= 1;
+                l.tex = crate::tex::decode_ttpf_texture_cached(&l.hit);
+                l.failed = l.tex.is_none();
+            }
+        }
+        let layers = &self.tex_layers;
+        let live = |ids: &[u16]| -> Vec<Arc<Texture2D>> {
+            ids.iter()
+                .filter_map(|&i| layers.get(i as usize))
+                .filter(|l| l.enabled)
+                .filter_map(|l| l.tex.clone())
+                .collect()
+        };
+        for m in &mut self.geom_materials {
+            // highest priority ticked color layer wins even when it could not be decoded
+            m.texture = match &m.embedded_color {
+                Some(t) => Some(t.clone()),
+                None => m.color_layers.iter().filter_map(|&i| layers.get(i as usize)).find(|l| l.enabled).and_then(|l| l.tex.clone()),
+            };
+            if m.eye {
+                // The eye's diffuseTex is just the iris on a transparent background; the game
+                // shader fills the rest with the sclera. Bake that in so the preview isn't black.
+                m.texture = m.texture.take().map(|t| over_sclera(&t));
+            }
+            m.normal = live(&m.normal_layers).into_iter().next();
+            m.overlays = live(&m.overlay_layers);
+            if matches!(m.pass, MaterialPass::Glass { .. }) {
+                if m.texture.as_ref().is_some_and(|t| t.w <= 4 && t.h <= 4 && t.pixels.iter().all(|p| p.a() == 0)) {
+                    m.texture = None;
+                }
+                m.pass = MaterialPass::Glass {
+                    texture_alpha: m.texture.as_ref().is_some_and(|t| t.pixels.iter().any(|p| p.a() < 255)),
+                };
+            }
+            // an enabled color texture that failed to decode keeps the neutral material look instead of paint
+            let color_bound = m.color_layers.iter().any(|&i| layers.get(i as usize).is_some_and(|l| l.enabled));
+            m.is_vehicle_paint = m.paint_capable && !color_bound;
+        }
+        self.has_paint_geom = self.geom_materials.iter().any(|m| m.paint_capable);
+        self.refresh_tex_status();
+        self.dirty = true;
+    }
+
+    // switches layers on or off by predicate and reapplies them
+    pub fn set_tex_layers(&mut self, on: impl Fn(&TexLayer) -> bool) {
+        for l in &mut self.tex_layers {
+            l.enabled = on(l);
+        }
+        self.apply_tex_layers();
+    }
+
+    fn refresh_tex_status(&mut self) {
+        if self.geom_materials.is_empty() {
+            return;
+        }
+        if let Some(at) = self.tex_status.find(" + ELS ") {
+            self.tex_status.truncate(at);
+        }
+        if self.texture.is_none() {
+            let textured = self.geom_materials.iter().filter(|m| m.texture.is_some()).count();
+            let paint = self.geom_materials.iter().filter(|m| m.is_vehicle_paint).count();
+            let drawn = self.geom_materials.iter().filter(|m| !m.auxiliary_pass).count().max(1);
+            if textured > 0 && paint > 0 {
+                self.tex_status = format!("Textures: {textured}/{drawn} geoms + preview paint ({paint})");
+            } else if textured > 0 {
+                self.tex_status = format!("Textures: {textured}/{drawn} geoms");
+            } else if paint > 0 {
+                self.tex_status = format!("Preview paint: {paint}/{drawn} geoms");
+            } else if !self.tex_layers.is_empty() {
+                self.tex_status = "No color textures applied; neutral preview".into();
+            }
+        }
+        if self.has_els {
+            self.tex_status.push_str(&format!(" + ELS {} emitters", self.els_points.len()));
+        }
+    }
+
     pub fn from_parts(
         name: String,
         verts: Vec<[f32; 3]>,
@@ -197,7 +361,14 @@ impl Mesh3D {
             texture,
             geom_materials: Vec::new(),
             has_paint_geom: false,
+            tex_layers: Vec::new(),
             paint_color: DEFAULT_PAINT_COLOR,
+            has_els: false,
+            els_enabled: false,
+            els_flash: true,
+            els_points: Vec::new(),
+            vehicle_attach_points: Vec::new(),
+            els_flash_phase: 0,
             tex_status,
             center,
             radius,
@@ -262,8 +433,90 @@ impl Mesh3D {
         self.dirty = true;
     }
 
-    /// Writes the visible part(s) as OBJ, one `o` group per drawable. A single isolated
-    /// part is re-centred on its own origin (undoing the grid offset).
+    // Adds an independently stored vehicle option at the same model-space
+    // origin. RAGE 9 tuning parts (bumpers, light bars, liveries, wheels, etc.)
+    // are separate fragment resources authored against the parent vehicle.
+    pub fn append_vehicle_part(&mut self, mut part: Mesh3D) {
+        let offset = if part.name.to_ascii_lowercase().starts_with("cmn_siren_roofbar1_") {
+            self.vehicle_attach_points
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("siren_roof_1"))
+                .map(|(_, position)| *position)
+                .unwrap_or([0.0; 3])
+        } else {
+            [0.0; 3]
+        };
+        if offset != [0.0; 3] {
+            for vertex in &mut part.verts {
+                for axis in 0..3 {
+                    vertex[axis] += offset[axis];
+                }
+            }
+            for light in &mut part.els_points {
+                for axis in 0..3 {
+                    light.position[axis] += offset[axis];
+                }
+            }
+            for (_, point) in &mut part.vehicle_attach_points {
+                for axis in 0..3 {
+                    point[axis] += offset[axis];
+                }
+            }
+        }
+        let vertex_base = self.verts.len() as u32;
+        let triangle_base = self.tris.len();
+        let geom_base = self.geom_materials.len() as u16;
+        let layer_base = self.tex_layers.len() as u16;
+        if self.parts.is_empty() && triangle_base > 0 {
+            self.parts.push(MeshPart {
+                name: self.name.clone(),
+                geoms: self.geom_count,
+                tris: 0..triangle_base,
+            });
+        }
+
+        self.verts.append(&mut part.verts);
+        self.uvs.append(&mut part.uvs);
+        self.normals.append(&mut part.normals);
+        self.tris.extend(part.tris.drain(..).map(|t| {
+            [t[0] + vertex_base, t[1] + vertex_base, t[2] + vertex_base]
+        }));
+        self.tri_geom.extend(part.tri_geom.drain(..).map(|g| g.saturating_add(geom_base)));
+        self.edges.extend(part.edges.drain(..).map(|(a, b)| (a + vertex_base, b + vertex_base)));
+
+        for material in &mut part.geom_materials {
+            for layer in material
+                .color_layers
+                .iter_mut()
+                .chain(&mut material.normal_layers)
+                .chain(&mut material.overlay_layers)
+            {
+                *layer = layer.saturating_add(layer_base);
+            }
+        }
+        self.geom_materials.append(&mut part.geom_materials);
+        self.tex_layers.append(&mut part.tex_layers);
+        self.els_points.append(&mut part.els_points);
+        self.vehicle_attach_points.append(&mut part.vehicle_attach_points);
+
+        let triangle_end = self.tris.len();
+        if triangle_end > triangle_base {
+            self.parts.push(MeshPart {
+                name: part.name,
+                geoms: part.geom_count,
+                tris: triangle_base..triangle_end,
+            });
+        }
+        self.geom_count += part.geom_count;
+        self.meshlet_count += part.meshlet_count;
+        self.bone_count = self.bone_count.max(part.bone_count);
+        self.has_els |= part.has_els;
+        self.active_part = None;
+        self.set_active_part(None);
+        self.apply_tex_layers();
+    }
+
+    // writes visible parts as obj one group per drawable and recenters isolated part
     pub fn export_obj(&self, path: &Path) -> std::io::Result<()> {
         let mut w = BufWriter::new(File::create(path)?);
         writeln!(w, "# Percy6Stars RAGE9 Model Export: {}", self.name)?;
@@ -506,7 +759,8 @@ pub fn read_virtual_from_file(f: &mut File, file_off: u64) -> Result<(Vec<u8>, u
     }
     let v_cnt = v[bmap_off + 8] as usize;
     let p_cnt = v[bmap_off + 9] as usize;
-    if !(1..=32).contains(&v_cnt) || !(1..=64).contains(&p_cnt) {
+    // Meta-only 0x7a resources legitimately use p_cnt = 0 (no graphics pages).
+    if !(1..=32).contains(&v_cnt) || p_cnt > 64 {
         return Err(format!("Invalid RAGE9 BlockMap counts (v={v_cnt}, p={p_cnt})"));
     }
     for _ in v_chunks_read..v_cnt {
@@ -797,120 +1051,124 @@ fn drawable_lod_shader_map(v: &[u8], base: usize, lod: usize) -> HashMap<(usize,
     out
 }
 
-enum MaterialTexture<'a> {
-    Embedded(&'a Arc<Texture2D>),
-    Streamed(u64, &'a crate::tex::TtpfHashHit),
-}
-
-#[derive(Default)]
-struct StreamedMaterialCache(HashMap<u64, Option<Arc<Texture2D>>>);
-
-impl StreamedMaterialCache {
-    fn decode(&mut self, hash: u64, hit: &crate::tex::TtpfHashHit) -> Option<Arc<Texture2D>> {
-        if let Some(cached) = self.0.get(&hash) {
-            return cached.clone();
-        }
-        if self.0.len() >= 384 {
-            return None;
-        }
-        let tex = crate::tex::decode_ttpf_texture_cached(hit);
-        self.0.insert(hash, tex.clone());
-        tex
-    }
-}
-
-fn resolve_shader_material(
-    v: &[u8],
-    shader: usize,
-    embedded: &HashMap<usize, (u8, Arc<Texture2D>)>,
-    ttpf_idx: Option<&HashMap<u64, crate::tex::TtpfHashHit>>,
-    is_vehicle: bool,
-    streamed: &mut StreamedMaterialCache,
-) -> GeomMaterial {
-    const DIFFUSE_TEX: u32 = 0xc8e8_c282; // joaat("diffuseTex")
-    const DIFFUSE_TEX2: u32 = 0x0df4_7048; // joaat("diffuseTex2")
-    const TINT_PALETTE_TEX: u32 = 0x2c8d_7182; // joaat("tintPaletteTex")
-    const ALT0_TEX: u32 = 0x3463_94ea; // vehicle body/livery/detail slot 0
-    const EMISSIVE_TEX: u32 = 0x8e0d_63ee; // joaat("emissiveTex")
-    const GLASS_SHADER: u32 = 0xe3ba_3129;
-    const EYE_SHADER: u32 = 0x89a1_cf72; // ped and animal eyeballs
-
-    let mut mat = GeomMaterial::default();
-    if shader + 0x28 > v.len() || &v[shader + 4..shader + 8] != b"atem" { return mat; }
-    mat.pass = match v.get(shader + 0x3c) {
-        Some(2) if ru32(v, shader) == GLASS_SHADER => MaterialPass::Glass { texture_alpha: false },
-        Some(2) => MaterialPass::Alpha,
-        Some(4) => MaterialPass::Decal,
-        Some(8) => MaterialPass::Cutout,
-        _ => MaterialPass::Opaque,
-    };
-    let Some(params) = vptr(ru64(v, shader + 0x20)) else { return mat };
-    let Some(slots) = vptr(ru64(v, shader + 0x10)) else { return mat };
-    if params + 8 > v.len() { return mat; }
-
-    let mut has_tint = false;
-    let mut candidates = [None, None, None, None];
-    for k in 0..v[params + 1] as usize {
-        let ent = params + 8 + k * 8;
+// texture parameters of the shader at saddr as param name hash and bound 64 bit texture hash none when the slot is empty
+fn shader_texture_params(v: &[u8], saddr: usize) -> Vec<(u32, Option<u64>)> {
+    let mut out = Vec::new();
+    if saddr + 0x28 > v.len() { return out; }
+    let (Some(p2), Some(p4)) = (vptr(ru64(v, saddr + 0x10)), vptr(ru64(v, saddr + 0x20))) else { return out };
+    if p4 + 8 > v.len() { return out; }
+    let tcnt = (v[p4 + 1] as usize).min(48);
+    for k in 0..tcnt {
+        let ent = p4 + 8 + k * 8;
         if ent + 8 > v.len() { break; }
-        let rank = match ru32(v, ent) {
-            DIFFUSE_TEX => 0,
-            ALT0_TEX => 1,
-            DIFFUSE_TEX2 => 2,
-            EMISSIVE_TEX => 3,
-            TINT_PALETTE_TEX => {
-                has_tint = true;
-                continue;
-            }
-            _ => continue, // An sRGB format alone does not make a map an albedo.
-        };
-        let code = ru32(v, ent + 4) as usize;
-        if code % 4 != 0 || slots + code * 2 + 8 > v.len() { continue; }
-        let Some(tp) = vptr(ru64(v, slots + code * 2)) else { continue };
-        let (candidate, dxgi) = if let Some((format, tex)) = embedded.get(&tp) {
-            (MaterialTexture::Embedded(tex), *format)
-        } else {
-            if tp + 0x38 > v.len() || ru64(v, tp + 0x10) != 0x980 { continue; }
-            let Some(reference) = vptr(ru64(v, tp + 0x30)) else { continue };
-            if reference + 16 > v.len() { continue; }
-            let hash = ru64(v, reference + 8);
-            let Some(hit) = ttpf_idx.and_then(|index| index.get(&hash)) else { continue };
-            let min_size = if rank == 0 { 4 } else { 16 };
-            if hit.w < min_size || hit.h < min_size { continue; }
-            (MaterialTexture::Streamed(hash, hit), hit.dxgi)
-        };
-        let uses_opacity = !matches!(mat.pass, MaterialPass::Opaque);
-        if !matches!(dxgi, 65 | 80 | 81 | 83 | 84) || (dxgi == 65 && uses_opacity && rank == 0) {
-            candidates[rank] = Some(candidate);
-        }
+        let param_hash = ru32(v, ent);
+        let slot = (ru32(v, ent + 4) / 4) as usize;
+        let tex_hash = (|| {
+            if p2 + slot * 8 + 8 > v.len() { return None; }
+            let tp = vptr(ru64(v, p2 + slot * 8))?;
+            if tp + 0x40 > v.len() || ru64(v, tp + 0x10) != 0x980 { return None; }
+            let ref_off = vptr(ru64(v, tp + 0x30))?;
+            if ref_off + 16 > v.len() { return None; }
+            Some(ru64(v, ref_off + 8))
+        })();
+        out.push((param_hash, tex_hash));
     }
+    out
+}
 
-    let paint_shader = is_vehicle && has_tint;
-    let candidate_count = if paint_shader { 2 } else { candidates.len() };
-    let has_color_binding = candidates[..candidate_count].iter().any(Option::is_some);
-    mat.texture = candidates.into_iter().take(candidate_count).flatten().find_map(|candidate| {
-        match candidate {
-            MaterialTexture::Embedded(tex) => Some(tex.clone()),
-            MaterialTexture::Streamed(hash, hit) => streamed.decode(hash, hit),
+// shader addresses of the shader group of drawable at base
+fn drawable_shader_addrs(v: &[u8], base: usize) -> Vec<usize> {
+    if base + 0x18 > v.len() { return Vec::new(); }
+    let Some(sg) = vptr(ru64(v, base + 0x10)) else { return Vec::new() };
+    if sg + 0x20 > v.len() { return Vec::new(); }
+    let Some(sp) = vptr(ru64(v, sg + 0x10)) else { return Vec::new() };
+    let scnt = ru16(v, sg + 0x18) as usize;
+    if scnt == 0 || scnt > 512 || sp + scnt * 8 > v.len() { return Vec::new(); }
+    // verify rage9 atem meta shader table tag
+    let Some(s0) = vptr(ru64(v, sp)) else { return Vec::new() };
+    if s0 + 8 > v.len() || (ru64(v, s0) >> 32) != 0x6d65_7461 { return Vec::new(); }
+    (0..scnt).filter_map(|i| vptr(ru64(v, sp + i * 8))).collect()
+}
+
+// known shader texture parameter names by joaat hash
+pub fn texture_param_name(param_hash: u32) -> Option<&'static str> {
+    Some(match param_hash {
+        0xc8e8_c282 => "diffuseTex",
+        0x2c8d_7182 => "tintPaletteTex",
+        0x8e0d_63ee => "emissiveTex",
+        0x7485_dafb => "dirtDiffuseTex",
+        0xcc15_5f4b => "dirtNoiseTex",
+        0xfb03_ae36 => "DustTexture",
+        _ => return None,
+    })
+}
+
+// one external texture a model binds in its shaders
+#[derive(Clone, Debug)]
+pub struct ModelTexRef {
+    pub hash64: u64,
+    // shader parameters this texture is bound to
+    pub params: Vec<u32>,
+    // number of shaders that bind it
+    pub shaders: usize,
+    // location in the ttpf pools none when no pool holds this hash
+    pub hit: Option<crate::tex::TtpfHashHit>,
+}
+
+impl ModelTexRef {
+    // short role label from the parameter name or the pixel format
+    pub fn role(&self) -> String {
+        if let Some(n) = self.params.iter().find_map(|&p| texture_param_name(p)) {
+            return n.to_string();
         }
-    });
-    if ru32(v, shader) == EYE_SHADER {
-        // The eye's diffuseTex is just the iris on a transparent background; the game
-        // shader fills the rest with the sclera. Bake that in so the preview isn't black.
-        mat.texture = mat.texture.map(|t| over_sclera(&t));
-    }
-    if matches!(mat.pass, MaterialPass::Glass { .. }) {
-        // Some glass uses a constant placeholder or has no decodable color map.
-        // The game shader still draws it; use a translucent tint in the preview.
-        if mat.texture.as_ref().is_some_and(|t| t.w <= 4 && t.h <= 4 && t.pixels.iter().all(|p| p.a() == 0)) {
-            mat.texture = None;
-        }
-        mat.pass = MaterialPass::Glass {
-            texture_alpha: mat.texture.as_ref().is_some_and(|t| t.pixels.iter().any(|p| p.a() < 255)),
+        let kind = match &self.hit {
+            Some(h) if h.is_normal_format() => "normal",
+            Some(h) if h.is_srgb() => "color",
+            Some(_) => "linear",
+            None => "param",
         };
+        format!("{kind}_{:08x}", self.params.first().copied().unwrap_or(0))
     }
-    mat.is_vehicle_paint = paint_shader && !has_color_binding && mat.pass == MaterialPass::Opaque;
-    mat
+}
+
+// every external texture bound by the shaders of the model at file_off in first use order
+pub fn list_model_texture_refs(rpf_path: &Path, file_off: u64) -> Result<Vec<ModelTexRef>, String> {
+    let mut f = File::open(rpf_path).map_err(|e| format!("Open error: {e}"))?;
+    let (v, _, _) = read_virtual_from_file(&mut f, file_off)?;
+    let mut bases: Vec<usize> = drawable_dictionary_entries(&v).into_iter().map(|(_, b)| b).collect();
+    if bases.is_empty() {
+        bases.push(0);
+        if v.len() >= 0x20 {
+            if let Some(fo) = vptr(ru64(&v, 0x18)) {
+                bases.push(fo);
+            }
+        }
+    }
+    let idx = crate::tex::ttpf_hash_index_for_rpf(rpf_path);
+    let mut out: Vec<ModelTexRef> = Vec::new();
+    let mut pos: HashMap<u64, usize> = HashMap::new();
+    let mut seen_shaders = HashSet::new();
+    for base in bases {
+        for saddr in drawable_shader_addrs(&v, base) {
+            if !seen_shaders.insert(saddr) { continue; }
+            let mut in_shader = HashSet::new();
+            for (param, tex_hash) in shader_texture_params(&v, saddr) {
+                let Some(h64) = tex_hash else { continue };
+                let i = *pos.entry(h64).or_insert_with(|| {
+                    out.push(ModelTexRef {
+                        hash64: h64,
+                        params: Vec::new(),
+                        shaders: 0,
+                        hit: idx.as_ref().and_then(|m| m.get(&h64).cloned()),
+                    });
+                    out.len() - 1
+                });
+                if !out[i].params.contains(&param) { out[i].params.push(param); }
+                if in_shader.insert(h64) { out[i].shaders += 1; }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Composite a texture over an off-white eyeball color. `Color32` is premultiplied.
@@ -931,7 +1189,48 @@ fn over_sclera(t: &Arc<Texture2D>) -> Arc<Texture2D> {
     Arc::new(Texture2D { w: t.w, h: t.h, pixels })
 }
 
-/// Bind each geometry to its shader's own texture, whether embedded or streamed.
+/// Colour texture a shader binds from the drawable's own embedded dictionary, with its
+/// priority rank (0 = diffuseTex). Ped parts, props and small models embed their textures
+/// instead of streaming them from the .ttpf pools.
+fn embedded_shader_color(
+    v: &[u8],
+    shader: usize,
+    embedded: &HashMap<usize, (u8, Arc<Texture2D>)>,
+    uses_opacity: bool,
+) -> Option<(usize, Arc<Texture2D>)> {
+    const DIFFUSE_TEX: u32 = 0xc8e8_c282; // joaat("diffuseTex")
+    const DIFFUSE_TEX2: u32 = 0x0df4_7048; // joaat("diffuseTex2")
+    const ALT0_TEX: u32 = 0x3463_94ea; // vehicle body/livery/detail slot 0
+    const EMISSIVE_TEX: u32 = 0x8e0d_63ee; // joaat("emissiveTex")
+    if embedded.is_empty() || shader + 0x28 > v.len() { return None; }
+    let params = vptr(ru64(v, shader + 0x20))?;
+    let slots = vptr(ru64(v, shader + 0x10))?;
+    if params + 8 > v.len() { return None; }
+    let mut best: Option<(usize, Arc<Texture2D>)> = None;
+    for k in 0..v[params + 1] as usize {
+        let ent = params + 8 + k * 8;
+        if ent + 8 > v.len() { break; }
+        let rank = match ru32(v, ent) {
+            DIFFUSE_TEX => 0,
+            ALT0_TEX => 1,
+            DIFFUSE_TEX2 => 2,
+            EMISSIVE_TEX => 3,
+            _ => continue, // An sRGB format alone does not make a map an albedo.
+        };
+        let code = ru32(v, ent + 4) as usize;
+        if code % 4 != 0 || slots + code * 2 + 8 > v.len() { continue; }
+        let Some(tp) = vptr(ru64(v, slots + code * 2)) else { continue };
+        let Some((dxgi, tex)) = embedded.get(&tp) else { continue };
+        let usable = !matches!(dxgi, 65 | 80 | 81 | 83 | 84) || (*dxgi == 65 && uses_opacity && rank == 0);
+        if usable && best.as_ref().is_none_or(|(r, _)| rank < *r) {
+            best = Some((rank, tex.clone()));
+        }
+    }
+    best
+}
+
+/// Bind each geometry to its shader's textures: embedded ones directly, pooled ones as
+/// switchable layers (upstream's layer system from asm512).
 fn resolve_drawable_materials(
     v: &[u8],
     p: &[u8],
@@ -940,8 +1239,18 @@ fn resolve_drawable_materials(
     geoms: &[GeomRef],
     ttpf_idx: Option<&HashMap<u64, crate::tex::TtpfHashHit>>,
     is_vehicle: bool,
-    streamed: &mut StreamedMaterialCache,
+    layers: &mut Vec<TexLayer>,
+    layer_pos: &mut HashMap<u64, u16>,
 ) -> Vec<GeomMaterial> {
+    const DIFFUSE_TEX: u32 = 0xc8e8_c282; // diffuseTex
+    const TINT_PALETTE_TEX: u32 = 0x2c8d_7182; // tintPaletteTex
+    const ALT0_TEX: u32 = 0x3463_94ea; // vehicle body livery detail slot 0
+    const EMISSIVE_TEX: u32 = 0x8e0d_63ee; // emissiveTex
+    const DIRT_DIFFUSE_TEX: u32 = 0x7485_dafb; // dirtDiffuseTex
+    const SHARED_LUT_PARAM: u32 = 0x19df_25d7; // shared 128x256 vehicle lookup texture
+    const GLASS_SHADER: u32 = 0xe3ba_3129;
+    const EYE_SHADER: u32 = 0x89a1_cf72; // ped and animal eyeballs
+
     let mut mats = vec![GeomMaterial::default(); geoms.len()];
     if base + 0x18 > v.len() { return mats; }
     let Some(sg) = vptr(ru64(v, base + 0x10)) else { return mats };
@@ -954,6 +1263,10 @@ fn resolve_drawable_materials(
         .flat_map(|txd| crate::tex::extract_txd_textures_by_ptr(v, p, txd))
         .map(|(ptr, tex)| (ptr, (tex.dxgi, Arc::new(crate::tex::to_model_tex(tex)))))
         .collect();
+    // verify rage9 atem meta shader table tag
+    let Some(s0) = vptr(ru64(v, sp)) else { return mats };
+    if s0 + 8 > v.len() || (ru64(v, s0) >> 32) != 0x6d65_7461 { return mats; }
+
     let smap = drawable_lod_shader_map(v, base, lod);
     let has_main_pass = smap.values().any(|&(_, mask)| mask & 1 != 0);
     let mut shader_cache: HashMap<u16, GeomMaterial> = HashMap::new();
@@ -966,11 +1279,120 @@ fn resolve_drawable_materials(
             continue;
         }
         if sidx as usize >= scnt { continue; }
-        mats[gi] = shader_cache.entry(sidx).or_insert_with(|| {
-            vptr(ru64(v, sp + sidx as usize * 8))
-                .map(|shader| resolve_shader_material(v, shader, &embedded, ttpf_idx, is_vehicle, streamed))
-                .unwrap_or_default()
-        }).clone();
+        if let Some(cached) = shader_cache.get(&sidx) {
+            mats[gi] = cached.clone();
+            continue;
+        }
+        let mut mat = GeomMaterial::default();
+        if (sidx as usize) < scnt {
+            if let Some(saddr) = vptr(ru64(v, sp + (sidx as usize) * 8)) {
+                if saddr + 0x28 <= v.len() {
+                    mat.pass = match v.get(saddr + 0x3c) {
+                        Some(2) if ru32(v, saddr) == GLASS_SHADER => MaterialPass::Glass { texture_alpha: false },
+                        Some(2) => MaterialPass::Alpha,
+                        Some(4) => MaterialPass::Decal,
+                        Some(8) => MaterialPass::Cutout,
+                        _ => MaterialPass::Opaque,
+                    };
+                    let mut has_tint = false;
+                    let mut diffuse_cand: Option<u16> = None;
+                    let mut alt0_cand: Option<u16> = None;
+                    let mut emissive_cand: Option<u16> = None;
+                    let mut fallback_srgb: Option<u16> = None;
+                    let uses_opacity = !matches!(mat.pass, MaterialPass::Opaque);
+                    let mut layer_of = |h64: u64, hit: &crate::tex::TtpfHashHit, param: u32, kind: TexLayerKind| -> Option<u16> {
+                        if let Some(&i) = layer_pos.get(&h64) {
+                            return Some(i);
+                        }
+                        let i = u16::try_from(layers.len()).ok()?;
+                        let label = match (texture_param_name(param), kind) {
+                            (Some(n), _) => n.to_string(),
+                            (None, _) if param == ALT0_TEX => "liveryDetail".to_string(),
+                            (None, TexLayerKind::Color) => format!("color_{param:08x}"),
+                            (None, TexLayerKind::Normal) => format!("normal_{param:08x}"),
+                            (None, TexLayerKind::Overlay) => format!("overlay_{param:08x}"),
+                        };
+                        layers.push(TexLayer {
+                            hash64: h64,
+                            label,
+                            kind,
+                            w: hit.w,
+                            h: hit.h,
+                            source: format!("{} #{}", hit.path.file_stem().map(|s| s.to_string_lossy()).unwrap_or_default(), hit.tex_idx),
+                            mats: 0,
+                            enabled: false,
+                            default_on: false,
+                            hit: hit.clone(),
+                            tex: None,
+                            failed: false,
+                        });
+                        layer_pos.insert(h64, i);
+                        Some(i)
+                    };
+
+                    for (param_hash, tex_hash) in shader_texture_params(v, saddr) {
+                        if param_hash == TINT_PALETTE_TEX {
+                            has_tint = true;
+                        }
+                        let Some(idx_map) = ttpf_idx else { continue };
+                        let Some(h64) = tex_hash else { continue };
+                        let Some(hit) = idx_map.get(&h64) else { continue };
+                        let big = hit.w >= 16 && hit.h >= 16;
+                        if hit.is_normal_format() {
+                            if big {
+                                if let Some(i) = layer_of(h64, hit, param_hash, TexLayerKind::Normal) {
+                                    if !mat.normal_layers.contains(&i) { mat.normal_layers.push(i); }
+                                }
+                            }
+                            continue;
+                        }
+                        if hit.dxgi == 65 && !(uses_opacity && param_hash == DIFFUSE_TEX) { continue; }
+
+                        if param_hash == DIFFUSE_TEX && hit.w >= 4 && hit.h >= 4 {
+                            diffuse_cand = layer_of(h64, hit, param_hash, TexLayerKind::Color);
+                        } else if param_hash == ALT0_TEX && big {
+                            alt0_cand = layer_of(h64, hit, param_hash, TexLayerKind::Color);
+                        } else if param_hash == EMISSIVE_TEX && big {
+                            emissive_cand = layer_of(h64, hit, param_hash, TexLayerKind::Color);
+                        } else if hit.is_srgb()
+                            && big
+                            && param_hash != DIRT_DIFFUSE_TEX
+                            && param_hash != SHARED_LUT_PARAM
+                            && fallback_srgb.is_none()
+                        {
+                            fallback_srgb = layer_of(h64, hit, param_hash, TexLayerKind::Color);
+                        } else if big && param_hash != SHARED_LUT_PARAM {
+                            if let Some(i) = layer_of(h64, hit, param_hash, TexLayerKind::Overlay) {
+                                if !mat.overlay_layers.contains(&i) { mat.overlay_layers.push(i); }
+                            }
+                        }
+                    }
+
+                    // color candidates in priority order tinted vehicle bodies only take diffuse or livery detail
+                    let tinted_body = has_tint && is_vehicle;
+                    let extra = if tinted_body { [None, None] } else { [emissive_cand, fallback_srgb] };
+                    for i in [diffuse_cand, alt0_cand].into_iter().chain(extra).flatten() {
+                        if !mat.color_layers.contains(&i) { mat.color_layers.push(i); }
+                    }
+                    // a texture already used as color or normal is not also multiplied over the same material
+                    mat.overlay_layers.retain(|i| !mat.color_layers.contains(i) && !mat.normal_layers.contains(i));
+                    // An embedded texture wins unless a pooled one has a better rank.
+                    if let Some((rank, tex)) = embedded_shader_color(v, saddr, &embedded, uses_opacity) {
+                        let pooled_better = (rank > 0 && diffuse_cand.is_some())
+                            || (rank > 1 && alt0_cand.is_some())
+                            || (rank > 3 && emissive_cand.is_some());
+                        let allowed = !tinted_body || rank <= 1;
+                        if !pooled_better && allowed {
+                            mat.embedded_color = Some(tex);
+                        }
+                    }
+                    mat.eye = ru32(v, saddr) == EYE_SHADER;
+                    mat.paint_capable = tinted_body && mat.pass == MaterialPass::Opaque && mat.embedded_color.is_none();
+                }
+            }
+        }
+        shader_cache.insert(sidx, mat.clone());
+        mats[gi] = mat;
     }
     mats
 }
@@ -1274,6 +1696,116 @@ fn extract_rage9_bone_count(v: &[u8]) -> usize {
     0
 }
 
+fn quat_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    [
+        a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+        a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+        a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+        a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+    ]
+}
+
+fn quat_rotate(q: [f32; 4], p: [f32; 3]) -> [f32; 3] {
+    let qv = [q[0], q[1], q[2]];
+    let uv = [
+        qv[1] * p[2] - qv[2] * p[1],
+        qv[2] * p[0] - qv[0] * p[2],
+        qv[0] * p[1] - qv[1] * p[0],
+    ];
+    let uuv = [
+        qv[1] * uv[2] - qv[2] * uv[1],
+        qv[2] * uv[0] - qv[0] * uv[2],
+        qv[0] * uv[1] - qv[1] * uv[0],
+    ];
+    [
+        p[0] + 2.0 * (q[3] * uv[0] + uuv[0]),
+        p[1] + 2.0 * (q[3] * uv[1] + uuv[1]),
+        p[2] + 2.0 * (q[3] * uv[2] + uuv[2]),
+    ]
+}
+
+fn rage9_siren_slot(name: &str) -> Option<u16> {
+    let lower = name.to_ascii_lowercase();
+    let siren_at = lower.rfind("siren")?;
+    lower[siren_at + "siren".len()..].parse::<u16>().ok()
+}
+
+// RAGE 9 vehicle ELS emitters are skeleton bones whose final token is siren<number>,
+// for example siren1, ext_front_siren2, or ext_rear_1_roof_siren1.
+// They are independent from emissiveTex, which is commonly the dashboard gauge atlas.
+fn extract_rage9_skeleton_points(v: &[u8]) -> (Vec<ElsPoint>, Vec<(String, [f32; 3])>) {
+    let mut bases = vec![0usize];
+    if v.len() >= 0x20 {
+        if let Some(fo) = vptr(ru64(v, 0x18)) {
+            if fo + 0x20 <= v.len() { bases.push(fo); }
+        }
+    }
+    for base in bases {
+        let Some(so) = (base + 0x20 <= v.len()).then(|| vptr(ru64(v, base + 0x18))).flatten() else { continue };
+        if so + 0x70 > v.len() { continue; }
+        let count = ru16(v, so + 0x6c) as usize;
+        let Some(bones) = vptr(ru64(v, so + 0x28)) else { continue };
+        if !(1..=1024).contains(&count) || bones + count * 0x50 > v.len() { continue; }
+
+        let mut world_rot = vec![[0.0, 0.0, 0.0, 1.0]; count];
+        let mut world_pos = vec![[0.0; 3]; count];
+        let mut world_scale = vec![[1.0; 3]; count];
+        let mut out = Vec::new();
+        let mut attach_points = Vec::new();
+        for i in 0..count {
+            let b = bones + i * 0x50;
+            let mut rot = [rf32(v, b), rf32(v, b + 4), rf32(v, b + 8), rf32(v, b + 12)];
+            let len = (rot.iter().map(|x| x * x).sum::<f32>()).sqrt();
+            if len > 1e-6 {
+                for x in &mut rot { *x /= len; }
+            } else {
+                rot = [0.0, 0.0, 0.0, 1.0];
+            }
+            let pos = [rf32(v, b + 0x10), rf32(v, b + 0x14), rf32(v, b + 0x18)];
+            let scale = [rf32(v, b + 0x20), rf32(v, b + 0x24), rf32(v, b + 0x28)];
+            let parent = ru16(v, b + 0x46) as usize;
+            if parent < i {
+                let scaled = [
+                    pos[0] * world_scale[parent][0],
+                    pos[1] * world_scale[parent][1],
+                    pos[2] * world_scale[parent][2],
+                ];
+                let offset = quat_rotate(world_rot[parent], scaled);
+                world_pos[i] = [
+                    world_pos[parent][0] + offset[0],
+                    world_pos[parent][1] + offset[1],
+                    world_pos[parent][2] + offset[2],
+                ];
+                world_rot[i] = quat_mul(world_rot[parent], rot);
+                world_scale[i] = [
+                    world_scale[parent][0] * scale[0],
+                    world_scale[parent][1] * scale[1],
+                    world_scale[parent][2] * scale[2],
+                ];
+            } else {
+                world_pos[i] = pos;
+                world_rot[i] = rot;
+                world_scale[i] = scale;
+            }
+
+            let Some(name_off) = vptr(ru64(v, b + 0x30)) else { continue };
+            let end = v[name_off..].iter().position(|&c| c == 0).map(|n| name_off + n).unwrap_or(name_off);
+            let Ok(name) = std::str::from_utf8(&v[name_off..end]) else { continue };
+            attach_points.push((name.to_string(), world_pos[i]));
+            let Some(number) = rage9_siren_slot(name) else { continue };
+            out.push(ElsPoint {
+                position: world_pos[i],
+                bank: number % 2 == 0,
+                slot: number.min(u8::MAX as u16) as u8,
+            });
+        }
+        if !out.is_empty() || !attach_points.is_empty() {
+            return (out, attach_points);
+        }
+    }
+    (Vec::new(), Vec::new())
+}
+
 pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name: &str) -> Result<Mesh3D, String> {
     decode_rage9_model_from_rpf_lod(rpf_path, file_off, fallback_name, 0)
 }
@@ -1354,13 +1886,16 @@ pub fn decode_rage9_model_from_rpf_lod(rpf_path: &Path, file_off: u64, fallback_
     let mut parts = Vec::with_capacity(groups.len());
     let mut part_verts = Vec::with_capacity(groups.len());
     let mut geom_materials: Vec<GeomMaterial> = Vec::with_capacity(geom_count);
-    let mut streamed = StreamedMaterialCache::default();
+    let mut tex_layers: Vec<TexLayer> = Vec::new();
+    let mut layer_pos: HashMap<u64, u16> = HashMap::new();
     let mut gi_idx = 0u16;
     for (name, base_opt, geoms) in &groups {
-        let mats = if let Some(base) = *base_opt {
-            resolve_drawable_materials(&v, &p, base, lod, geoms, ttpf_idx.as_deref(), is_vehicle, &mut streamed)
-        } else {
-            vec![GeomMaterial::default(); geoms.len()]
+        let mats = {
+            if let Some(base) = *base_opt {
+                resolve_drawable_materials(&v, &p, base, lod, geoms, ttpf_idx.as_deref(), is_vehicle, &mut tex_layers, &mut layer_pos)
+            } else {
+                vec![GeomMaterial::default(); geoms.len()]
+            }
         };
         let (t0, v0) = (b.tris.len(), b.verts.len());
         for (&g, mut mat) in geoms.iter().zip(mats) {
@@ -1380,17 +1915,28 @@ pub fn decode_rage9_model_from_rpf_lod(rpf_path: &Path, file_off: u64, fallback_
     }
     layout_parts_in_grid(&mut b.verts, &part_verts);
 
-    let resolved_tex_geoms = geom_materials.iter().filter(|m| m.texture.is_some()).count();
-    let paint_geoms = geom_materials.iter().filter(|m| m.is_vehicle_paint).count();
-    let preview_geoms = geom_materials.iter().filter(|m| !m.auxiliary_pass).count();
-    let tex_status = match (resolved_tex_geoms, paint_geoms) {
-        (0, 0) if ttpf_idx.is_none() => "No .ttpf archives found; neutral preview".into(),
-        (0, 0) => "No usable color textures; neutral preview".into(),
-        (0, paint) => format!("Preview paint: {paint}/{preview_geoms} geoms"),
-        (tex, 0) => format!("Textures: {tex}/{preview_geoms} geoms"),
-        (tex, paint) => format!("Textures: {tex}/{preview_geoms} geoms + preview paint ({paint})"),
-    };
+    // Optional vehicle fragments are often too small to pass the whole-vehicle
+    // classifier but can still carry their own siren emitter bones.
+    let (els_points, vehicle_attach_points) = extract_rage9_skeleton_points(&v);
 
+    // default look applies the first color candidate of every drawn material
+    for m in geom_materials.iter().filter(|m| !m.auxiliary_pass) {
+        for &i in m.color_layers.iter().chain(&m.normal_layers).chain(&m.overlay_layers) {
+            tex_layers[i as usize].mats += 1;
+        }
+        if let Some(&first) = m.color_layers.first() {
+            tex_layers[first as usize].default_on = true;
+        }
+    }
+    for l in &mut tex_layers {
+        l.enabled = l.default_on;
+    }
+
+    let tex_status: String = if ttpf_idx.is_none() {
+        "No .ttpf archives found; neutral preview".into()
+    } else {
+        "No usable color textures; neutral preview".into()
+    };
     let mut mesh = Mesh3D::from_parts(
         model_name,
         b.verts,
@@ -1405,7 +1951,11 @@ pub fn decode_rage9_model_from_rpf_lod(rpf_path: &Path, file_off: u64, fallback_
         lod_label,
     );
     mesh.geom_materials = geom_materials;
-    mesh.has_paint_geom = paint_geoms > 0;
+    mesh.tex_layers = tex_layers;
+    mesh.has_els = !els_points.is_empty();
+    mesh.els_points = els_points;
+    mesh.vehicle_attach_points = vehicle_attach_points;
+    mesh.apply_tex_layers();
     mesh.bone_count = extract_rage9_bone_count(&v);
     mesh.lod = lod;
     mesh.lod_geoms = lod_geoms;
@@ -1461,6 +2011,15 @@ fn blend_preview_pixel(dst: &mut Color32, src: Color32, alpha: u8) {
     let a = alpha as u16;
     let mix = |s: u8, d: u8| ((s as u16 * a + d as u16 * (255 - a) + 127) / 255) as u8;
     *dst = Color32::from_rgb(mix(src.r(), dst.r()), mix(src.g(), dst.g()), mix(src.b(), dst.b()));
+}
+
+#[inline]
+fn add_preview_pixel(dst: &mut Color32, src: Color32, strength: f32) {
+    *dst = Color32::from_rgb(
+        (dst.r() as f32 + src.r() as f32 * strength).min(255.0) as u8,
+        (dst.g() as f32 + src.g() as f32 * strength).min(255.0) as u8,
+        (dst.b() as f32 + src.b() as f32 * strength).min(255.0) as u8,
+    );
 }
 
 fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
@@ -1585,6 +2144,13 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                 {
                     continue;
                 }
+                // normal map and multiply overlays of the material only in textured mode without a manual texture
+                let layered = do_textured && has_uvs && mesh.texture.is_none();
+                let normal_tex: Option<&Texture2D> = if layered { gmat.and_then(|m| m.normal.as_deref()) } else { None };
+                let overlay_texs: &[Arc<Texture2D>] = match gmat {
+                    Some(m) if layered => &m.overlays,
+                    _ => &[],
+                };
                 let blend = blend_material(ti).is_some();
                 let pass = if do_textured && mesh.texture.is_some() {
                     MaterialPass::Cutout
@@ -1616,20 +2182,29 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                     continue;
                 }
 
-                let n = mesh.normals[ti];
-                let nx1 = n[0] * cy - n[1] * sy;
-                let ny1 = n[0] * sy + n[1] * cy;
-                let ny2 = -ny1 * cp + n[2] * sp;
-                let nz2 = n[2] * cp + ny1 * sp;
-
-                let ndl1 = (nx1 * l1[0] + ny2 * l1[1] + nz2 * l1[2]).abs();
-                let ndl2 = (nx1 * l2[0] + ny2 * l2[1] + nz2 * l2[2]).max(0.0);
-                let spec = ndl1.powi(10) * 0.35;
-                let rim = (1.0 - ny2.abs()).powi(2) * 0.22;
-
-                let shade_r = (0.18 + ndl1 * 0.72 + spec + rim * 0.45).min(1.15);
-                let shade_g = (0.18 + ndl1 * 0.72 + ndl2 * 0.18 + spec + rim * 0.40).min(1.15);
-                let shade_b = (0.20 + ndl1 * 0.70 + ndl2 * 0.28 + spec + rim * 0.55).min(1.15);
+                // world vector into the lighting frame
+                let to_view = |n: [f32; 3]| {
+                    let ny1 = n[0] * sy + n[1] * cy;
+                    [n[0] * cy - n[1] * sy, -ny1 * cp + n[2] * sp, n[2] * cp + ny1 * sp]
+                };
+                // rgb shade factors plus the main light term and rim used by the paint clearcoat
+                let shade_of = |nv: [f32; 3]| {
+                    let ndl1 = (nv[0] * l1[0] + nv[1] * l1[1] + nv[2] * l1[2]).abs();
+                    let ndl2 = (nv[0] * l2[0] + nv[1] * l2[1] + nv[2] * l2[2]).max(0.0);
+                    let spec = ndl1.powi(10) * 0.35;
+                    let rim = (1.0 - nv[1].abs()).powi(2) * 0.22;
+                    (
+                        [
+                            (0.18 + ndl1 * 0.72 + spec + rim * 0.45).min(1.15),
+                            (0.18 + ndl1 * 0.72 + ndl2 * 0.18 + spec + rim * 0.40).min(1.15),
+                            (0.20 + ndl1 * 0.70 + ndl2 * 0.28 + spec + rim * 0.55).min(1.15),
+                        ],
+                        ndl1,
+                        rim,
+                    )
+                };
+                let n_view = to_view(mesh.normals[ti]);
+                let ([shade_r, shade_g, shade_b], ndl1, rim) = shade_of(n_view);
 
                 let is_paint = do_textured
                     && active_tex.is_none()
@@ -1676,14 +2251,33 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                 let mut w2_row = (px_start - p0[0]) * e01_dx + (py_start - p0[1]) * e01_dy;
                 let span_len = ix1 - ix0 + 1;
 
-                if let Some(tex) = active_tex {
+                if active_tex.is_some() || normal_tex.is_some() || !overlay_texs.is_empty() {
                     let uv0 = mesh.uvs[i0];
                     let uv1 = mesh.uvs[i1];
                     let uv2 = mesh.uvs[i2];
                     // Perspective-correct UVs: weight each corner by its 1/w (persp) so the
                     // texture stays pinned to the surface. Plain screen-space barycentrics
                     // (affine mapping) make the image slide along the quad diagonal as you orbit.
-                    let (q0, q1, q2) = (mesh.persp_buf[i0], mesh.persp_buf[i1], mesh.persp_buf[i2]);
+                    let (pq0, pq1, pq2) = (mesh.persp_buf[i0], mesh.persp_buf[i1], mesh.persp_buf[i2]);
+                    // tangent frame of the triangle in the lighting frame for normal mapping
+                    let tbn = normal_tex.and_then(|_| {
+                        let (q0, q1, q2) = (mesh.verts[i0], mesh.verts[i1], mesh.verts[i2]);
+                        let e1 = [q1[0] - q0[0], q1[1] - q0[1], q1[2] - q0[2]];
+                        let e2 = [q2[0] - q0[0], q2[1] - q0[1], q2[2] - q0[2]];
+                        let (du1, dv1, du2, dv2) = (uv1[0] - uv0[0], uv1[1] - uv0[1], uv2[0] - uv0[0], uv2[1] - uv0[1]);
+                        let det = du1 * dv2 - du2 * dv1;
+                        if det.abs() < 1e-12 {
+                            return None;
+                        }
+                        let unit = |a: [f32; 3]| {
+                            let l = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
+                            (l > 1e-12).then(|| [a[0] / l, a[1] / l, a[2] / l])
+                        };
+                        let t = unit(std::array::from_fn(|k| (e1[k] * dv2 - e2[k] * dv1) / det))?;
+                        let b = unit(std::array::from_fn(|k| (e2[k] * du1 - e1[k] * du2) / det))?;
+                        Some((to_view(t), to_view(b)))
+                    });
+                    let flat_rgb = [base_albedo[0] * 255.0, base_albedo[1] * 255.0, base_albedo[2] * 255.0];
                     for y in iy0..=iy1 {
                         let row_start = y * w + ix0;
                         let z_row = &mut mesh.z_buf[row_start..row_start + span_len];
@@ -1694,29 +2288,52 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                                 let (b0, b1, b2) = (w0 * inv_abs, w1 * inv_abs, w2 * inv_abs);
                                 let z = b0 * p0[2] + b1 * p1[2] + b2 * p2[2];
                                 if z + depth_bias > z_row[x] {
-                                    let (c0, c1, c2) = (b0 * q0, b1 * q1, b2 * q2);
+                                    // Perspective-correct blend (see q0..q2 above).
+                                    let (c0, c1, c2) = (b0 * pq0, b1 * pq1, b2 * pq2);
                                     let inv_q = 1.0 / (c0 + c1 + c2);
-                                    let tc = tex.sample(
-                                        (c0 * uv0[0] + c1 * uv1[0] + c2 * uv2[0]) * inv_q,
-                                        (c0 * uv0[1] + c1 * uv1[1] + c2 * uv2[1]) * inv_q,
-                                    );
-                                    let alpha = match pass {
-                                        MaterialPass::Opaque => 255,
-                                        MaterialPass::Cutout => if tc.a() >= 128 { 255 } else { 0 },
-                                        MaterialPass::Glass { texture_alpha: false } => GLASS_PREVIEW_ALPHA,
-                                        _ => tc.a(),
+                                    let u = (c0 * uv0[0] + c1 * uv1[0] + c2 * uv2[0]) * inv_q;
+                                    let v = (c0 * uv0[1] + c1 * uv1[1] + c2 * uv2[1]) * inv_q;
+                                    let tc = active_tex.map(|tex| tex.sample(u, v));
+                                    let alpha = match (pass, tc) {
+                                        (MaterialPass::Glass { .. }, None) | (MaterialPass::Glass { texture_alpha: false }, _) => GLASS_PREVIEW_ALPHA,
+                                        (MaterialPass::Opaque, _) | (_, None) => 255,
+                                        (MaterialPass::Cutout, Some(tc)) => if tc.a() >= 128 { 255 } else { 0 },
+                                        (_, Some(tc)) => tc.a(),
                                     };
                                     // Holes leave both color and depth untouched.
                                     if alpha != 0 {
-                                        let [r, g, b, _] = if pass != MaterialPass::Opaque && tc.a() != 255 {
-                                            tc.to_srgba_unmultiplied()
-                                        } else {
-                                            tc.to_array()
+                                        let mut rgb = match tc {
+                                            Some(tc) => {
+                                                let [r, g, b, _] = if pass != MaterialPass::Opaque && tc.a() != 255 {
+                                                    tc.to_srgba_unmultiplied()
+                                                } else {
+                                                    tc.to_array()
+                                                };
+                                                [r as f32, g as f32, b as f32]
+                                            }
+                                            None => flat_rgb,
                                         };
+                                        for ov in overlay_texs {
+                                            let oc = ov.sample(u, v);
+                                            rgb[0] *= oc.r() as f32 / 255.0;
+                                            rgb[1] *= oc.g() as f32 / 255.0;
+                                            rgb[2] *= oc.b() as f32 / 255.0;
+                                        }
+                                        let (shade, ndl, rim_px) = match (normal_tex, tbn) {
+                                            (Some(nt), Some((tv, bv))) => {
+                                                let nc = nt.sample(u, v);
+                                                let (tx, ty, tz) = (nc.r() as f32 / 127.5 - 1.0, nc.g() as f32 / 127.5 - 1.0, (nc.b() as f32 / 127.5 - 1.0).max(0.05));
+                                                let nv: [f32; 3] = std::array::from_fn(|k| tv[k] * tx + bv[k] * ty + n_view[k] * tz);
+                                                let len = (nv[0] * nv[0] + nv[1] * nv[1] + nv[2] * nv[2]).sqrt().max(1e-6);
+                                                shade_of([nv[0] / len, nv[1] / len, nv[2] / len])
+                                            }
+                                            _ => ([shade_r, shade_g, shade_b], ndl1, rim),
+                                        };
+                                        let coat = if is_paint { (ndl.powi(24) * 0.55 + rim_px * 0.14) * 255.0 } else { 0.0 };
                                         let src = Color32::from_rgb(
-                                            ((r as f32 * shade_r).min(255.0)) as u8,
-                                            ((g as f32 * shade_g).min(255.0)) as u8,
-                                            ((b as f32 * shade_b).min(255.0)) as u8,
+                                            ((rgb[0] * shade[0] + coat).min(255.0)) as u8,
+                                            ((rgb[1] * shade[1] + coat).min(255.0)) as u8,
+                                            ((rgb[2] * shade[2] + coat).min(255.0)) as u8,
                                         );
                                         if blend {
                                             blend_preview_pixel(&mut c_row[x], src, alpha);
@@ -1799,6 +2416,112 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
             }
         }
     }
+
+    if mesh.els_enabled && !mesh.els_points.is_empty() {
+        let glow_radius = ((w.min(h) as f32) * 0.014).clamp(5.0, 18.0);
+        let core_radius = (glow_radius * 0.28).max(2.0);
+        for light in &mesh.els_points {
+            if mesh.els_flash && !rage9_siren_lit(light.slot, mesh.els_flash_phase) {
+                continue;
+            }
+            let v = light.position;
+            let x = v[0] - ctr[0];
+            let y = v[1] - ctr[1];
+            let z = v[2] - ctr[2];
+            let x1 = x * cy - y * sy;
+            let y1 = x * sy + y * cy;
+            let y2 = -y1 * cp + z * sp;
+            let z2 = z * cp + y1 * sp;
+            let persp = 1.0 / (1.0 - (y2 * persp_k).clamp(-0.65, 0.65));
+            let sx = cx + x1 * scale * persp;
+            let sy = cy_s - z2 * scale * persp;
+            if sx < -glow_radius || sy < -glow_radius || sx >= wf + glow_radius || sy >= hf + glow_radius {
+                continue;
+            }
+            let center_x = sx.clamp(0.0, wf - 1.0) as usize;
+            let center_y = sy.clamp(0.0, hf - 1.0) as usize;
+            let center_depth = mesh.z_buf[center_y * w + center_x];
+            if center_depth.is_finite() && y2 < center_depth - mesh.radius * 0.08 {
+                continue;
+            }
+            let color = if light.bank {
+                Color32::from_rgb(45, 115, 255)
+            } else {
+                Color32::from_rgb(255, 35, 28)
+            };
+            let x0 = (sx - glow_radius).floor().max(0.0) as usize;
+            let x1 = (sx + glow_radius).ceil().min(wf - 1.0) as usize;
+            let y0 = (sy - glow_radius).floor().max(0.0) as usize;
+            let y1 = (sy + glow_radius).ceil().min(hf - 1.0) as usize;
+            for py in y0..=y1 {
+                for px in x0..=x1 {
+                    let dx = px as f32 + 0.5 - sx;
+                    let dy = py as f32 + 0.5 - sy;
+                    let distance = (dx * dx + dy * dy).sqrt();
+                    if distance <= glow_radius {
+                        let strength = if distance <= core_radius {
+                            1.0
+                        } else {
+                            let t = 1.0 - (distance - core_radius) / (glow_radius - core_radius);
+                            t * t * 0.42
+                        };
+                        add_preview_pixel(&mut mesh.color_buf[py * w + px], color, strength);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// dropdown that switches individual material textures of the mesh on and off
+pub fn tex_layer_menu(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
+    if mesh.tex_layers.is_empty() || mesh.texture.is_some() {
+        return;
+    }
+    let on = mesh.tex_layers.iter().filter(|l| l.enabled).count();
+    let mut changed = false;
+    let mut preset: Option<fn(&TexLayer) -> bool> = None;
+    ui.menu_button(format!("Applied textures {on}/{} ⏷", mesh.tex_layers.len()), |ui| {
+        ui.set_min_width(430.0);
+        ui.horizontal(|ui| {
+            if ui.button("Default").on_hover_text("One color texture per material").clicked() { preset = Some(|l| l.default_on); }
+            if ui.button("Color + normals").clicked() { preset = Some(|l| l.default_on || l.kind == TexLayerKind::Normal); }
+            if ui.button("None").clicked() { preset = Some(|_| false); }
+        });
+        ui.label(
+            RichText::new("Color: first ticked one per material is drawn. Normal: bends the lighting. Overlay: multiplied on top.")
+                .size(10.5)
+                .color(Color32::from_rgb(150, 160, 180)),
+        );
+        ui.separator();
+        egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+            for (kind, title) in [
+                (TexLayerKind::Color, "Color"),
+                (TexLayerKind::Normal, "Normal maps"),
+                (TexLayerKind::Overlay, "Overlays (dirt, dust, masks)"),
+            ] {
+                if !mesh.tex_layers.iter().any(|l| l.kind == kind) {
+                    continue;
+                }
+                ui.label(RichText::new(title).strong().size(11.5).color(Color32::from_rgb(255, 168, 28)));
+                for l in mesh.tex_layers.iter_mut().filter(|l| l.kind == kind) {
+                    let text = format!("{}  ·  {}x{}  ·  {} mat{}", l.label, l.w, l.h, l.mats, if l.mats == 1 { "" } else { "s" });
+                    let tip = format!("{}\nhash {:016x}{}", l.source, l.hash64, if l.failed { "\ncould not be decoded" } else { "" });
+                    if ui.checkbox(&mut l.enabled, text).on_hover_text(tip).changed() {
+                        changed = true;
+                    }
+                }
+                ui.add_space(4.0);
+            }
+        });
+    });
+    if let Some(f) = preset {
+        mesh.shade_mode = ShadeMode::Textured;
+        mesh.set_tex_layers(f);
+    } else if changed {
+        mesh.shade_mode = ShadeMode::Textured;
+        mesh.apply_tex_layers();
+    }
 }
 
 /// Drawable picker for multi-part meshes (drawable dictionaries). No-op otherwise.
@@ -1861,7 +2584,7 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
                     let rgba = img.to_rgba8();
                     let (w, h) = (rgba.width() as usize, rgba.height() as usize);
                     let pixels: Vec<Color32> = rgba
-                        .chunks_exact(4)
+                        .as_chunks::<4>().0.iter()
                         .map(|c| Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]))
                         .collect();
                     mesh.texture = Some(Texture2D { w, h, pixels });
@@ -1885,6 +2608,7 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
                 let _ = mesh.export_obj(&p);
             }
         }
+        tex_layer_menu(ui, mesh);
         if mesh.has_paint_geom {
             ui.add_space(4.0);
             ui.label(RichText::new("Paint:").size(11.0).color(Color32::from_rgb(175, 185, 205)));
@@ -1909,6 +2633,26 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
             }
             if ui.color_edit_button_rgb(&mut mesh.paint_color).changed() {
                 mesh.shade_mode = ShadeMode::Textured;
+                mesh.dirty = true;
+            }
+        }
+        if mesh.has_els {
+            ui.add_space(4.0);
+            let label = if mesh.els_enabled { "ELS On" } else { "ELS Off" };
+            if ui
+                .selectable_label(mesh.els_enabled, label)
+                .on_hover_text(format!("Preview {} RAGE 9 siren-bone emitters.", mesh.els_points.len()))
+                .clicked()
+            {
+                mesh.els_enabled = !mesh.els_enabled;
+                mesh.shade_mode = ShadeMode::Textured;
+                mesh.dirty = true;
+            }
+            if ui
+                .add_enabled(mesh.els_enabled, egui::Checkbox::new(&mut mesh.els_flash, "Flash"))
+                .on_hover_text("Use the game-authored 32-step siren sequencers at 500 BPM.")
+                .changed()
+            {
                 mesh.dirty = true;
             }
         }
@@ -1972,6 +2716,18 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
         mesh.dirty = true;
         ui.ctx().request_repaint();
     }
+    if mesh.els_enabled && mesh.els_flash {
+        let steps_per_second = RAGE9_SIREN_BPM / 60.0 * (RAGE9_SIREN_MULTIPLES * 2) as f64;
+        let phase = (ui.input(|i| i.time) * steps_per_second) as u64;
+        if phase != mesh.els_flash_phase {
+            mesh.els_flash_phase = phase;
+            mesh.dirty = true;
+        }
+        ui.ctx().request_repaint();
+    } else if mesh.els_flash_phase != 0 {
+        mesh.els_flash_phase = 0;
+        mesh.dirty = true;
+    }
     if mesh.last_dragging && !dragging {
         mesh.dirty = true;
     }
@@ -2011,6 +2767,66 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rage9_siren_uses_game_sequencers_and_sub_flashes() {
+        assert_eq!(rage9_siren_slot("siren1"), Some(1));
+        assert_eq!(rage9_siren_slot("ext_front_siren2"), Some(2));
+        assert_eq!(rage9_siren_slot("siren_bumper_r_bar4"), None);
+        assert_eq!(rage9_siren_slot("siren_roof_round_1"), None);
+        assert_eq!(rage9_siren_slot("siren_roof"), None);
+        // siren1 starts with 1, siren4 with the inverse 0.
+        assert!(rage9_siren_lit(1, 0));
+        assert!(!rage9_siren_lit(4, 0));
+        // Three flashes are emitted inside an active beat.
+        assert!(!rage9_siren_lit(1, 1));
+        assert!(rage9_siren_lit(1, 2));
+        assert!(rage9_siren_lit(1, 4));
+        // The next bit reverses the pair; unused and invalid slots stay dark.
+        assert!(!rage9_siren_lit(1, 6));
+        assert!(rage9_siren_lit(4, 6));
+        assert!(!rage9_siren_lit(9, 0));
+        assert!(!rage9_siren_lit(0, 0));
+        assert!(!rage9_siren_lit(21, 0));
+    }
+
+    #[test]
+    fn vehicle_parts_merge_in_parent_model_space() {
+        let mut base = Mesh3D::from_parts(
+            "car_hi".into(),
+            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            vec![[0.0; 2]; 3],
+            vec![[0, 1, 2]],
+            vec![0],
+            vec![],
+            None,
+            String::new(),
+            1,
+            1,
+            "High".into(),
+        );
+        let mut lightbar = Mesh3D::from_parts(
+            "car_lightbar_hi".into(),
+            vec![[0.0, 0.0, 2.0], [1.0, 0.0, 2.0], [0.0, 1.0, 2.0]],
+            vec![[0.0; 2]; 3],
+            vec![[0, 1, 2]],
+            vec![0],
+            vec![],
+            None,
+            String::new(),
+            1,
+            1,
+            "High".into(),
+        );
+        lightbar.has_els = true;
+        lightbar.els_points.push(ElsPoint { position: [0.5, 0.5, 2.0], bank: false, slot: 1 });
+        base.append_vehicle_part(lightbar);
+        assert_eq!(base.verts.len(), 6);
+        assert_eq!(base.tris, vec![[0, 1, 2], [3, 4, 5]]);
+        assert_eq!(base.parts.len(), 2);
+        assert_eq!(base.els_points.len(), 1);
+        assert!(base.has_els);
+    }
 
     #[test]
     fn upright_and_not_mirrored() {
@@ -2371,8 +3187,124 @@ mod dictionary_decode_tests {
         assert!((ext[0] - 224.2).abs() < 2.0 && (ext[1] - 197.1).abs() < 2.0 && (ext[2] - 207.7).abs() < 2.0, "extents {ext:?}");
     }
 
-    /// External .ttpf material resolution on a vehicle (paint + textures) and a world SLOD.
-    /// Same PERCYSTAR_LEVELS_RPF gate; set PERCYSTAR_RENDER_DIR to also dump PNG renders.
+    // texture layers start as one color texture per material and can be switched individually
+    #[test]
+    fn vehicle_texture_layers_toggle() {
+        let Ok(rpf) = std::env::var("PERCYSTAR_LEVELS_RPF") else { return };
+        if !Path::new(&rpf).exists() {
+            return;
+        }
+        let out_dir = std::env::var("PERCYSTAR_RENDER_DIR").ok();
+        let mut m = decode_rage9_model_from_rpf(Path::new(&rpf), 74_053_521_424, "cheetah2_hi").expect("decode");
+        let count = |m: &Mesh3D, k: TexLayerKind| m.tex_layers.iter().filter(|l| l.kind == k).count();
+        eprintln!(
+            "layers color={} normal={} overlay={} default_on={}",
+            count(&m, TexLayerKind::Color),
+            count(&m, TexLayerKind::Normal),
+            count(&m, TexLayerKind::Overlay),
+            m.tex_layers.iter().filter(|l| l.default_on).count()
+        );
+        assert!(count(&m, TexLayerKind::Color) > 0 && count(&m, TexLayerKind::Normal) > 0 && count(&m, TexLayerKind::Overlay) > 0);
+        assert!(m.tex_layers.iter().all(|l| l.enabled == l.default_on && l.mats > 0));
+        let textured = |m: &Mesh3D| m.geom_materials.iter().filter(|g| g.texture.is_some()).count();
+        let default_textured = textured(&m);
+        assert_eq!(default_textured, 19, "default look keeps the 19 textured materials");
+        assert!(m.geom_materials.iter().all(|g| g.normal.is_none() && g.overlays.is_empty()));
+        let shot = |m: &mut Mesh3D, tag: &str| {
+            rasterize_mesh(m, 800, 600);
+            if let Some(d) = &out_dir {
+                let _ = fs::create_dir_all(d);
+                let rgba: Vec<u8> = m.color_buf.iter().flat_map(|c| c.to_srgba_unmultiplied()).collect();
+                image::save_buffer(Path::new(d).join(format!("layers_{tag}.png")), &rgba, 800, 600, image::ColorType::Rgba8).expect("save");
+            }
+            m.color_buf.clone()
+        };
+        let base = shot(&mut m, "default");
+
+        m.set_tex_layers(|l| l.default_on || l.kind == TexLayerKind::Normal);
+        assert!(m.geom_materials.iter().any(|g| g.normal.is_some()));
+        assert_eq!(textured(&m), default_textured);
+        let with_normals = shot(&mut m, "normals");
+        assert!(with_normals != base, "normal maps should change the render");
+
+        m.set_tex_layers(|l| l.default_on || l.label == "DustTexture");
+        assert!(m.geom_materials.iter().any(|g| !g.overlays.is_empty()));
+        assert!(shot(&mut m, "dust") != base, "an overlay should change the render");
+
+        m.set_tex_layers(|_| false);
+        assert_eq!(textured(&m), 0);
+        assert!(m.geom_materials.iter().all(|g| g.normal.is_none() && g.overlays.is_empty()));
+        assert!(m.has_paint_geom && m.geom_materials.iter().any(|g| g.is_vehicle_paint));
+        shot(&mut m, "none");
+
+        // one layer off only unbinds the materials that drew it
+        m.set_tex_layers(|l| l.default_on);
+        let draws = |m: &Mesh3D, li: usize| {
+            let Some(t) = m.tex_layers[li].tex.as_ref() else { return 0 };
+            m.geom_materials.iter().filter(|g| g.texture.as_ref().is_some_and(|x| Arc::ptr_eq(x, t))).count()
+        };
+        let first = (0..m.tex_layers.len()).find(|&li| draws(&m, li) > 0).expect("a drawn layer");
+        m.tex_layers[first].enabled = false;
+        m.apply_tex_layers();
+        assert_eq!(draws(&m, first), 0, "a switched off layer is no longer drawn");
+        m.set_tex_layers(|l| l.default_on);
+        assert_eq!(textured(&m), default_textured);
+        assert!(shot(&mut m, "default_again") == base, "returning to the default set reproduces the default render");
+    }
+
+    // vehicles bind their textures by hash into the ttpf pools
+    #[test]
+    fn vehicle_texture_refs_resolve() {
+        let Ok(rpf) = std::env::var("PERCYSTAR_LEVELS_RPF") else { return };
+        if !Path::new(&rpf).exists() {
+            return;
+        }
+        for (tag, off) in [("cheetah2_hi", 74_053_521_424u64), ("cheetah2_mid", 74_058_629_136u64), ("cheetah2", 74_051_276_816u64)] {
+            let refs = list_model_texture_refs(Path::new(&rpf), off).expect("list refs");
+            let hits: Vec<_> = refs.iter().filter_map(|r| r.hit.as_ref().map(|h| (r, h))).collect();
+            let bytes: usize = hits.iter().map(|(_, h)| h.w * h.h * 4).sum();
+            eprintln!("[{tag}] unique={} resolved={} rgba_mb={}", refs.len(), hits.len(), bytes >> 20);
+            if std::env::var("PERCYSTAR_TEX_DUMP").is_ok() {
+                for r in &refs {
+                    match &r.hit {
+                        Some(h) => eprintln!("   {:<24} {:016x} {}x{} dxgi{} {} #{} x{}", r.role(), r.hash64, h.w, h.h, h.dxgi, h.path.file_name().unwrap().to_string_lossy(), h.tex_idx, r.shaders),
+                        None => eprintln!("   {:<24} {:016x} unresolved x{}", r.role(), r.hash64, r.shaders),
+                    }
+                }
+            }
+            assert!(hits.len() >= 3, "{tag} should resolve textures");
+            assert!(refs.iter().any(|r| r.role() == "diffuseTex" && r.hit.is_some()), "{tag} should resolve a diffuse texture");
+            assert!(hits.iter().all(|(r, _)| r.shaders > 0 && !r.params.is_empty()));
+            let (first, hit) = hits[0];
+            let tex = crate::tex::decode_ttpf_texture(&hit.path, hit.tex_idx).expect("decode first ref");
+            assert_eq!((tex.w, tex.h), (hit.w, hit.h), "{tag} {:016x}", first.hash64);
+        }
+    }
+
+    #[test]
+    fn vehicle_option_fragments_compose() {
+        let Ok(rpf) = std::env::var("PERCYSTAR_LEVELS_RPF") else { return };
+        if !Path::new(&rpf).exists() {
+            return;
+        }
+        let mut car = decode_rage9_model_from_rpf(Path::new(&rpf), 73_817_919_504, "stanierg2_hi")
+            .expect("decode base vehicle");
+        let option = decode_rage9_model_from_rpf(Path::new(&rpf), 73_831_055_376, "stanierg2_siren_roofbar1_mount_01_hi")
+            .expect("decode separate roofbar mount");
+        let (verts, tris) = (car.verts.len(), car.tris.len());
+        car.append_vehicle_part(option);
+        assert!(car.verts.len() > verts && car.tris.len() > tris);
+        assert!(car.parts.iter().any(|p| p.name.contains("siren_roofbar")));
+        assert!(!car.has_els, "a mount point is not itself an emergency light");
+
+        let roofbar = decode_rage9_model_from_rpf(Path::new(&rpf), 74_963_226_640, "cmn_siren_roofbar1_02_hi")
+            .expect("decode shared roofbar");
+        car.append_vehicle_part(roofbar);
+        assert!(car.has_els && car.els_points.len() >= 12);
+        assert!(car.els_points.iter().all(|p| p.position[2] > 0.7), "roofbar emitters attach at the vehicle mount");
+    }
+
+    // external ttpf material resolution on vehicle paint and world slod
     #[test]
     fn ttpf_vehicle_and_world_materials() {
         let Ok(rpf) = std::env::var("PERCYSTAR_LEVELS_RPF") else { return };
@@ -2382,20 +3314,30 @@ mod dictionary_decode_tests {
         let cases = [
             ("cheetah2", 74_051_276_816u64),
             ("cheetah2_hi", 74_053_521_424u64),
+            ("ambulance_hi", 71_757_271_056u64),
+            ("firetruk2_hi", 74_492_911_632u64),
             ("brickell_slod", 8_679_358_480u64),
             ("fern", 71_430_041_616u64),
             ("dress", 67_927_576_592u64),
         ];
         for (tag, off) in cases {
-            let m = decode_rage9_model_from_rpf(Path::new(&rpf), off, tag).expect("decode model");
+            let mut m = decode_rage9_model_from_rpf(Path::new(&rpf), off, tag).expect("decode model");
             let tex_mats = m.geom_materials.iter().filter(|gm| gm.texture.is_some()).count();
             let paint_mats = m.geom_materials.iter().filter(|gm| gm.is_vehicle_paint).count();
             eprintln!("[{tag}] status='{}' geoms={} tex_mats={} paint_mats={}", m.tex_status, m.geom_count, tex_mats, paint_mats);
             if tag.starts_with("cheetah2") {
                 assert!(tex_mats > 0, "{tag} should resolve external TTPF textures");
                 assert!(paint_mats > 0 && m.has_paint_geom, "{tag} should detect vehicle paint geoms");
+            } else if tag == "ambulance_hi" {
+                assert_eq!(m.els_points.len(), 37, "ambulance should expose its siren1..37 bones");
+            } else if tag == "firetruk2_hi" {
+                assert!(!m.els_points.is_empty(), "firetruck should expose prefixed siren bones");
             } else {
                 assert!(tex_mats > 0, "{tag} should resolve external TTPF textures");
+            }
+            if m.has_els {
+                m.els_enabled = true;
+                m.els_flash = false;
             }
             render_sample(m, tag);
         }

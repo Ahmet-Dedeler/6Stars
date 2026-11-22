@@ -34,6 +34,7 @@ const IID_IDXC_RESULT: Guid = Guid::from_values(
     [0x94, 0x61, 0x6f, 0x87, 0xaf, 0x5e, 0x06, 0x59],
 );
 
+#[cfg(windows)]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Guid {
@@ -43,6 +44,7 @@ struct Guid {
     data4: [u8; 8],
 }
 
+#[cfg(windows)]
 impl Guid {
     const fn from_values(data1: u32, data2: u16, data3: u16, data4: [u8; 8]) -> Self {
         Self {
@@ -73,6 +75,7 @@ pub fn disassemble(data: &[u8]) -> String {
     }
 }
 
+#[cfg(test)]
 pub fn disassemble_with_source(data: &[u8], source: &str) -> String {
     match extract_fssm(data) {
         Ok(fssm) => format_fssm_disasm(&fssm, source),
@@ -268,11 +271,11 @@ fn get_dxc_create_instance(
 {
     #[link(name = "kernel32")]
     extern "system" {
-        fn GetProcAddress(library: *mut c_void, name: *const u8) -> *mut c_void;
+        fn GetProcAddress(library: isize, name: *const u8) -> *const c_void;
     }
 
     let name = c"DxcCreateInstance";
-    let address = unsafe { GetProcAddress(library, name.as_ptr() as *const u8) };
+    let address = unsafe { GetProcAddress(library as isize, name.as_ptr() as *const u8) };
     if address.is_null() {
         return Err("dxcompiler.dll does not export DxcCreateInstance".into());
     }
