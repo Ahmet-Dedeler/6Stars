@@ -15,6 +15,9 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+mod smoke;
+pub use smoke::run_gpu_world_smoke;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct GpuVertex {
@@ -579,6 +582,7 @@ struct GpuState {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     depth_view: wgpu::TextureView,
+    depth_texture: wgpu::Texture,
     shadow_view: wgpu::TextureView,
     uniform_buf: wgpu::Buffer,
     uniform_bg: wgpu::BindGroup,
@@ -612,7 +616,7 @@ struct GpuState {
     map_span: [f32; 2],
 }
 
-fn create_depth_view(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
+fn create_depth_texture(device: &wgpu::Device, w: u32, h: u32) -> wgpu::Texture {
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("world_depth"),
         size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
@@ -620,10 +624,10 @@ fn create_depth_view(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Depth32Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
-    tex.create_view(&wgpu::TextureViewDescriptor::default())
+    tex
 }
 
 fn upload_texture(
@@ -747,7 +751,8 @@ impl GpuState {
         };
         surface.configure(&device, &config);
 
-        let depth_view = create_depth_view(&device, config.width, config.height);
+        let depth_texture = create_depth_texture(&device, config.width, config.height);
+        let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let shadow_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("sun_shadow_map"),
             size: wgpu::Extent3d { width: 2048, height: 2048, depth_or_array_layers: 1 },
@@ -1014,6 +1019,7 @@ impl GpuState {
             queue,
             config,
             depth_view,
+            depth_texture,
             shadow_view,
             uniform_buf,
             uniform_bg,
@@ -1050,12 +1056,17 @@ impl GpuState {
         if let Some(ref terrain) = cfg.terrain {
             st.map_min = [terrain.bmin[0], terrain.bmin[1]];
             st.map_span = [terrain.bmax[0] - terrain.bmin[0], terrain.bmax[1] - terrain.bmin[1]];
-            let tmesh = terrain.build_terrain_mesh(8);
+            let tmesh = terrain.build_world_terrain_mesh(8);
             if let Some(ref t) = tmesh.texture {
                 let (mbg, bytes) = upload_texture(&st.device, &st.queue, &st.tex_bgl, &st.tex_samp, t, 1024);
                 st.minimap_bg = mbg;
                 st.tex_bytes += bytes;
             }
+            st.add_batch(&WorldBatchInput {
+                mesh: tmesh,
+                instances: vec![(Vec3::ZERO, Quat::IDENTITY, Vec3::ONE, [1.0; 4])],
+            });
+            st.model_count = st.model_count.saturating_sub(1);
         }
 
         for b in &cfg.batches {
@@ -1199,7 +1210,8 @@ impl GpuState {
         self.config.width = w;
         self.config.height = h;
         self.surface.configure(&self.device, &self.config);
-        self.depth_view = create_depth_view(&self.device, w, h);
+        self.depth_texture = create_depth_texture(&self.device, w, h);
+        self.depth_view = self.depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
     }
 }
 
@@ -1231,6 +1243,7 @@ struct GpuWorldApp {
     last_cursor: Option<PhysicalPosition<f64>>,
     last_frame: Instant,
     last_title: Instant,
+    smoke_frames: Option<u32>,
 }
 
 impl GpuWorldApp {
@@ -1263,6 +1276,7 @@ impl GpuWorldApp {
             last_cursor: None,
             last_frame: Instant::now(),
             last_title: Instant::now(),
+            smoke_frames: None,
         }
     }
 
@@ -1297,6 +1311,7 @@ impl ApplicationHandler for GpuWorldApp {
             start_pos: [0.0, 0.0, 120.0],
         });
         self.gpu = Some(GpuState::new(win, &cfg));
+        self.gpu.as_ref().unwrap().window.request_redraw();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -1551,8 +1566,11 @@ impl ApplicationHandler for GpuWorldApp {
                     rp.set_bind_group(2, &g.shadow_bg, &[]);
                     rp.draw(0..3, 0..1);
 
-                    rp.set_pipeline(&g.water_pipeline);
-                    rp.draw(0..6, 0..1);
+                    // Smoke checks must not mistake the ocean plane for loaded geometry.
+                    if self.smoke_frames.is_none() {
+                        rp.set_pipeline(&g.water_pipeline);
+                        rp.draw(0..6, 0..1);
+                    }
 
                     rp.set_pipeline(&g.main_pipeline);
                     let mut drawn = 0usize;
@@ -1697,6 +1715,15 @@ impl ApplicationHandler for GpuWorldApp {
 
                 g.queue.submit(Some(enc.finish()));
                 frame.present();
+                if let Some(frames) = &mut self.smoke_frames {
+                    if !g.batches.is_empty() {
+                        *frames -= 1;
+                        if *frames == 0 {
+                            g.assert_visible_geometry();
+                            event_loop.exit();
+                        }
+                    }
+                }
                 g.window.request_redraw();
             }
             _ => {}

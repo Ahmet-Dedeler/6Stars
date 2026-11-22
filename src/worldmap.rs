@@ -477,6 +477,11 @@ mod tests {
         let mesh = d.build_terrain_mesh(4);
         assert!(!mesh.verts.is_empty());
         assert!(!mesh.tris.is_empty());
+        let world = d.build_world_terrain_mesh(4);
+        assert_eq!(world.name, "mhiu_world_terrain");
+        assert_eq!(world.verts[0][0], -1000.0);
+        assert_eq!(world.verts[0][1], 1000.0);
+        assert_eq!(world.verts[0][2], d.elevation_m(0, 0).max(0.0) - 1.0);
         assert_eq!(parse_nav_coords("nav_256_256_(0,0).ynv"), Some((0.0, 0.0)));
     }
 }

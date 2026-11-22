@@ -4773,6 +4773,13 @@ fn main() -> eframe::Result<()> {
     }
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 2 && args[1] == "--gpu-world" {
+        if args.get(2).is_some_and(|a| a == "--smoke-scene") {
+            if let Err(error) = world_gpu::run_gpu_world_smoke(args.get(3).map(String::as_str).unwrap_or("terrain")) {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         let mut common_p: Option<PathBuf> = None;
         let mut levels_p: Option<PathBuf> = None;
         let mut idx = 2usize;
