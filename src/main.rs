@@ -6,6 +6,7 @@ mod boot;
 mod dat;
 mod dxbc;
 mod mapdata;
+mod meta7a;
 mod psin;
 mod rsc9;
 mod sgd5;
@@ -14,14 +15,15 @@ mod worldmap;
 mod model3d;
 mod rdna2;
 mod tex;
+mod vehicle_variations;
 use model3d::{
-    Mesh3D, decode_rage9_model_from_rpf, extract_0drpz_mesh, extract_rage9_model_name,
+    Mesh3D, decode_rage9_model_from_rpf, decode_rage9_model_from_rpf_lod, extract_0drpz_mesh, extract_rage9_model_name,
     has_rage9_meshlets, is_vehicle_virtual, is_zlib_head, parse_obj,
-    probe_large_rage9_model_in_buf, render_mesh3d_viewport,
+    probe_large_rage9_model_in_buf, read_virtual_from_file, render_mesh3d_viewport,
 };
 use rdna2::{
-    Ps09Cache, Ps09ShaderEntry, ShaderStage, format_gfx103_disasm, format_spirv_abi_summary,
-    lift_to_hlsl, lift_to_spirv,
+    Ps09Cache, Ps09ResourceName, Ps09ShaderEntry, ShaderStage, format_gfx103_disasm,
+    format_spirv_abi_summary, lift_to_hlsl, lift_to_spirv,
 };
 use tex::{
     DecodedTexture, build_dds_dx10, decode_0drpz_text, decode_mhiu_heightmap, decode_navmesh_from_rpf,
@@ -484,6 +486,65 @@ enum Category {
     Binary,
 }
 
+const MODEL_TEX_TIP: &str = "Open every texture this model's materials use as flat images for inspection and export";
+
+// lod switch requested from the 3d viewer header
+#[derive(Clone, Copy)]
+enum LodPick {
+    // entry index of a sibling detail file
+    File(usize),
+    // lod slot inside the current file
+    Level(usize),
+}
+
+// file names of the three detail levels of a model stem_hi stem_mid stem ordered high to low
+fn lod_sibling_names(name: &str) -> Option<[String; 3]> {
+    let (stem, ext) = name.rsplit_once('.')?;
+    let lower = stem.to_ascii_lowercase();
+    let cut = if lower.ends_with("_hi") { 3 } else if lower.ends_with("_mid") { 4 } else { 0 };
+    let base = &stem[..stem.len() - cut];
+    if base.is_empty() {
+        return None;
+    }
+    Some([format!("{base}_hi.{ext}"), format!("{base}_mid.{ext}"), format!("{base}.{ext}")])
+}
+
+fn model_file_stem(name: &str) -> String {
+    let stem = name.rsplit_once('.').map(|x| x.0).unwrap_or(name).to_ascii_lowercase();
+    stem.strip_suffix("_hi")
+        .or_else(|| stem.strip_suffix("_mid"))
+        .unwrap_or(&stem)
+        .to_string()
+}
+
+// detail file and in file lod buttons for the viewer header returns the clicked switch
+fn lod_switch_ui(ui: &mut egui::Ui, mesh: &Mesh3D, siblings: &[(&'static str, usize)], selected: Option<usize>) -> Option<LodPick> {
+    let mut pick = None;
+    let levels = mesh.lod_geoms.iter().filter(|&&n| n > 0).count();
+    if siblings.is_empty() && levels < 2 {
+        return None;
+    }
+    ui.separator();
+    ui.label(RichText::new("Detail:").size(11.0).color(Color32::from_rgb(130, 138, 156)));
+    for &(lbl, idx) in siblings {
+        if ui.selectable_label(selected == Some(idx), lbl).on_hover_text("Separate detail level file of this model").clicked() && selected != Some(idx) {
+            pick = Some(LodPick::File(idx));
+        }
+    }
+    if levels >= 2 {
+        for (l, &n) in mesh.lod_geoms.iter().enumerate() {
+            if n == 0 {
+                continue;
+            }
+            let tip = format!("{n} geometries stored in this file");
+            if ui.selectable_label(mesh.lod == l, model3d::LOD_NAMES[l]).on_hover_text(tip).clicked() && mesh.lod != l {
+                pick = Some(LodPick::Level(l));
+            }
+        }
+    }
+    pick
+}
+
 #[derive(Clone, Debug)]
 struct RpfEntry {
     source_rpf: PathBuf,
@@ -505,6 +566,7 @@ struct ScanState {
     entries: Vec<RpfEntry>,
     rpf_names: Vec<String>,
     file_sig: HashMap<PathBuf, (u64, Option<SystemTime>)>,
+    audio_bank_meta: HashMap<u64, dat::ResolvedAwcMeta>,
     ver: u64,
 }
 
@@ -513,11 +575,33 @@ struct MediaState {
     loading: bool,
     status: String,
     loaded_tracks: Option<(Vec<audio_player::LoadedWavTrack>, Arc<Vec<u8>>)>,
+    loaded_bank_ctx: Option<audio_player::AudioBankContext>,
     bink_child_pid: Option<u32>,
     bink_hwnd: Option<isize>,
     bink_clip: Option<PathBuf>,
     loaded_mesh: Option<Mesh3D>,
+    loaded_vehicle_parts: Vec<(usize, usize, Mesh3D)>,
+    loaded_vehicle_configurations: Option<(u64, vehicle_variations::VehicleConfigurationDb)>,
     loaded_textures: Option<Vec<DecodedTexture>>,
+    // textures bound by the viewed model with a summary note the model stays loaded behind them
+    loaded_model_textures: Option<(Vec<DecodedTexture>, String)>,
+}
+
+#[derive(Clone)]
+struct VehiclePartCandidate {
+    entry: usize,
+    name: String,
+    enabled: bool,
+    loading: bool,
+}
+
+#[derive(Clone)]
+struct ResolvedVehicleVariation {
+    label: String,
+    colour: Option<[f32; 3]>,
+    entries: Vec<usize>,
+    part_names: Vec<String>,
+    unresolved: Vec<u32>,
 }
 
 #[derive(Default)]
@@ -690,11 +774,13 @@ struct Rpf9App {
     tex_handle: Option<(usize, TextureHandle)>,
     tex_zoom: f32,
     vehicles_only: bool,
+    audio_named: bool,
     // cachd ui list so huge scans never re filter or clone evry fram
     view: Vec<usize>,
-    view_key: Option<(u64, String, Category, String, bool)>,
+    view_key: Option<(u64, String, Category, String, bool, bool)>,
     hay: Vec<String>,
     hay_ver: u64,
+    hay_audio_named: bool,
     counts: [usize; 11],
     cached_rpf_names: Vec<String>,
     last_rebuild: Instant,
@@ -704,6 +790,30 @@ struct Rpf9App {
     mv_cat: ModelCat,
     mv_filter: String,
     mv_hide_lods: bool,
+    // detail level files of the selected model label and entry index ordered high to low
+    lod_siblings: Vec<(&'static str, usize)>,
+    // lod switch clicked in the viewer header applied at the start of the next frame
+    lod_pick: Option<LodPick>,
+    // archive entry of the viewed model none for obj navmesh and animation previews
+    model_entry: Option<usize>,
+    // Base vehicle plus independently stored tuning fragments selected by the user.
+    vehicle_base_mesh: Option<Mesh3D>,
+    vehicle_parts: Vec<VehiclePartCandidate>,
+    vehicle_part_meshes: HashMap<usize, Mesh3D>,
+    vehicle_part_filter: String,
+    vehicle_configuration_db: vehicle_variations::VehicleConfigurationDb,
+    vehicle_configuration_loaded: bool,
+    vehicle_configuration_loading: bool,
+    vehicle_configuration_generation: u64,
+    vehicle_variations: Vec<ResolvedVehicleVariation>,
+    vehicle_variation_selected: usize,
+    vehicle_variation_filter: String,
+    // textures button clicked in the viewer header applied at the start of the next frame
+    tex_pick: bool,
+    // shown textures belong to the viewed model so the viewer offers a way back to it
+    tex_from_model: bool,
+    // camera yaw pitch zoom pan carried across a lod switch
+    lod_keep_cam: Option<[f32; 5]>,
     mv_drawer_open: bool,
     mv_entries: Vec<(usize, ModelCat, String)>,
     mv_counts: [usize; 10],
@@ -749,7 +859,44 @@ fn sgd5_stage(stage: &str) -> ShaderStage {
     }
 }
 
-fn sgd5_ps09_entry(shader: &sgd5::Sgd5Shader, fssm: &dxbc::FssmShader) -> Ps09ShaderEntry {
+fn sgd5_resource_declaration(resource_type: u16) -> Option<&'static str> {
+    match resource_type {
+        0x0102 => Some("Texture2D<float4>"),
+        0x0142 => Some("Texture2DArray<float4>"),
+        0x0202 => Some("TextureCube<float4>"),
+        0x0302 => Some("Texture3D<float4>"),
+        0x0401 => Some("Buffer<float4>"),
+        0x0405 => Some("StructuredBuffer<uint>"),
+        0x0407 => Some("ByteAddressBuffer"),
+        0x0423 => Some("SamplerState"),
+        0x0430 => Some("cbuffer"),
+        _ => None,
+    }
+}
+
+fn sgd5_resource_names(file: &sgd5::Sgd5File, shader: &sgd5::Sgd5Shader) -> Vec<Ps09ResourceName> {
+    shader.reflection_records.iter().filter_map(|record| {
+        let declaration = sgd5_resource_declaration(record.resource_type)?;
+        let register_prefix = match record.resource_type {
+            0x0423 => "s",
+            0x0430 => "b",
+            _ => "t",
+        };
+        let name = record
+            .name
+            .clone()
+            .or_else(|| file.resolve_name(record.name_hash).map(|name| name.to_string()))
+            ;
+        Some(Ps09ResourceName {
+            declaration: declaration.to_string(),
+            register: format!("{register_prefix}{}", record.slot),
+            name,
+            hash: record.name_hash,
+        })
+    }).collect()
+}
+
+fn sgd5_ps09_entry(file: &sgd5::Sgd5File, shader: &sgd5::Sgd5Shader, fssm: &dxbc::FssmShader) -> Ps09ShaderEntry {
     Ps09ShaderEntry {
         index: shader.index,
         code_offset: u32::try_from(fssm.code_offset).unwrap_or(0),
@@ -759,7 +906,9 @@ fn sgd5_ps09_entry(shader: &sgd5::Sgd5Shader, fssm: &dxbc::FssmShader) -> Ps09Sh
         rsrc1: None,
         rsrc2: None,
         bindings: Vec::new(),
-        pso_hash: shader.hash,
+        resource_names: sgd5_resource_names(file, shader),
+        pso_hash: 0,
+        sga_hash: Some(shader.sga_hash),
         has_rt: false,
         has_ngg: false,
         insn_count: u32::try_from(rdna2::decode_gfx103(fssm.code(), 4000).len()).unwrap_or(0),
@@ -818,10 +967,12 @@ impl Rpf9App {
             tex_handle: None,
             tex_zoom: 1.0,
             vehicles_only: false,
+            audio_named: true,
             view: Vec::new(),
             view_key: None,
             hay: Vec::new(),
             hay_ver: u64::MAX,
+            hay_audio_named: true,
             counts: [0; 11],
             cached_rpf_names: Vec::new(),
             last_rebuild: Instant::now(),
@@ -830,6 +981,23 @@ impl Rpf9App {
             mv_cat: ModelCat::All,
             mv_filter: String::new(),
             mv_hide_lods: true,
+            lod_siblings: Vec::new(),
+            lod_pick: None,
+            model_entry: None,
+            vehicle_base_mesh: None,
+            vehicle_parts: Vec::new(),
+            vehicle_part_meshes: HashMap::new(),
+            vehicle_part_filter: String::new(),
+            vehicle_configuration_db: HashMap::new(),
+            vehicle_configuration_loaded: false,
+            vehicle_configuration_loading: false,
+            vehicle_configuration_generation: 0,
+            vehicle_variations: Vec::new(),
+            vehicle_variation_selected: 0,
+            vehicle_variation_filter: String::new(),
+            tex_pick: false,
+            tex_from_model: false,
+            lod_keep_cam: None,
             mv_drawer_open: true,
             mv_entries: Vec::new(),
             mv_counts: [0; 10],
@@ -883,6 +1051,19 @@ impl Rpf9App {
 
     fn reset_selection(&mut self) {
         self.selected = None;
+        self.lod_siblings.clear();
+        self.lod_pick = None;
+        self.model_entry = None;
+        self.vehicle_base_mesh = None;
+        self.vehicle_parts.clear();
+        self.vehicle_part_meshes.clear();
+        self.vehicle_part_filter.clear();
+        self.vehicle_variations.clear();
+        self.vehicle_variation_selected = 0;
+        self.vehicle_variation_filter.clear();
+        self.tex_pick = false;
+        self.tex_from_model = false;
+        self.lod_keep_cam = None;
         self.preview.clear();
         self.last_dock_rect = [0; 4];
         self.mesh3d = None;
@@ -901,7 +1082,9 @@ impl Rpf9App {
         m.status.clear();
         m.loading = false;
         m.loaded_mesh = None;
+        m.loaded_vehicle_parts.clear();
         m.loaded_textures = None;
+        m.loaded_model_textures = None;
     }
 
     fn browse_videos(&mut self) {
@@ -999,6 +1182,10 @@ impl Rpf9App {
         self.is_folder = false;
         self.selected_rpf = "All RPFs".into();
         self.reset_selection();
+        self.vehicle_configuration_db.clear();
+        self.vehicle_configuration_loaded = false;
+        self.vehicle_configuration_loading = false;
+        self.vehicle_configuration_generation = 0;
         let _gen = self.bump_gen();
         {
             let mut st = self.state.lock().unwrap();
@@ -1042,6 +1229,10 @@ impl Rpf9App {
         self.target_path = Some(folder.clone());
         self.is_folder = true;
         self.reset_selection();
+        self.vehicle_configuration_db.clear();
+        self.vehicle_configuration_loaded = false;
+        self.vehicle_configuration_loading = false;
+        self.vehicle_configuration_generation = 0;
         let gen = self.bump_gen();
         {
             let mut st = self.state.lock().unwrap();
@@ -1109,6 +1300,7 @@ impl Rpf9App {
 
                 let mut changed = Vec::new();
                 let mut cache_hits = 0usize;
+                let mut disk_cache_dirty = false;
                 {
                     let mut st = state.lock().unwrap();
                     for (p, meta) in &rpfs {
@@ -1117,7 +1309,24 @@ impl Rpf9App {
                             let sig = (meta.len(), meta.modified().ok());
                             if st.file_sig.get(p) != Some(&sig) {
                                 let key = format!("{}|{}|{}", p.display(), meta.len(), mtime_s);
-                                if let Some(cached_entries) = disk_cache.get(&key) {
+                                if let Some(cached_entries) = disk_cache.get_mut(&key) {
+                                    let is_audio = p.file_name().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("audio.rpf")).unwrap_or(false);
+                                    if is_audio {
+                                        let needs_enrich = !cached_entries.iter().any(|e| e.kind == "DAT")
+                                            || cached_entries.iter().filter(|e| e.kind == "AWC").any(|e| e.name.contains("_Radio_Music_") || e.name.contains("_Score_Streams_"))
+                                            || cached_entries.iter().filter(|e| e.kind == "AWC").take(10).all(|e| e.name.starts_with("sound_00") && e.name.matches('_').count() == 2);
+                                        if needs_enrich {
+                                            for e in cached_entries.iter_mut() {
+                                                if e.kind == "AWC" {
+                                                    e.name = display_entry_name(e, false).into_owned();
+                                                }
+                                            }
+                                            st.audio_bank_meta = enrich_audio_rpf_entries(p, meta.len(), cached_entries);
+                                            disk_cache_dirty = true;
+                                        } else if st.audio_bank_meta.is_empty() {
+                                            st.audio_bank_meta = enrich_audio_rpf_entries(p, meta.len(), cached_entries);
+                                        }
+                                    }
                                     let is_levels = p.file_name().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("levels.rpf")).unwrap_or(false);
                                     st.entries.retain(|e| &e.source_rpf != p || (is_levels && e.offset >= VEH_ZONE_OFF));
                                     st.entries.extend(cached_entries.iter().cloned());
@@ -1138,6 +1347,9 @@ impl Rpf9App {
                         st.rpf_names.sort();
                         st.status = format!("Loaded {cache_hits} cached RPFs ({} entries)...", st.entries.len());
                     }
+                }
+                if disk_cache_dirty {
+                    save_disk_cache(&disk_cache);
                 }
 
                 if !changed.is_empty() {
@@ -1211,36 +1423,655 @@ impl Rpf9App {
         });
     }
 
+    // other detail level files of e in the same archive stem_hi stem_mid stem
+    fn find_lod_siblings(&self, e: &RpfEntry) -> Vec<(&'static str, usize)> {
+        let Some(names) = lod_sibling_names(&e.name) else { return Vec::new() };
+        let mut found: [Option<usize>; 3] = [None; 3];
+        let st = self.state.lock().unwrap();
+        for (i, o) in st.entries.iter().enumerate() {
+            if o.kind != "MODEL" && o.kind != "VEH" {
+                continue;
+            }
+            for (k, n) in names.iter().enumerate() {
+                if found[k].is_none() && o.name.eq_ignore_ascii_case(n) && o.source_rpf == e.source_rpf {
+                    found[k] = Some(i);
+                }
+            }
+        }
+        let out: Vec<_> = ["Hi", "Mid", "Low"].into_iter().zip(found).filter_map(|(l, f)| f.map(|i| (l, i))).collect();
+        if out.len() < 2 { Vec::new() } else { out }
+    }
+
+    fn find_vehicle_parts(&self, e: &RpfEntry) -> Vec<VehiclePartCandidate> {
+        if e.kind != "VEH" {
+            return Vec::new();
+        }
+        let base = model_file_stem(&e.name);
+        let prefix = format!("{base}_");
+        let want_hi = e.name.rsplit_once('.').map(|x| x.0).unwrap_or(&e.name).to_ascii_lowercase().ends_with("_hi");
+        let st = self.state.lock().unwrap();
+        let mut by_stem: HashMap<String, (usize, bool)> = HashMap::new();
+        for (idx, part) in st.entries.iter().enumerate() {
+            if part.source_rpf != e.source_rpf || (part.kind != "MODEL" && part.kind != "VEH") {
+                continue;
+            }
+            let raw = part.name.rsplit_once('.').map(|x| x.0).unwrap_or(&part.name).to_ascii_lowercase();
+            let related = raw.starts_with(&prefix);
+            let shared_emergency = raw.starts_with("cmn_siren_");
+            if (!related && !shared_emergency)
+                || matches!(raw.as_str(), x if x == format!("{base}_hi") || x == format!("{base}_mid"))
+            {
+                continue;
+            }
+            let logical = raw.strip_suffix("_hi").or_else(|| raw.strip_suffix("_mid")).unwrap_or(&raw).to_string();
+            let detail_match = raw.ends_with("_hi") == want_hi;
+            by_stem
+                .entry(logical)
+                .and_modify(|slot| {
+                    if detail_match && !slot.1 {
+                        *slot = (idx, true);
+                    }
+                })
+                .or_insert((idx, detail_match));
+        }
+        let mut out: Vec<_> = by_stem
+            .into_values()
+            .map(|(entry, _)| VehiclePartCandidate {
+                entry,
+                name: st.entries[entry].name.clone(),
+                enabled: false,
+                loading: false,
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    fn ensure_vehicle_configuration_db(&mut self) {
+        if self.vehicle_configuration_loading || self.vehicle_configuration_loaded {
+            return;
+        }
+        let entries: Vec<RpfEntry> = self
+            .state
+            .lock()
+            .unwrap()
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.rpf_name.eq_ignore_ascii_case("packs.rpf")
+                    && matches!(entry.kind, "META7A" | "ANIM")
+            })
+            .cloned()
+            .collect();
+        if entries.is_empty() {
+            return;
+        }
+        let generation = *self.watch_gen.lock().unwrap();
+        self.vehicle_configuration_generation = generation;
+        self.vehicle_configuration_loading = true;
+        let media = Arc::clone(&self.media);
+        std::thread::spawn(move || {
+            let mut database = vehicle_variations::VehicleConfigurationDb::new();
+            for entry in entries {
+                let parsed = File::open(&entry.source_rpf)
+                    .map_err(|error| error.to_string())
+                    .and_then(|mut file| read_virtual_from_file(&mut file, entry.offset).map(|result| result.0))
+                    .ok()
+                    .filter(|bytes| meta7a::has_schema_enums(bytes))
+                    .map(|bytes| vehicle_variations::parse_configurations(&bytes));
+                if let Some(configurations) = parsed {
+                    vehicle_variations::merge_configurations(&mut database, configurations);
+                }
+            }
+            media.lock().unwrap().loaded_vehicle_configurations = Some((generation, database));
+        });
+    }
+
+    fn refresh_vehicle_variations(&mut self) {
+        let Some(model_index) = self.model_entry else {
+            self.vehicle_variations.clear();
+            return;
+        };
+        let st = self.state.lock().unwrap();
+        let Some(model) = st.entries.get(model_index) else { return };
+        if model.kind != "VEH" {
+            self.vehicle_variations.clear();
+            return;
+        }
+        let base = model_file_stem(&model.name);
+        let model_hash = psin::joaat(&base);
+        let Some(configurations) = self.vehicle_configuration_db.get(&model_hash) else {
+            self.vehicle_variations.clear();
+            self.vehicle_variation_selected = 0;
+            return;
+        };
+        let wants_hi = model.name.rsplit_once('.').map(|part| part.0).unwrap_or(&model.name).to_ascii_lowercase().ends_with("_hi");
+        let mut entries_by_hash: HashMap<u32, (usize, bool)> = HashMap::new();
+        for (index, entry) in st.entries.iter().enumerate() {
+            if (entry.kind != "MODEL" && entry.kind != "VEH") || entry.source_rpf != model.source_rpf {
+                continue;
+            }
+            let raw = entry.name.rsplit_once('.').map(|part| part.0).unwrap_or(&entry.name).to_ascii_lowercase();
+            let logical = raw.strip_suffix("_hi").or_else(|| raw.strip_suffix("_mid")).unwrap_or(&raw);
+            let detail_match = raw.ends_with("_hi") == wants_hi;
+            for hash in [psin::joaat(logical), psin::joaat(&raw)] {
+                let preferred = vehicle_variations::prefer_lod_entry(entries_by_hash.get(&hash).copied(), index, detail_match);
+                entries_by_hash.insert(hash, preferred);
+            }
+        }
+
+        let mount_prefix = format!("{base}_siren_roofbar1_mount_");
+        let implicit_mount = st
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| (entry.kind == "MODEL" || entry.kind == "VEH") && entry.source_rpf == model.source_rpf)
+            .filter_map(|(index, entry)| {
+                let raw = entry.name.rsplit_once('.').map(|part| part.0).unwrap_or(&entry.name).to_ascii_lowercase();
+                raw.starts_with(&mount_prefix).then_some((index, raw.ends_with("_hi") == wants_hi, raw))
+            })
+            .min_by(|a, b| (!a.1, &a.2).cmp(&(!b.1, &b.2)))
+            .map(|item| item.0);
+
+        let entry_names: HashMap<usize, String> = entries_by_hash
+            .values()
+            .map(|&(entry, _)| (entry, st.entries[entry].name.clone()))
+            .collect();
+        self.vehicle_variations = configurations
+            .iter()
+            .enumerate()
+            .map(|(index, configuration)| {
+                let resolved = vehicle_variations::resolve_configuration_parts(
+                    model_hash,
+                    &configuration.parts,
+                    &entries_by_hash,
+                    &entry_names,
+                );
+                let entries = vehicle_variations::with_implicit_roofbar_mount(
+                    resolved.entries,
+                    implicit_mount,
+                    resolved.needs_roofbar_mount,
+                );
+                let part_names = entries
+                    .iter()
+                    .filter_map(|&entry| st.entries.get(entry))
+                    .map(|entry| model_file_stem(&entry.name))
+                    .collect();
+                ResolvedVehicleVariation {
+                    label: format!("Configuration {:02}", index + 1),
+                    colour: configuration.colour_argb.map(vehicle_variations::argb_to_linear_rgb),
+                    entries,
+                    part_names,
+                    unresolved: resolved.unresolved,
+                }
+            })
+            .collect();
+        self.vehicle_variation_selected = self.vehicle_variation_selected.min(self.vehicle_variations.len());
+    }
+
+    fn apply_vehicle_variation(&mut self, selected: usize) {
+        self.vehicle_variation_selected = selected.min(self.vehicle_variations.len());
+        if self.vehicle_variation_selected > 0 {
+            for part in &mut self.vehicle_parts {
+                part.enabled = false;
+            }
+        }
+        let entries = self
+            .vehicle_variation_selected
+            .checked_sub(1)
+            .and_then(|index| self.vehicle_variations.get(index))
+            .map(|variation| variation.entries.clone())
+            .unwrap_or_default();
+        for entry in entries {
+            if !self.vehicle_part_meshes.contains_key(&entry) {
+                self.spawn_vehicle_part_decode(entry);
+            }
+        }
+        self.rebuild_vehicle_parts();
+    }
+
+    fn rebuild_vehicle_parts(&mut self) {
+        let Some(mut mesh) = self.vehicle_base_mesh.clone() else { return };
+        let mut appended = std::collections::HashSet::new();
+        if let Some(variation) = self
+            .vehicle_variation_selected
+            .checked_sub(1)
+            .and_then(|index| self.vehicle_variations.get(index))
+        {
+            for &entry in &variation.entries {
+                if let Some(part) = self.vehicle_part_meshes.get(&entry) {
+                    mesh.append_vehicle_part(part.clone());
+                    appended.insert(entry);
+                }
+            }
+        }
+        for choice in &self.vehicle_parts {
+            if choice.enabled && appended.insert(choice.entry) {
+                if let Some(part) = self.vehicle_part_meshes.get(&choice.entry) {
+                    mesh.append_vehicle_part(part.clone());
+                }
+            }
+        }
+        if let Some(current) = self.mesh3d.as_ref() {
+            (mesh.yaw, mesh.pitch, mesh.zoom, mesh.pan_x, mesh.pan_y) =
+                (current.yaw, current.pitch, current.zoom, current.pan_x, current.pan_y);
+            mesh.paint_color = self
+                .vehicle_variation_selected
+                .checked_sub(1)
+                .and_then(|index| self.vehicle_variations.get(index))
+                .and_then(|variation| variation.colour)
+                .unwrap_or(current.paint_color);
+            mesh.els_enabled = current.els_enabled && mesh.has_els;
+            mesh.els_flash = current.els_flash;
+        }
+        self.mesh3d = Some(mesh);
+    }
+
+    fn spawn_vehicle_part_decode(&self, entry: usize) {
+        let Some(e) = self.state.lock().unwrap().entries.get(entry).cloned() else { return };
+        let Some(owner) = self.model_entry else { return };
+        let media = Arc::clone(&self.media);
+        std::thread::spawn(move || {
+            let result = decode_rage9_model_from_rpf_lod(&e.source_rpf, e.offset, &e.name, 0);
+            let mut m = media.lock().unwrap();
+            match result {
+                Ok(mesh) => m.loaded_vehicle_parts.push((owner, entry, mesh)),
+                Err(err) => m.status = format!("Vehicle part decode error ({}): {err}", e.name),
+            }
+        });
+    }
+
+    fn spawn_model_decode(&self, e: &RpfEntry, lod: usize) {
+        let media = Arc::clone(&self.media);
+        {
+            let mut m = media.lock().unwrap();
+            m.loading = true;
+            m.status = format!("Decoding RAGE9 meshlets: {}...", e.name);
+        }
+        let src = e.source_rpf.clone();
+        let off = e.offset;
+        let nm = e.name.clone();
+        std::thread::spawn(move || {
+            match decode_rage9_model_from_rpf_lod(&src, off, &nm, lod) {
+                Ok(mut mesh) => {
+                    // the viewer also applies normal maps unless the model binds an unusually large set
+                    let normals = mesh.tex_layers.iter().filter(|l| l.kind == model3d::TexLayerKind::Normal).count();
+                    if (1..=64).contains(&normals) {
+                        mesh.set_tex_layers(|l| l.default_on || l.kind == model3d::TexLayerKind::Normal);
+                    }
+                    let mut m = media.lock().unwrap();
+                    m.loading = false;
+                    m.status.clear();
+                    m.loaded_mesh = Some(mesh);
+                }
+                Err(err) => {
+                    let mut m = media.lock().unwrap();
+                    m.loading = false;
+                    m.status = format!("Model decode error ({nm}): {err}");
+                }
+            }
+        });
+    }
+
+    fn vehicle_parts_ui(&mut self, ui: &mut egui::Ui) {
+        if self.vehicle_parts.is_empty() {
+            return;
+        }
+        let enabled = self.vehicle_parts.iter().filter(|p| p.enabled).count();
+        let mut loads = Vec::new();
+        let mut rebuild = false;
+        egui::CollapsingHeader::new(format!("Advanced / Manual Parts ({enabled}/{})", self.vehicle_parts.len()))
+            .id_salt("vehicle_parts")
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.vehicle_part_filter)
+                            .hint_text("Filter bumpers, sirens, liveries, wheels…")
+                            .desired_width(320.0),
+                    );
+                    if ui.button("Clear selected").clicked() {
+                        for part in &mut self.vehicle_parts {
+                            part.enabled = false;
+                        }
+                        rebuild = true;
+                    }
+                });
+                let filter = self.vehicle_part_filter.trim().to_ascii_lowercase();
+                egui::ScrollArea::vertical()
+                    .id_salt("vehicle_parts_list")
+                    .max_height(180.0)
+                    .show(ui, |ui| {
+                        for part in &mut self.vehicle_parts {
+                            if !filter.is_empty() && !part.name.to_ascii_lowercase().contains(&filter) {
+                                continue;
+                            }
+                            ui.horizontal(|ui| {
+                                let changed = ui.checkbox(&mut part.enabled, &part.name).changed();
+                                if part.loading {
+                                    ui.spinner();
+                                }
+                                if changed {
+                                    if part.enabled && !self.vehicle_part_meshes.contains_key(&part.entry) {
+                                        part.loading = true;
+                                        loads.push(part.entry);
+                                    }
+                                    rebuild = true;
+                                }
+                            });
+                        }
+                    });
+                ui.label(
+                    RichText::new("Parts are separate RAGE 9 fragments and are overlaid in vehicle model space.")
+                        .size(10.5)
+                        .color(Color32::from_rgb(135, 145, 165)),
+                );
+            });
+        for entry in loads {
+            self.spawn_vehicle_part_decode(entry);
+        }
+        if rebuild {
+            self.rebuild_vehicle_parts();
+        }
+    }
+
+    fn vehicle_variations_ui(&mut self, ui: &mut egui::Ui) {
+        let is_vehicle = self
+            .model_entry
+            .and_then(|index| self.state.lock().unwrap().entries.get(index).map(|entry| entry.kind == "VEH"))
+            .unwrap_or(false);
+        if !is_vehicle {
+            return;
+        }
+        self.ensure_vehicle_configuration_db();
+        if self.vehicle_configuration_loading {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Reading authored vehicle configurations from packs.rpf…");
+            });
+            return;
+        }
+        if self.vehicle_configuration_db.is_empty() {
+            ui.label(
+                RichText::new("Authored variations unavailable: packs.rpf metadata was not found in the current scan.")
+                    .size(11.0)
+                    .color(Color32::from_rgb(180, 145, 110)),
+            );
+            return;
+        }
+        if self.vehicle_variations.is_empty() {
+            ui.label(
+                RichText::new("No authored fixed configurations were found for this vehicle.")
+                    .size(11.0)
+                    .color(Color32::from_rgb(150, 160, 180)),
+            );
+            return;
+        }
+
+        let selected_label = self
+            .vehicle_variation_selected
+            .checked_sub(1)
+            .and_then(|index| self.vehicle_variations.get(index))
+            .map(|variation| variation.label.as_str())
+            .unwrap_or("Stock / base model");
+        let mut selection = None;
+        egui::CollapsingHeader::new(format!("Vehicle Variation · {selected_label}"))
+            .id_salt("vehicle_variations")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.vehicle_variation_filter)
+                            .hint_text("Filter configurations…")
+                            .desired_width(260.0),
+                    );
+                    if ui.selectable_label(self.vehicle_variation_selected == 0, "Stock / base").clicked() {
+                        selection = Some(0);
+                    }
+                });
+                let filter = self.vehicle_variation_filter.trim().to_ascii_lowercase();
+                egui::ScrollArea::vertical()
+                    .id_salt("vehicle_variations_list")
+                    .max_height(150.0)
+                    .show(ui, |ui| {
+                        for (index, variation) in self.vehicle_variations.iter().enumerate() {
+                            if !filter.is_empty() && !variation.label.to_ascii_lowercase().contains(&filter) {
+                                continue;
+                            }
+                            ui.horizontal(|ui| {
+                                if let Some(rgb) = variation.colour {
+                                    let colour = Color32::from_rgb(
+                                        (rgb[0] * 255.0).round() as u8,
+                                        (rgb[1] * 255.0).round() as u8,
+                                        (rgb[2] * 255.0).round() as u8,
+                                    );
+                                    ui.colored_label(colour, "■");
+                                }
+                                if ui
+                                    .selectable_label(self.vehicle_variation_selected == index + 1, &variation.label)
+                                    .clicked()
+                                {
+                                    selection = Some(index + 1);
+                                }
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} models{}",
+                                        variation.part_names.len(),
+                                        if variation.unresolved.is_empty() {
+                                            String::new()
+                                        } else {
+                                            format!(" · {} ids with no model file", variation.unresolved.len())
+                                        }
+                                    ))
+                                    .size(10.0)
+                                    .color(Color32::from_rgb(135, 145, 165)),
+                                );
+                            });
+                        }
+                    });
+                if let Some(variation) = self
+                    .vehicle_variation_selected
+                    .checked_sub(1)
+                    .and_then(|index| self.vehicle_variations.get(index))
+                {
+                    if !variation.part_names.is_empty() {
+                        ui.label(
+                            RichText::new(format!("Models in this build: {}", variation.part_names.join(", ")))
+                                .size(10.5)
+                                .color(Color32::from_rgb(180, 210, 190)),
+                        );
+                    }
+                    if !variation.unresolved.is_empty() {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} configuration ids do not match any model filename in the scanned archives.",
+                                variation.unresolved.len()
+                            ))
+                            .size(10.5)
+                            .color(Color32::from_rgb(170, 150, 130)),
+                        );
+                    }
+                }
+            });
+        if let Some(selected) = selection {
+            self.apply_vehicle_variation(selected);
+        }
+    }
+
+    // decoded texture viewer with zoom export and a picker strip
+    fn render_texture_viewer(&mut self, ui: &mut egui::Ui) {
+        if self.tex_sel >= self.textures.len() {
+            self.tex_sel = 0;
+        }
+        let t = &self.textures[self.tex_sel];
+        let mut back = false;
+        let mut export_all = false;
+        ui.horizontal(|ui| {
+            if self.tex_from_model && ui.button("◀ Back to model").clicked() {
+                back = true;
+            }
+            ui.label(RichText::new(&t.name).strong().color(Color32::from_rgb(255, 168, 28)));
+            ui.label(RichText::new(format!("{}x{} · {} · mips={}", t.w, t.h, t.fmt_name, t.mips)).color(Color32::from_rgb(170, 210, 235)));
+            ui.add(egui::Slider::new(&mut self.tex_zoom, 0.25..=4.0).text("Zoom").fixed_decimals(2));
+            if ui.button("Export PNG").clicked() {
+                let safe: String = t.name.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') { c } else { '_' }).collect();
+                if let Some(p) = rfd::FileDialog::new().set_file_name(format!("{safe}.png")).add_filter("PNG Image", &["png"]).save_file() {
+                    if let Err(err) = export_texture_png(t, &p) {
+                        self.state.lock().unwrap().status = err;
+                    } else {
+                        self.state.lock().unwrap().status = format!("Saved {}", p.display());
+                    }
+                }
+            }
+            if ui.button("Export DDS").clicked() {
+                let safe: String = t.name.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') { c } else { '_' }).collect();
+                if let Some(p) = rfd::FileDialog::new().set_file_name(format!("{safe}.dds")).add_filter("DirectDraw Surface", &["dds"]).save_file() {
+                    let dds = build_dds_dx10(t.w, t.h, t.dxgi, &t.raw_dds_payload);
+                    if let Err(err) = fs::write(&p, &dds) {
+                        self.state.lock().unwrap().status = format!("DDS write error: {err}");
+                    } else {
+                        self.state.lock().unwrap().status = format!("Saved {}", p.display());
+                    }
+                }
+            }
+            if self.textures.len() > 1 && ui.button("Export All PNG").clicked() {
+                export_all = true;
+            }
+        });
+        if export_all {
+            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                let mut ok = 0;
+                for (i, t) in self.textures.iter().enumerate() {
+                    let safe: String = t.name.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') { c } else { '_' }).collect();
+                    if export_texture_png(t, &dir.join(format!("{i:02}_{safe}.png"))).is_ok() {
+                        ok += 1;
+                    }
+                }
+                self.state.lock().unwrap().status = format!("Saved {ok}/{} textures to {}", self.textures.len(), dir.display());
+            }
+        }
+        if back {
+            self.textures.clear();
+            self.tex_handle = None;
+            self.tex_from_model = false;
+            self.show_3d = true;
+            return;
+        }
+        if self.textures.len() > 1 {
+            ui.horizontal(|ui| {
+                if ui.button("◀").clicked() {
+                    self.tex_sel = if self.tex_sel == 0 { self.textures.len() - 1 } else { self.tex_sel - 1 };
+                }
+                ui.label(RichText::new(format!("{}/{}", self.tex_sel + 1, self.textures.len())).color(Color32::from_rgb(190, 180, 215)));
+                if ui.button("▶").clicked() {
+                    self.tex_sel = (self.tex_sel + 1) % self.textures.len();
+                }
+                egui::ScrollArea::horizontal().id_salt("txd_strip").show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for (i, item) in self.textures.iter().enumerate() {
+                            if ui.selectable_label(self.tex_sel == i, format!("{} ({}x{})", item.name, item.w, item.h)).clicked() {
+                                self.tex_sel = i;
+                            }
+                        }
+                    });
+                });
+            });
+        }
+        ui.separator();
+        let need_upload = self.tex_handle.as_ref().map(|(idx, _)| *idx != self.tex_sel).unwrap_or(true);
+        if need_upload {
+            let cur = &self.textures[self.tex_sel];
+            let ci = ColorImage { size: [cur.w, cur.h], pixels: cur.pixels.clone() };
+            let h = ui.ctx().load_texture(format!("percystar_tex_{}", self.tex_sel), ci, TextureOptions::LINEAR);
+            self.tex_handle = Some((self.tex_sel, h));
+        }
+        if let Some((_, handle)) = &self.tex_handle {
+            let cur = &self.textures[self.tex_sel];
+            let avail = ui.available_size();
+            let fit = (avail.x / cur.w as f32).min(avail.y / cur.h as f32).min(1.0).max(0.05);
+            let disp = egui::vec2(cur.w as f32 * fit * self.tex_zoom, cur.h as f32 * fit * self.tex_zoom);
+            egui::ScrollArea::both().show(ui, |ui| {
+                ui.image((handle.id(), disp));
+            });
+        }
+    }
+
+    // lists and decodes every pooled texture the selected model binds in its shaders
+    fn load_model_textures(&mut self) {
+        let Some(e) = self.model_entry.and_then(|i| self.state.lock().unwrap().entries.get(i).cloned()) else { return };
+        let media = Arc::clone(&self.media);
+        {
+            let mut m = media.lock().unwrap();
+            m.loading = true;
+            m.status = format!("Resolving textures of {}...", e.name);
+        }
+        std::thread::spawn(move || {
+            let res = model3d::list_model_texture_refs(&e.source_rpf, e.offset).and_then(|refs| {
+                let total = refs.len();
+                let pooled: Vec<_> = refs.iter().filter(|r| r.hit.is_some()).collect();
+                let mut texs = Vec::with_capacity(pooled.len());
+                for (i, r) in pooled.iter().enumerate() {
+                    media.lock().unwrap().status = format!("Decoding textures of {} ({}/{})...", e.name, i + 1, pooled.len());
+                    let Some(hit) = &r.hit else { continue };
+                    if let Ok(mut t) = decode_ttpf_texture(&hit.path, hit.tex_idx) {
+                        let pool = hit.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                        t.name = format!("{} · {pool} #{}", r.role(), hit.tex_idx);
+                        texs.push(t);
+                    }
+                }
+                if texs.is_empty() {
+                    return Err(format!("none of its {total} texture references are in the TTPF pools"));
+                }
+                let note = format!(
+                    "{}: loaded {} of {total} bound textures ({} are shared engine defaults outside the TTPF pools)",
+                    e.name,
+                    texs.len(),
+                    total - pooled.len()
+                );
+                Ok((texs, note))
+            });
+            let mut m = media.lock().unwrap();
+            m.loading = false;
+            match res {
+                Ok(v) => {
+                    m.status.clear();
+                    m.loaded_model_textures = Some(v);
+                }
+                Err(err) => m.status = format!("Model textures ({}): {err}", e.name),
+            }
+        });
+    }
+
+    // switches the viewed model to another detail file or in file lod level keeping the camera
+    fn apply_lod_pick(&mut self, pick: LodPick) {
+        let cam = self.mesh3d.as_ref().map(|m| [m.yaw, m.pitch, m.zoom, m.pan_x, m.pan_y]);
+        match pick {
+            LodPick::File(idx) => {
+                let show = self.show_3d;
+                self.select_entry(idx);
+                self.show_3d = show;
+            }
+            LodPick::Level(lod) => {
+                let Some(e) = self.selected.and_then(|i| self.state.lock().unwrap().entries.get(i).cloned()) else { return };
+                self.spawn_model_decode(&e, lod);
+            }
+        }
+        self.lod_keep_cam = cam;
+    }
+
     fn select_entry(&mut self, idx: usize) {
         let Some(e) = self.state.lock().unwrap().entries.get(idx).cloned() else { return };
         self.reset_selection();
         self.selected = Some(idx);
 
         if e.kind == "MODEL" || e.kind == "VEH" {
-            let media = Arc::clone(&self.media);
-            {
-                let mut m = media.lock().unwrap();
-                m.loading = true;
-                m.status = format!("Decoding RAGE9 meshlets: {}...", e.name);
+            self.lod_siblings = self.find_lod_siblings(&e);
+            self.vehicle_parts = self.find_vehicle_parts(&e);
+            self.model_entry = Some(idx);
+            if e.kind == "VEH" {
+                self.ensure_vehicle_configuration_db();
+                self.refresh_vehicle_variations();
             }
-            let src = e.source_rpf.clone();
-            let off = e.offset;
-            let nm = e.name.clone();
-            std::thread::spawn(move || {
-                match decode_rage9_model_from_rpf(&src, off, &nm) {
-                    Ok(mesh) => {
-                        let mut m = media.lock().unwrap();
-                        m.loading = false;
-                        m.status.clear();
-                        m.loaded_mesh = Some(mesh);
-                    }
-                    Err(err) => {
-                        let mut m = media.lock().unwrap();
-                        m.loading = false;
-                        m.status = format!("Model decode error ({nm}): {err}");
-                    }
-                }
-            });
+            self.spawn_model_decode(&e, 0);
             return;
         }
 
@@ -1372,10 +2203,21 @@ impl Rpf9App {
                 }
             }
         } else if e.kind == "AWC" {
+            let bank_ctx = if e.rpf_name.eq_ignore_ascii_case("audio.rpf") {
+                self.state.lock().unwrap().audio_bank_meta.get(&e.offset).map(|meta| {
+                    audio_player::AudioBankContext {
+                        pack_name: meta.pack_name.clone(),
+                        used_by: meta.used_by.clone(),
+                    }
+                })
+            } else {
+                None
+            };
             let media = Arc::clone(&self.media);
             {
                 let mut m = media.lock().unwrap();
                 m.loading = true;
+                m.loaded_bank_ctx = bank_ctx;
                 m.status = format!("Decoding {} Opus streams...", e.name);
             }
             std::thread::spawn(move || decode_awc_for_player(&e, &media));
@@ -1438,13 +2280,13 @@ impl Rpf9App {
     // throtled view rebuilder runs 4x a sec during live scans
     fn refresh_view(&mut self) {
         let ver = self.state.lock().unwrap().ver;
-        let key = (ver, self.filter.clone(), self.category.clone(), self.selected_rpf.clone(), self.vehicles_only);
+        let key = (ver, self.filter.clone(), self.category.clone(), self.selected_rpf.clone(), self.vehicles_only, self.audio_named);
         if self.view_sort != self.sort_mode {
             self.view_key = None;
         }
         if let Some(old) = &self.view_key {
             if *old == key { return; }
-            let only_ver = old.1 == key.1 && old.2 == key.2 && old.3 == key.3 && old.4 == key.4;
+            let only_ver = old.1 == key.1 && old.2 == key.2 && old.3 == key.3 && old.4 == key.4 && old.5 == key.5;
             if only_ver && self.last_rebuild.elapsed() < Duration::from_millis(1000) {
                 return;
             }
@@ -1455,12 +2297,13 @@ impl Rpf9App {
         self.rebuild_view(key);
     }
 
-    fn rebuild_view(&mut self, key: (u64, String, Category, String, bool)) {
+    fn rebuild_view(&mut self, key: (u64, String, Category, String, bool, bool)) {
         let st = self.state.lock().unwrap();
-        if self.hay_ver != st.ver {
-            self.hay = st.entries.iter().map(|e| format!("{}|{}|{}", e.name, e.rpf_name, e.kind).to_lowercase()).collect();
+        if self.hay_ver != st.ver || self.hay_audio_named != self.audio_named {
+            self.hay = st.entries.iter().map(|e| format!("{}|{}|{}|{}", e.name, display_entry_name(e, false), e.rpf_name, e.kind).to_lowercase()).collect();
             self.cached_rpf_names = st.rpf_names.clone();
             self.hay_ver = st.ver;
+            self.hay_audio_named = self.audio_named;
             let mut c = [0usize; 11];
             for e in &st.entries {
                 c[0] += 1;
@@ -1473,7 +2316,7 @@ impl Rpf9App {
                     "BK2" => 6,
                     "AWC" => 7,
                     "XML" => 8,
-                    "PSIN" | "ANIM" | "RSC9" => 9,
+                    "PSIN" | "ANIM" | "RSC9" | "META7A" => 9,
                     _ => 10,
                 }] += 1;
             }
@@ -1498,7 +2341,7 @@ impl Rpf9App {
                     Category::Videos => e.kind == "BK2",
                     Category::Audio => e.kind == "AWC",
                     Category::Xml => e.kind == "XML",
-                    Category::Resources => matches!(e.kind, "PSIN" | "ANIM" | "RSC9"),
+                    Category::Resources => matches!(e.kind, "PSIN" | "ANIM" | "RSC9" | "META7A"),
                     Category::Binary => e.kind == "ZLIB",
                 };
                 let h = &self.hay[*i];
@@ -1648,9 +2491,7 @@ impl Rpf9App {
         let mut browse_videos = false;
 
         if self.mv_drawer_open {
-            egui::SidePanel::left("mv_sidebar")
-                .default_width(360.0)
-                .frame(egui::Frame::new().fill(Color32::from_rgb(20, 13, 31)).inner_margin(10.0))
+            model_viewer_sidebar(ctx)
                 .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("MODELS").size(12.0).strong().color(Color32::from_rgb(255, 168, 28)));
@@ -1664,22 +2505,13 @@ impl Rpf9App {
                 });
                 ui.add_space(5.0);
 
-                ui.horizontal(|ui| {
-                    let sr = ui.add(
-                        egui::TextEdit::singleline(&mut self.mv_filter)
-                            .desired_width(ui.available_width() - 28.0)
-                            .hint_text("Search models (Ctrl+F) · words AND · -exclude"),
-                    );
-                    if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
-                        sr.request_focus();
-                    }
-                    if sr.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                        self.mv_filter.clear();
-                    }
-                    if ui.button("✕").on_hover_text("Clear filter").clicked() {
-                        self.mv_filter.clear();
-                    }
-                });
+                let sr = model_search_row(ui, &mut self.mv_filter);
+                if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
+                    sr.request_focus();
+                }
+                if sr.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    self.mv_filter.clear();
+                }
 
                 ui.add_space(5.0);
                 ui.horizontal_wrapped(|ui| {
@@ -1739,15 +2571,10 @@ impl Rpf9App {
                 let cur_pos = self.selected.and_then(|sel| {
                     self.mv_view.iter().position(|&mi| self.mv_entries[mi].0 == sel)
                 });
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.mv_hide_lods, "hide LOD copies");
-                    sort_combo(ui, "mv_sort_combo", &mut self.sort_mode);
-                    let has_any = !self.mv_view.is_empty();
-                    if ui.add_enabled(has_any, egui::Button::new("Random")).clicked() {
-                        let r = self.next_rand() % self.mv_view.len();
-                        to_select = Some(self.mv_entries[self.mv_view[r]].0);
-                    }
-                });
+                if model_browser_options(ui, &mut self.mv_hide_lods, &mut self.sort_mode, !self.mv_view.is_empty()) {
+                    let r = self.next_rand() % self.mv_view.len();
+                    to_select = Some(self.mv_entries[self.mv_view[r]].0);
+                }
                 ui.label(RichText::new("Up/Down arrow keys step through the list").size(10.5).color(Color32::from_rgb(130, 134, 150)));
 
                 // Arrow key / W-S navigation when search box is not focused
@@ -1873,7 +2700,12 @@ impl Rpf9App {
                             self.select_entry(eidx);
                         }
                     });
-                } else if let Some(mesh) = self.mesh3d.as_mut() {
+                } else if self.tex_from_model && !self.textures.is_empty() {
+                    self.render_texture_viewer(ui);
+                } else if self.mesh3d.is_some() {
+                    self.vehicle_variations_ui(ui);
+                    self.vehicle_parts_ui(ui);
+                    let mesh = self.mesh3d.as_mut().unwrap();
                     ui.horizontal_wrapped(|ui| {
                         ui.label(RichText::new(&mesh.name).size(15.0).strong().color(Color32::from_rgb(255, 168, 28)));
                         ui.label(
@@ -1888,6 +2720,12 @@ impl Rpf9App {
                             .size(11.5)
                             .color(Color32::from_rgb(170, 200, 230)),
                         );
+                        if let Some(pick) = lod_switch_ui(ui, mesh, &self.lod_siblings, self.selected) {
+                            self.lod_pick = Some(pick);
+                        }
+                        if self.model_entry.is_some() && ui.button("Texture Browser").on_hover_text(MODEL_TEX_TIP).clicked() {
+                            self.tex_pick = true;
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             // Quick camera presets
                             for (lbl, yaw, pitch) in [
@@ -2247,7 +3085,7 @@ impl Rpf9App {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.sgd5_search)
                             .desired_width(f32::INFINITY)
-                            .hint_text("Filter SGD5 shaders by name, hash, or stage..."),
+                            .hint_text("Filter SGD5 shaders by name, SGA hash, or stage..."),
                     );
                     let query = self.sgd5_search.trim().to_ascii_lowercase();
                     let filtered: Vec<usize> = group
@@ -2259,7 +3097,10 @@ impl Rpf9App {
                                 .map_or(true, |stage| shader.stage == stage)
                                 && (query.is_empty()
                                     || shader.name.to_ascii_lowercase().contains(&query)
-                                    || format!("0x{:016x}", shader.hash).contains(&query))
+                                    || format!("0x{:016x}", shader.sga_hash).contains(&query)
+                                    || group.effect_names_for_shader(shader.stage, shader.index)
+                                        .iter()
+                                        .any(|name| name.to_ascii_lowercase().contains(&query)))
                         })
                         .map(|(index, _)| index)
                         .collect();
@@ -2271,12 +3112,15 @@ impl Rpf9App {
                                 let shader = &group.shaders[index];
                                 let selected = self.sgd5_selected == Some(index);
                                 let color = sgd5_stage_color(shader.stage);
+                                let effects = group.effect_names_for_shader(shader.stage, shader.index);
                                 let label = format!(
-                                    "[{}] #{:05} {} {:5}B",
+                                    "[{}] #{:05} {} {:5}B{}",
                                     shader.stage,
                                     shader.index,
                                     shader.name,
-                                    shader.uncompressed_size
+                                    shader.uncompressed_size,
+                                    if effects.is_empty() { String::new() }
+                                    else { format!(" · {}", effects.join(", ")) }
                                 );
                                 let button = egui::Button::new(
                                     RichText::new(label)
@@ -2465,12 +3309,14 @@ impl Rpf9App {
                 if let Some(files) = self.sgd5_cache.clone() {
                     let group_index = self.sgd5_group.min(files.len() - 1);
                     if let Some(shader_index) = self.sgd5_selected {
-                        if let Some(shader) = files[group_index].shaders.get(shader_index) {
-                            match sgd5::decompress_shader(&files[group_index], shader) {
+                        let file = &files[group_index];
+                        if let Some(shader) = file.shaders.get(shader_index) {
+                            let effect_names = file.effect_names_for_shader(shader.stage, shader.index);
+                            match sgd5::decompress_shader(file, shader) {
                                 Ok(blob) => match dxbc::extract_fssm(&blob) {
                                     Ok(fssm) => {
                                         let code = fssm.code().to_vec();
-                                        let entry = sgd5_ps09_entry(shader, &fssm);
+                                        let entry = sgd5_ps09_entry(file, shader, &fssm);
                                         let stem = format!(
                                             "sgd5_{:05}_{}_{}",
                                             shader.index,
@@ -2490,6 +3336,13 @@ impl Rpf9App {
                                                 .size(13.0)
                                                 .color(Color32::from_rgb(255, 168, 28)),
                                             );
+                                            if !effect_names.is_empty() {
+                                                ui.label(
+                                                    RichText::new(format!("Effects: {}", effect_names.join(", ")))
+                                                        .size(11.0)
+                                                        .color(Color32::from_rgb(120, 220, 255)),
+                                                );
+                                            }
                                             ui.separator();
                                             for (mode, label) in [
                                                 (ShaderViewMode::Asm, "GFX10.3 ASM"),
@@ -2803,6 +3656,7 @@ fn load_disk_cache() -> HashMap<String, Vec<RpfEntry>> {
             "PSIN" => "PSIN",
             "ANIM" => "ANIM",
             "RSC9" => "RSC9",
+            "META7A" => "META7A",
             _ => "ZLIB",
         };
         // tolerate old 11 col cache rows and newer 10 col ones
@@ -3041,6 +3895,46 @@ impl SortMode {
     }
 }
 
+fn model_viewer_sidebar(ctx: &egui::Context) -> egui::SidePanel {
+    let max_width = (ctx.available_rect().width() * 0.45).min(480.0);
+    egui::SidePanel::left("mv_sidebar")
+        .default_width(360.0)
+        .width_range(240.0_f32.min(max_width)..=max_width)
+        .resizable(true)
+        .frame(egui::Frame::new().fill(Color32::from_rgb(20, 13, 31)).inner_margin(10.0))
+}
+
+fn model_search_row(ui: &mut egui::Ui, filter: &mut String) -> egui::Response {
+    ui.horizontal(|ui| {
+        // Lay out the button first, then give the field the remaining outer width.
+        // TextEdit::desired_width alone excludes its own horizontal margins.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("✕").on_hover_text("Clear filter").clicked() {
+                filter.clear();
+            }
+            ui.add_sized(
+                egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
+                egui::TextEdit::singleline(filter)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("Search models (Ctrl+F) · words AND · -exclude"),
+            )
+        }).inner
+    }).inner
+}
+
+fn model_browser_options(ui: &mut egui::Ui, hide_lods: &mut bool, sort: &mut SortMode, has_models: bool) -> bool {
+    let random = ui.horizontal(|ui| {
+        ui.checkbox(hide_lods, "hide LOD copies");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_enabled(has_models, egui::Button::new("Random")).clicked()
+        }).inner
+    }).inner;
+    // ComboBox contains its own horizontal layout and cannot reliably wrap as
+    // one widget alongside the checkbox; give it a row of its own.
+    sort_combo(ui, "mv_sort_combo", sort);
+    random
+}
+
 // compact sort dropdown lists pick up the change on next refresh
 fn sort_combo(ui: &mut egui::Ui, id: &str, mode: &mut SortMode) {
     egui::ComboBox::from_id_salt(id)
@@ -3157,6 +4051,44 @@ fn extract_xml_tag(bytes: &[u8]) -> Option<String> {
     None
 }
 
+fn probe_meta7a_zlib(
+    buf: &[u8],
+    zlib_at: usize,
+    read_n: usize,
+    off: u64,
+    path: &Path,
+    rname: &str,
+    probe_dec: &mut Decompress,
+    probe_out: &mut [u8],
+) -> Option<RpfEntry> {
+    if zlib_at + 8 > read_n || !is_zlib_head(&buf[zlib_at..read_n]) {
+        return None;
+    }
+    let end = (zlib_at + 32768).min(read_n);
+    probe_dec.reset(true);
+    let _ = probe_dec.decompress(&buf[zlib_at..end], probe_out, FlushDecompress::None);
+    let olen = probe_dec.total_out() as usize;
+    if olen < 0x80 || !meta7a::has_schema_enums(&probe_out[..olen]) {
+        return None;
+    }
+    let vft = u64::from_le_bytes(probe_out[0..8].try_into().ok()?);
+    let bmap = u64::from_le_bytes(probe_out[8..16].try_into().ok()?);
+    if vft != 0 || !(0x5000_0000..0x5800_0000).contains(&bmap) {
+        return None;
+    }
+    Some(RpfEntry {
+        source_rpf: path.to_path_buf(),
+        rpf_name: rname.to_string(),
+        name: format!("meta7a_{:012x}.#7a", off + zlib_at as u64),
+        kind: "META7A",
+        offset: off + zlib_at as u64,
+        comp_size: probe_dec.total_in(),
+        raw_size: olen as u64,
+        tracks: 0,
+        chunks: Vec::new(),
+    })
+}
+
 // shared rage9 page detector used by both veh scanner and full archive pass
 fn probe_rage9_page(
     buf: &[u8],
@@ -3168,6 +4100,10 @@ fn probe_rage9_page(
     probe_dec: &mut Decompress,
     probe_out: &mut [u8],
 ) -> Option<RpfEntry> {
+    // packs.rpf vehicle tables are often indexed at the zlib stream itself.
+    if let Some(meta) = probe_meta7a_zlib(buf, pos, read_n, off, path, rname, probe_dec, probe_out) {
+        return Some(meta);
+    }
     let p = pos + 0x10;
     if p + 8 > read_n || !is_zlib_head(&buf[p..read_n]) {
         return None;
@@ -3182,6 +4118,11 @@ fn probe_rage9_page(
     if vft != 0 || !(0x5000_0000..0x5800_0000).contains(&bmap) {
         return None;
     }
+    // Schema resources such as vehicle configurations share the 0DRPz tag with
+    // clip dictionaries. Enum definitions distinguish them before the anim probe.
+    if let Some(meta) = probe_meta7a_zlib(buf, p, read_n, off, path, rname, probe_dec, probe_out) {
+        return Some(meta);
+    }
     // 0. crClipDictionary (.ycd animation dictionary with 0DRPz tag at +0x10)
     if let Some((aname, clip_cnt)) = anim::probe_anim_dict(&probe_out[..olen]) {
         return Some(RpfEntry {
@@ -3195,9 +4136,6 @@ fn probe_rage9_page(
             tracks: clip_cnt,
             chunks: Vec::new(),
         });
-    }
-    if &probe_out[0x10..0x15] == b"0DRPz" {
-        return None;
     }
     // reject mid resource virtual chunks that start directly with a grmgeometry struct
     if u64::from_le_bytes(probe_out[0x60..0x68].try_into().ok()?) == 0x1601 {
@@ -3581,27 +4519,155 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
                     }
                 }
             }
-            i += 16;
+                i += 16;
         }
+    }
+
+    if rname.eq_ignore_ascii_case("audio.rpf") {
+        enrich_audio_rpf_entries(path, sz, &mut found);
     }
 
     Ok((hdr_info, found))
 }
 
+fn display_entry_name(e: &RpfEntry, audio_named: bool) -> std::borrow::Cow<'_, str> {
+    if !audio_named && e.kind == "AWC" && e.name.starts_with("sound_") && e.name.matches('_').count() > 2 {
+        if let Some(tail) = e.name.rsplit('_').next() {
+            if e.name.len() >= 10 {
+                return std::borrow::Cow::Owned(format!("{}_{}", &e.name[..10], tail));
+            }
+        }
+    }
+    std::borrow::Cow::Borrowed(&e.name)
+}
+
+fn enrich_audio_rpf_entries(audio_rpf: &PathBuf, total_sz: u64, entries: &mut Vec<RpfEntry>) -> HashMap<u64, dat::ResolvedAwcMeta> {
+    let mut meta_map = HashMap::new();
+    let awc_indices: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.kind == "AWC")
+        .map(|(i, _)| i)
+        .collect();
+    let first_awc_off = awc_indices
+        .first()
+        .map(|&i| entries[i].offset)
+        .unwrap_or(19_509_248);
+    let Some(cat) = dat::parse_audio_rpf_catalog(audio_rpf, first_awc_off) else {
+        return meta_map;
+    };
+    let rname = audio_rpf
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    if !entries.iter().any(|e| e.kind == "DAT") {
+        for (name, kind, off, raw_size, chunks) in &cat.metadata_chunks {
+            let comp_size: u64 = chunks.iter().map(|c| c.1).sum();
+            entries.push(RpfEntry {
+                source_rpf: audio_rpf.clone(),
+                rpf_name: rname.clone(),
+                name: name.clone(),
+                kind,
+                offset: *off,
+                comp_size,
+                raw_size: *raw_size,
+                tracks: 0,
+                chunks: chunks.clone(),
+            });
+        }
+    }
+    if !awc_indices.is_empty() && !cat.banks.is_empty() {
+        let awc_offs_tracks: Vec<(u64, u32)> = awc_indices
+            .iter()
+            .map(|&i| (entries[i].offset, entries[i].tracks))
+            .collect();
+        let resolved = dat::resolve_awc_names_from_catalog(&awc_offs_tracks, total_sz, &cat);
+        for (k, &entry_idx) in awc_indices.iter().enumerate() {
+            if let Some(Some(meta)) = resolved.get(k) {
+                entries[entry_idx].name = meta.name.clone();
+                if meta.exact_size > 0 {
+                    entries[entry_idx].comp_size = meta.exact_size;
+                    entries[entry_idx].raw_size = meta.exact_size;
+                }
+                meta_map.insert(entries[entry_idx].offset, meta.clone());
+            }
+        }
+    }
+    meta_map
+}
+
 impl eframe::App for Rpf9App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_sgd5_cache();
+        if let Some(pick) = self.lod_pick.take() {
+            self.apply_lod_pick(pick);
+        }
+        if std::mem::take(&mut self.tex_pick) {
+            self.load_model_textures();
+        }
         let (media_loading, media_status) = {
-            let mut m = self.media.lock().unwrap();
-            if let Some(mesh) = m.loaded_mesh.take() {
+            let media = Arc::clone(&self.media);
+            let mut m = media.lock().unwrap();
+            if let Some((generation, database)) = m.loaded_vehicle_configurations.take() {
+                if generation == self.vehicle_configuration_generation
+                    && generation == *self.watch_gen.lock().unwrap()
+                {
+                    self.vehicle_configuration_db = database;
+                    self.vehicle_configuration_loaded = true;
+                    self.vehicle_configuration_loading = false;
+                    self.refresh_vehicle_variations();
+                }
+            }
+            if let Some(mut mesh) = m.loaded_mesh.take() {
                 self.textures.clear();
                 self.tex_handle = None;
+                self.tex_from_model = false;
+                if let Some([yaw, pitch, zoom, pan_x, pan_y]) = self.lod_keep_cam.take() {
+                    (mesh.yaw, mesh.pitch, mesh.zoom, mesh.pan_x, mesh.pan_y) = (yaw, pitch, zoom, pan_x, pan_y);
+                }
+                if let Some((lbl, _)) = self.lod_siblings.iter().find(|(_, i)| Some(*i) == self.selected) {
+                    mesh.lod_label = format!("{lbl} detail file · {}", mesh.lod_label);
+                }
+                let is_vehicle = self
+                    .model_entry
+                    .and_then(|index| self.state.lock().unwrap().entries.get(index).map(|entry| entry.kind == "VEH"))
+                    .unwrap_or(false);
+                if is_vehicle {
+                    self.vehicle_base_mesh = Some(mesh.clone());
+                }
                 self.mesh3d = Some(mesh);
+                if self.vehicle_base_mesh.is_some() {
+                    self.rebuild_vehicle_parts();
+                }
                 self.show_3d = true;
+            }
+            let loaded_parts: Vec<_> = m.loaded_vehicle_parts.drain(..).collect();
+            let had_loaded_parts = !loaded_parts.is_empty();
+            for (owner, entry, mesh) in loaded_parts {
+                if Some(owner) != self.model_entry {
+                    continue;
+                }
+                self.vehicle_part_meshes.insert(entry, mesh);
+                if let Some(choice) = self.vehicle_parts.iter_mut().find(|p| p.entry == entry) {
+                    choice.loading = false;
+                }
+            }
+            if had_loaded_parts {
+                self.rebuild_vehicle_parts();
+            }
+            if let Some((texs, note)) = m.loaded_model_textures.take() {
+                self.textures = texs;
+                self.tex_sel = 0;
+                self.tex_handle = None;
+                self.tex_zoom = 1.0;
+                self.tex_from_model = true;
+                self.state.lock().unwrap().status = note;
             }
             if let Some(texs) = m.loaded_textures.take() {
                 self.mesh3d = None;
                 self.show_3d = false;
+                self.tex_from_model = false;
                 self.textures = texs;
                 self.tex_sel = 0;
                 self.tex_handle = None;
@@ -3609,9 +4675,14 @@ impl eframe::App for Rpf9App {
             }
             if let Some((tracks, awc_bytes)) = m.loaded_tracks.take() {
                 self.audio_player.set_tracks(tracks, awc_bytes);
+                self.audio_player.bank_ctx = m.loaded_bank_ctx.take();
             }
             (m.loading, m.status.clone())
         };
+        if let Some(q) = self.audio_player.requested_search.take() {
+            self.category = Category::Audio;
+            self.filter = q;
+        }
 
         egui::TopBottomPanel::top("top").frame(egui::Frame::new().fill(Color32::from_rgb(24, 14, 36)).inner_margin(10.0)).show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -3854,6 +4925,20 @@ impl eframe::App for Rpf9App {
                 });
                 ui.add_space(4.0);
             }
+            if self.category == Category::Audio {
+                ui.horizontal(|ui| {
+                    let btn = egui::Button::new(
+                        RichText::new(if self.audio_named { "Audio Names: ON" } else { "Audio Names: OFF (Raw)" })
+                            .strong()
+                            .color(if self.audio_named { Color32::BLACK } else { Color32::from_rgb(255, 72, 165) }),
+                    )
+                    .fill(if self.audio_named { Color32::from_rgb(90, 235, 165) } else { Color32::from_rgb(38, 24, 56) });
+                    if ui.add(btn).clicked() {
+                        self.audio_named = !self.audio_named;
+                    }
+                });
+                ui.add_space(4.0);
+            }
             self.refresh_view();
             if !ctx.wants_keyboard_input() && !self.view.is_empty() {
                 let cur_pos = self.selected.and_then(|sel| self.view.iter().position(|&i| i == sel));
@@ -3912,10 +4997,11 @@ impl eframe::App for Rpf9App {
                         ui.set_height(ROW_H);
                         ui.label(RichText::new(format!("{:<4}", e.kind)).strong().size(11.5).color(kind_color(e.kind)));
                         let sz_s = format_size(e.raw_size);
+                        let dname = display_entry_name(e, self.audio_named);
                         let label = if self.is_folder {
-                            format!("{} / {}  ({})", e.rpf_name, e.name, sz_s)
+                            format!("{} / {}  ({})", e.rpf_name, dname, sz_s)
                         } else {
-                            format!("{}  ({})", e.name, sz_s)
+                            format!("{}  ({})", dname, sz_s)
                         };
                         let is_sel = self.selected == Some(*idx);
                         let resp = ui.selectable_label(is_sel, RichText::new(label).size(12.5));
@@ -4013,74 +5099,11 @@ impl eframe::App for Rpf9App {
                         });
                 }
             } else if !self.textures.is_empty() {
-                if self.tex_sel >= self.textures.len() {
-                    self.tex_sel = 0;
-                }
-                let t = &self.textures[self.tex_sel];
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(&t.name).strong().color(Color32::from_rgb(255, 168, 28)));
-                    ui.label(RichText::new(format!("{}x{} · {} · mips={}", t.w, t.h, t.fmt_name, t.mips)).color(Color32::from_rgb(170, 210, 235)));
-                    ui.add(egui::Slider::new(&mut self.tex_zoom, 0.25..=4.0).text("Zoom").fixed_decimals(2));
-                    if ui.button("Export PNG").clicked() {
-                        let safe: String = t.name.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') { c } else { '_' }).collect();
-                        if let Some(p) = rfd::FileDialog::new().set_file_name(format!("{safe}.png")).add_filter("PNG Image", &["png"]).save_file() {
-                            if let Err(err) = export_texture_png(t, &p) {
-                                self.state.lock().unwrap().status = err;
-                            } else {
-                                self.state.lock().unwrap().status = format!("Saved {}", p.display());
-                            }
-                        }
-                    }
-                    if ui.button("Export DDS").clicked() {
-                        let safe: String = t.name.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') { c } else { '_' }).collect();
-                        if let Some(p) = rfd::FileDialog::new().set_file_name(format!("{safe}.dds")).add_filter("DirectDraw Surface", &["dds"]).save_file() {
-                            let dds = build_dds_dx10(t.w, t.h, t.dxgi, &t.raw_dds_payload);
-                            if let Err(err) = fs::write(&p, &dds) {
-                                self.state.lock().unwrap().status = format!("DDS write error: {err}");
-                            } else {
-                                self.state.lock().unwrap().status = format!("Saved {}", p.display());
-                            }
-                        }
-                    }
-                });
-                if self.textures.len() > 1 {
-                    ui.horizontal(|ui| {
-                        if ui.button("◀").clicked() {
-                            self.tex_sel = if self.tex_sel == 0 { self.textures.len() - 1 } else { self.tex_sel - 1 };
-                        }
-                        ui.label(RichText::new(format!("{}/{}", self.tex_sel + 1, self.textures.len())).color(Color32::from_rgb(190, 180, 215)));
-                        if ui.button("▶").clicked() {
-                            self.tex_sel = (self.tex_sel + 1) % self.textures.len();
-                        }
-                        egui::ScrollArea::horizontal().id_salt("txd_strip").show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                for (i, item) in self.textures.iter().enumerate() {
-                                    if ui.selectable_label(self.tex_sel == i, format!("{} ({}x{})", item.name, item.w, item.h)).clicked() {
-                                        self.tex_sel = i;
-                                    }
-                                }
-                            });
-                        });
-                    });
-                }
-                ui.separator();
-                let need_upload = self.tex_handle.as_ref().map(|(idx, _)| *idx != self.tex_sel).unwrap_or(true);
-                if need_upload {
-                    let cur = &self.textures[self.tex_sel];
-                    let ci = ColorImage { size: [cur.w, cur.h], pixels: cur.pixels.clone() };
-                    let h = ctx.load_texture(format!("percystar_tex_{}", self.tex_sel), ci, TextureOptions::LINEAR);
-                    self.tex_handle = Some((self.tex_sel, h));
-                }
-                if let Some((_, handle)) = &self.tex_handle {
-                    let cur = &self.textures[self.tex_sel];
-                    let avail = ui.available_size();
-                    let fit = (avail.x / cur.w as f32).min(avail.y / cur.h as f32).min(1.0).max(0.05);
-                    let disp = egui::vec2(cur.w as f32 * fit * self.tex_zoom, cur.h as f32 * fit * self.tex_zoom);
-                    egui::ScrollArea::both().show(ui, |ui| {
-                        ui.image((handle.id(), disp));
-                    });
-                }
-            } else if let Some(mesh) = self.mesh3d.as_mut() {
+                self.render_texture_viewer(ui);
+            } else if self.mesh3d.is_some() {
+                self.vehicle_variations_ui(ui);
+                self.vehicle_parts_ui(ui);
+                let mesh = self.mesh3d.as_mut().unwrap();
                 let mut toggle_3d = self.show_3d;
                 ui.horizontal(|ui| {
                     if ui.selectable_label(!toggle_3d, "Info").clicked() { toggle_3d = false; }
@@ -4097,6 +5120,12 @@ impl eframe::App for Rpf9App {
                             mesh.verts = next.verts;
                             mesh.dirty = true;
                         }
+                    }
+                    if let Some(pick) = lod_switch_ui(ui, mesh, &self.lod_siblings, self.selected) {
+                        self.lod_pick = Some(pick);
+                    }
+                    if self.model_entry.is_some() && ui.button("Texture Browser").on_hover_text(MODEL_TEX_TIP).clicked() {
+                        self.tex_pick = true;
                     }
                 });
                 if self.anim_dur > 0.0 && self.anim_playing && toggle_3d {
@@ -4178,6 +5207,71 @@ mod tests {
     use super::*;
 
     #[test]
+    fn model_sidebar_width_stays_stable_across_frames() {
+        let ctx = egui::Context::default();
+        let mut filter = String::new();
+        let mut widths = Vec::new();
+        for frame in 0..64 {
+            if frame == 16 { filter = "long_model_search_".repeat(100); }
+            let _ = ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1320.0, 800.0))),
+                ..Default::default()
+            }, |ctx| {
+                let panel = model_viewer_sidebar(ctx).show(ctx, |ui| {
+                    model_search_row(ui, &mut filter);
+                });
+                widths.push(panel.response.rect.width());
+                egui::CentralPanel::default().show(ctx, |_| {});
+            });
+        }
+        assert!(widths.iter().all(|w| (w - widths[0]).abs() <= 1.0),
+            "Sidebar expands without input: first={} last={}", widths[0], widths.last().unwrap());
+    }
+
+    #[test]
+    fn model_sidebar_recovers_from_an_oversized_saved_width() {
+        let ctx = egui::Context::default();
+        ctx.data_mut(|data| data.insert_persisted(
+            egui::Id::new("mv_sidebar"),
+            egui::containers::panel::PanelState {
+                rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(2000.0, 800.0)),
+            },
+        ));
+        let mut filter = "long_search_".repeat(100);
+        let mut hide_lods = true;
+        let mut sort = SortMode::Relevance;
+        for width in [1320.0_f32, 640.0, 960.0] {
+            for _ in 0..8 {
+                let _ = ctx.run(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 800.0))),
+                    ..Default::default()
+                }, |ctx| {
+                    let panel = model_viewer_sidebar(ctx).show(ctx, |ui| {
+                        model_search_row(ui, &mut filter);
+                        let _ = model_browser_options(ui, &mut hide_lods, &mut sort, true);
+                    });
+                    assert!(panel.response.rect.width() <= (width * 0.45).min(480.0) + 1.0,
+                        "Sidebar {} exceeds limit for window {width}", panel.response.rect.width());
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        assert!(ui.available_width() > width * 0.5);
+                    });
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn lod_sibling_names_cover_hi_mid_and_base() {
+        let want = ["cheetah2_hi.#ft".to_string(), "cheetah2_mid.#ft".to_string(), "cheetah2.#ft".to_string()];
+        for n in ["cheetah2.#ft", "cheetah2_hi.#ft", "cheetah2_MID.#ft"] {
+            assert_eq!(lod_sibling_names(n).unwrap(), want, "{n}");
+        }
+        assert_eq!(lod_sibling_names("a_b_bonnet_01_mid.#ft").unwrap()[2], "a_b_bonnet_01.#ft");
+        assert!(lod_sibling_names("noext").is_none());
+        assert!(lod_sibling_names("_hi.#ft").is_none());
+    }
+
+    #[test]
     fn model_viewer_categories_classify_correctly() {
         assert_eq!(classify_model_cat("VEH", "banshee_hi.#ft"), ModelCat::Vehicles);
         assert_eq!(classify_model_cat("MODEL", "sentinelclassic2_skirt_split_l_histr_01.#ft"), ModelCat::Vehicles);
@@ -4215,6 +5309,79 @@ mod tests {
         assert!(parse_semver("bad").is_none());
     }
 
+    /// PERCYSTAR_PACKS_RPF=<packs.rpf> cargo test packs_vehicle_table_is_schema_not_animation -- --nocapture
+    #[test]
+    fn packs_vehicle_table_is_schema_not_animation() {
+        let Ok(path) = std::env::var("PERCYSTAR_PACKS_RPF") else { return };
+        let path = PathBuf::from(path);
+        if !path.exists() {
+            return;
+        }
+        let mut file = File::open(path).expect("open packs.rpf");
+        let (bytes, _, _) = read_virtual_from_file(&mut file, 0x0bae_c010).expect("read vehicle table");
+        assert!(meta7a::has_schema_enums(&bytes), "vehicle tables must not be classified as clip dictionaries");
+        let configurations = vehicle_variations::parse_configurations(&bytes);
+        let stanier = configurations.get(&psin::joaat("stanierg2")).expect("stanierg2 configurations");
+        assert!(stanier.len() >= 20, "expected the authored stanierg2 rows, got {}", stanier.len());
+    }
+
+    /// PERCYSTAR_PACKS_RPF=<packs.rpf> cargo test authored_stanierg2_configurations -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn authored_stanierg2_configurations() {
+        let Ok(path) = std::env::var("PERCYSTAR_PACKS_RPF") else { return };
+        let path = PathBuf::from(path);
+        let (_, entries) = scan_single_rpf(&path, None).expect("scan packs.rpf");
+        let mut metadata: Vec<_> = entries.iter().filter(|entry| entry.kind == "META7A").collect();
+        // Known table resource in this supported build; also makes the fixture
+        // useful when an imported/partial catalog did not index metadata rows.
+        let fallback;
+        if metadata.is_empty() {
+            // Known packs.rpf vehicle-config resource for this supported build.
+            fallback = RpfEntry {
+                source_rpf: path.clone(),
+                rpf_name: "packs.rpf".into(),
+                name: "vehicle_tables.#7a".into(),
+                kind: "META7A",
+                offset: 0x0bae_c010,
+                comp_size: 0,
+                raw_size: 0,
+                tracks: 0,
+                chunks: Vec::new(),
+            };
+            metadata.push(&fallback);
+        }
+        assert!(!metadata.is_empty(), "no 0x7a metadata resources indexed");
+        let mut database = vehicle_variations::VehicleConfigurationDb::new();
+        let mut failures = 0usize;
+        for entry in &metadata {
+            let mut file = File::open(&entry.source_rpf).expect("open packs.rpf");
+            match read_virtual_from_file(&mut file, entry.offset) {
+                Ok((bytes, _, _)) => vehicle_variations::merge_configurations(
+                    &mut database,
+                    vehicle_variations::parse_configurations(&bytes),
+                ),
+                Err(_) => failures += 1,
+            }
+        }
+        assert!(failures < metadata.len(), "failed to decode every packs.rpf 0x7a resource");
+        let configurations = database
+            .get(&psin::joaat("stanierg2"))
+            .unwrap_or_else(|| panic!("stanierg2 configurations missing after {} meta resources", metadata.len()));
+        assert!(
+            configurations.len() >= 20,
+            "expected ~23 stanierg2 configurations, got {}",
+            configurations.len()
+        );
+        assert!(
+            configurations.iter().any(|configuration| {
+                !configuration.parts.is_empty()
+                    && configuration.parts.contains(&psin::joaat("cmn_siren_roofbar1_02"))
+            }),
+            "stanierg2 police configuration should reference the shared roofbar with a resolved part list"
+        );
+    }
+
     #[test]
     fn sgd5_shader_lifts_through_gfx103_paths() {
         let shader = sgd5::Sgd5Shader {
@@ -4224,11 +5391,12 @@ mod tests {
             wave_size: 32,
             compressed_size: 8,
             uncompressed_size: 8,
-            hash: 0x0123_4567_89ab_cdef,
+            sga_hash: 0x0123_4567_89ab_cdef,
             register_count: 8,
             cbuffer_count: 1,
             texture_count: 0,
             binary_offset: 0,
+            reflection_records: Vec::new(),
         };
         let mut data = vec![0u8; 0x20];
         data.extend_from_slice(&0xBFA0_0003u32.to_le_bytes());
@@ -4238,10 +5406,33 @@ mod tests {
             code_size: 8,
             data,
         };
-        let entry = sgd5_ps09_entry(&shader, &fssm);
+        let entry = sgd5_ps09_entry(
+            &sgd5::Sgd5File {
+                data: Vec::new(),
+                group_hash: 0,
+                descriptors: Vec::new(),
+                shared_reflection: sgd5::Sgd5SharedReflection {
+                    size: 0,
+                    referenced_count: 0,
+                    extra_count: 0,
+                    reserved: 0,
+                    records: Vec::new(),
+                },
+                shaders: vec![shader.clone()],
+                declared_effect_count: 0,
+                effect_count: 0,
+                trailer_flags: 0,
+                trailer_reserved: [0; 6],
+                effects: Vec::new(),
+                hash_names: Default::default(),
+                effect_shader_map: Default::default(),
+            },
+            &shader,
+            &fssm,
+        );
 
         assert_eq!(entry.stage, ShaderStage::Vertex);
-        assert_eq!(entry.pso_hash, shader.hash);
+        assert_eq!(entry.sga_hash, Some(shader.sga_hash));
         assert_eq!(entry.insn_count, 2);
         assert!(lift_to_hlsl(&entry, fssm.code()).contains("VSMain"));
         assert_eq!(
@@ -4773,6 +5964,13 @@ fn main() -> eframe::Result<()> {
     }
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 2 && args[1] == "--gpu-world" {
+        if args.get(2).is_some_and(|a| a == "--smoke-scene") {
+            if let Err(error) = world_gpu::run_gpu_world_smoke(args.get(3).map(String::as_str).unwrap_or("terrain")) {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         let mut common_p: Option<PathBuf> = None;
         let mut levels_p: Option<PathBuf> = None;
         let mut idx = 2usize;
@@ -4787,7 +5985,10 @@ fn main() -> eframe::Result<()> {
                 idx += 1;
             }
         }
-        world_gpu::run_gpu_world_cli(common_p.as_deref(), levels_p.as_deref());
+        if let Err(error) = world_gpu::run_gpu_world_cli(common_p.as_deref(), levels_p.as_deref()) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
         return Ok(());
     }
     if args.len() >= 3 && args[1] == "--probe-maps" {
