@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Version-v1.4.7-FFA81C?style=flat-square" alt="Version" />
-  <img src="https://img.shields.io/badge/Rust-1.85%2B-orange?style=flat-square&logo=rust" alt="Rust" />
+  <img src="https://img.shields.io/badge/Rust-1.89%2B-orange?style=flat-square&logo=rust" alt="Rust" />
   <img src="https://img.shields.io/badge/Shaders-RDNA2%20GFX10.3%20%E2%86%92%20HLSL%20%2F%20SPIR--V-FF4FA3?style=flat-square" alt="Shaders" />
   <img src="https://img.shields.io/badge/Textures-100%25%20DXGI%20%2B%20RDNA2%204KB%2F64KB-48D2FF?style=flat-square" alt="Textures" />
   <img src="https://img.shields.io/badge/3D-Model%20Viewer%20(10%20Categories)-FF55AF?style=flat-square" alt="3D" />
@@ -79,6 +79,8 @@
   - Watertight fixed-point rasterizer (top-left fill rule, no pinholes in dense meshes, no double blending on glass), rendered on all CPU cores, supersampled when the camera rests and adaptive resolution while it moves.
 - **Export With Normals, Materials & Textures (`src/model3d/export.rs`)**
   - **Export .OBJ** writes shared `vn` normals, bottom-left `vt`, a `.mtl` library and the applied textures as PNG. **Export .GLB** writes binary glTF 2.0 (Y-up, one node per drawable, embedded PNG textures, `MASK`/`BLEND` alpha modes) that opens directly in Blender and game engines.
+- **Open From the Command Line or by Drag & Drop (`src/main.rs`)**
+  - `PercyStar <path>` ("Open with", or dragging a file onto the exe) and dropping a file or folder onto the window open a game folder, an `.rpf`/`.ttpf` archive, an `.obj` model or a `.ps09` cache directly.
 - **Texture Decoder Fixes (`src/tex.rs`)**
   - `BC2`/`BC3` color blocks are always decoded four-color, `BC4_SNORM`/`BC5_SNORM` are decoded signed, and single-channel `BC4` masks are no longer bound as normal maps.
 
@@ -207,7 +209,7 @@ PercyStar/
 
 ## Building from Source
 
-Requires **Rust** (`x86_64-pc-windows-gnu` with MinGW `windres`/`dlltool`, or `msvc`). Cargo fetches all pinned dependencies from `Cargo.lock`:
+Requires **Rust 1.89 or newer** (`x86_64-pc-windows-gnu` with MinGW `windres`/`dlltool`, or `msvc`). Cargo fetches all pinned dependencies from `Cargo.lock`:
 
 ```powershell
 cargo test
