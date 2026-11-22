@@ -1071,12 +1071,6 @@ fn build_effect_shader_map(
     map
 }
 
-pub fn parse_sgd5(path: &Path) -> Result<Sgd5File, Sgd5Error> {
-    let data =
-        fs::read(path).map_err(|error| Sgd5Error(format!("read {}: {error}", path.display())))?;
-    parse_sgd5_data(path, data)
-}
-
 pub fn load_sgd5(path: &Path) -> Result<Vec<Sgd5File>, Sgd5Error> {
     let data =
         fs::read(path).map_err(|error| Sgd5Error(format!("read {}: {error}", path.display())))?;
@@ -1238,7 +1232,7 @@ fn extract_sgd5_file(
         "index,stage,name,wave_size,compressed_size,uncompressed_size,sga_hash,registers,cbuffers,textures,filename\n",
     );
     for shader in selected {
-        let blob = decompress_shader(&file, shader)?;
+        let blob = decompress_shader(file, shader)?;
         let filename = format!(
             "{:05}_{}_{}.dxbc",
             shader.index,

@@ -81,8 +81,8 @@ pub fn dxgi_info(dxgi: u8) -> Option<(&'static str, bool, usize)> {
 }
 
 pub fn padded_4kb_size(w: usize, h: usize, is_bc: bool, bpe: usize) -> usize {
-    let ew = if is_bc { (w + 3) / 4 } else { w }.max(1);
-    let eh = if is_bc { (h + 3) / 4 } else { h }.max(1);
+    let ew = if is_bc { w.div_ceil(4) } else { w }.max(1);
+    let eh = if is_bc { h.div_ceil(4) } else { h }.max(1);
     let (tw, th) = match bpe {
         16 => (16usize, 16usize),
         8 => (32, 16),
@@ -90,14 +90,14 @@ pub fn padded_4kb_size(w: usize, h: usize, is_bc: bool, bpe: usize) -> usize {
         2 => (64, 32),
         _ => (64, 64),
     };
-    let pw = ((ew + tw - 1) / tw) * tw;
-    let ph = ((eh + th - 1) / th) * th;
+    let pw = ew.div_ceil(tw) * tw;
+    let ph = eh.div_ceil(th) * th;
     pw * ph * bpe
 }
 
 pub fn padded_64kb_size(w: usize, h: usize, is_bc: bool, bpe: usize) -> usize {
-    let ew = if is_bc { (w + 3) / 4 } else { w }.max(1);
-    let eh = if is_bc { (h + 3) / 4 } else { h }.max(1);
+    let ew = if is_bc { w.div_ceil(4) } else { w }.max(1);
+    let eh = if is_bc { h.div_ceil(4) } else { h }.max(1);
     let (tw, th) = match bpe {
         16 => (64usize, 64usize),
         8 => (128, 64),
@@ -105,15 +105,15 @@ pub fn padded_64kb_size(w: usize, h: usize, is_bc: bool, bpe: usize) -> usize {
         2 => (256, 128),
         _ => (256, 256),
     };
-    let pw = ((ew + tw - 1) / tw) * tw;
-    let ph = ((eh + th - 1) / th) * th;
+    let pw = ew.div_ceil(tw) * tw;
+    let ph = eh.div_ceil(th) * th;
     pw * ph * bpe
 }
 
 /// Verified AMD RDNA2 / Xbox Scarlett SW_4KB_D deswizzle for all 5 bit depths (8..128bpp).
 pub fn deswizzle_4kb_d(raw: &[u8], w: usize, h: usize, is_bc: bool, bpe: usize) -> Vec<u8> {
-    let ew = if is_bc { (w + 3) / 4 } else { w }.max(1);
-    let eh = if is_bc { (h + 3) / 4 } else { h }.max(1);
+    let ew = if is_bc { w.div_ceil(4) } else { w }.max(1);
+    let eh = if is_bc { h.div_ceil(4) } else { h }.max(1);
     let (tw, th) = match bpe {
         16 => (16usize, 16usize),
         8 => (32, 16),
@@ -121,8 +121,8 @@ pub fn deswizzle_4kb_d(raw: &[u8], w: usize, h: usize, is_bc: bool, bpe: usize) 
         2 => (64, 32),
         _ => (64, 64),
     };
-    let pw = ((ew + tw - 1) / tw) * tw;
-    let ph = ((eh + th - 1) / th) * th;
+    let pw = ew.div_ceil(tw) * tw;
+    let ph = eh.div_ceil(th) * th;
     let needed = pw * ph * bpe;
     let lin_len = ew * eh * bpe;
     if raw.len() < needed {
@@ -165,8 +165,8 @@ pub fn deswizzle_4kb_d(raw: &[u8], w: usize, h: usize, is_bc: bool, bpe: usize) 
 
 /// Verified Xbox Scarlett 64KB TTPF tile deswizzle for ALL 5 bit depths (8..128bpp, BCn & uncompressed).
 pub fn deswizzle_64kb_ttpf(raw: &[u8], w: usize, h: usize, is_bc: bool, bpe: usize) -> Vec<u8> {
-    let bw = if is_bc { (w + 3) / 4 } else { w }.max(1);
-    let bh = if is_bc { (h + 3) / 4 } else { h }.max(1);
+    let bw = if is_bc { w.div_ceil(4) } else { w }.max(1);
+    let bh = if is_bc { h.div_ceil(4) } else { h }.max(1);
     let (tw, th, shift) = match bpe {
         16 => (64usize, 64usize, 12usize),
         8 => (128, 64, 13),
@@ -174,8 +174,8 @@ pub fn deswizzle_64kb_ttpf(raw: &[u8], w: usize, h: usize, is_bc: bool, bpe: usi
         2 => (256, 128, 15),
         _ => (256, 256, 16),
     };
-    let pw = ((bw + tw - 1) / tw) * tw;
-    let ph = ((bh + th - 1) / th) * th;
+    let pw = bw.div_ceil(tw) * tw;
+    let ph = bh.div_ceil(th) * th;
     let needed = pw * ph * bpe;
     let mut padded = Vec::new();
     let src: &[u8] = if raw.len() >= needed {
@@ -302,7 +302,7 @@ pub fn decode_linear_to_rgba(lin: &[u8], w: usize, h: usize, dxgi: u8) -> Option
                 // overflows `1i16 << 16` in debug builds. Convert mode-15 blocks to mode-3 (0x03)
                 // untransformed blocks safely so BC6H never panics.
                 let mut safe = lin.to_vec();
-                for blk in safe.chunks_exact_mut(16) {
+                for blk in safe.as_chunks_mut::<16>().0 {
                     if (blk[0] & 0x1F) == 0x0F {
                         blk[0] = (blk[0] & !0x1F) | 0x03;
                     }
@@ -344,8 +344,8 @@ pub fn decode_linear_to_rgba(lin: &[u8], w: usize, h: usize, dxgi: u8) -> Option
     }
     if matches!(dxgi, 74 | 75) {
         // BC2 = 8-byte 4-bit explicit alpha + 8-byte BC1 color per 4x4 block
-        let bw = (w + 3) / 4;
-        let bh = (h + 3) / 4;
+        let bw = w.div_ceil(4);
+        let bh = h.div_ceil(4);
         if lin.len() < bw * bh * 16 { return None; }
         let mut bc1_only = Vec::with_capacity(bw * bh * 8);
         for b in 0..bw * bh {
@@ -381,23 +381,23 @@ pub fn decode_linear_to_rgba(lin: &[u8], w: usize, h: usize, dxgi: u8) -> Option
     match dxgi {
         10 => {
             if lin.len() < w * h * 8 { return None; }
-            for px in lin[..w * h * 8].chunks_exact(8) {
+            for px in lin[..w * h * 8].as_chunks::<8>().0 {
                 let r = tonemap_u8(f16_to_f32(ru16(px, 0)));
                 let g = tonemap_u8(f16_to_f32(ru16(px, 2)));
                 let b = tonemap_u8(f16_to_f32(ru16(px, 4)));
-                let a = (f16_to_f32(ru16(px, 6)).clamp(0.0, 1.0) * 255.0) as u8;
-                pixels.push(Color32::from_rgba_unmultiplied(r, g, b, a.max(255)));
+                let _a = (f16_to_f32(ru16(px, 6)).clamp(0.0, 1.0) * 255.0) as u8;
+                pixels.push(Color32::from_rgba_unmultiplied(r, g, b, 255));
             }
         }
         11 => {
             if lin.len() < w * h * 8 { return None; }
-            for px in lin[..w * h * 8].chunks_exact(8) {
+            for px in lin[..w * h * 8].as_chunks::<8>().0 {
                 pixels.push(Color32::from_rgba_unmultiplied(px[1], px[3], px[5], px[7]));
             }
         }
         24 => {
             if lin.len() < w * h * 4 { return None; }
-            for px in lin[..w * h * 4].chunks_exact(4) {
+            for px in lin[..w * h * 4].as_chunks::<4>().0 {
                 let v = ru32(px, 0);
                 let r = ((v & 0x3FF) >> 2) as u8;
                 let g = (((v >> 10) & 0x3FF) >> 2) as u8;
@@ -408,13 +408,13 @@ pub fn decode_linear_to_rgba(lin: &[u8], w: usize, h: usize, dxgi: u8) -> Option
         }
         28 | 29 => {
             if lin.len() < w * h * 4 { return None; }
-            for px in lin[..w * h * 4].chunks_exact(4) {
+            for px in lin[..w * h * 4].as_chunks::<4>().0 {
                 pixels.push(Color32::from_rgba_unmultiplied(px[0], px[1], px[2], px[3]));
             }
         }
         34 => {
             if lin.len() < w * h * 4 { return None; }
-            for px in lin[..w * h * 4].chunks_exact(4) {
+            for px in lin[..w * h * 4].as_chunks::<4>().0 {
                 let r = tonemap_u8(f16_to_f32(ru16(px, 0)));
                 let g = tonemap_u8(f16_to_f32(ru16(px, 2)));
                 pixels.push(Color32::from_rgb(r, g, 0));
@@ -422,26 +422,26 @@ pub fn decode_linear_to_rgba(lin: &[u8], w: usize, h: usize, dxgi: u8) -> Option
         }
         41 => {
             if lin.len() < w * h * 4 { return None; }
-            for px in lin[..w * h * 4].chunks_exact(4) {
+            for px in lin[..w * h * 4].as_chunks::<4>().0 {
                 let g = tonemap_u8(rf32(px, 0));
                 pixels.push(Color32::from_gray(g));
             }
         }
         87 | 91 => {
             if lin.len() < w * h * 4 { return None; }
-            for px in lin[..w * h * 4].chunks_exact(4) {
+            for px in lin[..w * h * 4].as_chunks::<4>().0 {
                 pixels.push(Color32::from_rgba_unmultiplied(px[2], px[1], px[0], px[3]));
             }
         }
         49 => {
             if lin.len() < w * h * 2 { return None; }
-            for px in lin[..w * h * 2].chunks_exact(2) {
+            for px in lin[..w * h * 2].as_chunks::<2>().0 {
                 pixels.push(Color32::from_rgb(px[0], px[1], 0));
             }
         }
         54 => {
             if lin.len() < w * h * 2 { return None; }
-            let vals: Vec<f32> = lin[..w * h * 2].chunks_exact(2).map(|px| f16_to_f32(ru16(px, 0))).collect();
+            let vals: Vec<f32> = lin[..w * h * 2].as_chunks::<2>().0.iter().map(|px| f16_to_f32(ru16(px, 0))).collect();
             let mut mn = f32::INFINITY;
             let mut mx = f32::NEG_INFINITY;
             for &v in &vals {
@@ -458,7 +458,7 @@ pub fn decode_linear_to_rgba(lin: &[u8], w: usize, h: usize, dxgi: u8) -> Option
         }
         56 => {
             if lin.len() < w * h * 2 { return None; }
-            for px in lin[..w * h * 2].chunks_exact(2) {
+            for px in lin[..w * h * 2].as_chunks::<2>().0 {
                 pixels.push(Color32::from_gray(px[1]));
             }
         }
@@ -565,8 +565,8 @@ pub fn extract_txd_textures(v: &[u8], p: &[u8], dict_off: usize) -> Vec<DecodedT
         if mip0_off >= p.len() { continue; }
         let slice_end = (mip0_off + mip0_sz).min(p.len());
         let lin = if swiz == 0 {
-            let ew = if is_bc { (w + 3) / 4 } else { w }.max(1);
-            let eh = if is_bc { (h + 3) / 4 } else { h }.max(1);
+            let ew = if is_bc { w.div_ceil(4) } else { w }.max(1);
+            let eh = if is_bc { h.div_ceil(4) } else { h }.max(1);
             let need = ew * eh * bpe;
             let mut b = vec![0u8; need];
             let n = (p.len() - mip0_off).min(need);
@@ -718,7 +718,7 @@ pub fn probe_txd_header(c0: &[u8]) -> Option<(String, usize)> {
     if let Some(mut no) = vptr(ru64(c0, tp + 0x30)) {
         if no + 8 < c0.len() && c0[no..no + 8] == [0u8; 8] { no += 8; }
         if let Some(rel) = c0[no..].iter().position(|&b| b == 0) {
-            if rel >= 2 && rel < 96 {
+            if (2..96).contains(&rel) {
                 let s = String::from_utf8_lossy(&c0[no..no + rel]).into_owned();
                 if s.chars().all(|c| c.is_ascii_graphic()) {
                     first_nm = if i_cnt > 1 { format!("{s} (+{}).#td", i_cnt - 1) } else { format!("{s}.#td") };
@@ -792,8 +792,8 @@ pub fn scan_ttpf_descriptors(path: &Path) -> Result<(String, Vec<TtpfTexMeta>), 
     }
     for d in &mut out {
         let (_, is_bc, bpe) = dxgi_info(d.dxgi).unwrap_or(("BC7_UNORM", true, 16));
-        let ew = if is_bc { (d.w + 3) / 4 } else { d.w }.max(1);
-        let eh = if is_bc { (d.h + 3) / 4 } else { d.h }.max(1);
+        let ew = if is_bc { d.w.div_ceil(4) } else { d.w }.max(1);
+        let eh = if is_bc { d.h.div_ceil(4) } else { d.h }.max(1);
         let est = ((ew * eh * bpe) as u64).max(0x10000);
         d.alloc_sz = nxt.get(&d.byte_off).copied().unwrap_or((d.byte_off + est).min(tot_uncomp)).saturating_sub(d.byte_off).max(0x1000);
     }
@@ -903,8 +903,8 @@ pub fn decode_ttpf_texture(path: &Path, tex_idx: usize) -> Result<DecodedTexture
 
     let (fmt_name, is_bc, bpe) = dxgi_info(d.dxgi)
         .ok_or_else(|| format!("Unsupported DXGI format {} (fmt_byte=0x{:02x})", d.dxgi, d.fmt_byte))?;
-    let ew = if is_bc { (d.w + 3) / 4 } else { d.w }.max(1);
-    let eh = if is_bc { (d.h + 3) / 4 } else { d.h }.max(1);
+    let ew = if is_bc { d.w.div_ceil(4) } else { d.w }.max(1);
+    let eh = if is_bc { d.h.div_ceil(4) } else { d.h }.max(1);
     let mip0_lin = ew * eh * bpe;
     // Mipmapped textures use 4KB tiles at every size; mip-less ones use 64KB tiles once over 64KB
     // (uncompressed >= 128KB also uses 64KB tiles when mip-less or full-size allocation).
@@ -939,8 +939,8 @@ pub fn decode_ttpf_texture(path: &Path, tex_idx: usize) -> Result<DecodedTexture
             for mip in 1..=6u8 {
                 let mw = (d.w >> mip).max(4);
                 let mh = (d.h >> mip).max(4);
-                let m_ew = if is_bc { (mw + 3) / 4 } else { mw }.max(1);
-                let m_eh = if is_bc { (mh + 3) / 4 } else { mh }.max(1);
+                let m_ew = if is_bc { mw.div_ceil(4) } else { mw }.max(1);
+                let m_eh = if is_bc { mh.div_ceil(4) } else { mh }.max(1);
                 let m_lin = m_ew * m_eh * bpe;
                 let m_64k = !is_bc && m_lin > 65536;
                 let m_pad = if m_64k { padded_64kb_size(mw, mh, is_bc, bpe) } else { padded_4kb_size(mw, mh, is_bc, bpe) };
@@ -1506,7 +1506,7 @@ pub fn decode_mhiu_heightmap(data: &[u8]) -> Option<DecodedTexture> {
         let c = if v <= 23 {
             Color32::from_rgb(16, 44, 92)
         } else if v <= 30 {
-            let t = (v - 23) as u8 * 14;
+            let t = (v - 23) * 14;
             Color32::from_rgb(45 + t, 115 + t, 72)
         } else if v <= 85 {
             let t = ((v - 30) as u16 * 120 / 55) as u8;
@@ -1522,7 +1522,7 @@ pub fn decode_mhiu_heightmap(data: &[u8]) -> Option<DecodedTexture> {
         w,
         h,
         mips: 1,
-        fmt_name: "MHIU RLE8".into(),
+        fmt_name: "MHIU RLE8",
         dxgi: 28,
         pixels,
         raw_dds_payload: Vec::new(),

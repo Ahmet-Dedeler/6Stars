@@ -15,7 +15,7 @@ pub fn is_qqqq_table(head: &[u8]) -> bool {
     }
     let cnt = rd32(head, 0x14);
     let p0 = rd64(head, 0x28);
-    rd64(head, 0) == 0 && (1..=200_000).contains(&cnt) && p0 >= 0x40 && p0 < 0x1000_0000
+    rd64(head, 0) == 0 && (1..=200_000).contains(&cnt) && (0x40..0x1000_0000).contains(&p0)
 }
 
 // detect rage 9 cinematic / cutscene rsc9 resource (pack:/cinematic + .anim)

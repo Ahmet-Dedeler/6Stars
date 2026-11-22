@@ -108,7 +108,7 @@ fn rage9_siren_lit(slot: u8, phase: u64) -> bool {
     let subdivisions = RAGE9_SIREN_MULTIPLES * 2;
     let beat = (phase / subdivisions) % 32;
     let pulse = phase % subdivisions;
-    sequencer & (1 << (31 - beat)) != 0 && pulse % 2 == 0
+    sequencer & (1 << (31 - beat)) != 0 && pulse.is_multiple_of(2)
 }
 
 impl GeomMaterial {
@@ -2356,7 +2356,7 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
                     let rgba = img.to_rgba8();
                     let (w, h) = (rgba.width() as usize, rgba.height() as usize);
                     let pixels: Vec<Color32> = rgba
-                        .chunks_exact(4)
+                        .as_chunks::<4>().0.iter()
                         .map(|c| Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]))
                         .collect();
                     mesh.texture = Some(Texture2D { w, h, pixels });

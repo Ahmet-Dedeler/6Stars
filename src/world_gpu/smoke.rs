@@ -96,6 +96,67 @@ pub fn run_gpu_world_smoke(scene: &str) -> Result<(), String> {
     Ok(())
 }
 
+impl GpuState {
+    // Smoke mode checks geometry coverage, not merely successful submission.
+    pub(super) fn assert_visible_geometry(&self) {
+        let row_bytes = (self.config.width * 4).div_ceil(256) * 256;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("smoke_depth_readback"),
+            size: row_bytes as u64 * self.config.height as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.depth_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::DepthOnly,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row_bytes),
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d {
+                width: self.config.width,
+                height: self.config.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(Some(encoder.finish()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().expect("Could not read GPU depth buffer");
+        let data = buffer.slice(..).get_mapped_range();
+        let mut visible = 0usize;
+        let mut total = 0usize;
+        // Exclude the minimap and window edges. Sky never writes depth.
+        for y in self.config.height / 4..self.config.height * 3 / 4 {
+            for x in self.config.width / 4..self.config.width * 3 / 4 {
+                let offset = (y * row_bytes + x * 4) as usize;
+                let depth = f32::from_ne_bytes(data[offset..offset + 4].try_into().unwrap());
+                visible += usize::from(depth.is_finite() && depth < 1.0);
+                total += 1;
+            }
+        }
+        assert!(
+            visible > total / 100,
+            "Only sky is visible: geometry covers {visible}/{total} central pixels"
+        );
+        println!("WORLD_GEOMETRY_VISIBLE {visible}/{total}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,66 +216,5 @@ mod tests {
                 assert!(stdout.contains("WORLD_MATERIAL_BATCHES 2"));
             }
         }
-    }
-}
-
-impl GpuState {
-    // Smoke mode checks geometry coverage, not merely successful submission.
-    pub(super) fn assert_visible_geometry(&self) {
-        let row_bytes = (self.config.width * 4).div_ceil(256) * 256;
-        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("smoke_depth_readback"),
-            size: row_bytes as u64 * self.config.height as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.depth_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::DepthOnly,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &buffer,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(row_bytes),
-                    rows_per_image: None,
-                },
-            },
-            wgpu::Extent3d {
-                width: self.config.width,
-                height: self.config.height,
-                depth_or_array_layers: 1,
-            },
-        );
-        self.queue.submit(Some(encoder.finish()));
-        let (tx, rx) = std::sync::mpsc::channel();
-        buffer
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |result| {
-                let _ = tx.send(result);
-            });
-        self.device.poll(wgpu::Maintain::Wait);
-        rx.recv().unwrap().expect("Could not read GPU depth buffer");
-        let data = buffer.slice(..).get_mapped_range();
-        let mut visible = 0usize;
-        let mut total = 0usize;
-        // Exclude the minimap and window edges. Sky never writes depth.
-        for y in self.config.height / 4..self.config.height * 3 / 4 {
-            for x in self.config.width / 4..self.config.width * 3 / 4 {
-                let offset = (y * row_bytes + x * 4) as usize;
-                let depth = f32::from_ne_bytes(data[offset..offset + 4].try_into().unwrap());
-                visible += usize::from(depth.is_finite() && depth < 1.0);
-                total += 1;
-            }
-        }
-        assert!(
-            visible > total / 100,
-            "Only sky is visible: geometry covers {visible}/{total} central pixels"
-        );
-        println!("WORLD_GEOMETRY_VISIBLE {visible}/{total}");
     }
 }

@@ -891,7 +891,7 @@ pub fn decode_gfx103(code: &[u8], max_insns: usize) -> Vec<DecodedInsn> {
                 format!("v{vdst}, {s0}, {s1}")
             };
             (mn.to_string(), ops, kind)
-        } else if matches!(enc6, 0x35 | 0x34 | 0x38 | 0x39 | 0x36 | 0x37) {
+        } else if matches!(enc6, 0x34..=0x39) {
             let fam = match enc6 {
                 0x35 => "vop3",
                 0x34 => "vop3p",
@@ -1222,7 +1222,7 @@ fn push_spv_op(words: &mut Vec<u32>, opcode: u16, operands: &[u32]) {
 
 fn push_spv_str(words: &mut Vec<u32>, opcode: u16, prefix: &[u32], text: &str, suffix: &[u32]) {
     let bytes = text.as_bytes();
-    let str_words = (bytes.len() + 1 + 3) / 4;
+    let str_words = (bytes.len() + 1).div_ceil(4);
     let wc = (1 + prefix.len() + str_words + suffix.len()) as u32;
     words.push((wc << 16) | (opcode as u32));
     words.extend_from_slice(prefix);
@@ -1503,7 +1503,7 @@ mod tests {
         assert!(hlsl.contains("mrt0 = float4("));
 
         let spv = lift_to_spirv(&entry, &bytes);
-        assert!(spv.len() >= 20 && spv.len() % 4 == 0);
+        assert!(spv.len() >= 20 && spv.len().is_multiple_of(4));
         assert_eq!(u32::from_le_bytes([spv[0], spv[1], spv[2], spv[3]]), 0x0723_0203);
     }
 }

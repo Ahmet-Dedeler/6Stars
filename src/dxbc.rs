@@ -75,6 +75,7 @@ pub fn disassemble(data: &[u8]) -> String {
     }
 }
 
+#[cfg(test)]
 pub fn disassemble_with_source(data: &[u8], source: &str) -> String {
     match extract_fssm(data) {
         Ok(fssm) => format_fssm_disasm(&fssm, source),

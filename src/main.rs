@@ -55,7 +55,7 @@ const VEH_ZONE_OFF: u64 = 0x10b2_0000_00;
 // win32 docking + PlaySound; non-windows builds use the stubs in the other `plat` below
 #[cfg(windows)]
 mod plat {
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[link(name = "winmm")]
 extern "system" {
@@ -153,12 +153,6 @@ pub fn find_binkplay() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(r"C:\Program Files (x86)\RADVideo\binkplay.exe"))
 }
 
-pub fn play_wav_async(path: &Path) {
-    let mut wide: Vec<u16> = path.to_string_lossy().encode_utf16().collect();
-    wide.push(0);
-    unsafe { PlaySoundW(wide.as_ptr(), 0, 0x00020000 | 0x0001); }
-}
-
 pub fn stop_wav() {
     unsafe { PlaySoundW(std::ptr::null(), 0, 0); }
 }
@@ -192,14 +186,6 @@ pub fn find_binkplay() -> PathBuf {
         .and_then(|p| p.parent().map(|d| d.join("binkplay")))
         .filter(|p| p.exists())
         .unwrap_or_else(|| PathBuf::from("binkplay"))
-}
-
-pub fn play_wav_async(path: &Path) {
-    stop_wav();
-    let player = if cfg!(target_os = "macos") { "afplay" } else { "aplay" };
-    if let Ok(c) = Command::new(player).arg(path).spawn() {
-        *WAV_PROC.lock().unwrap() = Some(c);
-    }
 }
 
 pub fn stop_wav() {
@@ -1160,7 +1146,7 @@ impl Rpf9App {
             .map(|e| (e.rpf_name.to_ascii_lowercase(), e.offset))
             .collect();
 
-        for (li, line) in BufReader::new(f).lines().flatten().enumerate() {
+        for (li, line) in BufReader::new(f).lines().map_while(Result::ok).enumerate() {
             if li == 0 && line.starts_with("archive,") { continue; }
             let cols: Vec<&str> = line.split(',').collect();
             if cols.len() < 4 { continue; }
@@ -3145,7 +3131,7 @@ impl Rpf9App {
                         .enumerate()
                         .filter(|(_, shader)| {
                             self.sgd5_stage_filter
-                                .map_or(true, |stage| shader.stage == stage)
+                                .is_none_or(|stage| shader.stage == stage)
                                 && (query.is_empty()
                                     || shader.name.to_ascii_lowercase().contains(&query)
                                     || format!("0x{:016x}", shader.sga_hash).contains(&query)
@@ -3263,7 +3249,7 @@ impl Rpf9App {
                         .iter()
                         .enumerate()
                         .filter(|(_, s)| {
-                            let st_ok = self.sh_stage_filter.map_or(true, |f| s.stage == f);
+                            let st_ok = self.sh_stage_filter.is_none_or(|f| s.stage == f);
                             if !st_ok {
                                 return false;
                             }
@@ -3687,7 +3673,7 @@ fn load_disk_cache() -> HashMap<String, Vec<RpfEntry>> {
     let mut map: HashMap<String, Vec<RpfEntry>> = HashMap::new();
     let Some(p) = cache_file_path() else { return map };
     let Ok(f) = File::open(p) else { return map };
-    for line in BufReader::new(f).lines().flatten() {
+    for line in BufReader::new(f).lines().map_while(Result::ok) {
         let cols: Vec<&str> = line.split('\t').collect();
         if cols.len() < 9 { continue; }
         let kind: &'static str = match cols[4] {
@@ -4349,7 +4335,7 @@ fn scan_levels_vehicle_zone(levels_rpf: &PathBuf, live_state: Option<&Arc<Mutex<
                         g.entries.extend(local_batch.iter().cloned());
                         g.ver += 1;
                     }
-                    all_entries.extend(local_batch.drain(..));
+                    all_entries.append(&mut local_batch);
                 }
             }
             pos += 0x1000;
@@ -4486,7 +4472,7 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
                     tracks: sc,
                     chunks: Vec::new(),
                 });
-            } else if &tag[..3] == b"KB2" && (b'a'..=b'z').contains(&tag[3]) {
+            } else if &tag[..3] == b"KB2" && tag[3].is_ascii_lowercase() {
                 let fsize = u32::from_le_bytes([buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7]]) as u64;
                 let frames = u32::from_le_bytes([buf[pos + 8], buf[pos + 9], buf[pos + 10], buf[pos + 11]]);
                 let frames2 = u32::from_le_bytes([buf[pos + 16], buf[pos + 17], buf[pos + 18], buf[pos + 19]]);
@@ -4739,7 +4725,7 @@ impl eframe::App for Rpf9App {
                 }
                 self.show_3d = true;
             }
-            let loaded_parts: Vec<_> = m.loaded_vehicle_parts.drain(..).collect();
+            let loaded_parts: Vec<_> = std::mem::take(&mut m.loaded_vehicle_parts);
             let had_loaded_parts = !loaded_parts.is_empty();
             for (owner, entry, mesh) in loaded_parts {
                 if Some(owner) != self.model_entry {
@@ -5383,6 +5369,406 @@ impl eframe::App for Rpf9App {
     }
 }
 
+
+fn export_models_cli(rpf_path: &PathBuf, out_dir: &PathBuf, filter: &str, vehicles_only: bool) {
+    let _ = fs::create_dir_all(out_dir);
+    let q = filter.to_ascii_lowercase();
+    eprintln!("Scanning {}...", rpf_path.display());
+    let entries = if vehicles_only {
+        scan_levels_vehicle_zone(rpf_path, None)
+    } else {
+        match scan_single_rpf(rpf_path, None) {
+            Ok((_, e)) => e,
+            Err(err) => {
+                eprintln!("Scan failed: {err}");
+                return;
+            }
+        }
+    };
+    let mut best: HashMap<String, (u64, String, bool)> = HashMap::new();
+    for e in entries {
+        if vehicles_only {
+            if e.kind != "VEH" || e.name.to_ascii_lowercase().contains("_mid.") { continue; }
+            let stem = e.name.trim_end_matches(".#ft");
+            let is_hi = stem.ends_with("_hi");
+            let base = stem.trim_end_matches("_hi").to_ascii_lowercase();
+            match best.get(&base) {
+                Some((_, _, prev_hi)) if *prev_hi && !is_hi => {}
+                _ => { best.insert(base, (e.offset, e.name, is_hi)); }
+            }
+        } else {
+            if e.kind != "MODEL" && e.kind != "VEH" { continue; }
+            let lo = e.name.to_ascii_lowercase();
+            if !q.is_empty() && !q.split(',').any(|tok| !tok.is_empty() && lo.contains(tok)) { continue; }
+            best.entry(lo).or_insert((e.offset, e.name, false));
+        }
+    }
+    let mut list: Vec<(String, u64, String)> = best.into_iter().map(|(k, (o, n, _))| (k, o, n)).collect();
+    list.sort_by(|a, b| a.0.cmp(&b.0));
+    eprintln!("Found {} models -> exporting .OBJs...", list.len());
+    let mut ok = 0usize;
+    for (idx, (key, off, name)) in list.iter().enumerate() {
+        if let Ok(mesh) = decode_rage9_model_from_rpf(rpf_path, *off, name) {
+            let fname = if vehicles_only { format!("{key}.obj") } else { format!("{}.obj", name.replace('#', "").replace('.', "_")) };
+            if mesh.export_obj(&out_dir.join(fname)).is_ok() {
+                ok += 1;
+                if ok <= 25 || ok.is_multiple_of(50) {
+                    eprintln!("  [{}/{}] {} ({} v, {} f)", idx + 1, list.len(), key, mesh.verts.len(), mesh.tris.len());
+                }
+            }
+        }
+    }
+    eprintln!("DONE: Exported {ok}/{} models to {}", list.len(), out_dir.display());
+}
+
+fn dump_textures_cli(src_path: &PathBuf, out_dir: &PathBuf, limit: usize) {
+    let _ = fs::create_dir_all(out_dir);
+    let is_ttpf = src_path.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("ttpf")).unwrap_or(false);
+    let (mut ok, mut bcpk, mut fail) = (0usize, 0usize, 0usize);
+    if is_ttpf {
+        let ix = match tex::ttpf_index(src_path) {
+            Ok(i) => i,
+            Err(e) => { eprintln!("TTPF index error: {e}"); return; }
+        };
+        let n = if limit == 0 { ix.descs.len() } else { limit.min(ix.descs.len()) };
+        eprintln!("Dumping up to {n}/{} textures from {}...", ix.descs.len(), src_path.display());
+        for d in ix.descs.iter().take(n) {
+            match decode_ttpf_texture(src_path, d.idx) {
+                Ok(tx) => {
+                    if export_texture_png(&tx, &out_dir.join(format!("{}.png", tx.name))).is_ok() {
+                        ok += 1;
+                    }
+                }
+                Err(e) if e.contains("BCPack") => bcpk += 1,
+                Err(_) => fail += 1,
+            }
+            if (ok + bcpk + fail) % 250 == 0 {
+                eprintln!("  progress: ok={ok} bcpack={bcpk} fail={fail}");
+            }
+        }
+    } else {
+        let entries = match scan_single_rpf(src_path, None) {
+            Ok((_, e)) => e,
+            Err(err) => { eprintln!("Scan failed: {err}"); return; }
+        };
+        let txds: Vec<&RpfEntry> = entries.iter().filter(|e| e.kind == "TXD").collect();
+        eprintln!("Found {} TXDs in {} -> dumping PNGs...", txds.len(), src_path.display());
+        let mut seen = std::collections::HashSet::new();
+        'outer: for e in txds {
+            match decode_txd_from_rpf(src_path, e.offset) {
+                Ok(vec_t) => {
+                    for tx in &vec_t {
+                        let safe: String = tx.name.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') { c } else { '_' }).collect();
+                        let fname = if seen.insert(safe.clone()) { format!("{safe}.png") } else { format!("{safe}_{:x}.png", e.offset) };
+                        if export_texture_png(tx, &out_dir.join(fname)).is_ok() {
+                            ok += 1;
+                            if limit > 0 && ok >= limit { break 'outer; }
+                        }
+                    }
+                }
+                Err(_) => fail += 1,
+            }
+        }
+    }
+    eprintln!("DONE: Exported {ok} PNGs (bcpack={bcpk}, fail={fail}) to {}", out_dir.display());
+}
+
+fn load_ps09_from_path(path: &Path) -> Result<Ps09Cache, String> {
+    if path.is_dir() {
+        let mut bins: Vec<PathBuf> = fs::read_dir(path)
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("bin")).unwrap_or(false))
+            .collect();
+        bins.sort();
+        if bins.is_empty() {
+            return Err("No .bin chunks found in directory".into());
+        }
+        let mut raw = Vec::with_capacity(bins.len() * 65536);
+        for b in bins {
+            raw.extend_from_slice(&fs::read(&b).map_err(|e| e.to_string())?);
+        }
+        Ps09Cache::parse(raw).ok_or_else(|| "Directory chunks did not start with PS\\x00\\x09".into())
+    } else {
+        let data = fs::read(path).map_err(|e| e.to_string())?;
+        if data.starts_with(b"PS\x00\x09") {
+            return Ps09Cache::parse(data).ok_or_else(|| "Invalid PS\\x00\\x09 stream".into());
+        }
+        // Decompress all 64KB zlib chunks starting from the first PS\x00\x09 stream inside shaders.rpf
+        let mut raw = Vec::new();
+        let mut pos = 0usize;
+        let mut found = false;
+        while pos + 2 < data.len() {
+            if data[pos] == 0x78 && matches!(data[pos + 1], 0x9c | 0xda | 0x01) {
+                let mut dec = Decompress::new(true);
+                let mut out = vec![0u8; 65536];
+                if let Ok(Status::StreamEnd | Status::Ok) = dec.decompress(&data[pos..], &mut out, FlushDecompress::Finish) {
+                    let produced = dec.total_out() as usize;
+                    if produced >= 64 {
+                        if !found && out[..produced].starts_with(b"PS\x00\x09") {
+                            found = true;
+                        }
+                        if found {
+                            raw.extend_from_slice(&out[..produced]);
+                            pos += (dec.total_in() as usize).max(2);
+                            continue;
+                        }
+                    }
+                }
+            }
+            pos += 1;
+        }
+        if !found {
+            return Err("No PS\\x00\\x09 zlib stream found in file".into());
+        }
+        Ps09Cache::parse(raw).ok_or_else(|| "Decompressed PS\\x00\\x09 stream failed validation".into())
+    }
+}
+
+fn disasm_shaders_cli(src: &Path, out_dir: &Path, limit: usize) {
+    let cache = match load_ps09_from_path(src) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to load PS09 from {}: {e}", src.display());
+            return;
+        }
+    };
+    let _ = fs::create_dir_all(out_dir);
+    println!(
+        "Loaded PS\\x00\\x09 ({}, drv {}): {} shaders, {} Gfx PSOs, {} Compute PSOs",
+        cache.header.id,
+        cache.header.driver,
+        cache.shaders.len(),
+        cache.header.graphics_pso_count,
+        cache.header.compute_pso_count
+    );
+    let mut csv = String::from("index,stage,pso_hash,code_off,code_size,insns,bindings,has_rt,has_ngg,numthreads\n");
+    let (mut cs, mut ps, mut vs, mut ngg, mut rt) = (0usize, 0, 0, 0, 0);
+    for s in &cache.shaders {
+        match s.stage {
+            ShaderStage::Compute => cs += 1,
+            ShaderStage::Pixel => ps += 1,
+            ShaderStage::Vertex => vs += 1,
+            ShaderStage::MeshNgg => ngg += 1,
+            ShaderStage::RayTracing => rt += 1,
+            _ => {}
+        }
+        let nt = s.num_threads.map(|[x, y, z]| format!("{x}x{y}x{z}")).unwrap_or_default();
+        csv.push_str(&format!(
+            "{},{},0x{:016x},0x{:08x},{},{},{},{},{},{}\n",
+            s.index, s.stage.tag(), s.pso_hash, s.code_offset, s.code_size,
+            s.insn_count, s.bindings.len(), s.has_rt as u8, s.has_ngg as u8, nt
+        ));
+    }
+    let _ = fs::write(out_dir.join("shaders_index.csv"), csv);
+    println!("Stage totals: PS={ps} VS={vs} CS={cs} NGG/Mesh={ngg} RT_BVH64={rt}");
+    let dump_n = if limit == 0 { 25.min(cache.shaders.len()) } else { limit.min(cache.shaders.len()) };
+    for s in cache.shaders.iter().take(dump_n) {
+        let code = cache.shader_bytes(s);
+        let stem = format!("sh_{:05}_{}", s.index, s.stage.tag());
+        let _ = fs::write(out_dir.join(format!("{stem}.asm")), format_gfx103_disasm(s, code));
+        let _ = fs::write(out_dir.join(format!("{stem}.hlsl")), lift_to_hlsl(s, code));
+        let _ = fs::write(out_dir.join(format!("{stem}.spv")), lift_to_spirv(s, code));
+    }
+    println!("Wrote shaders_index.csv + {dump_n} shaders (.asm/.hlsl/.spv) to {}", out_dir.display());
+}
+
+fn extract_sgd5_cli(src: &Path, out_dir: &Path, limit: usize) {
+    match sgd5::extract_sgd5(src, out_dir, limit) {
+        Ok(extraction) => {
+            let mut stage_counts = std::collections::BTreeMap::new();
+            for file in &extraction.files {
+                for shader in &file.shaders {
+                    *stage_counts.entry(shader.stage).or_insert(0usize) += 1;
+                }
+            }
+            let counts = stage_counts
+                .iter()
+                .map(|(stage, count)| format!("{stage}={count}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let shader_count = extraction
+                .files
+                .iter()
+                .map(|file| file.shaders.len())
+                .sum::<usize>();
+            let effect_count = extraction
+                .files
+                .iter()
+                .map(|file| file.effect_count as usize)
+                .sum::<usize>();
+            println!(
+                "Loaded SGD5: {} groups, {shader_count} shaders ({counts}), {effect_count} effects",
+                extraction.files.len()
+            );
+            println!(
+                "Extracted {} DXBC shaders and {} manifests to {}",
+                extraction.extracted_count,
+                extraction.manifests.len(),
+                out_dir.display()
+            );
+        }
+        Err(error) => {
+            eprintln!("Failed to extract SGD5 from {}: {error}", src.display());
+        }
+    }
+}
+
+fn disassemble_dxbc_cli(src: &Path, output: Option<&PathBuf>) {
+    match fs::read(src) {
+        Ok(data) => {
+            let text = dxbc::disassemble(&data);
+            match output {
+                Some(path) => {
+                    if let Err(error) = fs::write(path, &text) {
+                        eprintln!("Failed to write {}: {error}", path.display());
+                    }
+                }
+                None => println!("{text}"),
+            }
+        }
+        Err(error) => eprintln!("Failed to read {}: {error}", src.display()),
+    }
+}
+
+fn main() -> eframe::Result<()> {
+    // remove leftover old exe from previous self update
+    if let Ok(cur) = std::env::current_exe() {
+        let _ = fs::remove_file(cur.with_extension("exe.old"));
+    }
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 2 && args[1] == "--gpu-world" {
+        if args.get(2).is_some_and(|a| a == "--smoke-scene") {
+            if let Err(error) = world_gpu::run_gpu_world_smoke(args.get(3).map(String::as_str).unwrap_or("terrain")) {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        let mut common_p: Option<PathBuf> = None;
+        let mut levels_p: Option<PathBuf> = None;
+        let mut idx = 2usize;
+        while idx + 1 < args.len() {
+            if args[idx] == "--common" {
+                common_p = Some(PathBuf::from(&args[idx + 1]));
+                idx += 2;
+            } else if args[idx] == "--levels" {
+                levels_p = Some(PathBuf::from(&args[idx + 1]));
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+        }
+        if let Err(error) = world_gpu::run_gpu_world_cli(common_p.as_deref(), levels_p.as_deref()) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    if args.len() >= 3 && args[1] == "--probe-maps" {
+        mapdata::probe_maps_cli(&PathBuf::from(&args[2]));
+        return Ok(());
+    }
+    if args.len() >= 3 && args[1] == "--export-psin" {
+        let tsv = args.iter().any(|a| a == "--tsv");
+        match fs::read(&args[2]) {
+            Ok(data) => match psin::parse_psin_doc(&data) {
+                Ok(doc) => print!("{}", doc.export_placements_csv(None, tsv)),
+                Err(e) => eprintln!("PSIN error: {e}"),
+            },
+            Err(e) => eprintln!("Read error: {e}"),
+        }
+        return Ok(());
+    }
+    if args.len() >= 4 && args[1] == "--decode-bk2" {
+        let bk2 = PathBuf::from(&args[2]);
+        let out_dir = PathBuf::from(&args[3]);
+        let max_f = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(30);
+        let dll = bk2.parent().map(|d| d.join("bink2w64.dll")).filter(|p| p.exists())
+            .unwrap_or_else(|| PathBuf::from("bink2w64.dll"));
+        match bink2::decode_bk2_to_pngs(&dll, &bk2, &out_dir, max_f) {
+            Ok((info, n)) => println!("Decoded {n} frames ({}x{}) to {}", info.width, info.height, out_dir.display()),
+            Err(e) => eprintln!("BK2 decode error: {e}"),
+        }
+        return Ok(());
+    }
+    if args.len() >= 3 && args[1] == "--inspect-exe" {
+        let exe_path = PathBuf::from(&args[2]);
+        match fs::read(&exe_path) {
+            Ok(data) => {
+                println!("{}", boot::inspect_pe64_for_bringup(&data));
+                if let Some(dir) = exe_path.parent() {
+                    if let Ok(cfg) = fs::read_to_string(dir.join("MicrosoftGame.Config")) {
+                        let lay = fs::read_dir(dir).ok().and_then(|rd| {
+                            rd.filter_map(|e| e.ok()).find_map(|e| {
+                                let n = e.file_name().to_string_lossy().into_owned();
+                                if n.starts_with("layout_") && n.ends_with(".xml") {
+                                    fs::read_to_string(e.path()).ok()
+                                } else {
+                                    None
+                                }
+                            })
+                        });
+                        println!("{}", boot::summarize_gdk_manifest(&cfg, lay.as_deref()));
+                    }
+                }
+            }
+            Err(e) => eprintln!("Failed to read {}: {e}", exe_path.display()),
+        }
+        return Ok(());
+    }
+    if args.len() >= 4 && args[1] == "--disasm-shaders" {
+        let lim = args.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(25);
+        disasm_shaders_cli(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), lim);
+        return Ok(());
+    }
+    if args.len() >= 4 && args[1] == "--extract-sgd5" {
+        let lim = args
+            .get(4)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        extract_sgd5_cli(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), lim);
+        return Ok(());
+    }
+    if args.len() >= 3 && args[1] == "--disassemble-dxbc" {
+        disassemble_dxbc_cli(
+            &PathBuf::from(&args[2]),
+            args.get(3).map(PathBuf::from).as_ref(),
+        );
+        return Ok(());
+    }
+    if args.len() >= 4 && args[1] == "--dump-textures" {
+        let lim = args.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+        dump_textures_cli(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), lim);
+        return Ok(());
+    }
+    if args.len() >= 4 && args[1] == "--extract-vehicles" {
+        export_models_cli(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), "", true);
+        return Ok(());
+    }
+    if args.len() >= 4 && args[1] == "--extract-models" {
+        let filt = args.get(4).map(|s| s.as_str()).unwrap_or("");
+        export_models_cli(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), filt, false);
+        return Ok(());
+    }
+
+    // decod embedded logo once and share bytes across window icon and topbar
+    let logo_rgba = image::load_from_memory(include_bytes!("../assets/logo.png"))
+        .ok()
+        .map(|img| {
+            let rgba = img.to_rgba8();
+            (rgba.as_raw().to_vec(), rgba.width(), rgba.height())
+        });
+    let mut vb = egui::ViewportBuilder::default().with_inner_size([1320.0, 800.0]);
+    if let Some((ref raw, w, h)) = logo_rgba {
+        vb = vb.with_icon(egui::IconData { rgba: raw.clone(), width: w, height: h });
+    }
+    let opts = eframe::NativeOptions { viewport: vb, ..Default::default() };
+    let title = format!("PercyStar v{APP_VERSION}");
+    eframe::run_native(&title, opts, Box::new(move |cc| Ok(Box::new(Rpf9App::new(cc, logo_rgba)))))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5761,12 +6147,12 @@ mod tests {
             let Ok(raw) = tex::ttpf_read_virtual(&src, &ix, d.byte_off, d.alloc_sz as usize) else { eprintln!("{id}: bcpack"); continue };
             let mut res = Vec::new();
             for (dxgi, bpe, is_bc) in [(98u8, 16usize, true), (71, 8, true), (77, 16, true), (80, 8, true), (83, 16, true), (95, 16, true), (28, 4, false), (61, 1, false), (49, 2, false)] {
-                let (bw, bh) = if is_bc { ((d.w + 3) / 4, (d.h + 3) / 4) } else { (d.w, d.h) };
+                let (bw, bh) = if is_bc { (d.w.div_ceil(4), d.h.div_ceil(4)) } else { (d.w, d.h) };
                 for t64 in [false, true] {
                     if t64 && !is_bc { continue; }
                     let pad = if t64 {
                         let (tw, th) = if bpe == 16 { (64, 64) } else { (128, 64) };
-                        ((bw + tw - 1) / tw) * tw * ((bh + th - 1) / th) * th * bpe
+                        bw.div_ceil(tw) * tw * bh.div_ceil(th) * th * bpe
                     } else { tex::padded_4kb_size(d.w, d.h, is_bc, bpe) };
                     let mut offs = vec![0usize];
                     if raw.len() > pad { offs.push(raw.len() - pad); }
@@ -5941,403 +6327,4 @@ mod tests {
             "packs.rpf @ 0x00001000 (alpha.#ft)\ntextures.rpf @ 0x000020a0 (beta.#td)"
         );
     }
-}
-
-fn export_models_cli(rpf_path: &PathBuf, out_dir: &PathBuf, filter: &str, vehicles_only: bool) {
-    let _ = fs::create_dir_all(out_dir);
-    let q = filter.to_ascii_lowercase();
-    eprintln!("Scanning {}...", rpf_path.display());
-    let entries = if vehicles_only {
-        scan_levels_vehicle_zone(rpf_path, None)
-    } else {
-        match scan_single_rpf(rpf_path, None) {
-            Ok((_, e)) => e,
-            Err(err) => {
-                eprintln!("Scan failed: {err}");
-                return;
-            }
-        }
-    };
-    let mut best: HashMap<String, (u64, String, bool)> = HashMap::new();
-    for e in entries {
-        if vehicles_only {
-            if e.kind != "VEH" || e.name.to_ascii_lowercase().contains("_mid.") { continue; }
-            let stem = e.name.trim_end_matches(".#ft");
-            let is_hi = stem.ends_with("_hi");
-            let base = stem.trim_end_matches("_hi").to_ascii_lowercase();
-            match best.get(&base) {
-                Some((_, _, prev_hi)) if *prev_hi && !is_hi => {}
-                _ => { best.insert(base, (e.offset, e.name, is_hi)); }
-            }
-        } else {
-            if e.kind != "MODEL" && e.kind != "VEH" { continue; }
-            let lo = e.name.to_ascii_lowercase();
-            if !q.is_empty() && !q.split(',').any(|tok| !tok.is_empty() && lo.contains(tok)) { continue; }
-            best.entry(lo).or_insert((e.offset, e.name, false));
-        }
-    }
-    let mut list: Vec<(String, u64, String)> = best.into_iter().map(|(k, (o, n, _))| (k, o, n)).collect();
-    list.sort_by(|a, b| a.0.cmp(&b.0));
-    eprintln!("Found {} models -> exporting .OBJs...", list.len());
-    let mut ok = 0usize;
-    for (idx, (key, off, name)) in list.iter().enumerate() {
-        if let Ok(mesh) = decode_rage9_model_from_rpf(rpf_path, *off, name) {
-            let fname = if vehicles_only { format!("{key}.obj") } else { format!("{}.obj", name.replace('#', "").replace('.', "_")) };
-            if mesh.export_obj(&out_dir.join(fname)).is_ok() {
-                ok += 1;
-                if ok <= 25 || ok % 50 == 0 {
-                    eprintln!("  [{}/{}] {} ({} v, {} f)", idx + 1, list.len(), key, mesh.verts.len(), mesh.tris.len());
-                }
-            }
-        }
-    }
-    eprintln!("DONE: Exported {ok}/{} models to {}", list.len(), out_dir.display());
-}
-
-fn dump_textures_cli(src_path: &PathBuf, out_dir: &PathBuf, limit: usize) {
-    let _ = fs::create_dir_all(out_dir);
-    let is_ttpf = src_path.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("ttpf")).unwrap_or(false);
-    let (mut ok, mut bcpk, mut fail) = (0usize, 0usize, 0usize);
-    if is_ttpf {
-        let ix = match tex::ttpf_index(src_path) {
-            Ok(i) => i,
-            Err(e) => { eprintln!("TTPF index error: {e}"); return; }
-        };
-        let n = if limit == 0 { ix.descs.len() } else { limit.min(ix.descs.len()) };
-        eprintln!("Dumping up to {n}/{} textures from {}...", ix.descs.len(), src_path.display());
-        for d in ix.descs.iter().take(n) {
-            match decode_ttpf_texture(src_path, d.idx) {
-                Ok(tx) => {
-                    if export_texture_png(&tx, &out_dir.join(format!("{}.png", tx.name))).is_ok() {
-                        ok += 1;
-                    }
-                }
-                Err(e) if e.contains("BCPack") => bcpk += 1,
-                Err(_) => fail += 1,
-            }
-            if (ok + bcpk + fail) % 250 == 0 {
-                eprintln!("  progress: ok={ok} bcpack={bcpk} fail={fail}");
-            }
-        }
-    } else {
-        let entries = match scan_single_rpf(src_path, None) {
-            Ok((_, e)) => e,
-            Err(err) => { eprintln!("Scan failed: {err}"); return; }
-        };
-        let txds: Vec<&RpfEntry> = entries.iter().filter(|e| e.kind == "TXD").collect();
-        eprintln!("Found {} TXDs in {} -> dumping PNGs...", txds.len(), src_path.display());
-        let mut seen = std::collections::HashSet::new();
-        'outer: for e in txds {
-            match decode_txd_from_rpf(src_path, e.offset) {
-                Ok(vec_t) => {
-                    for tx in &vec_t {
-                        let safe: String = tx.name.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') { c } else { '_' }).collect();
-                        let fname = if seen.insert(safe.clone()) { format!("{safe}.png") } else { format!("{safe}_{:x}.png", e.offset) };
-                        if export_texture_png(tx, &out_dir.join(fname)).is_ok() {
-                            ok += 1;
-                            if limit > 0 && ok >= limit { break 'outer; }
-                        }
-                    }
-                }
-                Err(_) => fail += 1,
-            }
-        }
-    }
-    eprintln!("DONE: Exported {ok} PNGs (bcpack={bcpk}, fail={fail}) to {}", out_dir.display());
-}
-
-fn load_ps09_from_path(path: &Path) -> Result<Ps09Cache, String> {
-    if path.is_dir() {
-        let mut bins: Vec<PathBuf> = fs::read_dir(path)
-            .map_err(|e| e.to_string())?
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("bin")).unwrap_or(false))
-            .collect();
-        bins.sort();
-        if bins.is_empty() {
-            return Err("No .bin chunks found in directory".into());
-        }
-        let mut raw = Vec::with_capacity(bins.len() * 65536);
-        for b in bins {
-            raw.extend_from_slice(&fs::read(&b).map_err(|e| e.to_string())?);
-        }
-        Ps09Cache::parse(raw).ok_or_else(|| "Directory chunks did not start with PS\\x00\\x09".into())
-    } else {
-        let data = fs::read(path).map_err(|e| e.to_string())?;
-        if data.starts_with(b"PS\x00\x09") {
-            return Ps09Cache::parse(data).ok_or_else(|| "Invalid PS\\x00\\x09 stream".into());
-        }
-        // Decompress all 64KB zlib chunks starting from the first PS\x00\x09 stream inside shaders.rpf
-        let mut raw = Vec::new();
-        let mut pos = 0usize;
-        let mut found = false;
-        while pos + 2 < data.len() {
-            if data[pos] == 0x78 && matches!(data[pos + 1], 0x9c | 0xda | 0x01) {
-                let mut dec = Decompress::new(true);
-                let mut out = vec![0u8; 65536];
-                if let Ok(Status::StreamEnd | Status::Ok) = dec.decompress(&data[pos..], &mut out, FlushDecompress::Finish) {
-                    let produced = dec.total_out() as usize;
-                    if produced >= 64 {
-                        if !found && out[..produced].starts_with(b"PS\x00\x09") {
-                            found = true;
-                        }
-                        if found {
-                            raw.extend_from_slice(&out[..produced]);
-                            pos += (dec.total_in() as usize).max(2);
-                            continue;
-                        }
-                    }
-                }
-            }
-            pos += 1;
-        }
-        if !found {
-            return Err("No PS\\x00\\x09 zlib stream found in file".into());
-        }
-        Ps09Cache::parse(raw).ok_or_else(|| "Decompressed PS\\x00\\x09 stream failed validation".into())
-    }
-}
-
-fn disasm_shaders_cli(src: &Path, out_dir: &Path, limit: usize) {
-    let cache = match load_ps09_from_path(src) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Failed to load PS09 from {}: {e}", src.display());
-            return;
-        }
-    };
-    let _ = fs::create_dir_all(out_dir);
-    println!(
-        "Loaded PS\\x00\\x09 ({}, drv {}): {} shaders, {} Gfx PSOs, {} Compute PSOs",
-        cache.header.id,
-        cache.header.driver,
-        cache.shaders.len(),
-        cache.header.graphics_pso_count,
-        cache.header.compute_pso_count
-    );
-    let mut csv = String::from("index,stage,pso_hash,code_off,code_size,insns,bindings,has_rt,has_ngg,numthreads\n");
-    let (mut cs, mut ps, mut vs, mut ngg, mut rt) = (0usize, 0, 0, 0, 0);
-    for s in &cache.shaders {
-        match s.stage {
-            ShaderStage::Compute => cs += 1,
-            ShaderStage::Pixel => ps += 1,
-            ShaderStage::Vertex => vs += 1,
-            ShaderStage::MeshNgg => ngg += 1,
-            ShaderStage::RayTracing => rt += 1,
-            _ => {}
-        }
-        let nt = s.num_threads.map(|[x, y, z]| format!("{x}x{y}x{z}")).unwrap_or_default();
-        csv.push_str(&format!(
-            "{},{},0x{:016x},0x{:08x},{},{},{},{},{},{}\n",
-            s.index, s.stage.tag(), s.pso_hash, s.code_offset, s.code_size,
-            s.insn_count, s.bindings.len(), s.has_rt as u8, s.has_ngg as u8, nt
-        ));
-    }
-    let _ = fs::write(out_dir.join("shaders_index.csv"), csv);
-    println!("Stage totals: PS={ps} VS={vs} CS={cs} NGG/Mesh={ngg} RT_BVH64={rt}");
-    let dump_n = if limit == 0 { 25.min(cache.shaders.len()) } else { limit.min(cache.shaders.len()) };
-    for s in cache.shaders.iter().take(dump_n) {
-        let code = cache.shader_bytes(s);
-        let stem = format!("sh_{:05}_{}", s.index, s.stage.tag());
-        let _ = fs::write(out_dir.join(format!("{stem}.asm")), format_gfx103_disasm(s, code));
-        let _ = fs::write(out_dir.join(format!("{stem}.hlsl")), lift_to_hlsl(s, code));
-        let _ = fs::write(out_dir.join(format!("{stem}.spv")), lift_to_spirv(s, code));
-    }
-    println!("Wrote shaders_index.csv + {dump_n} shaders (.asm/.hlsl/.spv) to {}", out_dir.display());
-}
-
-fn extract_sgd5_cli(src: &Path, out_dir: &Path, limit: usize) {
-    match sgd5::extract_sgd5(src, out_dir, limit) {
-        Ok(extraction) => {
-            let mut stage_counts = std::collections::BTreeMap::new();
-            for file in &extraction.files {
-                for shader in &file.shaders {
-                    *stage_counts.entry(shader.stage).or_insert(0usize) += 1;
-                }
-            }
-            let counts = stage_counts
-                .iter()
-                .map(|(stage, count)| format!("{stage}={count}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let shader_count = extraction
-                .files
-                .iter()
-                .map(|file| file.shaders.len())
-                .sum::<usize>();
-            let effect_count = extraction
-                .files
-                .iter()
-                .map(|file| file.effect_count as usize)
-                .sum::<usize>();
-            println!(
-                "Loaded SGD5: {} groups, {shader_count} shaders ({counts}), {effect_count} effects",
-                extraction.files.len()
-            );
-            println!(
-                "Extracted {} DXBC shaders and {} manifests to {}",
-                extraction.extracted_count,
-                extraction.manifests.len(),
-                out_dir.display()
-            );
-        }
-        Err(error) => {
-            eprintln!("Failed to extract SGD5 from {}: {error}", src.display());
-        }
-    }
-}
-
-fn disassemble_dxbc_cli(src: &Path, output: Option<&PathBuf>) {
-    match fs::read(src) {
-        Ok(data) => {
-            let text = dxbc::disassemble(&data);
-            match output {
-                Some(path) => {
-                    if let Err(error) = fs::write(path, &text) {
-                        eprintln!("Failed to write {}: {error}", path.display());
-                    }
-                }
-                None => println!("{text}"),
-            }
-        }
-        Err(error) => eprintln!("Failed to read {}: {error}", src.display()),
-    }
-}
-
-fn main() -> eframe::Result<()> {
-    // remove leftover old exe from previous self update
-    if let Ok(cur) = std::env::current_exe() {
-        let _ = fs::remove_file(cur.with_extension("exe.old"));
-    }
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() >= 2 && args[1] == "--gpu-world" {
-        if args.get(2).is_some_and(|a| a == "--smoke-scene") {
-            if let Err(error) = world_gpu::run_gpu_world_smoke(args.get(3).map(String::as_str).unwrap_or("terrain")) {
-                eprintln!("{error}");
-                std::process::exit(1);
-            }
-            return Ok(());
-        }
-        let mut common_p: Option<PathBuf> = None;
-        let mut levels_p: Option<PathBuf> = None;
-        let mut idx = 2usize;
-        while idx + 1 < args.len() {
-            if args[idx] == "--common" {
-                common_p = Some(PathBuf::from(&args[idx + 1]));
-                idx += 2;
-            } else if args[idx] == "--levels" {
-                levels_p = Some(PathBuf::from(&args[idx + 1]));
-                idx += 2;
-            } else {
-                idx += 1;
-            }
-        }
-        if let Err(error) = world_gpu::run_gpu_world_cli(common_p.as_deref(), levels_p.as_deref()) {
-            eprintln!("{error}");
-            std::process::exit(1);
-        }
-        return Ok(());
-    }
-    if args.len() >= 3 && args[1] == "--probe-maps" {
-        mapdata::probe_maps_cli(&PathBuf::from(&args[2]));
-        return Ok(());
-    }
-    if args.len() >= 3 && args[1] == "--export-psin" {
-        let tsv = args.iter().any(|a| a == "--tsv");
-        match fs::read(&args[2]) {
-            Ok(data) => match psin::parse_psin_doc(&data) {
-                Ok(doc) => print!("{}", doc.export_placements_csv(None, tsv)),
-                Err(e) => eprintln!("PSIN error: {e}"),
-            },
-            Err(e) => eprintln!("Read error: {e}"),
-        }
-        return Ok(());
-    }
-    if args.len() >= 4 && args[1] == "--decode-bk2" {
-        let bk2 = PathBuf::from(&args[2]);
-        let out_dir = PathBuf::from(&args[3]);
-        let max_f = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(30);
-        let dll = bk2.parent().map(|d| d.join("bink2w64.dll")).filter(|p| p.exists())
-            .unwrap_or_else(|| PathBuf::from("bink2w64.dll"));
-        match bink2::decode_bk2_to_pngs(&dll, &bk2, &out_dir, max_f) {
-            Ok((info, n)) => println!("Decoded {n} frames ({}x{}) to {}", info.width, info.height, out_dir.display()),
-            Err(e) => eprintln!("BK2 decode error: {e}"),
-        }
-        return Ok(());
-    }
-    if args.len() >= 3 && args[1] == "--inspect-exe" {
-        let exe_path = PathBuf::from(&args[2]);
-        match fs::read(&exe_path) {
-            Ok(data) => {
-                println!("{}", boot::inspect_pe64_for_bringup(&data));
-                if let Some(dir) = exe_path.parent() {
-                    if let Ok(cfg) = fs::read_to_string(dir.join("MicrosoftGame.Config")) {
-                        let lay = fs::read_dir(dir).ok().and_then(|rd| {
-                            rd.filter_map(|e| e.ok()).find_map(|e| {
-                                let n = e.file_name().to_string_lossy().into_owned();
-                                if n.starts_with("layout_") && n.ends_with(".xml") {
-                                    fs::read_to_string(e.path()).ok()
-                                } else {
-                                    None
-                                }
-                            })
-                        });
-                        println!("{}", boot::summarize_gdk_manifest(&cfg, lay.as_deref()));
-                    }
-                }
-            }
-            Err(e) => eprintln!("Failed to read {}: {e}", exe_path.display()),
-        }
-        return Ok(());
-    }
-    if args.len() >= 4 && args[1] == "--disasm-shaders" {
-        let lim = args.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(25);
-        disasm_shaders_cli(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), lim);
-        return Ok(());
-    }
-    if args.len() >= 4 && args[1] == "--extract-sgd5" {
-        let lim = args
-            .get(4)
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0);
-        extract_sgd5_cli(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), lim);
-        return Ok(());
-    }
-    if args.len() >= 3 && args[1] == "--disassemble-dxbc" {
-        disassemble_dxbc_cli(
-            &PathBuf::from(&args[2]),
-            args.get(3).map(PathBuf::from).as_ref(),
-        );
-        return Ok(());
-    }
-    if args.len() >= 4 && args[1] == "--dump-textures" {
-        let lim = args.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-        dump_textures_cli(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), lim);
-        return Ok(());
-    }
-    if args.len() >= 4 && args[1] == "--extract-vehicles" {
-        export_models_cli(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), "", true);
-        return Ok(());
-    }
-    if args.len() >= 4 && args[1] == "--extract-models" {
-        let filt = args.get(4).map(|s| s.as_str()).unwrap_or("");
-        export_models_cli(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), filt, false);
-        return Ok(());
-    }
-
-    // decod embedded logo once and share bytes across window icon and topbar
-    let logo_rgba = image::load_from_memory(include_bytes!("../assets/logo.png"))
-        .ok()
-        .map(|img| {
-            let rgba = img.to_rgba8();
-            (rgba.as_raw().to_vec(), rgba.width(), rgba.height())
-        });
-    let mut vb = egui::ViewportBuilder::default().with_inner_size([1320.0, 800.0]);
-    if let Some((ref raw, w, h)) = logo_rgba {
-        vb = vb.with_icon(egui::IconData { rgba: raw.clone(), width: w, height: h });
-    }
-    let opts = eframe::NativeOptions { viewport: vb, ..Default::default() };
-    let title = format!("PercyStar v{APP_VERSION}");
-    eframe::run_native(&title, opts, Box::new(move |cc| Ok(Box::new(Rpf9App::new(cc, logo_rgba)))))
 }

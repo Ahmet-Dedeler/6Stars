@@ -60,7 +60,7 @@ struct FrameUniforms {
     sky_horizon: [f32; 4],
     flags: [f32; 4], // x=rt_on, y=time_hours, z=map_min_x, w=map_span_x
     map_y: [f32; 4], // x=map_min_y, y=map_span_y, z=viewport_w, w=viewport_h
-    hud: [f32; 4],   // x=load_progress, y=loading_active, z=elapsed_sec, w=sgd5_count
+    hud: [f32; 4],   // x=load_progress, y=loading_active, z=elapsed_sec, w=fog_density
 }
 
 pub struct WorldBatchInput {
@@ -81,7 +81,6 @@ pub enum WorldStreamMsg {
     MapCount(usize),
     TotalArchetypes(usize),
     ArchetypeDone,
-    Sgd5Count(usize),
 }
 
 pub fn launch_world_gpu_process(
@@ -297,11 +296,10 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -
                             let (h, moff, ref insts) = groups[i];
                             if let Ok(mesh) = crate::model3d::decode_rage9_model_from_rpf(&lp, moff, &format!("arch_{h:08x}")) {
                                 let lo = mesh.name.to_ascii_lowercase();
-                                if !(lo.ends_with("_shadow") || lo.ends_with("_pxy") || lo.ends_with("_lit_proxy")) {
-                                    if tx.send(WorldStreamMsg::Batch(WorldBatchInput { mesh, instances: insts.clone() })).is_err() {
+                                if !(lo.ends_with("_shadow") || lo.ends_with("_pxy") || lo.ends_with("_lit_proxy"))
+                                    && tx.send(WorldStreamMsg::Batch(WorldBatchInput { mesh, instances: insts.clone() })).is_err() {
                                         break;
                                     }
-                                }
                             }
                             if tx.send(WorldStreamMsg::ArchetypeDone).is_err() {
                                 break;
@@ -652,7 +650,6 @@ struct GpuState {
     map_count: usize,
     stream_done: usize,
     stream_total: usize,
-    sgd5_count: usize,
     tex_bytes: usize,
     geom_bytes: usize,
     vram_oom: bool,
@@ -664,7 +661,8 @@ struct GpuState {
 }
 
 fn create_depth_texture(device: &wgpu::Device, w: u32, h: u32) -> wgpu::Texture {
-    let tex = device.create_texture(&wgpu::TextureDescriptor {
+    
+    device.create_texture(&wgpu::TextureDescriptor {
         label: Some("world_depth"),
         size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
         mip_level_count: 1,
@@ -673,8 +671,7 @@ fn create_depth_texture(device: &wgpu::Device, w: u32, h: u32) -> wgpu::Texture 
         format: wgpu::TextureFormat::Depth32Float,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
-    });
-    tex
+    })
 }
 
 fn upload_texture(
@@ -1089,7 +1086,6 @@ impl GpuState {
             map_count: cfg.map_count,
             stream_done: 0,
             stream_total: 0,
-            sgd5_count: 0,
             tex_bytes: 0,
             geom_bytes: 0,
             vram_oom: false,
@@ -1494,7 +1490,6 @@ impl ApplicationHandler for GpuWorldApp {
                             WorldStreamMsg::MapCount(mc) => g.map_count = mc,
                             WorldStreamMsg::TotalArchetypes(t) => g.stream_total = t,
                             WorldStreamMsg::ArchetypeDone => g.stream_done += 1,
-                            WorldStreamMsg::Sgd5Count(n) => g.sgd5_count = n,
                         }
                     }
                 }
@@ -1556,13 +1551,12 @@ impl ApplicationHandler for GpuWorldApp {
                     } else {
                         " | Indexing...".to_string()
                     };
-                    let sgd_lbl = if g.sgd5_count > 0 { format!(" | SGD5: {}", g.sgd5_count) } else { String::new() };
                     g.window.set_title(&format!(
-                        "PercyStar 3D World | pos {:.0} {:.0} {:.0} | {} | Sun az {:.1} el {:+.1} (F6) | Time {:.2}h | {} maps | {} models | {} instances | {:.2} M tris | RT: {}{}{}",
+                        "PercyStar 3D World | pos {:.0} {:.0} {:.0} | {} | Sun az {:.1} el {:+.1} (F6) | Time {:.2}h | {} maps | {} models | {} instances | {:.2} M tris | RT: {}{}",
                         self.cam_pos.x, self.cam_pos.y, self.cam_pos.z, mode_lbl,
                         az.to_degrees().rem_euclid(360.0), el.to_degrees(),
                         self.time_h, g.map_count, g.model_count, g.instance_count,
-                        g.tri_count as f64 / 1e6, rt_lbl, load_lbl, sgd_lbl
+                        g.tri_count as f64 / 1e6, rt_lbl, load_lbl
                     ));
                 }
 

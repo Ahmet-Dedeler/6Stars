@@ -447,7 +447,7 @@ fn decode_opus_chunk_into(
                 continue;
             }
             let dir_bytes = n_sub * 24 + total_blks * 4;
-            let dir_blks = ((dir_bytes + 2047) / 2048).max(1);
+            let dir_blks = dir_bytes.div_ceil(2048).max(1);
             let start_blk: usize = dir_blks + counts[..sub_idx].iter().sum::<usize>();
             let end_blk = start_blk + counts[sub_idx];
             let byte_start = start_blk * 2048;
@@ -569,7 +569,7 @@ where
                         }
                     }
                     let d = done_cnt.fetch_add(1, Ordering::Relaxed) + 1;
-                    if d == total || d % 8 == 0 {
+                    if d == total || d.is_multiple_of(8) {
                         on_progress(d, total);
                     }
                 }

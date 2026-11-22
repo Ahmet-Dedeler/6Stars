@@ -58,7 +58,7 @@ fn is_zlib_hdr(d: &[u8]) -> bool {
     }
     let b0 = d[0] as u16;
     let b1 = d[1] as u16;
-    b0 == 0x78 && matches!(b1, 0x01 | 0x5E | 0x9C | 0xDA) && ((b0 << 8) | b1) % 31 == 0
+    b0 == 0x78 && matches!(b1, 0x01 | 0x5E | 0x9C | 0xDA) && ((b0 << 8) | b1).is_multiple_of(31)
 }
 
 fn known_pack_fallback(pack_hash: u32) -> Option<&'static str> {
