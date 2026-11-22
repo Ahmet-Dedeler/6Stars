@@ -18,6 +18,7 @@ mod worldmap;
 mod model3d;
 mod rdna2;
 mod tex;
+mod vehicle_data;
 mod vehicle_variations;
 mod bench;
 use std::collections::HashSet;
@@ -595,6 +596,17 @@ struct ResolvedVehicleVariation {
     unresolved: Vec<u32>,
 }
 
+// physics components of the viewed vehicle filled in by a worker thread
+#[derive(Default)]
+struct VehicleDataState {
+    // archive and file name of the model the data belongs to
+    model: Option<(PathBuf, String)>,
+    loading: bool,
+    data: Option<vehicle_data::VehicleData>,
+    // scanned vehicle model names by hash used to label parents
+    names: vehicle_data::Names,
+}
+
 #[derive(Default)]
 struct UpdateState {
     available: Option<(String, String)>,
@@ -847,6 +859,7 @@ struct Rpf9App {
     vehicle_variations: Vec<ResolvedVehicleVariation>,
     vehicle_variation_selected: usize,
     vehicle_variation_filter: String,
+    vehicle_data: Arc<Mutex<VehicleDataState>>,
     // textures button clicked in the viewer header applied at the start of the next frame
     tex_pick: bool,
     // shown textures belong to the viewed model so the viewer offers a way back to it
@@ -1044,6 +1057,7 @@ impl Rpf9App {
             vehicle_variations: Vec::new(),
             vehicle_variation_selected: 0,
             vehicle_variation_filter: String::new(),
+            vehicle_data: Arc::default(),
             tex_pick: false,
             tex_from_model: false,
             lod_keep_cam: None,
@@ -1990,6 +2004,61 @@ impl Rpf9App {
         }
     }
 
+    // read only physics and handling records of the viewed vehicle from data.rpf next to its archive
+    fn vehicle_data_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(index) = self.model_entry else { return };
+        let shared = Arc::clone(&self.vehicle_data);
+        let mut slot = shared.lock().unwrap_or_else(|p| p.into_inner());
+        {
+            let st = self.state.lock().unwrap();
+            let Some(model) = st.entries.get(index).filter(|entry| entry.kind == "VEH") else { return };
+            let current = slot.model.as_ref().is_some_and(|(rpf, name)| *rpf == model.source_rpf && *name == model.name);
+            if !current {
+                let names: vehicle_data::Names = st
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.kind == "VEH")
+                    .map(|entry| {
+                        let stem = model_file_stem(&entry.name);
+                        (psin::joaat(&stem), stem)
+                    })
+                    .collect();
+                let key = (model.source_rpf.clone(), model.name.clone());
+                let hash = psin::joaat(&model_file_stem(&model.name));
+                *slot = VehicleDataState { model: Some(key.clone()), loading: true, ..Default::default() };
+                let (shared, ctx) = (Arc::clone(&shared), ui.ctx().clone());
+                std::thread::spawn(move || {
+                    // a missing data.rpf or a model without an entry simply leaves the panel hidden
+                    let data = std::panic::catch_unwind(|| {
+                        let db = vehicle_data::load_from_folder(key.0.parent()?)?;
+                        db.lookup(hash, &names).map(|data| (data, names))
+                    })
+                    .ok()
+                    .flatten();
+                    let mut slot = shared.lock().unwrap_or_else(|p| p.into_inner());
+                    if slot.model.as_ref() == Some(&key) {
+                        slot.loading = false;
+                        if let Some((data, names)) = data {
+                            slot.data = Some(data);
+                            slot.names = names;
+                        }
+                    }
+                    ctx.request_repaint();
+                });
+            }
+        }
+        if slot.loading {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Reading vehicle data from data.rpf…");
+            });
+            return;
+        }
+        if let Some(data) = slot.data.as_ref() {
+            vehicle_data::panel_ui(ui, data, &slot.names);
+        }
+    }
+
     // decoded texture viewer with zoom export and a picker strip
     fn render_texture_viewer(&mut self, ui: &mut egui::Ui) {
         if self.tex_sel >= self.textures.len() {
@@ -2790,6 +2859,7 @@ impl Rpf9App {
                 } else if self.mesh3d.is_some() {
                     self.vehicle_variations_ui(ui);
                     self.vehicle_parts_ui(ui);
+                    self.vehicle_data_ui(ui);
                     let mesh = self.mesh3d.as_mut().unwrap();
                     ui.horizontal_wrapped(|ui| {
                         ui.label(RichText::new(&mesh.name).size(15.0).strong().color(Color32::from_rgb(255, 168, 28)));
@@ -5754,6 +5824,7 @@ impl eframe::App for Rpf9App {
             } else if self.mesh3d.is_some() {
                 self.vehicle_variations_ui(ui);
                 self.vehicle_parts_ui(ui);
+                self.vehicle_data_ui(ui);
                 let mesh = self.mesh3d.as_mut().unwrap();
                 let mut toggle_3d = self.show_3d;
                 ui.horizontal(|ui| {
