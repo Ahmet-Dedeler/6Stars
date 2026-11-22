@@ -263,6 +263,13 @@ cargo build --release
 
 Compiled standalone binary: `target/release/PercyStar.exe`. `scripts/build_linux.sh` and `scripts/build_macos.sh` package the other platforms. Every push and pull request is built and tested by [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
+---
+
+## Support & Donations
+
+PercyStar is completely free and open-source. If it's helped your research or saved you time and you'd ever like to kindly support ongoing R&D, server/hardware costs, and late-night builds, **[sponsoring via GitHub Sponsors](https://github.com/sponsors/rpatty-dev)** is always deeply appreciated — no pressure at all, starring the repo or sharing test reports helps just as much!
+
+
 Optional external tools are only loaded from trusted locations: `binkplay.exe` next to `PercyStar.exe`, on `PATH`, in the RAD install folders or from `BINKPLAY_PATH`; `dxcompiler.dll` next to `PercyStar.exe`, in `System32` or from `DXCOMPILER_DLL`; `bink2w64.dll` next to `PercyStar.exe` or from `BINK2_DLL`. They are never picked up from the working directory or from the folder of an opened file.
 
 ---
