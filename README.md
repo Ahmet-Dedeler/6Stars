@@ -62,6 +62,19 @@
 
 ---
 
+## What's New (v1.4.8)
+
+- **Stale Decode & World Streamer Reliability (PR #43, `@asm512`)**:
+  - Dropped superseded out-of-order selection decodes (model, navmesh, TXD/TTPF, AWC) and ensured decoder panics clear the spinner.
+  - Re-queued skipped world streamer models when the camera moves mid-batch, eliminating permanent map holes.
+- **World Textures, Cell Batching & Background Export (PR #43 + PercyStar Optimizations)**:
+  - World streamer reads capped 128px mips directly (`decode_ttpf_texture_capped`) with shared texture uploads, 1 GiB byte-bounded TTPF cache, thread-local `File` handle reuse (`LAST_TTPF_FILE`), and `Rc<PathBuf>` chunk cache keys.
+  - 1024 m cell batching for per-cell culling (draw cap `6000`), lock-free per-worker streaming completion (`(cores / 2).clamp(3, 6)` threads, zero per-archetype mutex/sleep), background Export All/Selected with Cancel, and 45s scan-cache autosave.
+- **RF World View (`src/worldmap.rs`, `src/world_gpu.rs`)**:
+  - Added **RF World View** button alongside `Launch 3D GPU World (wgpu)` with Time-of-Day presets (`Dawn`, `Noon`, `Golden`, `Night`), `Water (V)` toggle, `700m`–`16km` draw radius presets, and `C`-down flight controls powered by `PercyStar`'s PBR/sky/water/RT shaders.
+  - Fixed `CEntityDef` world entity orientation (conjugated + finite-guarded quaternions) and replaced linear archetype distance scans with a `200m` spatial grid streaming nearest-cell-first up to `6 km`.
+- **Verified Test Suite**: `98 passed; 0 failed` (`cargo test --release`).
+
 ## What's New (v1.4.7)
 
 - **Code Health Pass**

@@ -196,7 +196,16 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -
             let start = cam_track_bg.lock().unwrap().0;
             for e in &ix.entities {
                 let p = Vec3::from_array(e.pos);
-                let q = Quat::from_xyzw(e.rot[0], e.rot[1], e.rot[2], e.rot[3]).normalize();
+                if !p.is_finite() || !e.scale_xy.is_finite() || !e.scale_z.is_finite() {
+                    continue;
+                }
+                let q_raw = Quat::from_xyzw(e.rot[0], e.rot[1], e.rot[2], e.rot[3]);
+                // RAGE CEntityDef stores inverse rotation; conjugate maps local -> world space
+                let q = if !q_raw.is_finite() || q_raw.length_squared() < 1e-6 {
+                    Quat::IDENTITY
+                } else {
+                    q_raw.conjugate().normalize()
+                };
                 if !ix.models.contains_key(&e.archetype_hash) {
                     if p.distance_squared(start) <= 2200.0 * 2200.0 && box_insts.len() < 12_000 {
                         let h = e.archetype_hash;
@@ -235,11 +244,27 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -
                 let _ = tx.send(WorldStreamMsg::Batch(WorldBatchInput { mesh: bmesh, instances: box_insts }));
             }
 
-            let all_groups: Vec<(u32, u64, Vec3, Vec<(Vec3, Quat, Vec3, [f32; 4])>)> = grouped
+            let all_groups: Vec<(u32, u64, Vec<(Vec3, Quat, Vec3, [f32; 4])>)> = grouped
                 .into_iter()
-                .filter_map(|(h, (rep, insts))| ix.models.get(&h).map(|&moff| (h, moff, rep, insts)))
+                .filter_map(|(h, (_rep, insts))| ix.models.get(&h).map(|&moff| (h, moff, insts)))
                 .collect();
-            eprintln!("[world-gpu] {} unique drawable archetypes indexed for live camera streaming", all_groups.len());
+            // 200m spatial grid for O(cells) distance-tiered streaming up to 6 km
+            const STREAM_CELL: f32 = 200.0;
+            let mut stream_grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+            for (idx, (_, _, insts)) in all_groups.iter().enumerate() {
+                for &(p, _, _, _) in insts {
+                    let key = ((p.x / STREAM_CELL).floor() as i32, (p.y / STREAM_CELL).floor() as i32);
+                    let cell_vec = stream_grid.entry(key).or_default();
+                    if cell_vec.last().copied() != Some(idx) {
+                        cell_vec.push(idx);
+                    }
+                }
+            }
+            for v in stream_grid.values_mut() {
+                v.sort_unstable();
+                v.dedup();
+            }
+            eprintln!("[world-gpu] {} unique drawable archetypes across {} 200m cells indexed for live streaming", all_groups.len(), stream_grid.len());
 
             let mut loaded = std::collections::HashSet::<u32>::new();
             let mut last_gen = 0u64;
@@ -250,28 +275,48 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -
                     continue;
                 }
                 last_gen = cur_gen;
-                let mut nearby: Vec<(usize, f32)> = all_groups
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, (h, _, _, _))| !loaded.contains(h))
-                    .filter_map(|(idx, (_, _, _, insts))| {
-                        let d2 = insts.iter().map(|i| i.0.distance_squared(cam_p)).fold(f32::MAX, f32::min);
-                        (d2 <= 3200.0 * 3200.0).then_some((idx, d2))
-                    })
-                    .collect();
-                if nearby.is_empty() {
+                let max_r = 6000.0f32;
+                let cr = (max_r / STREAM_CELL).ceil() as i32;
+                let cx0 = (cam_p.x / STREAM_CELL).floor() as i32;
+                let cy0 = (cam_p.y / STREAM_CELL).floor() as i32;
+                let mut cells: Vec<((i32, i32), f32)> = Vec::new();
+                for dx in -cr..=cr {
+                    for dy in -cr..=cr {
+                        let key = (cx0 + dx, cy0 + dy);
+                        if !stream_grid.contains_key(&key) {
+                            continue;
+                        }
+                        let x0 = key.0 as f32 * STREAM_CELL;
+                        let y0 = key.1 as f32 * STREAM_CELL;
+                        let rx = (x0 - cam_p.x).max(0.0).max(cam_p.x - (x0 + STREAM_CELL));
+                        let ry = (y0 - cam_p.y).max(0.0).max(cam_p.y - (y0 + STREAM_CELL));
+                        let d2 = rx * rx + ry * ry;
+                        if d2 <= max_r * max_r {
+                            cells.push((key, d2));
+                        }
+                    }
+                }
+                cells.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+                let take_n = if loaded.is_empty() { 1200 } else { 500 };
+                let mut seen_idx = std::collections::HashSet::new();
+                let mut batch_list: Vec<(u32, u64, Vec<(Vec3, Quat, Vec3, [f32; 4])>)> = Vec::with_capacity(take_n);
+                'outer: for (key, _) in cells {
+                    if let Some(indices) = stream_grid.get(&key) {
+                        for &idx in indices {
+                            let (h, moff, ref insts) = all_groups[idx];
+                            if loaded.contains(&h) || !seen_idx.insert(idx) {
+                                continue;
+                            }
+                            batch_list.push((h, moff, insts.clone()));
+                            if batch_list.len() >= take_n {
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+                if batch_list.is_empty() {
                     continue;
                 }
-                nearby.sort_by(|a, b| a.1.total_cmp(&b.1));
-                let take_n = nearby.len().min(if loaded.is_empty() { 1200 } else { 500 });
-                let batch_list: Vec<(u32, u64, Vec<(Vec3, Quat, Vec3, [f32; 4])>)> = nearby
-                    .into_iter()
-                    .take(take_n)
-                    .map(|(idx, _)| {
-                        let (h, moff, _, ref insts) = all_groups[idx];
-                        (h, moff, insts.clone())
-                    })
-                    .collect();
                 let _ = tx.send(WorldStreamMsg::TotalArchetypes(loaded.len() + batch_list.len()));
                 let groups = Arc::new(batch_list);
                 let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
