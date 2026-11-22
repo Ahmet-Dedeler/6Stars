@@ -4415,13 +4415,17 @@ fn read_entry_bytes(e: &RpfEntry) -> std::io::Result<Vec<u8>> {
         Ok(combined)
     } else {
         f.seek(SeekFrom::Start(e.offset))?;
-        let mut raw = vec![0u8; e.comp_size as usize];
-        f.read_exact(&mut raw)?;
         if matches!(e.kind, "XML" | "DAT" | "PSIN" | "ANIM" | "RSC9" | "RBF0" | "GFX" | "GXT" | "ZLIB") {
+            // The scanner only inflates the first 32 KiB to classify an entry, so `comp_size`
+            // is short for anything bigger. Inflate from the file until the zlib stream ends
+            // instead of trusting it (bounded, in case the offset is not a stream at all).
+            const MAX_STREAM: u64 = 256 << 20;
             let mut out = Vec::new();
-            ZlibDecoder::new(&raw[..]).read_to_end(&mut out)?;
+            ZlibDecoder::new(BufReader::new(f).take(MAX_STREAM)).take(MAX_STREAM).read_to_end(&mut out)?;
             Ok(out)
         } else {
+            let mut raw = vec![0u8; e.comp_size as usize];
+            f.read_exact(&mut raw)?;
             Ok(raw)
         }
     }
@@ -6763,6 +6767,37 @@ mod tests {
             eprintln!("  capped {} -> {:?} tracks", e.name, tracks);
             assert!(tracks.is_ok_and(|n| n > 0), "{}", e.name);
         }
+    }
+
+    /// The scanner records `comp_size` after inflating only 32 KiB, so it is short for larger
+    /// streams. Reading must still return the whole stream (28% of ANIM entries failed).
+    #[test]
+    fn compressed_entries_read_past_a_short_comp_size() {
+        use flate2::{write::ZlibEncoder, Compression};
+        use std::io::Write;
+        let payload: Vec<u8> = (0..200_000u32).flat_map(|i| (i.wrapping_mul(2_654_435_761) >> 13).to_le_bytes()).collect();
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&payload).unwrap();
+        let z = enc.finish().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.rpf");
+        let mut file = vec![0xAAu8; 64];
+        file.extend_from_slice(&z);
+        file.extend_from_slice(&[0x55; 4096]); // whatever follows the stream in the archive
+        fs::write(&p, &file).unwrap();
+        let e = RpfEntry {
+            source_rpf: p,
+            rpf_name: "a.rpf".into(),
+            name: "clip.ycd".into(),
+            kind: "ANIM",
+            offset: 64,
+            comp_size: 1000, // far short of z.len()
+            raw_size: 32768,
+            tracks: 0,
+            chunks: Vec::new(),
+        };
+        assert!(z.len() > 1000);
+        assert_eq!(read_entry_bytes(&e).unwrap(), payload);
     }
 
     #[test]
