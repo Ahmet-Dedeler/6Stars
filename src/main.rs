@@ -5088,7 +5088,24 @@ impl eframe::App for Rpf9App {
             // rows must be exactly row_h tall or show_rows miscomputes total height
             const ROW_H: f32 = 20.0;
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-            let scroll_resp = egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, ROW_H, self.view.len(), |ui, range| {
+            let (p_down, p_pos, ctrl_held, esc_pressed) = ctx.input(|i| {
+                (
+                    i.pointer.primary_down(),
+                    i.pointer.interact_pos(),
+                    i.modifiers.command,
+                    i.key_pressed(egui::Key::Escape),
+                )
+            });
+            if esc_pressed || !p_down {
+                self.marquee_start = None;
+            }
+            let marquee_active = p_down
+                && self.marquee_start.is_some()
+                && p_pos.is_some_and(|p| self.marquee_start.unwrap().distance(p) > 5.0);
+            let scroll_resp = egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .enable_scrolling(!marquee_active)
+                .show_rows(ui, ROW_H, self.view.len(), |ui, range| {
                 let rows: Vec<(usize, RpfEntry)> = {
                     let st = self.state.lock().unwrap();
                     self.view[range].iter().filter_map(|&i| st.entries.get(i).map(|e| (i, e.clone()))).collect()
@@ -5147,10 +5164,9 @@ impl eframe::App for Rpf9App {
                     row_rects.push((*idx, row_alloc.response.rect.min.y, row_alloc.response.rect.max.y));
                 }
             });
-            // Marquee drag selection in Explorer list (#38)
+            // Marquee drag selection in Explorer list (#38, #41 scroll-locked while active)
             let list_rect = scroll_resp.inner_rect;
-            let (p_down, p_pos, ctrl_held) = ctx.input(|i| (i.pointer.primary_down(), i.pointer.interact_pos(), i.modifiers.command));
-            if p_down {
+            if p_down && !esc_pressed {
                 if let Some(pos) = p_pos {
                     if self.marquee_start.is_none() && list_rect.contains(pos) {
                         self.marquee_start = Some(pos);
