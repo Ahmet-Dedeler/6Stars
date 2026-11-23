@@ -23,6 +23,10 @@ tempfile = "3"
 # BCPack BC1 decoder (MIT OR Apache-2.0), pinned to a reviewed commit.
 bcpack-rs = { git = "https://github.com/Ahmet-Dedeler/bcpack-rs", rev = "0a887de1edc9c22a425605091f1a8365fdf74dbb", default-features = false }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Clean-room Bink 2 video decoder (Apache-2.0), pinned to a reviewed commit.
+bink2_decoder = { package = "bink2", git = "https://github.com/codingkoala/bink2-decoder", rev = "277c4702b5ee5731bd3fd2af4f3cec631124b930" }
+
 [target.'cfg(windows)'.dependencies]
 raw-window-handle = "0.6"
 windows = { version = "0.58", features = ["Win32_Media_Audio", "Win32_System_Com"] }

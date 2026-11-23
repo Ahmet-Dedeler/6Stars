@@ -467,6 +467,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "bink2"
+version = "0.1.0"
+source = "git+https://github.com/codingkoala/bink2-decoder?rev=277c4702b5ee5731bd3fd2af4f3cec631124b930#277c4702b5ee5731bd3fd2af4f3cec631124b930"
+
+[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2685,6 +2690,7 @@ name = "rpf9_explorer"
 version = "1.12.0"
 dependencies = [
  "bcpack-rs",
+ "bink2",
  "bytemuck",
  "eframe",
  "egui-wgpu",
