@@ -204,6 +204,14 @@ What changed:
   ```
   The Shaders tab is source-driven: opening a raw `shaders.rpf` loads the PS09 runtime cache and every SGD5 group, while separate buttons load a PS09 cache, zlib directory, or SGD5 `.bin`. Selecting either source or any shader switches the browser and viewer to that dataset. Both sources support GFX10.3 disassembly plus experimental HLSL and SPIR-V lifting; SGD5 extraction gives each group its own output folder and `sgd5_index.csv`. GTA `Wrapped`/`NOBC` shaders are unwrapped to their zlib `FSSM` payload before RDNA2 decoding.
 
+  SGD5 uses one reflection-table parser for shared metadata, individual shaders, and both effect tables. Its sections are named `resources`, `members`, and provisional `auxiliary_records`; members describe CBV contents or Buffer element metadata. Resource records expose byte-sized slot, auxiliary count, member count, and flags fields. Member records expose separate value-type and auxiliary-count bytes. Observed-zero words are retained as reserved fields, and default-data offsets are interpreted only on members. Descriptor tables and inline property tables share the `Sgd5BindingTable` model; property references resolve through the table's 32-bit hash. Auxiliary payloads and default-value data remain untyped, the second reflection hash remains independent, and the opaque 144-byte shader metadata is retained. CSV manifests use `archive_size`, `decompressed_size`, `resources`, `members`, and `auxiliary_records` columns.
+
+  Run parser regressions with `cargo test sgd5`. To validate the analysis archive, set `PERCY_SGD5_SAMPLE` to its path and run `cargo test sample_archive_uses_common_tables_and_decompresses_each_stage -- --ignored`.
+
+  The SGD5 viewer has a **Metadata** view and text export with compiled DXBC input/output signatures, resource hashes and types, member packing/default bytes, shared reflection matches, effect ownership, and resolved binding-table references. ASM/HLSL exports include that metadata as comments. SGD5 slots are shown as metadata indices; they no longer create guessed HLSL resource declarations or register assignments. See [the SGD5 format notes](docs/SGD5.md) for what is confirmed and what remains inferred.
+
+  FSSM extraction follows the active program descriptor and its declared range instead of searching for an instruction marker. Program metadata shows the payload size, stage-pointer field, complete program range, and compiler hash embedded in leading no-ops, with a DXBC `HASH` comparison. Disassembly retains those no-ops and instructions before prefetch, and continues past early `s_endpgm` instructions to the code-end padding.
+
 ---
 
 ## Project Layout

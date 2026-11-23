@@ -7,8 +7,9 @@ use std::sync::OnceLock;
 
 const DXBC_MAGIC: &[u8; 4] = b"DXBC";
 const FSSM_MAGIC: &[u8; 4] = b"FSSM";
-const GFX103_CODE_START: [u8; 4] = 0xBFA0_0003u32.to_le_bytes();
-const GFX103_CODE_END: [u8; 4] = 0xBF81_0000u32.to_le_bytes();
+const FSSM_PAYLOAD_BASE: usize = 0x10;
+const FSSM_EMPTY_STAGE: u64 = 0xDEAD_BEEF_DEAD_BEEF;
+const MAX_FSSM_BYTES: usize = 64 << 20;
 
 #[cfg(windows)]
 const CLSID_DXC_COMPILER: Guid = Guid::from_values(
@@ -86,18 +87,133 @@ pub fn disassemble_with_source(data: &[u8], source: &str) -> String {
 #[derive(Clone, Debug)]
 pub struct FssmShader {
     pub data: Vec<u8>,
+    pub version: u32,
+    pub payload_size: u64,
+    pub stage_pointer_offset: usize,
+    pub stage_descriptor_offset: usize,
     pub code_offset: usize,
     pub code_size: usize,
+    pub compiler_hash: Option<[u8; 16]>,
+    pub dxbc_hash_match: Option<bool>,
 }
 
 impl FssmShader {
     pub fn code(&self) -> &[u8] {
-        let end = (self.code_offset + self.code_size).min(self.data.len());
-        &self.data[self.code_offset..end]
+        self.code_offset
+            .checked_add(self.code_size)
+            .and_then(|end| self.data.get(self.code_offset..end))
+            .unwrap_or_default()
     }
 }
 
+fn read_u32(data: &[u8], offset: usize) -> Result<u32, String> {
+    let end = offset.checked_add(4).ok_or("u32 offset overflow")?;
+    let bytes = data.get(offset..end).ok_or("truncated u32")?;
+    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn read_u64(data: &[u8], offset: usize) -> Result<u64, String> {
+    let end = offset.checked_add(8).ok_or("u64 offset overflow")?;
+    let bytes = data.get(offset..end).ok_or("truncated u64")?;
+    Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn payload_offset(relative: u64) -> Result<usize, String> {
+    usize::try_from(relative)
+        .ok()
+        .and_then(|offset| offset.checked_add(FSSM_PAYLOAD_BASE))
+        .ok_or_else(|| "FSSM relative offset overflow".into())
+}
+
+fn compiler_hash(program: &[u8]) -> Option<[u8; 16]> {
+    let mut hash = [0; 16];
+    for index in 0..2 {
+        let offset = index * 12;
+        let word0 = read_u32(program, offset).ok()?;
+        let word1 = read_u32(program, offset + 4).ok()?;
+        let word2 = read_u32(program, offset + 8).ok()?;
+        if word0 & 0xFFFF_0000 != 0xD580_0000 || word1 & 0xFFFE_0100 != 0x03FE_0100 {
+            return None;
+        }
+        let packed = (word0 & 0xffff) | ((word1 & 0xff) << 16) | (((word1 >> 9) & 0xff) << 24);
+        hash[index * 8..index * 8 + 4].copy_from_slice(&packed.to_le_bytes());
+        hash[index * 8 + 4..index * 8 + 8].copy_from_slice(&word2.to_le_bytes());
+    }
+    Some(hash)
+}
+
+pub fn parse_fssm(data: Vec<u8>) -> Result<FssmShader, String> {
+    if data.get(..4) != Some(FSSM_MAGIC) {
+        return Err("not an FSSM container".into());
+    }
+    if data.len() > MAX_FSSM_BYTES {
+        return Err("FSSM exceeds 64 MiB".into());
+    }
+    let version = read_u32(&data, 4)?;
+    if version != 0x101 {
+        return Err(format!("unsupported FSSM version 0x{version:x}"));
+    }
+    let payload_size = read_u64(&data, 8)?;
+    if payload_offset(payload_size)? != data.len() {
+        return Err("FSSM payload size mismatch".into());
+    }
+    data.get(..0x78)
+        .ok_or("truncated FSSM stage-pointer table")?;
+    let mut active = None;
+    for offset in (0x18..0x78).step_by(8) {
+        let relative = read_u64(&data, offset)?;
+        if relative == FSSM_EMPTY_STAGE || relative == 0 {
+            continue;
+        }
+        if active.is_some() {
+            return Err("multiple active FSSM programs are not supported".into());
+        }
+        active = Some((offset, payload_offset(relative)?));
+    }
+    let (stage_pointer_offset, stage_descriptor_offset) =
+        active.ok_or("FSSM has no active program")?;
+    if stage_descriptor_offset < 0x78 {
+        return Err("FSSM stage descriptor overlaps its pointer table".into());
+    }
+    let code_offset = payload_offset(read_u64(&data, stage_descriptor_offset)?)?;
+    let size_offset = stage_descriptor_offset
+        .checked_add(8)
+        .ok_or("stage descriptor overflow")?;
+    let code_size =
+        usize::try_from(read_u64(&data, size_offset)?).map_err(|_| "FSSM program size overflow")?;
+    let code_end = code_offset
+        .checked_add(code_size)
+        .ok_or("FSSM program extent overflow")?;
+    if code_size == 0 || code_size % 4 != 0 || code_offset < 0x78 || code_offset % 4 != 0 {
+        return Err("invalid FSSM program alignment or size".into());
+    }
+    let descriptor_end = stage_descriptor_offset
+        .checked_add(16)
+        .ok_or("stage descriptor overflow")?;
+    if code_offset < descriptor_end && code_end > stage_descriptor_offset {
+        return Err("FSSM program overlaps its descriptor".into());
+    }
+    let program = data
+        .get(code_offset..code_end)
+        .ok_or("FSSM program exceeds its payload")?;
+    let compiler_hash = compiler_hash(program);
+    Ok(FssmShader {
+        data,
+        version,
+        payload_size,
+        stage_pointer_offset,
+        stage_descriptor_offset,
+        code_offset,
+        code_size,
+        compiler_hash,
+        dxbc_hash_match: None,
+    })
+}
+
 pub fn extract_fssm(data: &[u8]) -> Result<FssmShader, String> {
+    if data.get(..4) == Some(FSSM_MAGIC) {
+        return parse_fssm(data.to_vec());
+    }
     let payload = find_dxil_payload(data)?;
 
     // probe common nobc zlib offsets first before scanning 0x60..0xc0
@@ -110,7 +226,7 @@ pub fn extract_fssm(data: &[u8]) -> Result<FssmShader, String> {
         // bounded inflate a shader never comes close to this
         let mut decompressed = Vec::new();
         if ZlibDecoder::new(&payload[offset..])
-            .take(64 << 20)
+            .take(MAX_FSSM_BYTES as u64 + 1)
             .read_to_end(&mut decompressed)
             .is_err()
             || decompressed.len() < 4
@@ -119,19 +235,15 @@ pub fn extract_fssm(data: &[u8]) -> Result<FssmShader, String> {
             continue;
         }
 
-        let code_offset = find_bytes(&decompressed, &GFX103_CODE_START)
-            .ok_or_else(|| "FSSM has no GFX10.3 code start marker".to_string())?;
-        let code_size = decompressed[code_offset + 4..]
-            .windows(4)
-            .position(|window| window == GFX103_CODE_END)
-            .map(|end_offset| end_offset + 8)
-            .unwrap_or_else(|| decompressed.len() - code_offset);
-
-        return Ok(FssmShader {
-            data: decompressed,
-            code_offset,
-            code_size,
-        });
+        let mut shader = parse_fssm(decompressed)?;
+        if let (Some(hash), Ok(Some(chunk))) =
+            (shader.compiler_hash, find_dxbc_chunk(data, b"HASH"))
+        {
+            if let Some(digest) = chunk.get(4..20) {
+                shader.dxbc_hash_match = Some(digest == hash);
+            }
+        }
+        return Ok(shader);
     }
 
     Err("DXIL payload does not contain a zlib FSSM stream".into())
@@ -267,10 +379,15 @@ fn load_dxc_library() -> Result<*mut c_void, String> {
         unsafe { LoadLibraryExW(wide.as_ptr(), std::ptr::null_mut(), flags) }
     };
     // explicit full path or the folder of the executable and system32
-    let explicit = std::env::var_os("DXCOMPILER_DLL").map(std::path::PathBuf::from).filter(|p| p.is_absolute() && p.is_file());
+    let explicit = std::env::var_os("DXCOMPILER_DLL")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute() && p.is_file());
     let library = match explicit {
         Some(path) => load(path.as_os_str(), SEARCH_DLL_LOAD_DIR | SEARCH_SYSTEM32),
-        None => load(std::ffi::OsStr::new("dxcompiler.dll"), SEARCH_APPLICATION_DIR | SEARCH_SYSTEM32),
+        None => load(
+            std::ffi::OsStr::new("dxcompiler.dll"),
+            SEARCH_APPLICATION_DIR | SEARCH_SYSTEM32,
+        ),
     };
     if library.is_null() {
         return Err("dxcompiler.dll was not found next to PercyStar.exe (or set DXCOMPILER_DLL to its full path)".into());
@@ -296,40 +413,46 @@ fn get_dxc_create_instance(
     Ok(unsafe { std::mem::transmute(address) })
 }
 
-fn find_dxil_payload(data: &[u8]) -> Result<&[u8], String> {
-    if data.len() < 0x24 || &data[..4] != DXBC_MAGIC {
+fn find_dxbc_chunk<'a>(data: &'a [u8], wanted: &[u8; 4]) -> Result<Option<&'a [u8]>, String> {
+    if data.get(..4) != Some(DXBC_MAGIC) {
         return Err("not a DXBC container".into());
     }
-
-    let read_u32 = |offset: usize| {
-        u32::from_le_bytes([
-            data[offset],
-            data[offset + 1],
-            data[offset + 2],
-            data[offset + 3],
-        ])
-    };
-    let chunk_count = read_u32(0x1c) as usize;
-
-    for chunk_index in 0..chunk_count {
-        let table_offset = 0x20 + chunk_index * 4;
-        if table_offset + 4 > data.len() {
-            break;
-        }
-        let chunk_offset = read_u32(table_offset) as usize;
-        if chunk_offset + 8 > data.len() || &data[chunk_offset..chunk_offset + 4] != b"DXIL" {
+    let size = read_u32(data, 0x18)? as usize;
+    let data = data
+        .get(..size)
+        .filter(|data| data.len() >= 0x20)
+        .ok_or("invalid DXBC extent")?;
+    let count = read_u32(data, 0x1c)? as usize;
+    let table_end = count
+        .checked_mul(4)
+        .and_then(|size| size.checked_add(0x20))
+        .filter(|end| *end <= data.len())
+        .ok_or("invalid DXBC chunk count")?;
+    for table_offset in (0x20..table_end).step_by(4) {
+        let chunk_offset = read_u32(data, table_offset)? as usize;
+        let header_end = chunk_offset
+            .checked_add(8)
+            .ok_or("DXBC chunk offset overflow")?;
+        let header = data
+            .get(chunk_offset..header_end)
+            .ok_or("truncated DXBC chunk header")?;
+        if &header[..4] != wanted {
             continue;
         }
-
-        let size = read_u32(chunk_offset + 4) as usize;
-        let start = chunk_offset + 8;
-        let end = start.checked_add(size).ok_or("invalid DXIL chunk size")?;
-        if end <= data.len() {
-            return Ok(&data[start..end]);
-        }
+        let size = read_u32(header, 4)? as usize;
+        let end = header_end
+            .checked_add(size)
+            .ok_or("DXBC chunk size overflow")?;
+        return data
+            .get(header_end..end)
+            .map(Some)
+            .ok_or_else(|| "truncated DXBC chunk".into());
     }
+    Ok(None)
+}
 
-    Err("DXBC container has no valid DXIL chunk".into())
+fn find_dxil_payload(data: &[u8]) -> Result<&[u8], String> {
+    find_dxbc_chunk(data, b"DXIL")?.ok_or_else(|| "DXBC container has no valid DXIL chunk".into())
 }
 
 fn is_zlib_header(header: &[u8]) -> bool {
@@ -340,9 +463,26 @@ fn is_zlib_header(header: &[u8]) -> bool {
         && (u16::from(header[0]) << 8 | u16::from(header[1])) % 31 == 0
 }
 
-fn find_bytes(data: &[u8], needle: &[u8]) -> Option<usize> {
-    data.windows(needle.len())
-        .position(|window| window == needle)
+pub fn format_fssm_metadata(fssm: &FssmShader) -> String {
+    let mut text = format!("FSSM program metadata\n  version_field=0x{:08x} payload_bytes={}\n  stage_pointer_field=payload+0x{:x} descriptor_file_offset=0x{:x}\n  declared_program_file_offset=0x{:x} program_bytes={} (includes compiler no-ops and allocation padding)\n",
+        fssm.version, fssm.payload_size, fssm.stage_pointer_offset.saturating_sub(FSSM_PAYLOAD_BASE),
+        fssm.stage_descriptor_offset, fssm.code_offset, fssm.code_size);
+    if let Some(hash) = fssm.compiler_hash {
+        let hash = hash
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let matches = match fssm.dxbc_hash_match {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => "unavailable",
+        };
+        let _ = writeln!(
+            text,
+            "  compiler_hash_embedded_in_noops={hash} DXBC_HASH_match={matches}"
+        );
+    }
+    text
 }
 
 fn format_fssm_disasm(fssm: &FssmShader, source: &str) -> String {
@@ -353,13 +493,16 @@ fn format_fssm_disasm(fssm: &FssmShader, source: &str) -> String {
         "; =============================================================================\n\
          ; PercyStar AMD RDNA2 (GFX10.3) Disassembly\n\
          ; Source: {source}\n\
-         ; FSSM: {} bytes | Code: 0x{:X} + {} bytes | {} insns\n\
+         ; FSSM: {} bytes | Declared program: 0x{:X} + {} bytes | {} insns\n\
          ; =============================================================================\n",
         fssm.data.len(),
         fssm.code_offset,
         fssm.code_size,
         instructions.len()
     );
+    for line in format_fssm_metadata(fssm).lines() {
+        let _ = writeln!(output, "; {line}");
+    }
 
     for instruction in &instructions {
         let mut words = String::new();
@@ -438,6 +581,31 @@ mod tests {
     use flate2::Compression;
     use std::io::Write as _;
 
+    fn synthetic_fssm(program: &[u32]) -> Vec<u8> {
+        let mut data = vec![0; 0xd0];
+        data[..4].copy_from_slice(FSSM_MAGIC);
+        data[4..8].copy_from_slice(&0x101u32.to_le_bytes());
+        for offset in (0x18..0x78).step_by(8) {
+            data[offset..offset + 8].copy_from_slice(&FSSM_EMPTY_STAGE.to_le_bytes());
+        }
+        data[0x58..0x60].copy_from_slice(&0xb0u64.to_le_bytes());
+        data[0xc0..0xc8].copy_from_slice(&0xc0u64.to_le_bytes());
+        data[0xc8..0xd0].copy_from_slice(&(program.len() as u64 * 4).to_le_bytes());
+        for word in program {
+            data.extend_from_slice(&word.to_le_bytes());
+        }
+        let size = data.len() as u64 - 16;
+        data[8..16].copy_from_slice(&size.to_le_bytes());
+        data
+    }
+
+    fn fingerprint_program() -> Vec<u32> {
+        vec![
+            0xd5802957, 0x03ffe3e0, 0x666b5907, 0xd580ccb6, 0x03fecf20, 0xdfe4d789, 0xbe842104,
+            0xbfa00003, 0xbf810000, 0xbf9f0000,
+        ]
+    }
+
     #[test]
     fn inspects_dxbc_chunk_table() {
         let mut data = vec![0u8; 0x24];
@@ -455,10 +623,8 @@ mod tests {
 
     #[test]
     fn extracts_and_disassembles_fssm_from_dxil() {
-        let mut fssm = vec![0u8; 0x84];
-        fssm[..4].copy_from_slice(FSSM_MAGIC);
-        fssm.extend_from_slice(&GFX103_CODE_START);
-        fssm.extend_from_slice(&GFX103_CODE_END);
+        let fssm = synthetic_fssm(&fingerprint_program());
+        let hash = parse_fssm(fssm.clone()).unwrap().compiler_hash.unwrap();
 
         let mut payload = vec![0u8; 0x7c];
         payload[..4].copy_from_slice(b"XBCH");
@@ -466,22 +632,96 @@ mod tests {
         compressor.write_all(&fssm).unwrap();
         payload.extend_from_slice(&compressor.finish().unwrap());
 
-        let mut data = vec![0u8; 0x24];
+        let mut data = vec![0u8; 0x28];
         data[..4].copy_from_slice(DXBC_MAGIC);
-        data[0x1c..0x20].copy_from_slice(&1u32.to_le_bytes());
-        data[0x20..0x24].copy_from_slice(&0x24u32.to_le_bytes());
+        data[0x1c..0x20].copy_from_slice(&2u32.to_le_bytes());
+        data[0x20..0x24].copy_from_slice(&0x28u32.to_le_bytes());
         data.extend_from_slice(b"DXIL");
         data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         data.extend_from_slice(&payload);
+        let hash_offset = data.len() as u32;
+        data[0x24..0x28].copy_from_slice(&hash_offset.to_le_bytes());
+        data.extend_from_slice(b"HASH");
+        data.extend_from_slice(&20u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&hash);
+        let total = data.len() as u32;
+        data[0x18..0x1c].copy_from_slice(&total.to_le_bytes());
 
         let extracted = extract_fssm(&data).unwrap();
         assert_eq!(extracted.data, fssm);
-        assert_eq!(extracted.code_offset, 0x84);
-        assert_eq!(extracted.code_size, 8);
+        assert_eq!(extracted.code_offset, 0xd0);
+        assert_eq!(extracted.code_size, 40);
+        assert_eq!(extracted.stage_pointer_offset, 0x58);
+        assert_eq!(extracted.stage_descriptor_offset, 0xc0);
+        assert_eq!(extracted.dxbc_hash_match, Some(true));
 
         let text = disassemble_with_source(&data, "synthetic SGD5 shader");
-        assert!(text.contains("s_setprio"));
+        assert!(text.contains("v_nop_e64"));
+        assert!(text.contains("s_inst_prefetch"));
+        assert!(text.contains("s_swappc_b64"));
         assert!(text.contains("s_endpgm"));
         assert!(text.contains("synthetic SGD5 shader"));
+        *data.last_mut().unwrap() ^= 1;
+        assert_eq!(extract_fssm(&data).unwrap().dxbc_hash_match, Some(false));
+    }
+
+    #[test]
+    fn declared_program_does_not_depend_on_instruction_markers() {
+        let data = synthetic_fssm(&[0xbf810000, 0xbf800000, 0xbf810000, 0xbf9f0000]);
+        let shader = parse_fssm(data).unwrap();
+        assert_eq!(shader.code_offset, 0xd0);
+        assert_eq!(shader.code_size, 16);
+        assert_eq!(shader.compiler_hash, None);
+        let instructions = crate::rdna2::decode_gfx103(shader.code(), 10);
+        assert_eq!(instructions.len(), 4);
+        assert_eq!(instructions[2].mnemonic, "s_endpgm");
+    }
+
+    #[test]
+    fn invalid_fssm_sizes_and_relative_offsets_are_rejected() {
+        let data = synthetic_fssm(&fingerprint_program());
+        for length in 0..data.len() {
+            assert!(parse_fssm(data[..length].to_vec()).is_err());
+        }
+        let mut invalid = data.clone();
+        invalid[0x58..0x60].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(parse_fssm(invalid).is_err());
+        let mut invalid = data.clone();
+        invalid[0xc8..0xd0].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(parse_fssm(invalid).is_err());
+        let mut invalid = data.clone();
+        invalid[0x20..0x28].copy_from_slice(&0xb0u64.to_le_bytes());
+        assert!(parse_fssm(invalid).unwrap_err().contains("multiple active"));
+    }
+
+    #[test]
+    #[ignore = "requires PERCY_SGD5_SAMPLE pointing to the analysis archive"]
+    fn all_sample_fssm_programs_use_declared_ranges_and_match_compiler_hashes() {
+        let path = std::env::var_os("PERCY_SGD5_SAMPLE").expect("set PERCY_SGD5_SAMPLE");
+        let files = crate::sgd5::load_sgd5(std::path::Path::new(&path)).unwrap();
+        let mut count = 0;
+        let mut leading_calls = 0;
+        for file in &files {
+            for shader in &file.shaders {
+                let blob = crate::sgd5::decompress_shader(file, shader).unwrap();
+                let program = extract_fssm(&blob).unwrap();
+                assert_eq!(program.version, 0x101);
+                assert_eq!(program.payload_size as usize, program.data.len() - 16);
+                assert_eq!(program.stage_descriptor_offset, 0xc0);
+                assert_eq!(program.dxbc_hash_match, Some(true));
+                assert_eq!(program.code_size % 64, 0);
+                let instructions = crate::rdna2::decode_gfx103(program.code(), 3);
+                assert_eq!(instructions[0].mnemonic, "v_nop_e64");
+                assert_eq!(instructions[0].offset, 0);
+                assert_eq!(instructions[1].offset, 12);
+                assert_eq!(instructions[1].mnemonic, "v_nop_e64");
+                assert_eq!(instructions[2].offset, 24);
+                leading_calls += usize::from(instructions[2].mnemonic == "s_swappc_b64");
+                count += 1;
+            }
+        }
+        assert_eq!(count, 26_503);
+        assert_eq!(leading_calls, 630);
     }
 }

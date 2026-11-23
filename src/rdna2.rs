@@ -196,13 +196,14 @@ fn quick_classify_code(code: &[u8]) -> (ShaderStage, bool, bool, u32) {
     let mut has_rt = false;
     let mut has_interp = false;
     let mut insns = 0u32;
-    let body = skip_scarlett_prologue(code);
+    let body = code;
     let mut i = 0usize;
     while i + 4 <= body.len() {
         let w0 = rd32(body, i);
         if w0 == 0xBF81_0000 {
             insns += 1;
-            break;
+            i += 4;
+            continue;
         }
         if w0 == 0xBF9F_0000 {
             break;
@@ -241,16 +242,6 @@ fn quick_classify_code(code: &[u8]) -> (ShaderStage, bool, bool, u32) {
         ShaderStage::Compute
     };
     (st, has_rt, has_prim, insns)
-}
-
-/// Xbox Scarlett D3D12.X compiler prepends a 36-byte (9-dword) identity hash prologue
-/// ending with `d5800000 03fe0100 00000ac0` before `bfa00003` (`s_setprio 3`).
-pub fn skip_scarlett_prologue(code: &[u8]) -> &[u8] {
-    if code.len() >= 0x28 && rd32(code, 0x18) == 0xD580_0000 && rd32(code, 0x1c) == 0x03FE_0100 {
-        &code[0x24..]
-    } else {
-        code
-    }
 }
 
 impl Ps09Cache {
@@ -483,6 +474,15 @@ fn fmt_src(s: u32) -> String {
     }
 }
 
+fn fmt_src64(source: u32) -> String {
+    match source {
+        0..=104 => format!("s[{source}:{}]", source + 1),
+        106 => "vcc".into(),
+        126 => "exec".into(),
+        _ => fmt_src(source),
+    }
+}
+
 fn fmt_lit_f32(w: u32) -> String {
     let f = f32::from_bits(w);
     if f.is_finite() && (f == 0.0 || (f.abs() >= 1e-5 && f.abs() <= 1e7)) {
@@ -546,7 +546,7 @@ pub fn gfx103_insn_len(buf: &[u8], i: usize) -> usize {
 }
 
 pub fn decode_gfx103(code: &[u8], max_insns: usize) -> Vec<DecodedInsn> {
-    let body = skip_scarlett_prologue(code);
+    let body = code;
     let mut out = Vec::new();
     let mut i = 0usize;
     while i + 4 <= body.len() && out.len() < max_insns {
@@ -578,20 +578,23 @@ pub fn decode_gfx103(code: &[u8], max_insns: usize) -> Vec<DecodedInsn> {
                 9 => "s_cbranch_execnz",
                 10 => "s_barrier",
                 12 => "s_waitcnt",
+                15 => "s_setprio",
                 16 => "s_sendmsg",
-                22 => "s_waitcnt_depctr",
-                23 => "s_waitcnt_vscnt",
-                24 => "s_waitcnt_vmcnt",
-                25 => "s_waitcnt_expcnt",
-                26 => "s_waitcnt_lgkmcnt",
+                22 => "s_ttracedata",
+                23 => "s_cbranch_cdbgsys",
+                24 => "s_cbranch_cdbguser",
+                25 => "s_cbranch_cdbgsys_or_user",
+                26 => "s_cbranch_cdbgsys_and_user",
                 31 => "s_code_end",
-                32 => "s_setprio",
+                32 => "s_inst_prefetch",
                 33 => "s_clause",
+                34 => "s_wait_idle",
+                35 => "s_waitcnt_depctr",
                 _ => "sopp",
             };
             let ops = match op {
                 1 | 10 | 31 => String::new(),
-                2 | 4..=9 => format!("{:+} (0x{:04x})", rel as i32 * 4, (i as i32 + 4 + rel as i32 * 4).max(0)),
+                2 | 4..=9 | 23..=26 => format!("{:+} (0x{:04x})", rel as i32 * 4, (i as i32 + 4 + rel as i32 * 4).max(0)),
                 12 => format!(
                     "vmcnt({}) expcnt({}) lgkmcnt({})",
                     (simm & 0xF) | ((simm >> 10) & 0x30),
@@ -604,7 +607,7 @@ pub fn decode_gfx103(code: &[u8], max_insns: usize) -> Vec<DecodedInsn> {
                 1 => InsnKind::EndPgm,
                 31 => InsnKind::CodeEnd,
                 12 => InsnKind::WaitCnt(simm),
-                2 | 4..=9 => InsnKind::Branch { op: mn, rel },
+                2 | 4..=9 | 23..=26 => InsnKind::Branch { op: mn, rel },
                 _ => InsnKind::Other,
             };
             (mn.to_string(), ops, kind)
@@ -619,15 +622,24 @@ pub fn decode_gfx103(code: &[u8], max_insns: usize) -> Vec<DecodedInsn> {
                 7 => "s_not_b32",
                 9 => "s_wqm_b32",
                 10 => "s_wqm_b64",
-                34 => "s_and_saveexec_b32",
-                36 => "s_or_saveexec_b32",
-                44 => "s_swappc_b64",
-                46 => "s_setpc_b64",
+                31 => "s_getpc_b64",
+                32 => "s_setpc_b64",
+                33 => "s_swappc_b64",
+                36 => "s_and_saveexec_b64",
+                37 => "s_or_saveexec_b64",
+                60 => "s_and_saveexec_b32",
+                61 => "s_or_saveexec_b32",
                 _ => "sop1",
             };
             let rhs = if ssrc == 255 { fmt_lit_f32(w1) } else { fmt_src(ssrc) };
-            let ops = format!("{}, {rhs}", fmt_src(sdst));
-            let kind = if op == 3 || op == 4 {
+            let rhs64 = if ssrc == 255 { format!("0x{w1:08x}") } else { fmt_src64(ssrc) };
+            let ops = match op {
+                31 => fmt_src64(sdst),
+                32 => rhs64,
+                4 | 10 | 33 | 36 | 37 => format!("{}, {rhs64}", fmt_src64(sdst)),
+                _ => format!("{}, {rhs}", fmt_src(sdst)),
+            };
+            let kind = if op == 3 {
                 InsnKind::Mov { dst: fmt_src(sdst), src: rhs }
             } else {
                 InsnKind::Other
@@ -826,12 +838,14 @@ pub fn decode_gfx103(code: &[u8], max_insns: usize) -> Vec<DecodedInsn> {
                 55 => "v_not_b32",
                 _ => "vop1",
             };
-            let kind = if op == 1 {
+            let kind = if op == 0 {
+                InsnKind::Other
+            } else if op == 1 {
                 InsnKind::Mov { dst: format!("v{vdst}"), src: s0.clone() }
             } else {
                 InsnKind::AluUnary { op: mn, dst: vdst, src0: s0.clone() }
             };
-            (mn.to_string(), format!("v{vdst}, {s0}"), kind)
+            (mn.to_string(), if op == 0 { String::new() } else { format!("v{vdst}, {s0}") }, kind)
         } else if enc7 == 0x3E {
             let op = (w0 >> 17) & 0xFF;
             let src0 = w0 & 0x1FF;
@@ -892,6 +906,8 @@ pub fn decode_gfx103(code: &[u8], max_insns: usize) -> Vec<DecodedInsn> {
                 format!("v{vdst}, {s0}, {s1}")
             };
             (mn.to_string(), ops, kind)
+        } else if enc6 == 0x35 && (w0 >> 16) & 0x3ff == 0x180 {
+            ("v_nop_e64".into(), String::new(), InsnKind::Other)
         } else if matches!(enc6, 0x34..=0x39) {
             let fam = match enc6 {
                 0x35 => "vop3",
@@ -922,7 +938,7 @@ pub fn decode_gfx103(code: &[u8], max_insns: usize) -> Vec<DecodedInsn> {
             (format!("unk_0x{enc6:02x}"), format!("0x{w0:08x}"), InsnKind::Other)
         };
 
-        let stop = matches!(kind, InsnKind::EndPgm | InsnKind::CodeEnd);
+        let stop = matches!(kind, InsnKind::CodeEnd);
         out.push(DecodedInsn {
             offset: i,
             len,
@@ -943,11 +959,12 @@ pub fn decode_gfx103(code: &[u8], max_insns: usize) -> Vec<DecodedInsn> {
 pub fn format_gfx103_disasm(entry: &Ps09ShaderEntry, code: &[u8]) -> String {
     let insns = decode_gfx103(code, 4000);
     let mut s = String::with_capacity(insns.len() * 48 + 512);
+    let hash_kind = if entry.sga_hash.is_some() { "SGA" } else { "PSO" };
     let _ = writeln!(
         s,
         "; =============================================================================\n\
          ; PercyStar AMD RDNA2 (GFX10.3 / Xbox Scarlett) Disassembly\n\
-         ; Shader #{idx} | Stage: {st} | PSO Hash: 0x{h:016X} | Size: {sz} bytes ({ic} insns)",
+         ; Shader #{idx} | Stage: {st} | {hash_kind} Hash: 0x{h:016X} | Size: {sz} bytes ({ic} insns)",
         idx = entry.index,
         st = entry.stage.tag(),
         h = entry.sga_hash.unwrap_or(entry.pso_hash),
@@ -1453,6 +1470,22 @@ pub fn format_spirv_abi_summary(entry: &Ps09ShaderEntry, code: &[u8]) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn literal_nops_prefetch_and_calls_keep_program_offsets() {
+        let words = [0xd5802957u32, 0x03ffe3e0, 0x666b5907,
+            0xd580ccb6, 0x03fecf20, 0xdfe4d789, 0xbe842104, 0xbfa00003, 0xbf8f0003, 0xbf810000];
+        let bytes: Vec<_> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let instructions = decode_gfx103(&bytes, 10);
+        assert_eq!(instructions[0].mnemonic, "v_nop_e64");
+        assert_eq!(instructions[0].len, 12);
+        assert_eq!(instructions[1].offset, 12);
+        assert_eq!(instructions[2].offset, 24);
+        assert_eq!(instructions[2].mnemonic, "s_swappc_b64");
+        assert_eq!(instructions[2].operands, "s[4:5], s[4:5]");
+        assert_eq!(instructions[3].mnemonic, "s_inst_prefetch");
+        assert_eq!(instructions[4].mnemonic, "s_setprio");
+    }
 
     #[test]
     fn code_base_search_survives_offsets_near_the_address_space_end() {
