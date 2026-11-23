@@ -443,14 +443,19 @@ fn decode(file: &bink2_decoder::Container, dec: &mut bink2_decoder::Decoder, i: 
 /// centred bilinear chroma upsampling. Rows are split across threads.
 fn to_color_image(f: &bink2_decoder::VideoFrame) -> ColorImage {
     let (w, h) = (f.width, f.height);
-    let mut pixels = vec![Color32::BLACK; w * h];
+    // all-zero pixels: the allocation comes back zeroed from the OS, and the threads write it
+    let mut pixels = vec![Color32::TRANSPARENT; w * h];
+    let taps: Vec<(u32, u32, u32)> = (0..w).map(|x| chroma_taps(x, f.chroma_width())).map(|(a, b, k)| (a as u32, b as u32, k)).collect();
+    let lut = conv_lut();
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
     let band = h.div_ceil(threads).max(1);
     std::thread::scope(|s| {
         for (b, out) in pixels.chunks_mut(band * w).enumerate() {
+            let taps = &taps;
             s.spawn(move || {
+                let mut rows = (vec![0u16; f.chroma_width()], vec![0u16; f.chroma_width()]);
                 for (r, row) in out.chunks_mut(w).enumerate() {
-                    convert_row(f, b * band + r, row);
+                    convert_row(f, b * band + r, row, taps, lut, &mut rows);
                 }
             });
         }
@@ -471,27 +476,55 @@ fn chroma_taps(x: usize, cw: usize) -> (usize, usize, u32) {
     }
 }
 
-fn convert_row(f: &bink2_decoder::VideoFrame, y: usize, row: &mut [Color32]) {
+/// The bilinear chroma sum is in 16ths (0 ..= 16·255). For each sum, the matrix terms
+/// `1.402·v`, `0.344136·u`, `0.714136·v` and `1.772·u`, with u, v = sum / 16 − 128.5.
+struct ConvLut {
+    rv: Vec<f32>,
+    gu: Vec<f32>,
+    gv: Vec<f32>,
+    bu: Vec<f32>,
+}
+
+fn conv_lut() -> &'static ConvLut {
+    static LUT: std::sync::OnceLock<ConvLut> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| {
+        let c: Vec<f32> = (0..=16 * 255).map(|s| s as f32 / 16.0 - 128.5).collect();
+        ConvLut {
+            rv: c.iter().map(|v| 1.402 * v).collect(),
+            gu: c.iter().map(|u| 0.344_136 * u).collect(),
+            gv: c.iter().map(|v| 0.714_136 * v).collect(),
+            bu: c.iter().map(|u| 1.772 * u).collect(),
+        }
+    })
+}
+
+/// Converts output row `y`. `taps` holds `chroma_taps` for every column, `rows` is scratch for
+/// the vertically blended chroma rows (in quarters).
+fn convert_row(f: &bink2_decoder::VideoFrame, y: usize, row: &mut [Color32], taps: &[(u32, u32, u32)], lut: &ConvLut, rows: &mut (Vec<u16>, Vec<u16>)) {
     let (w, cw, ch) = (f.width, f.chroma_width(), f.chroma_height());
     let (r0, r1, wy) = chroma_taps(y, ch);
     // weight of the first row in quarters: even rows lean 1/4 on the row above
-    let (ka, kb) = if wy == 1 { (1u32, 3u32) } else { (3, 1) };
-    let ys = &f.y[y * w..y * w + w];
-    let up = |plane: &[u8], x: usize| -> f32 {
-        let (c0, c1, wx) = chroma_taps(x, cw);
-        let (ja, jb) = if wx == 1 { (1u32, 3u32) } else { (3, 1) };
-        let a = plane[r0 * cw + c0] as u32 * ja + plane[r0 * cw + c1] as u32 * jb;
-        let b = plane[r1 * cw + c0] as u32 * ja + plane[r1 * cw + c1] as u32 * jb;
-        (a * ka + b * kb) as f32 / 16.0
+    let (ka, kb) = if wy == 1 { (1u16, 3u16) } else { (3, 1) };
+    let blend = |plane: &[u8], out: &mut [u16]| {
+        let (a, b) = (&plane[r0 * cw..r0 * cw + cw], &plane[r1 * cw..r1 * cw + cw]);
+        for ((o, &a), &b) in out.iter_mut().zip(a).zip(b) {
+            *o = a as u16 * ka + b as u16 * kb;
+        }
     };
-    for (x, px) in row.iter_mut().enumerate() {
-        let yy = ys[x] as f32;
-        let u = up(&f.u, x) - 128.5;
-        let v = up(&f.v, x) - 128.5;
-        let r = yy + 1.402 * v;
-        let g = yy - 0.344_136 * u - 0.714_136 * v;
-        let b = yy + 1.772 * u;
-        let q = |c: f32| (c + 0.5).clamp(0.0, 255.0) as u8;
+    blend(&f.u, &mut rows.0);
+    blend(&f.v, &mut rows.1);
+    let (us, vs) = (&rows.0[..], &rows.1[..]);
+    let ys = &f.y[y * w..y * w + w];
+    let q = |c: f32| (c + 0.5).clamp(0.0, 255.0) as u8;
+    for ((px, &yy), &(c0, c1, wx)) in row.iter_mut().zip(ys).zip(taps) {
+        let (c0, c1) = (c0 as usize, c1 as usize);
+        let (ja, jb) = if wx == 1 { (1u16, 3u16) } else { (3, 1) };
+        let su = (us[c0] * ja + us[c1] * jb) as usize;
+        let sv = (vs[c0] * ja + vs[c1] * jb) as usize;
+        let yy = yy as f32;
+        let r = yy + lut.rv[sv];
+        let g = yy - lut.gu[su] - lut.gv[sv];
+        let b = yy + lut.bu[su];
         *px = Color32::from_rgb(q(r), q(g), q(b));
     }
 }
@@ -534,6 +567,58 @@ mod tests {
         // blue rises monotonically with U
         let b: Vec<u8> = img.pixels[..4].iter().map(|p| p.b()).collect();
         assert!(b[0] < b[1] && b[1] < b[2] && b[2] < b[3], "{b:?}");
+    }
+
+    /// The straightforward per-pixel conversion the fast path must reproduce exactly.
+    fn convert_ref(f: &bink2_decoder::VideoFrame) -> Vec<Color32> {
+        let (w, cw, ch) = (f.width, f.chroma_width(), f.chroma_height());
+        let mut out = Vec::with_capacity(w * f.height);
+        for y in 0..f.height {
+            let (r0, r1, wy) = chroma_taps(y, ch);
+            let (ka, kb) = if wy == 1 { (1u32, 3u32) } else { (3, 1) };
+            for x in 0..w {
+                let up = |plane: &[u8]| -> f32 {
+                    let (c0, c1, wx) = chroma_taps(x, cw);
+                    let (ja, jb) = if wx == 1 { (1u32, 3u32) } else { (3, 1) };
+                    let a = plane[r0 * cw + c0] as u32 * ja + plane[r0 * cw + c1] as u32 * jb;
+                    let b = plane[r1 * cw + c0] as u32 * ja + plane[r1 * cw + c1] as u32 * jb;
+                    (a * ka + b * kb) as f32 / 16.0
+                };
+                let yy = f.y[y * w + x] as f32;
+                let (u, v) = (up(&f.u) - 128.5, up(&f.v) - 128.5);
+                let q = |c: f32| (c + 0.5).clamp(0.0, 255.0) as u8;
+                out.push(Color32::from_rgb(q(yy + 1.402 * v), q(yy - 0.344_136 * u - 0.714_136 * v), q(yy + 1.772 * u)));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn fast_conversion_matches_reference() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 24) as u8
+        };
+        for (w, h) in [(37, 23), (64, 32), (1, 1), (2, 3)] {
+            let mut f = flat(w, h, 0, 0, 0);
+            f.y.iter_mut().for_each(|p| *p = rnd());
+            f.u.iter_mut().for_each(|p| *p = rnd());
+            f.v.iter_mut().for_each(|p| *p = rnd());
+            assert!(to_color_image(&f).pixels == convert_ref(&f), "{w}x{h}");
+        }
+        // every chroma sum with every luma value
+        let mut f = flat(256, 2, 0, 0, 0);
+        for (x, p) in f.y.iter_mut().enumerate() {
+            *p = x as u8;
+        }
+        for u in 0..=255u8 {
+            f.u.iter_mut().for_each(|p| *p = u);
+            f.v.iter_mut().for_each(|p| *p = 255 - u);
+            assert!(to_color_image(&f).pixels == convert_ref(&f), "u {u}");
+        }
     }
 
     #[test]

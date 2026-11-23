@@ -26,9 +26,9 @@ bcpack-rs = { git = "https://github.com/Ahmet-Dedeler/bcpack-rs", rev = "c51ec52
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Clean-room Bink 2 video and Bink Audio decoder (Apache-2.0) by codingkoala, pinned to a reviewed
-# commit (SPEC draft 8: includes the row edge flag fix from #3 and the bottom macroblock row of
-# 720p and 4K clips).
-bink2_decoder = { package = "bink2", git = "https://github.com/codingkoala/bink2-decoder", rev = "d0dca6025004725ac8275f9df46ec4d0a10c61b6" }
+# commit (SPEC draft 9: slices decode in parallel; includes the row edge flag fix from #3 and the
+# bottom macroblock row of 720p and 4K clips).
+bink2_decoder = { package = "bink2", git = "https://github.com/codingkoala/bink2-decoder", rev = "184851738e7b1706ae86ae534d43eb3693d0414e" }
 
 [target.'cfg(windows)'.dependencies]
 raw-window-handle = "0.6"
