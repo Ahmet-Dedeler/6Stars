@@ -358,6 +358,10 @@ pub fn kind_label(kind: &str, name: &str) -> String {
         ("GFX", _) => "Scaleform UI movie",
         ("XML", _) => "text / XML",
         ("HMAP", _) => "terrain heightmap",
+        ("HAIR", _) => "strand hair groom (ped physics)",
+        ("CLOTH", _) => "verlet cloth mesh (ped physics)",
+        ("SOFT", _) => "character soft-body mesh (ped physics)",
+        ("HDELTA", _) => "ped head blend delta (ped physics)",
         ("ZLIB", _) => "zlib-compressed binary",
         _ => "",
     };
@@ -394,9 +398,13 @@ pub fn decode_note(kind: &str) -> (&'static str, &'static str) {
         "PSIN" => ("reads the PSIN placement records", "formats/17-other.md (PSIN scene placements)"),
         "GXT" => ("reads the GXT string table", "formats/17-other.md (Text (GXT))"),
         "RSC9" => ("a RAGE9 resource root without meshlet data; shown as hex", "formats/02-resources.md"),
-        "BK2" => ("hands the clip to the bundled RAD Bink 2 decoder", "not covered by the spec"),
+        "BK2" => ("hands the clip to the bundled RAD Bink 2 decoder (or bink2-decoder on Linux)", "not covered by the spec"),
         "XML" | "ZLIB" | "RBF0" | "GFX" => ("inflates the 64 KiB zlib chunks of a plain file", "formats/01-rpf9.md (Payload)"),
         "HMAP" => ("reads the terrain height grid for the world map", "not covered by the spec"),
+        "HAIR" => ("decodes the strand hair groom polylines and scalp anchors", "formats/19-ped-physics-resources.md"),
+        "CLOTH" => ("decodes the verlet cloth vertices and constraint edges", "formats/19-ped-physics-resources.md"),
+        "SOFT" => ("decodes the character soft-body mesh", "formats/19-ped-physics-resources.md"),
+        "HDELTA" => ("decodes the ped head blend-shape vertex deltas", "formats/19-ped-physics-resources.md"),
         _ => ("shown as hex", "formats/01-rpf9.md"),
     }
 }

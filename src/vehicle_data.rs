@@ -428,7 +428,10 @@ impl VehicleDb {
         (size > 0 && target.offset % size == 0).then_some((inst.tag, target.offset / size))
     }
 
-    fn type_size(&self, def: &FieldDef, siblings: &[FieldDef]) -> Option<usize> {
+    fn type_size(&self, def: &FieldDef, siblings: &[FieldDef], depth: usize) -> Option<usize> {
+        if depth >= MAX_DEPTH {
+            return None;
+        }
         Some(match def.kind {
             0x01 | 0x11 | 0x60 => 1,
             0x13 | 0x20 => 2,
@@ -438,7 +441,7 @@ impl VehicleDb {
             0x36 => 64,
             0x05 => self.structs.get(&def.reference)?.size,
             0x65 => def.sub.div_ceil(32).max(1) * 4,
-            0x50 => self.type_size(siblings.get(def.sub)?, siblings)?.checked_mul(def.reference as usize)?,
+            0x50 => self.type_size(siblings.get(def.sub)?, siblings, depth + 1)?.checked_mul(def.reference as usize)?,
             _ => return None,
         })
     }
@@ -457,7 +460,7 @@ impl VehicleDb {
         if count == 0 {
             return Some((0, 0, elem, 1));
         }
-        let elem_size = self.type_size(elem, siblings).filter(|&s| s > 0)?;
+        let elem_size = self.type_size(elem, siblings, 0).filter(|&s| s > 0)?;
         let target = self.resolve(pointer)?;
         let inst = self.instances[target.instance];
         let count = count.min((inst.size - target.offset) / elem_size);
@@ -465,18 +468,37 @@ impl VehicleDb {
     }
 
     fn decode_struct(&self, hash: u32, at: usize, depth: usize, budget: &mut usize) -> Value {
+        if depth > MAX_DEPTH {
+            return Value::Skipped;
+        }
         let Some(def) = self.structs.get(&hash) else { return Value::Unknown(0x05) };
         let fields = def
             .fields
             .iter()
             .filter(|f| f.name != ELEMENT)
-            .map(|f| Field { name: f.name, value: self.decode(f, &def.fields, at + f.offset, depth, budget) })
+            .map(|f| {
+                let value = at
+                    .checked_add(f.offset)
+                    .map_or(Value::Unknown(f.type_raw), |off| self.decode(f, &def.fields, off, depth, budget));
+                Field { name: f.name, value }
+            })
             .collect();
         Value::Struct(hash, fields)
     }
 
     fn decode_items(&self, elem: &FieldDef, siblings: &[FieldDef], base: usize, count: usize, size: usize, depth: usize, budget: &mut usize) -> Value {
-        Value::Array((0..count).map(|i| self.decode(elem, siblings, base + i * size, depth, budget)).collect())
+        let mut items = Vec::with_capacity(count.min((*budget).saturating_add(1)));
+        for i in 0..count {
+            if *budget == 0 {
+                items.push(Value::Skipped);
+                break;
+            }
+            let Some(off) = i.checked_mul(size).and_then(|d| base.checked_add(d)) else {
+                break;
+            };
+            items.push(self.decode(elem, siblings, off, depth, budget));
+        }
+        Value::Array(items)
     }
 
     fn decode(&self, def: &FieldDef, siblings: &[FieldDef], at: usize, depth: usize, budget: &mut usize) -> Value {
@@ -520,7 +542,11 @@ impl VehicleDb {
                     Value::Flags { raw, names }
                 })
             }
-            0x05 => Some(self.decode_struct(def.reference, at, depth, budget)),
+            0x05 => Some(if depth >= MAX_DEPTH {
+                Value::Skipped
+            } else {
+                self.decode_struct(def.reference, at, depth + 1, budget)
+            }),
             0x07 => rd64(d, at).map(|pointer| {
                 if pointer == 0 {
                     return Value::Null;
@@ -541,15 +567,16 @@ impl VehicleDb {
                 .map(|(base, count, elem, size)| self.decode_items(elem, siblings, base, count, size, depth, budget)),
             // fixed count inline array
             0x50 => siblings.get(def.sub).and_then(|elem| {
-                let size = self.type_size(elem, siblings)?;
+                let size = self.type_size(elem, siblings, 0)?;
                 Some(self.decode_items(elem, siblings, at, def.reference as usize, size, depth, budget))
             }),
             // inline storage for a fixed capacity followed by the used count
             // seen in one struct only so this layout is a best guess
             0x53 => siblings.get(def.sub).and_then(|elem| {
-                let size = self.type_size(elem, siblings)?;
+                let size = self.type_size(elem, siblings, 0)?;
                 let capacity = def.reference as usize;
-                let count = rd32(d, at + capacity * size)? as usize;
+                let count_off = capacity.checked_mul(size).and_then(|d| at.checked_add(d))?;
+                let count = rd32(d, count_off)? as usize;
                 (count <= capacity).then(|| self.decode_items(elem, siblings, at, count, size, depth, budget))
             }),
             0x75 => self.decode_map(at, depth, budget),
@@ -589,7 +616,7 @@ impl VehicleDb {
             return None;
         }
         let slot = group.fields.get(slots.sub)?;
-        let slot_size = self.type_size(slot, &group.fields)?;
+        let slot_size = self.type_size(slot, &group.fields, 0)?;
         let per_group = (control.reference.min(slots.reference)) as usize;
         let groups = groups.min((inst.size - target.offset) / group.size);
         let mut entries = Vec::new();

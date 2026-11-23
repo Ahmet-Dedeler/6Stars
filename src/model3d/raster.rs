@@ -509,9 +509,10 @@ fn draw_line_z(color_buf: &mut [Color32], z_buf: &mut [f32], w: usize, h: usize,
     }
     // Percy6Stars: a long segment (zoomed far in on a wireframe or a hair strand) is clipped to
     // the buffer instead of dropped, so only its visible part is walked.
-    let pad = thick as f32 + 1.0;
-    let (mut t0, mut t1) = (0.0f32, 1.0f32);
-    for (p, d, max) in [(p0[0], dx, w as f32), (p0[1], dy, h as f32)] {
+    let pad = thick as f64 + 1.0;
+    let (dx64, dy64, dz64) = (p1[0] as f64 - p0[0] as f64, p1[1] as f64 - p0[1] as f64, p1[2] as f64 - p0[2] as f64);
+    let (mut t0, mut t1) = (0.0f64, 1.0f64);
+    for (p, d, max) in [(p0[0] as f64, dx64, w as f64), (p0[1] as f64, dy64, h as f64)] {
         if d == 0.0 {
             if p < -pad || p > max + pad {
                 return;
@@ -525,22 +526,24 @@ fn draw_line_z(color_buf: &mut [Color32], z_buf: &mut [f32], w: usize, h: usize,
     if t0 > t1 {
         return;
     }
-    let total = steps.ceil().min(i32::MAX as f32 / 2.0);
-    let inv = 1.0 / total;
-    let (sx, sy, sz) = (dx * inv, dy * inv, (p1[2] - p0[2]) * inv);
+    let q0 = [p0[0] as f64 + dx64 * t0, p0[1] as f64 + dy64 * t0, p0[2] as f64 + dz64 * t0];
+    let q1 = [p0[0] as f64 + dx64 * t1, p0[1] as f64 + dy64 * t1, p0[2] as f64 + dz64 * t1];
+    let (cdx, cdy, cdz) = (q1[0] - q0[0], q1[1] - q0[1], q1[2] - q0[2]);
+    let n = cdx.abs().max(cdy.abs()).ceil().min((w + h + thick * 2 + 4) as f64 * 2.0) as i32;
+    let inv = if n > 0 { 1.0 / n as f64 } else { 0.0 };
+    let (sx, sy, sz) = (cdx * inv, cdy * inv, cdz * inv);
     // widen across the minor axis
-    let (ox, oy) = if dx.abs() >= dy.abs() { (0i32, 1i32) } else { (1, 0) };
-    let first = (t0 * total).floor();
-    let n = ((t1 * total).ceil() - first) as i32;
-    let (mut x, mut y, mut z) = (p0[0] + sx * first, p0[1] + sy * first, p0[2] + z_bias + sz * first);
+    let (ox, oy) = if dx64.abs() >= dy64.abs() { (0i32, 1i32) } else { (1, 0) };
+    let (mut x, mut y, mut z) = (q0[0], q0[1], q0[2] + z_bias as f64);
     for _ in 0..=n {
+        let zf = z as f32;
         for k in 0..thick as i32 {
             let xi = x as i32 + ox * k;
             let yi = y as i32 + oy * k;
             if xi >= 0 && yi >= 0 && (xi as usize) < w && (yi as usize) < h {
                 let idx = (yi as usize) * w + (xi as usize);
-                if z >= z_buf[idx] {
-                    z_buf[idx] = z;
+                if zf >= z_buf[idx] {
+                    z_buf[idx] = zf;
                     color_buf[idx] = col;
                 }
             }

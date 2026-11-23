@@ -48,7 +48,6 @@ fn push_limb(
     verts: &mut Vec<[f32; 3]>,
     uvs: &mut Vec<[f32; 2]>,
     tris: &mut Vec<[u32; 3]>,
-    edges: &mut Vec<(u32, u32)>,
     a: [f32; 3],
     b: [f32; 3],
     r: f32,
@@ -88,8 +87,6 @@ fn push_limb(
         let kn = (k + 1) % 4;
         tris.push([base + k, base + kn, base + 4 + kn]);
         tris.push([base + k, base + 4 + kn, base + 4 + k]);
-        edges.push((base + k, base + 4 + k));
-        edges.push((base + k, base + kn));
     }
 }
 
@@ -142,7 +139,6 @@ pub fn build_stickman_mesh(
     let mut verts = Vec::with_capacity(160);
     let mut uvs = Vec::with_capacity(160);
     let mut tris = Vec::with_capacity(160);
-    let mut edges = Vec::with_capacity(160);
 
     for (a, b, r) in [
         (pelvis, chest, 0.055),
@@ -159,7 +155,7 @@ pub fn build_stickman_mesh(
         (r_hi, r_kn, 0.038),
         (r_kn, r_ft, 0.030),
     ] {
-        push_limb(&mut verts, &mut uvs, &mut tris, &mut edges, a, b, r);
+        push_limb(&mut verts, &mut uvs, &mut tris, a, b, r);
     }
 
     let tri_geom = vec![0u16; tris.len()];
@@ -169,7 +165,7 @@ pub fn build_stickman_mesh(
         uvs,
         tris,
         tri_geom,
-        edges,
+        Vec::new(),
         None,
         format!("Stickman Rig ({track_count} tracks)"),
         1,

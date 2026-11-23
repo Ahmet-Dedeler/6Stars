@@ -318,10 +318,24 @@ fn decode_field_val(
             f32::from_bits(rd32(block, o + 12)),
         ]),
         0x44 | 0x48 | 0x4a if o + 4 <= block.len() => PsinValue::Hash(rd32(block, o)),
-        0x52 | 0x5c if o + 12 <= block.len() => {
-            let cnt = rd32(block, o + 8);
+        0x52 if o + 12 <= block.len() => {
+            let cnt = u16::from_le_bytes([block[o + 8], block[o + 9]]) as u32;
             let ptr_lo = rd32(block, o) as usize;
             let abs_off = inst_offset + o;
+            let target_inst = fixup_map
+                .get(&abs_off)
+                .copied()
+                .or_else(|| (ptr_lo != 0 && (ptr_lo >> 24) == 0).then_some(ptr_lo));
+            PsinValue::Array {
+                elem_type: f.ref_hash,
+                len: cnt,
+                target_inst,
+            }
+        }
+        0x5c if o + 16 <= block.len() => {
+            let cnt = rd32(block, o);
+            let ptr_lo = rd32(block, o + 8) as usize;
+            let abs_off = inst_offset + o + 8;
             let target_inst = fixup_map
                 .get(&abs_off)
                 .copied()

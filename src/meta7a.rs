@@ -126,10 +126,11 @@ impl<'a> Meta7a<'a> {
 
     pub fn object_u32(&self, struct_hash: u32, object: usize, member_hash: u32) -> Option<u32> {
         let member = self.member(struct_hash, member_hash)?;
+        let offset = object.checked_add(member.offset as usize)?;
         match member.ty {
-            0x10 | 0x11 | 0x12 | 0x13 | 0x14 | 0x15 | 0x4a | 0x60 => {
-                u32_at(self.data, object.checked_add(member.offset as usize)?)
-            }
+            0x10 | 0x11 | 0x60 => self.data.get(offset).copied().map(u32::from),
+            0x12 | 0x13 => u16_at(self.data, offset).map(u32::from),
+            0x14 | 0x15 | 0x4a => u32_at(self.data, offset),
             _ => None,
         }
     }
@@ -138,10 +139,15 @@ impl<'a> Meta7a<'a> {
         if let Some(offset) = system_offset(value).filter(|&offset| offset < self.data.len()) {
             return Some((0, offset));
         }
-        let block_index = (value & 0xfff) as usize;
+        let block_index = (value & 0xf_ffff) as usize;
         let byte_offset = (value >> 20) as usize;
         let &(hash, size, base) = self.blocks.get(block_index.checked_sub(1)?)?;
-        (base != usize::MAX && byte_offset < size as usize).then_some((hash, base + byte_offset))
+        if base == usize::MAX || byte_offset >= size as usize {
+            return None;
+        }
+        base.checked_add(byte_offset)
+            .filter(|&off| off < self.data.len())
+            .map(|off| (hash, off))
     }
 
     pub fn object_u32_array(&self, struct_hash: u32, object: usize, member_hash: u32) -> Vec<u32> {

@@ -998,6 +998,7 @@ struct Sgd5EffectSection {
     effects: Vec<Sgd5Effect>,
     trailer_flags: u32,
     trailer_reserved: [u8; 6],
+    end_offset: usize,
 }
 
 fn parse_effects_structured(
@@ -1021,6 +1022,7 @@ fn parse_effects_structured(
                 effects,
                 trailer_flags,
                 trailer_reserved,
+                end_offset: cursor + 10,
             });
         }
         if data.get(cursor..cursor + 4) == Some(MAGIC) {
@@ -1080,7 +1082,7 @@ pub fn load_sgd5(path: &Path) -> Result<Vec<Sgd5File>, Sgd5Error> {
     parse_sgd5_streams(path, data)
 }
 
-fn parse_sgd5_data(path: &Path, data: Vec<u8>) -> Result<Sgd5File, Sgd5Error> {
+fn parse_sgd5_data(path: &Path, data: &[u8]) -> Result<(Sgd5File, usize), Sgd5Error> {
     if data.len() < 0x20 || &data[..4] != MAGIC {
         return Err(Sgd5Error(format!(
             "{} is not an SGD5 shader-group file",
@@ -1088,26 +1090,27 @@ fn parse_sgd5_data(path: &Path, data: Vec<u8>) -> Result<Sgd5File, Sgd5Error> {
         )));
     }
 
-    let (group_hash, descriptors, shared_reflection, mut offset) = parse_container_header(&data)?;
+    let (group_hash, descriptors, shared_reflection, mut offset) = parse_container_header(data)?;
     let mut shaders = Vec::new();
     let mut stage_counts = [0u32; 6];
     for (stage_index, (stage, _)) in STAGES.iter().enumerate() {
-        let count = rd32(&data, offset)?;
+        let count = rd32(data, offset)?;
         offset += 4;
         if count > 100_000 {
             return Err(Sgd5Error(format!("invalid {stage} shader count {count}")));
         }
         stage_counts[stage_index] = count;
         for index in 0..count {
-            let (shader, next_offset) = parse_shader(&data, stage, index, offset)?;
+            let (shader, next_offset) = parse_shader(data, stage, index, offset)?;
             shaders.push(shader);
             offset = next_offset;
         }
     }
 
-    let declared_effect_count = rd32(&data, offset)?;
+    let declared_effect_count = rd32(data, offset)?;
     let section =
-        parse_effects_structured(&data, offset + 4, declared_effect_count, &stage_counts)?;
+        parse_effects_structured(data, offset + 4, declared_effect_count, &stage_counts)?;
+    let end_offset = section.end_offset;
     let effects = section.effects;
     let hash_names = build_hash_names(&effects);
     let effect_shader_map = build_effect_shader_map(&effects);
@@ -1124,49 +1127,41 @@ fn parse_sgd5_data(path: &Path, data: Vec<u8>) -> Result<Sgd5File, Sgd5Error> {
             record.name = hash_names.get(&record.name_hash).cloned();
         }
     }
-    Ok(Sgd5File {
-        data,
-        group_hash,
-        descriptors,
-        shared_reflection,
-        shaders,
-        declared_effect_count,
-        effect_count: effects.len() as u32,
-        trailer_flags: section.trailer_flags,
-        trailer_reserved: section.trailer_reserved,
-        effects,
-        hash_names,
-        effect_shader_map,
-    })
-}
-
-fn find_sgd5_starts(data: &[u8]) -> Vec<usize> {
-    let mut starts = Vec::new();
-    let mut offset = 0usize;
-    while let Some(found) = data[offset..]
-        .windows(MAGIC.len())
-        .position(|window| window == MAGIC)
-        .map(|position| offset + position)
-    {
-        starts.push(found);
-        offset = found + 1;
-    }
-    starts
+    Ok((
+        Sgd5File {
+            data: data[..end_offset].to_vec(),
+            group_hash,
+            descriptors,
+            shared_reflection,
+            shaders,
+            declared_effect_count,
+            effect_count: effects.len() as u32,
+            trailer_flags: section.trailer_flags,
+            trailer_reserved: section.trailer_reserved,
+            effects,
+            hash_names,
+            effect_shader_map,
+        },
+        end_offset,
+    ))
 }
 
 fn parse_sgd5_streams(path: &Path, data: Vec<u8>) -> Result<Vec<Sgd5File>, Sgd5Error> {
-    let starts = find_sgd5_starts(&data);
     let mut files = Vec::new();
-    for (stream_index, &start) in starts.iter().enumerate() {
-        let end = starts.get(stream_index + 1).copied().unwrap_or(data.len());
-        match parse_sgd5_data(path, data[start..end].to_vec()) {
-            Ok(file) => files.push(file),
-            Err(error) => {
-                return Err(Sgd5Error(format!(
-                    "SGD5 stream {stream_index} at 0x{start:x}: {error}"
-                )))
-            }
-        }
+    let mut offset = 0usize;
+    while let Some(rel) = data[offset..]
+        .windows(MAGIC.len())
+        .position(|window| window == MAGIC)
+    {
+        let start = offset + rel;
+        let stream_index = files.len();
+        let (file, consumed) = parse_sgd5_data(path, &data[start..]).map_err(|error| {
+            Sgd5Error(format!(
+                "SGD5 stream {stream_index} at 0x{start:x}: {error}"
+            ))
+        })?;
+        files.push(file);
+        offset = start + consumed;
     }
     if files.is_empty() {
         return Err(Sgd5Error("no valid SGD5 data".into()));

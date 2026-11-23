@@ -94,9 +94,14 @@ impl BinkNative {
                 }))
                 .unwrap_or_else(|_| Err("the decoder hit a bug on this clip".into()));
                 drop(dir); // keep the clip folder until playback ends
-                let mut s = sh.lock().unwrap_or_else(|p| p.into_inner());
-                s.error = res.err();
-                s.exited = true;
+                let player = {
+                    let mut s = sh.lock().unwrap_or_else(|p| p.into_inner());
+                    s.error = res.err();
+                    s.exited = true;
+                    s.status.audio_playing = false;
+                    s.player.take()
+                };
+                drop(player); // stop audio immediately if video decode errored or panicked
                 ctx.request_repaint();
             })
             .map_err(|e| format!("Start video decoder: {e}"))?;
@@ -105,7 +110,7 @@ impl BinkNative {
 
     /// Uploads a new frame if the decoder published one. Returns (exited, error).
     fn poll(&mut self, ctx: &egui::Context) -> (bool, Option<String>) {
-        let mut s = self.shared.lock().unwrap();
+        let mut s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
         self.status = s.status;
         self.audio_note.clone_from(&s.audio_note);
         if s.seq != self.last_seq {
@@ -212,8 +217,9 @@ impl Drop for BinkNative {
     fn drop(&mut self) {
         self.send(Cmd::Quit);
         let player = {
-            let mut s = self.shared.lock().unwrap();
+            let mut s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
             s.closed = true;
+            s.status.audio_playing = false;
             s.player.take()
         };
         drop(player); // stop the sound now
@@ -264,18 +270,22 @@ fn play(data: Arc<Vec<u8>>, sh: &Mutex<Shared>, ctx: &egui::Context, rx: Receive
 
     // Audio is decoded next to the video so the first frame isn't delayed.
     let (atx, audio_rx) = mpsc::channel();
+    let mut audio_pending = has_audio;
     if has_audio {
         let data = Arc::clone(&data);
         let spawned = std::thread::Builder::new().name("bink2-audio".into()).spawn(move || {
-            let _ = atx.send(decode_audio(&data));
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_audio(&data)))
+                .unwrap_or_else(|_| Err("audio decoder panicked on this clip".into()));
+            let _ = atx.send(res);
         });
         if let Err(e) = spawned {
+            audio_pending = false;
             set_note(format!("No audio: {e}"));
         }
     }
     let mut pcm: Option<Pcm> = None;
     let set_player = |p: Option<PcmPlayer>| {
-        let mut s = sh.lock().unwrap();
+        let mut s = sh.lock().unwrap_or_else(|p| p.into_inner());
         let new = if s.closed { None } else { p };
         let old = std::mem::replace(&mut s.player, new);
         s.status.audio_playing = s.player.is_some();
@@ -298,35 +308,53 @@ fn play(data: Arc<Vec<u8>>, sh: &Mutex<Shared>, ctx: &egui::Context, rx: Receive
     let mut show_now = false; // publish the next decoded frame even if late or paused (after a seek)
     // When decoding can't keep up, late frames are dropped but one is still shown every few periods.
     let mut last_shown: Option<Instant> = None;
+    let mut pending_vol_at: Option<Instant> = None;
     loop {
-        if has_audio && pcm.is_none() {
+        if audio_pending && pcm.is_none() {
             match audio_rx.try_recv() {
                 Ok(Ok(p)) => {
+                    audio_pending = false;
                     pcm = Some(p);
                     // join the video where it is now
                     restart_audio(&pcm, (!paused && next < n).then_some(next), volume);
                 }
-                Ok(Err(e)) => set_note(format!("No audio: {e}")),
-                Err(_) => {}
+                Ok(Err(e)) => {
+                    audio_pending = false;
+                    set_note(format!("No audio: {e}"));
+                }
+                Err(TryRecvError::Disconnected) => {
+                    audio_pending = false;
+                    set_note("No audio: audio decoder stopped unexpectedly".into());
+                }
+                Err(TryRecvError::Empty) => {}
             }
         }
-        if let Some(p) = sh.lock().unwrap().player.as_mut() {
-            p.current_frame(); // applies a pending volume change (may restart the process)
+        if let Some(at) = pending_vol_at {
+            if at.elapsed() >= Duration::from_millis(250) {
+                pending_vol_at = None;
+                if !paused && next < n {
+                    restart_audio(&pcm, Some(next), volume);
+                }
+            }
         }
-        let wait = if show_now {
+        let base_wait = if show_now {
             Duration::ZERO
         } else if paused {
-            Duration::from_millis(if has_audio && pcm.is_none() { 50 } else { 500 })
+            Duration::from_millis(if audio_pending { 50 } else { 500 })
         } else {
             clock.saturating_duration_since(Instant::now())
+        };
+        let wait = match pending_vol_at {
+            Some(at) => base_wait.min(Duration::from_millis(250).saturating_sub(at.elapsed())),
+            None => base_wait,
         };
         match rx.recv_timeout(wait) {
             Err(RecvTimeoutError::Disconnected) | Ok(Cmd::Quit) => return Ok(()),
             Ok(Cmd::Loop(l)) => looping = l,
             Ok(Cmd::Volume(v)) => {
                 volume = v;
-                if let Some(p) = sh.lock().unwrap().player.as_mut() {
-                    p.set_volume(v);
+                if pcm.is_some() && !paused && next < n {
+                    pending_vol_at = Some(Instant::now());
                 }
             }
             Ok(Cmd::TogglePause) => {

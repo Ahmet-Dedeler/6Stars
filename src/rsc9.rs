@@ -20,7 +20,7 @@ pub fn is_qqqq_table(head: &[u8]) -> bool {
 
 // detect rage 9 cinematic / cutscene rsc9 resource (pack:/cinematic + .anim)
 pub fn probe_cutscene_rsc9(data: &[u8]) -> Option<String> {
-    let pos = data.windows(14).position(|w| w == b"pack:/cinematic" || w.starts_with(b"pack:/cinemat"))?;
+    let pos = data.windows(13).position(|w| w == b"pack:/cinemat")?;
     let mut anim_hit = data.windows(5).any(|w| w == b".anim");
     if !anim_hit {
         anim_hit = data.windows(4).any(|w| w == b"_p1_" || w == b"_p2_");

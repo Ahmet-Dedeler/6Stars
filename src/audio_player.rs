@@ -486,6 +486,8 @@ mod backend {
         pub fn set_volume(&mut self, volume: f32) {
             if (volume - self.volume).abs() > 0.005 {
                 self.pending_volume = Some((volume, Instant::now()));
+            } else {
+                self.pending_volume = None;
             }
         }
         pub fn pause(&mut self) {
@@ -1348,7 +1350,10 @@ pub fn render_awc_audio_view(
                             .size(11.5)
                             .color(Color32::from_rgb(225, 215, 240)),
                     );
-                    if !player.status_msg.is_empty() {
+                    if let Some(ref err) = player.error {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(err).size(11.0).color(Color32::from_rgb(255, 120, 120)));
+                    } else if !player.status_msg.is_empty() {
                         ui.add_space(8.0);
                         ui.label(RichText::new(&player.status_msg).size(11.0).color(Color32::from_rgb(100, 220, 140)));
                     }

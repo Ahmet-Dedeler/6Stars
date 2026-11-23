@@ -1,4 +1,4 @@
-use crate::model3d::{Mesh3D, Texture2D};
+use crate::model3d::{MaterialPass, Mesh3D, Texture2D};
 use crate::worldmap::WorldMapData;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Quat, Vec3};
@@ -719,8 +719,8 @@ struct GpuState {
     tex_bytes: usize,
     geom_bytes: usize,
     vram_oom: bool,
-    // texture bind groups by pixel buffer address with the textures kept alive behind them
-    tex_uploads: HashMap<usize, wgpu::BindGroup>,
+    // texture bind groups by (pixel buffer address, force_opaque) with the textures kept alive behind them
+    tex_uploads: HashMap<(usize, bool), wgpu::BindGroup>,
     tex_keep: Vec<Arc<crate::model3d::Texture2D>>,
     frame_idx: u64,
     start_instant: Instant,
@@ -749,6 +749,7 @@ fn upload_texture(
     samp: &wgpu::Sampler,
     tex: &Texture2D,
     max_dim: usize,
+    force_opaque: bool,
 ) -> (wgpu::BindGroup, usize) {
     let w0 = tex.w.max(1);
     let h0 = tex.h.max(1);
@@ -761,14 +762,22 @@ fn upload_texture(
             let sy = (y * scale).min(h0 - 1);
             for x in 0..nw {
                 let sx = (x * scale).min(w0 - 1);
-                buf.extend_from_slice(&tex.pixels[sy * w0 + sx].to_array());
+                let mut px = tex.pixels[sy * w0 + sx].to_array();
+                if force_opaque {
+                    px[3] = 255;
+                }
+                buf.extend_from_slice(&px);
             }
         }
         (nw, nh, buf)
     } else {
         let mut buf = Vec::with_capacity(tex.pixels.len() * 4);
         for c in &tex.pixels {
-            buf.extend_from_slice(&c.to_array());
+            let mut px = c.to_array();
+            if force_opaque {
+                px[3] = 255;
+            }
+            buf.extend_from_slice(&px);
         }
         (w0, h0, buf)
     };
@@ -1115,8 +1124,8 @@ impl GpuState {
         });
 
         let white_tex = Texture2D::new(1, 1, vec![eframe::egui::Color32::from_rgb(190, 195, 205)]);
-        let (white_bg, _) = upload_texture(&device, &queue, &tex_bgl, &tex_samp, &white_tex, 256);
-        let (minimap_bg, _) = upload_texture(&device, &queue, &tex_bgl, &tex_samp, &white_tex, 256);
+        let (white_bg, _) = upload_texture(&device, &queue, &tex_bgl, &tex_samp, &white_tex, 256, true);
+        let (minimap_bg, _) = upload_texture(&device, &queue, &tex_bgl, &tex_samp, &white_tex, 256, true);
         let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
 
         let mut st = Self {
@@ -1165,7 +1174,7 @@ impl GpuState {
             st.map_span = [terrain.bmax[0] - terrain.bmin[0], terrain.bmax[1] - terrain.bmin[1]];
             let tmesh = terrain.build_world_terrain_mesh(8);
             if let Some(ref t) = tmesh.texture {
-                let (mbg, bytes) = upload_texture(&st.device, &st.queue, &st.tex_bgl, &st.tex_samp, t, 1024);
+                let (mbg, bytes) = upload_texture(&st.device, &st.queue, &st.tex_bgl, &st.tex_samp, t, 1024, true);
                 st.minimap_bg = mbg;
                 st.tex_bytes += bytes;
             }
@@ -1212,10 +1221,18 @@ impl GpuState {
         let mut by_geom: HashMap<u16, Vec<u32>> = HashMap::new();
         for (ti, &[i0, i1, i2]) in b.mesh.tris.iter().enumerate() {
             let g = if b.mesh.texture.is_some() { 0 } else { b.mesh.tri_geom.get(ti).copied().unwrap_or(0) };
+            if b.mesh.texture.is_none()
+                && b.mesh.geom_materials.get(g as usize).is_some_and(|m| m.auxiliary_pass)
+            {
+                continue;
+            }
             let v = by_geom.entry(g).or_default();
             v.push(i0);
             v.push(i1);
             v.push(i2);
+        }
+        if by_geom.is_empty() {
+            return;
         }
 
         let gv: Vec<GpuVertex> = b
@@ -1301,16 +1318,19 @@ impl GpuState {
         }
 
         for (g, index_count, ib) in ibs {
-            let shared = if b.mesh.texture.is_some() { None } else { b.mesh.geom_materials.get(g as usize).and_then(|m| m.texture.clone()) };
+            let mat = if b.mesh.texture.is_some() { None } else { b.mesh.geom_materials.get(g as usize) };
+            let shared = mat.and_then(|m| m.texture.clone());
+            let force_opaque = b.mesh.texture.is_some()
+                || mat.is_none_or(|m| m.pass == MaterialPass::Opaque);
             let tex = b.mesh.texture.as_ref().or(shared.as_deref());
             let tex_bg = match tex {
                 Some(t) if self.tex_bytes < 512 * 1024 * 1024 => {
                     // materials that share a decoded texture share one upload
-                    let key = t.pixels.as_ptr() as usize;
+                    let key = (t.pixels.as_ptr() as usize, force_opaque);
                     match self.tex_uploads.get(&key).filter(|_| shared.is_some()) {
                         Some(bg) => bg.clone(),
                         None => {
-                            let (bg, bytes) = upload_texture(&self.device, &self.queue, &self.tex_bgl, &self.tex_samp, t, 128);
+                            let (bg, bytes) = upload_texture(&self.device, &self.queue, &self.tex_bgl, &self.tex_samp, t, 128, force_opaque);
                             self.tex_bytes += bytes;
                             if let Some(keep) = shared.clone() {
                                 // holding the texture keeps its address from being reused by another one

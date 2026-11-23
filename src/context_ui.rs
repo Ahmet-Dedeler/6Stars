@@ -96,6 +96,10 @@ pub struct ContextUi {
 }
 
 impl ContextUi {
+    pub(crate) fn invalidate_related(&mut self) {
+        self.related = None;
+    }
+
     /// Queues "Copy as AI context" for `targets` (used by tests and the offscreen capture).
     #[cfg(test)]
     pub(crate) fn queue_ai_context(&mut self, targets: Vec<usize>, json: bool, head: bool) {
@@ -140,7 +144,15 @@ fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
     let r = crate::silent_cmd("explorer").arg("/select,").arg(path).spawn();
     #[cfg(not(any(target_os = "macos", windows)))]
     let r = std::process::Command::new("xdg-open").arg(path.parent().unwrap_or(path)).spawn();
-    r.map(|_| ()).map_err(|e| e.to_string())
+    match r {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            Ok(())
+        }
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 fn section(ui: &mut egui::Ui, title: &str) {
@@ -554,10 +566,7 @@ impl Rpf9App {
                 });
             }
         }
-        if self.selected != Some(idx) {
-            return None;
-        }
-        if !self.audio_player.tracks.is_empty() {
+        if self.audio_entry == Some(idx) && !self.audio_player.tracks.is_empty() {
             let ctx = self.audio_player.bank_ctx.as_ref();
             return Some(Decoded::Audio {
                 codec: "Opus (ADAT)".into(),
@@ -571,7 +580,7 @@ impl Rpf9App {
                 used_by: ctx.map(|c| c.used_by.clone()).unwrap_or_default(),
             });
         }
-        if !self.textures.is_empty() && !self.tex_from_model {
+        if self.texture_entry == Some(idx) && !self.textures.is_empty() && !self.tex_from_model {
             let kind = self.state.lock().unwrap().entries.get(idx).map(|e| e.kind);
             if kind == Some("TXD") {
                 return Some(Decoded::TextureDict {
@@ -602,7 +611,11 @@ impl Rpf9App {
         let (entries, meta, ver) = {
             let st = self.state.lock().unwrap();
             let entries: Vec<(usize, RpfEntry)> = targets.iter().filter_map(|&i| st.entries.get(i).map(|e| (i, e.clone()))).collect();
-            let meta = entries.iter().filter_map(|(_, e)| st.audio_bank_meta.get(&e.offset).map(|m| (e.offset, m.clone()))).collect();
+            let meta = entries
+                .iter()
+                .filter(|(_, e)| e.kind == "AWC" && e.rpf_name.eq_ignore_ascii_case("audio.rpf"))
+                .filter_map(|(_, e)| st.audio_bank_meta.get(&e.offset).map(|m| (e.offset, m.clone())))
+                .collect();
             (entries, meta, st.ver)
         };
         if entries.is_empty() {
@@ -648,12 +661,13 @@ impl Rpf9App {
                         b
                     });
                 }
-                let (mut decoded, tex_refs) = summarize(e, full && !input.live.contains_key(i), input.meta.get(&e.offset));
+                let (mut decoded, mut tex_refs) = summarize(e, full && !input.live.contains_key(i), input.meta.get(&e.offset));
                 if let Some(l) = input.live.get(i) {
                     // the preview's numbers, plus the texture list the decoder pass found
                     decoded = match (l.clone(), decoded) {
                         (Decoded::Model { verts, tris, geoms, meshlets, lod, lod_geoms, parts, bones, .. }, _) => {
                             let refs = crate::model3d::list_model_texture_refs(&e.source_rpf, e.offset).unwrap_or_default();
+                            tex_refs.extend(refs.iter().filter_map(|r| r.hit.as_ref().map(|h| (r.role(), h.path.clone(), h.tex_idx))));
                             Decoded::Model {
                                 verts,
                                 tris,

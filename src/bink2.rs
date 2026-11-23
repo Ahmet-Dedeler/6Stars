@@ -67,11 +67,19 @@ mod imp {
             if hbink.is_null() {
                 return Err(format!("BinkOpen failed for {}", bk2_path.display()));
             }
+            struct BinkGuard {
+                hbink: *mut c_void,
+                close: BinkCloseFn,
+            }
+            impl Drop for BinkGuard {
+                fn drop(&mut self) {
+                    unsafe { (self.close)(self.hbink) };
+                }
+            }
+            let _bink_guard = BinkGuard { hbink, close: bink_close };
+
             let words = unsafe { *(hbink as *const [u32; 7]) };
-            let info = validate_bink_prefix(&words).ok_or_else(|| {
-                unsafe { bink_close(hbink) };
-                "Invalid BINK struct header".to_string()
-            })?;
+            let info = validate_bink_prefix(&words).ok_or_else(|| "Invalid BINK struct header".to_string())?;
 
             std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
             let stride = (info.width * 4) as usize;
@@ -93,7 +101,6 @@ mod imp {
                     unsafe { bink_next(hbink) };
                 }
             }
-            unsafe { bink_close(hbink) };
             Ok((info, count))
         })();
 

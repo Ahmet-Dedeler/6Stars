@@ -234,7 +234,7 @@ impl<'a> Rec<'a> {
             }
             Sample::Texture(stem) => {
                 let t = load_texture(&data.join(format!("{stem}.png")), stem);
-                app.media.lock().unwrap().loaded_textures = Some(vec![t]);
+                app.media.lock().unwrap().loaded_textures = Some((idx, vec![t]));
             }
             Sample::Text(file) => {
                 app.preview = fs::read_to_string(data.join(file)).unwrap();
