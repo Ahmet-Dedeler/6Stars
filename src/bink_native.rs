@@ -8,8 +8,11 @@
 //! Video is decoded in-process by the clean-room `bink2` crate (imported as `bink2_decoder`)
 //! (https://github.com/codingkoala/bink2-decoder, Apache-2.0) on a background thread, converted
 //! to RGB the way RAD's tools do (BT.601 full range, centred bilinear chroma) and shown in an
-//! egui texture. Bink Audio is not decoded yet, so playback is silent.
+//! egui texture. Bink Audio (track 0) is decoded up front on a second thread and played through
+//! the AWC player's command-line backend (`audio_player::PcmPlayer`), restarted at the video's
+//! position on play, seek and loop.
 
+use crate::audio_player::PcmPlayer;
 use eframe::egui::{self, Color32, ColorImage, RichText, TextureHandle, TextureOptions};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -20,6 +23,7 @@ enum Cmd {
     TogglePause,
     Seek(f64),
     Loop(bool),
+    Volume(f32),
     Quit,
 }
 
@@ -33,6 +37,8 @@ pub struct NativeStatus {
     pub fps: f64,
     pub paused: bool,
     pub has_audio: bool,
+    /// A player process is playing the clip's sound right now.
+    pub audio_playing: bool,
 }
 
 #[derive(Default)]
@@ -41,8 +47,18 @@ struct Shared {
     seq: u64,
     image: Option<ColorImage>,
     error: Option<String>,
+    /// Why the clip plays without sound (audio can't be decoded or played), if it has audio.
+    audio_note: Option<String>,
     exited: bool,
+    /// The sound player. It lives here rather than on the decoder thread so that closing the
+    /// panel (or the app) stops the sound at once, without waiting for the detached thread.
+    player: Option<PcmPlayer>,
+    /// Set when the panel closed: the decoder thread must not start a new player.
+    closed: bool,
 }
+
+/// Decoded audio track: interleaved 16-bit PCM, sample rate, channels.
+type Pcm = (Arc<Vec<i16>>, u32, u16);
 
 pub struct BinkNative {
     title: String,
@@ -51,14 +67,16 @@ pub struct BinkNative {
     tex: Option<TextureHandle>,
     last_seq: u64,
     status: NativeStatus,
+    audio_note: Option<String>,
     scrub: Option<f64>,
+    muted: bool,
 }
 
 impl BinkNative {
     /// Starts decoding `dir/clip.bk2`. `ctx` is used to wake the UI when a frame is ready.
     /// The clip is read and validated on the decoder thread, so a large clip doesn't stall the UI;
     /// read and header errors show up in the panel like decode errors.
-    pub fn spawn(ctx: &egui::Context, dir: TempDir, title: String, looping: bool) -> Result<Self, String> {
+    pub fn spawn(ctx: &egui::Context, dir: TempDir, title: String, volume: f32, looping: bool) -> Result<Self, String> {
         let shared = Arc::new(Mutex::new(Shared::default()));
         let (tx, rx) = mpsc::channel();
         let (sh, ctx) = (Arc::clone(&shared), ctx.clone());
@@ -69,7 +87,7 @@ impl BinkNative {
             .spawn(move || {
                 let res = std::fs::read(dir.path().join("clip.bk2"))
                     .map_err(|e| format!("Read video clip: {e}"))
-                    .and_then(|data| play(&data, &sh, &ctx, rx, looping));
+                    .and_then(|data| play(Arc::new(data), &sh, &ctx, rx, volume, looping));
                 drop(dir); // keep the clip folder until playback ends
                 let mut s = sh.lock().unwrap();
                 s.error = res.err();
@@ -77,13 +95,14 @@ impl BinkNative {
                 ctx.request_repaint();
             })
             .map_err(|e| format!("Start video decoder: {e}"))?;
-        Ok(Self { title, tx, shared, tex: None, last_seq: 0, status: NativeStatus::default(), scrub: None })
+        Ok(Self { title, tx, shared, tex: None, last_seq: 0, status: NativeStatus::default(), audio_note: None, scrub: None, muted: false })
     }
 
     /// Uploads a new frame if the decoder published one. Returns (exited, error).
     fn poll(&mut self, ctx: &egui::Context) -> (bool, Option<String>) {
         let mut s = self.shared.lock().unwrap();
         self.status = s.status;
+        self.audio_note.clone_from(&s.audio_note);
         if s.seq != self.last_seq {
             if let Some(img) = s.image.take() {
                 self.last_seq = s.seq;
@@ -100,7 +119,7 @@ impl BinkNative {
         let _ = self.tx.send(cmd);
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui, looping: &mut bool) {
+    pub fn ui(&mut self, ui: &mut egui::Ui, volume: &mut f32, looping: &mut bool) {
         let ctx = ui.ctx().clone();
         let (exited, error) = self.poll(&ctx);
         if !exited {
@@ -151,7 +170,7 @@ impl BinkNative {
             let cur = if st.fps > 0.0 { st.frame.saturating_sub(1) as f64 / st.fps } else { 0.0 };
             let mut pos = self.scrub.unwrap_or(cur);
             ui.label(RichText::new(format!("{} / {}", fmt_time(pos), fmt_time(total))).monospace().color(Color32::from_rgb(200, 200, 215)));
-            let slider_w = (ui.available_width() - 250.0).max(80.0);
+            let slider_w = (ui.available_width() - 330.0).max(80.0);
             ui.spacing_mut().slider_width = slider_w;
             let r = ui.add(egui::Slider::new(&mut pos, 0.0..=total.max(0.01)).show_value(false));
             if r.dragged() {
@@ -161,8 +180,18 @@ impl BinkNative {
                 self.send(Cmd::Seek(pos));
                 self.scrub = None;
             }
-            if st.has_audio {
-                ui.label(RichText::new("No audio: Bink Audio is not supported on Linux yet").small().weak());
+            if let Some(note) = &self.audio_note {
+                ui.label(RichText::new(note).small().weak());
+            } else if st.has_audio {
+                if ui.selectable_label(self.muted, if self.muted { "🔇" } else { "🔊" }).clicked() {
+                    self.muted = !self.muted;
+                    self.send(Cmd::Volume(if self.muted { 0.0 } else { *volume }));
+                }
+                ui.spacing_mut().slider_width = 70.0;
+                if ui.add(egui::Slider::new(volume, 0.0..=1.0).show_value(false)).changed() {
+                    self.muted = false;
+                    self.send(Cmd::Volume(*volume));
+                }
             }
             if ui.selectable_label(*looping, "Loop").clicked() {
                 *looping = !*looping;
@@ -177,6 +206,12 @@ impl Drop for BinkNative {
     /// (and during seeks), and a read in progress finishes on its own.
     fn drop(&mut self) {
         self.send(Cmd::Quit);
+        let player = {
+            let mut s = self.shared.lock().unwrap();
+            s.closed = true;
+            s.player.take()
+        };
+        drop(player); // stop the sound now
     }
 }
 
@@ -185,10 +220,24 @@ fn keyframe_before(frames: &[bink2_decoder::FrameEntry], target: usize) -> usize
     (0..=target.min(frames.len().saturating_sub(1))).rev().find(|&i| frames[i].keyframe).unwrap_or(0)
 }
 
+/// Decodes audio track 0 of the clip in full (a few ms per minute of audio in release builds).
+fn decode_audio(data: &[u8]) -> Result<Pcm, String> {
+    let file = bink2_decoder::Container::parse(data).map_err(|e| e.to_string())?;
+    let (pcm, rate, channels) = bink2_decoder::decode_track(&file, 0).map_err(|e| e.to_string())?;
+    Ok((Arc::new(pcm), rate, channels))
+}
+
+/// Audio sample frame that plays together with video frame `frame` (audio starts at video time 0).
+fn audio_frame_at(frame: usize, fps: f64, rate: u32) -> usize {
+    (frame as f64 / fps * rate as f64).round() as usize
+}
+
 /// Decoder thread: keeps the playback clock, decodes every frame and publishes the ones that are
-/// due. Returns when told to quit (Ok) or when the file cannot be decoded (Err).
-fn play(data: &[u8], sh: &Mutex<Shared>, ctx: &egui::Context, rx: Receiver<Cmd>, mut looping: bool) -> Result<(), String> {
-    let file = bink2_decoder::Container::parse(data).map_err(|e| format!("Bink 2 header: {e}"))?;
+/// due. Audio plays from a separate player process that is restarted at the video position
+/// whenever playback (re)starts. Returns when told to quit (Ok) or when the video cannot be
+/// decoded (Err); audio problems only mute the clip.
+fn play(data: Arc<Vec<u8>>, sh: &Mutex<Shared>, ctx: &egui::Context, rx: Receiver<Cmd>, mut volume: f32, mut looping: bool) -> Result<(), String> {
+    let file = bink2_decoder::Container::parse(&data).map_err(|e| format!("Bink 2 header: {e}"))?;
     let hdr = &file.header;
     let n = file.num_frames();
     if n == 0 {
@@ -198,17 +247,45 @@ fn play(data: &[u8], sh: &Mutex<Shared>, ctx: &egui::Context, rx: Receiver<Cmd>,
     dec.set_options(bink2_decoder::DecoderOptions { conceal_slice_errors: true, ..Default::default() });
     let fps = if hdr.fps_num > 0 && hdr.fps_den > 0 { hdr.fps_num as f64 / hdr.fps_den as f64 } else { 30.0 };
     let period = Duration::from_secs_f64(1.0 / fps);
+    let has_audio = !hdr.audio_tracks.is_empty();
     {
         let mut s = sh.lock().unwrap();
-        s.status = NativeStatus {
-            width: hdr.width,
-            height: hdr.height,
-            frames: n as u32,
-            fps,
-            has_audio: !hdr.audio_tracks.is_empty(),
-            ..Default::default()
-        };
+        s.status = NativeStatus { width: hdr.width, height: hdr.height, frames: n as u32, fps, has_audio, ..Default::default() };
     }
+    let set_note = |note: String| {
+        sh.lock().unwrap().audio_note = Some(note);
+        ctx.request_repaint();
+    };
+
+    // Audio is decoded next to the video so the first frame isn't delayed.
+    let (atx, audio_rx) = mpsc::channel();
+    if has_audio {
+        let data = Arc::clone(&data);
+        let spawned = std::thread::Builder::new().name("bink2-audio".into()).spawn(move || {
+            let _ = atx.send(decode_audio(&data));
+        });
+        if let Err(e) = spawned {
+            set_note(format!("No audio: {e}"));
+        }
+    }
+    let mut pcm: Option<Pcm> = None;
+    let set_player = |p: Option<PcmPlayer>| {
+        let mut s = sh.lock().unwrap();
+        let new = if s.closed { None } else { p };
+        let old = std::mem::replace(&mut s.player, new);
+        s.status.audio_playing = s.player.is_some();
+        drop(s);
+        drop(old); // kills the old player process, outside the lock
+    };
+    // (Re)starts the sound at video frame `at`, or stops it when there is nothing to play.
+    let restart_audio = |pcm: &Option<Pcm>, at: Option<usize>, volume: f32| {
+        set_player(None);
+        let (Some((samples, rate, ch)), Some(at)) = (pcm, at) else { return };
+        match PcmPlayer::play_from(Arc::clone(samples), *rate, *ch, audio_frame_at(at, fps, *rate), volume) {
+            Ok(p) => set_player(Some(p)),
+            Err(e) => set_note(format!("No audio: {e}")),
+        }
+    };
 
     let mut next = 0usize; // next frame to decode
     let mut paused = false;
@@ -217,22 +294,43 @@ fn play(data: &[u8], sh: &Mutex<Shared>, ctx: &egui::Context, rx: Receiver<Cmd>,
     // When decoding can't keep up, late frames are dropped but one is still shown every few periods.
     let mut last_shown: Option<Instant> = None;
     loop {
+        if has_audio && pcm.is_none() {
+            match audio_rx.try_recv() {
+                Ok(Ok(p)) => {
+                    pcm = Some(p);
+                    // join the video where it is now
+                    restart_audio(&pcm, (!paused && next < n).then_some(next), volume);
+                }
+                Ok(Err(e)) => set_note(format!("No audio: {e}")),
+                Err(_) => {}
+            }
+        }
+        if let Some(p) = sh.lock().unwrap().player.as_mut() {
+            p.current_frame(); // applies a pending volume change (may restart the process)
+        }
         let wait = if show_now {
             Duration::ZERO
         } else if paused {
-            Duration::from_millis(500)
+            Duration::from_millis(if has_audio && pcm.is_none() { 50 } else { 500 })
         } else {
             clock.saturating_duration_since(Instant::now())
         };
         match rx.recv_timeout(wait) {
             Err(RecvTimeoutError::Disconnected) | Ok(Cmd::Quit) => return Ok(()),
             Ok(Cmd::Loop(l)) => looping = l,
+            Ok(Cmd::Volume(v)) => {
+                volume = v;
+                if let Some(p) = sh.lock().unwrap().player.as_mut() {
+                    p.set_volume(v);
+                }
+            }
             Ok(Cmd::TogglePause) => {
                 paused = !paused;
                 if !paused && next >= n {
                     next = 0; // play again from the top after stopping at the end
                 }
                 clock = Instant::now();
+                restart_audio(&pcm, (!paused).then_some(next), volume);
                 sh.lock().unwrap().status.paused = paused;
             }
             Ok(Cmd::Seek(mut secs)) => {
@@ -249,6 +347,7 @@ fn play(data: &[u8], sh: &Mutex<Shared>, ctx: &egui::Context, rx: Receiver<Cmd>,
                                 continue 'seek;
                             }
                             Ok(Cmd::Loop(l)) => looping = l,
+                            Ok(Cmd::Volume(v)) => volume = v, // the sound restarts after the seek
                             Ok(Cmd::TogglePause) => {
                                 paused = !paused;
                                 sh.lock().unwrap().status.paused = paused;
@@ -262,6 +361,7 @@ fn play(data: &[u8], sh: &Mutex<Shared>, ctx: &egui::Context, rx: Receiver<Cmd>,
                 next = target;
                 show_now = true;
                 clock = Instant::now();
+                restart_audio(&pcm, (!paused).then_some(next), volume);
             }
             Err(RecvTimeoutError::Timeout) => {
                 if paused && !show_now {
@@ -270,8 +370,10 @@ fn play(data: &[u8], sh: &Mutex<Shared>, ctx: &egui::Context, rx: Receiver<Cmd>,
                 if next >= n {
                     if looping {
                         next = 0;
+                        restart_audio(&pcm, Some(0), volume);
                     } else {
                         paused = true;
+                        set_player(None);
                         sh.lock().unwrap().status.paused = true;
                         continue;
                     }
@@ -412,6 +514,13 @@ mod tests {
         assert_eq!(keyframe_before(&frames, 99), 3);
     }
 
+    #[test]
+    fn audio_starts_at_the_video_position() {
+        assert_eq!(audio_frame_at(0, 30.0, 48000), 0);
+        assert_eq!(audio_frame_at(30, 30.0, 48000), 48000);
+        assert_eq!(audio_frame_at(1, 29.97, 44100), 1471);
+    }
+
     /// Silent end-to-end check on a real clip:
     /// PERCYSTAR_BK2=<clip.bk2> cargo test --release bink_native -- --ignored --nocapture
     #[test]
@@ -426,9 +535,9 @@ mod tests {
         let ctx = egui::Context::default();
         // closing right after opening (while the clip is still being read) must not wait for it
         let t = Instant::now();
-        drop(BinkNative::spawn(&ctx, copy_clip(src, 0, src.metadata().unwrap().len(), &AtomicBool::new(false)).unwrap(), "test".into(), true).unwrap());
+        drop(BinkNative::spawn(&ctx, copy_clip(src, 0, src.metadata().unwrap().len(), &AtomicBool::new(false)).unwrap(), "test".into(), 0.0, true).unwrap());
         assert!(t.elapsed() < Duration::from_millis(100), "closing while loading took {:?}", t.elapsed());
-        let mut p = BinkNative::spawn(&ctx, clip, "test".into(), true).unwrap();
+        let mut p = BinkNative::spawn(&ctx, clip, "test".into(), 0.0, true).unwrap(); // volume 0: silent
         let wait = |p: &mut BinkNative, ms: u64| {
             let t = Instant::now();
             let mut frames = 0;
@@ -448,11 +557,15 @@ mod tests {
         let st = p.status;
         println!("{}x{} {:.2}fps frame {}/{} shown {got} frames in 2s", st.width, st.height, st.fps, st.frame, st.frames);
         assert!(p.tex.is_some() && got as f64 > st.fps * 1.5, "frames should stream at ~video fps");
+        if st.has_audio {
+            assert!(st.audio_playing, "audio should play along: {:?}", p.audio_note);
+        }
         p.send(Cmd::TogglePause);
         wait(&mut p, 400);
         let f0 = p.status.frame;
         wait(&mut p, 600);
         assert!(p.status.paused && p.status.frame == f0, "pause should hold the frame");
+        assert!(!p.status.audio_playing, "pause should stop the sound");
         let target = (st.frames as f64 / st.fps * 0.5).min(1.0);
         p.send(Cmd::Seek(target));
         wait(&mut p, 600);
@@ -463,6 +576,7 @@ mod tests {
         wait(&mut p, 600);
         // compare publications, not frame numbers: a short looping clip may wrap meanwhile
         assert!(!p.status.paused && p.last_seq > seq, "playback resumes after the seek");
+        assert_eq!(p.status.audio_playing, st.has_audio, "sound resumes after the seek");
         // closing the panel during a long seek (rebuilding from an early keyframe) must not hang
         p.send(Cmd::Seek(st.frames as f64 / st.fps));
         std::thread::sleep(Duration::from_millis(20));
