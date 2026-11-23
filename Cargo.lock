@@ -469,7 +469,7 @@ dependencies = [
 [[package]]
 name = "bink2"
 version = "0.1.0"
-source = "git+https://github.com/Ahmet-Dedeler/bink2-decoder?rev=e365f099acea6304ab32dabf221e720bfcc6ee65#e365f099acea6304ab32dabf221e720bfcc6ee65"
+source = "git+https://github.com/codingkoala/bink2-decoder?rev=d0dca6025004725ac8275f9df46ec4d0a10c61b6#d0dca6025004725ac8275f9df46ec4d0a10c61b6"
 
 [[package]]
 name = "bit-set"
