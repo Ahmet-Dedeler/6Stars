@@ -461,7 +461,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 [[package]]
 name = "bcpack-rs"
 version = "0.2.0"
-source = "git+https://github.com/Ahmet-Dedeler/bcpack-rs?rev=0a887de1edc9c22a425605091f1a8365fdf74dbb#0a887de1edc9c22a425605091f1a8365fdf74dbb"
+source = "git+https://github.com/Ahmet-Dedeler/bcpack-rs?rev=c51ec521cbe6869136f29f5d157342374ef5cf33#c51ec521cbe6869136f29f5d157342374ef5cf33"
 dependencies = [
  "serde_json",
 ]

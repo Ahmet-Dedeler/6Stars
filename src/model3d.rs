@@ -67,7 +67,7 @@ pub(crate) fn bounds_of<'a>(pts: impl Iterator<Item = &'a [f32; 3]>) -> Option<(
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
-enum MaterialPass {
+pub(crate) enum MaterialPass {
     #[default]
     Opaque,
     Cutout,
@@ -81,8 +81,8 @@ pub struct GeomMaterial {
     // surface color texture currently applied first enabled entry of color_layers
     pub texture: Option<Arc<Texture2D>>,
     pub is_vehicle_paint: bool,
-    pass: MaterialPass,
-    auxiliary_pass: bool,
+    pub(crate) pass: MaterialPass,
+    pub(crate) auxiliary_pass: bool,
     // tinted opaque vehicle body material shown as car paint while no color texture is applied
     paint_capable: bool,
     // indices into mesh tex_layers color candidates in priority order
@@ -805,7 +805,7 @@ pub fn read_virtual_from_file(f: &mut File, file_off: u64) -> Result<(Vec<u8>, u
         return Err("Not a valid RAGE9 resource (missing BlockMap)".into());
     };
     let mut v_chunks_read = 1usize;
-    while v.len() <= bmap_off + 10 && v_chunks_read < 32 {
+    while v.len() < bmap_off + 10 && v_chunks_read < 32 {
         let Some(zoff) = find_next_zlib(f, next_off).map_err(|e| e.to_string())? else { break };
         let (chunk, nxt) = decompress_zlib_at(f, zoff, 16 * 1024 * 1024).map_err(|e| e.to_string())?;
         v.extend_from_slice(&chunk);
@@ -943,7 +943,7 @@ pub fn probe_large_rage9_model_in_buf(buf: &[u8], rpf_path: &Path, abs_off: u64)
     if bmap_off > 4 * 1024 * 1024 { return None; }
 
     let mut v_chunks_read = 1usize;
-    while v.len() <= bmap_off + 10 && v_chunks_read < 32 {
+    while v.len() < bmap_off + 10 && v_chunks_read < 32 {
         while pos + 3 < buf.len() && !is_zlib_head(&buf[pos..]) {
             pos += 1;
         }
@@ -1867,8 +1867,9 @@ fn extract_rage9_skeleton_points(v: &[u8]) -> (Vec<ElsPoint>, Vec<(String, [f32;
             }
 
             let Some(name_off) = vptr(ru64(v, b + 0x30)) else { continue };
-            let end = v[name_off..].iter().position(|&c| c == 0).map(|n| name_off + n).unwrap_or(name_off);
-            let Ok(name) = std::str::from_utf8(&v[name_off..end]) else { continue };
+            let Some(tail) = v.get(name_off..) else { continue };
+            let len = tail.iter().position(|&c| c == 0).unwrap_or(0);
+            let Ok(name) = std::str::from_utf8(&tail[..len]) else { continue };
             attach_points.push((name.to_string(), world_pos[i]));
             let Some(number) = rage9_siren_slot(name) else { continue };
             out.push(ElsPoint {
@@ -1979,6 +1980,10 @@ pub fn decode_rage9_model_from_rpf_lod(rpf_path: &Path, file_off: u64, fallback_
         for (&g, mut mat) in geoms.iter().zip(mats) {
             if !append_meshlet_geom(&p, g, gi_idx, &mut b) {
                 mat.texture = None;
+                mat.embedded_color = None;
+                mat.color_layers.clear();
+                mat.normal_layers.clear();
+                mat.overlay_layers.clear();
             }
             geom_materials.push(mat);
             gi_idx = gi_idx.wrapping_add(1);

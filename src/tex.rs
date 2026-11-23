@@ -830,7 +830,7 @@ fn read_rage9_vp_with_budget(f: &mut File, file_off: u64, budget: usize) -> Resu
     if v.len() < 0x40 { return Err("Virtual chunk too small".into()); }
     let Some(bmap_off) = vptr(ru64(&v, 8)) else { return Err("Missing BlockMap".into()) };
     let mut v_read = 1usize;
-    while v.len() <= bmap_off + 16 && v_read < 32 {
+    while v.len() < bmap_off + 10 && v_read < 32 {
         let Some(zoff) = find_next_zlib_near(f, next_off)? else { break };
         let (c, nxt) = decompress(f, zoff, 16 * 1024 * 1024)?;
         v.extend_from_slice(&c);
@@ -1031,6 +1031,8 @@ pub fn ttpf_index(path: &Path) -> Result<std::sync::Arc<TtpfIndex>, String> {
         // a chunk that ends past the file cannot be read and would only size a huge buffer
         if cend > prev_c && vend > vstart && cend <= file_len {
             chunks.push((prev_c, cend, vstart, vend - vstart, cur_codec));
+        }
+        if vend > vstart {
             vstart = vend;
         }
         prev_c = cend;
@@ -1097,7 +1099,7 @@ fn ttpf_chunk(path: &Path, file: &mut File, signature: ArchiveSignature, (cs, ce
         out
     } else if ch.len() as u64 == vl {
         ch
-    } else if BCPACK_DECODED & 1 << codec != 0 {
+    } else if codec < 8 && (BCPACK_DECODED & (1u8 << codec)) != 0 {
         bcpack_bc1_chunk(&ch, vl).map_err(|e| format!("Texture uses Xbox Series BCPack (BC1), but this chunk didn't decode: {e}"))?
     } else {
         let mode = bcpack_codec_name(codec);
@@ -1442,20 +1444,30 @@ pub fn decode_ttpf_texture_capped(path: &Path, tex_idx: usize, cap: usize) -> Re
                 // Average of the covered block. Texels are straight alpha, so colour is weighted
                 // by alpha: otherwise the colour stored under transparent texels bleeds into
                 // the edges of cutouts (upstream averages the channels unweighted).
-                let (mut sum, mut asum, mut n) = ([0u32; 3], 0u32, 0u32);
+                let (mut sum, mut raw, mut asum, mut n) = ([0u64; 3], [0u64; 3], 0u64, 0u64);
                 for yy in (y * step)..((y + 1) * step).min(t.h) {
                     for xx in (x * step)..((x + 1) * step).min(t.w) {
                         let [r, g, b, a] = t.pixels[yy * t.w + xx].to_array();
-                        let a = a as u32;
-                        sum[0] += r as u32 * a;
-                        sum[1] += g as u32 * a;
-                        sum[2] += b as u32 * a;
+                        let (r, g, b, a) = (r as u64, g as u64, b as u64, a as u64);
+                        sum[0] += r * a;
+                        sum[1] += g * a;
+                        sum[2] += b * a;
+                        raw[0] += r;
+                        raw[1] += g;
+                        raw[2] += b;
                         asum += a;
                         n += 1;
                     }
                 }
-                let c = |v: u32| if asum == 0 { 0 } else { ((v + asum / 2) / asum) as u8 };
-                shrunk.push(straight(c(sum[0]), c(sum[1]), c(sum[2]), (asum / n.max(1)) as u8));
+                let denom = n.max(1);
+                let c = |i: usize| {
+                    if asum == 0 {
+                        ((raw[i] + denom / 2) / denom) as u8
+                    } else {
+                        ((sum[i] + asum / 2) / asum) as u8
+                    }
+                };
+                shrunk.push(straight(c(0), c(1), c(2), ((asum + denom / 2) / denom) as u8));
             }
         }
         t.pixels = shrunk;
@@ -1666,8 +1678,12 @@ fn ttpf_decode_guess(path: &Path, ix: &TtpfIndex, d: &TtpfTexMeta, is_bc: bool, 
 /// Mean absolute RGB difference between `px1` and a 2x2 box filter of `px0`, on a sample
 /// of pixels. None when the texture is too small to compare.
 fn mip_pair_error(px0: &[Color32], w0: usize, h0: usize, px1: &[Color32], stride1: usize) -> Option<f64> {
-    let (w1, h1) = (w0 / 2, h0 / 2);
-    if w1 < 2 || h1 < 2 {
+    if stride1 == 0 {
+        return None;
+    }
+    let w1 = (w0 / 2).min(stride1);
+    let h1 = (h0 / 2).min(px1.len() / stride1);
+    if w1 < 2 || h1 < 2 || px0.len() < (2 * h1).saturating_mul(w0) {
         return None;
     }
     let step = ((w1 * h1) as f64 / 16384.0).sqrt().ceil().max(1.0) as usize;
@@ -2295,10 +2311,13 @@ pub fn decode_navmesh_from_rpf(rpf_path: &Path, file_off: u64, fallback_name: &s
     let mut tris = Vec::new();
     let mut tri_geom = Vec::new();
     let mut poly_cnt = 0usize;
-    for (boff, cnt) in p_blks {
+    let max_polys = v.len() / 44;
+    'polys: for (boff, cnt) in p_blks {
         for i in 0..cnt {
             let o = boff + i * 44;
             if o + 44 > v.len() { break; }
+            // more polygons than fit in the virtual buffer means the blocks overlap
+            if poly_cnt >= max_polys { break 'polys; }
             let vinfo = ru32(&v, o + 4);
             let f8 = ru32(&v, o + 8);
             let f18 = ru32(&v, o + 0x18);
@@ -3021,7 +3040,7 @@ impl TexChannel {
 /// is the same data as `pixels`; it stays because the channel views take `[u8; 4]` texels.
 /// `None` for formats without separate alpha or a payload that doesn't fit.
 pub fn decode_linear_straight_rgba(lin: &[u8], w: usize, h: usize, dxgi: u8) -> Option<Vec<[u8; 4]>> {
-    if !matches!(dxgi, 71 | 72 | 77 | 78 | 98 | 99 | 28 | 29 | 87 | 91) {
+    if !matches!(dxgi, 11 | 24 | 28 | 29 | 71 | 72 | 74 | 75 | 77 | 78 | 87 | 91 | 98 | 99) {
         return None;
     }
     Some(decode_linear_to_rgba(lin, w, h, dxgi)?.iter().map(|p| p.to_array()).collect())

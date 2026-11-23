@@ -671,11 +671,11 @@ fn groom_sys_coverage(s: &[u8], c: &mut Coverage) {
     }
     let n_bones = u32_at(s, 0x98).unwrap_or(0) as usize;
     if n_bones > 0 {
-        blocks.push((p(0xA0), n_bones * 4, "bones"));
+        blocks.push((p(0xA0), n_bones.saturating_mul(4), "bones"));
     }
     let n_parts = u32_at(s, 0xA8).unwrap_or(0) as usize;
     if n_parts > 0 {
-        blocks.push((p(0xB0), n_parts * 12, "parts"));
+        blocks.push((p(0xB0), n_parts.saturating_mul(12), "parts"));
     }
     if q(0x10) != 0 {
         blocks.push((p(0x10), 0x10, "extra"));
@@ -689,14 +689,19 @@ fn groom_sys_coverage(s: &[u8], c: &mut Coverage) {
             c.problems.push(format!("overlap at {name} {o:#x}"));
             continue;
         }
-        let gap = &s[cur..o.min(s.len())];
+        let gap = s.get(cur..o.min(s.len())).unwrap_or(&[]);
         if o - cur >= 16 || gap.iter().any(|&b| b != 0) {
             c.problems.push(format!("untyped system bytes before {name} {cur:#x}..{o:#x}"));
         } else {
             typed += o - cur;
         }
+        let Some(block_end) = o.checked_add(n).filter(|&e| e <= s.len()) else {
+            c.problems.push(format!("block {name} out of bounds {o:#x}+{n:#x} > {:#x}", s.len()));
+            cur = s.len();
+            continue;
+        };
         typed += n;
-        cur = o + n;
+        cur = block_end;
     }
     let rest = s.get(cur..).unwrap_or(&[]);
     if rest.len() >= 16 || rest.iter().any(|&b| b != 0) {
@@ -991,10 +996,11 @@ pub fn head_delta_coverage(sys: &[u8], gfx: &[u8]) -> Coverage {
     match decode_head_delta(sys, gfx) {
         Ok(d) => {
             c.sys_typed = sys.len();
+            let start = gfx_ptr(sys, 0x88).unwrap_or(0);
             let bytes = 0x20 + d.deltas.len() * 8;
             c.gfx_total = bytes;
             c.gfx_typed = bytes;
-            if gfx.get(bytes..).is_some_and(|pad| pad.iter().any(|&b| b != 0)) {
+            if gfx.get(start + bytes..).is_some_and(|pad| pad.iter().any(|&b| b != 0)) {
                 c.problems.push("non-zero padding after the delta buffer".into());
             }
         }
@@ -1047,13 +1053,22 @@ fn y_up(p: [f32; 3]) -> [f32; 3] {
     [p[0], p[2], -p[1]]
 }
 
+fn finite_f32(v: f32) -> f32 {
+    if v.is_finite() { v } else { 0.0 }
+}
+
+fn finite_vec3(p: [f32; 3]) -> [f32; 3] {
+    [finite_f32(p[0]), finite_f32(p[1]), finite_f32(p[2])]
+}
+
 fn minmax(pts: &[[f32; 3]]) -> (String, String) {
     let mut lo = [f32::MAX; 3];
     let mut hi = [f32::MIN; 3];
     for p in pts {
         for k in 0..3 {
-            lo[k] = lo[k].min(p[k]);
-            hi[k] = hi[k].max(p[k]);
+            let v = finite_f32(p[k]);
+            lo[k] = lo[k].min(v);
+            hi[k] = hi[k].max(v);
         }
     }
     if pts.is_empty() {
@@ -1069,47 +1084,76 @@ fn minmax(pts: &[[f32; 3]]) -> (String, String) {
 /// Groom as glTF line strands (port of hair_gltf.py): one LINES primitive, every guide strand a
 /// polyline of K points, positions converted to Y-up, and the f16 w lane as `_RADIUS`.
 pub fn groom_glb(g: &Groom, name: &str) -> Vec<u8> {
-    let pos: Vec<[f32; 3]> = g.points.iter().map(|p| y_up([p[0], p[1], p[2]])).collect();
+    let pos: Vec<[f32; 3]> = g.points.iter().map(|p| finite_vec3(y_up([p[0], p[1], p[2]]))).collect();
     let k = g.points_per_strand;
     let mut idx: Vec<u32> = Vec::with_capacity(g.strands * k.saturating_sub(1) * 2);
     for s in 0..g.strands {
         for i in 1..k {
-            idx.push((s * k + i - 1) as u32);
-            idx.push((s * k + i) as u32);
+            let a = s * k + i - 1;
+            let b = s * k + i;
+            if b < pos.len() {
+                idx.push(a as u32);
+                idx.push(b as u32);
+            }
         }
     }
     let mut bin = Vec::new();
     pos.iter().flatten().for_each(|f| bin.extend_from_slice(&f.to_le_bytes()));
     let w_off = bin.len();
-    g.points.iter().for_each(|p| bin.extend_from_slice(&p[3].to_le_bytes()));
+    g.points.iter().for_each(|p| bin.extend_from_slice(&finite_f32(p[3]).to_le_bytes()));
     let i_off = bin.len();
     idx.iter().for_each(|i| bin.extend_from_slice(&i.to_le_bytes()));
     let (lo, hi) = minmax(&pos);
+    let n = pos.len();
+    let ni = idx.len();
+    let (primitives, buffers, views, accessors) = if n == 0 {
+        (String::new(), String::new(), String::new(), String::new())
+    } else if ni == 0 {
+        (
+            r#"{"attributes":{"POSITION":0,"_RADIUS":1},"mode":0}"#.to_string(),
+            format!(r#"{{"byteLength":{}}}"#, a4(bin.len())),
+            format!(
+                r#"{{"buffer":0,"byteOffset":0,"byteLength":{plen},"target":34962}},{{"buffer":0,"byteOffset":{woff},"byteLength":{wlen},"target":34962}}"#,
+                plen = w_off,
+                woff = w_off,
+                wlen = i_off - w_off,
+            ),
+            format!(
+                r#"{{"bufferView":0,"componentType":5126,"count":{n},"type":"VEC3","min":{lo},"max":{hi}}},{{"bufferView":1,"componentType":5126,"count":{n},"type":"SCALAR"}}"#
+            ),
+        )
+    } else {
+        (
+            r#"{"attributes":{"POSITION":0,"_RADIUS":1},"indices":2,"mode":1}"#.to_string(),
+            format!(r#"{{"byteLength":{}}}"#, a4(bin.len())),
+            format!(
+                r#"{{"buffer":0,"byteOffset":0,"byteLength":{plen},"target":34962}},{{"buffer":0,"byteOffset":{woff},"byteLength":{wlen},"target":34962}},{{"buffer":0,"byteOffset":{ioff},"byteLength":{ilen},"target":34963}}"#,
+                plen = w_off,
+                woff = w_off,
+                wlen = i_off - w_off,
+                ioff = i_off,
+                ilen = bin.len() - i_off,
+            ),
+            format!(
+                r#"{{"bufferView":0,"componentType":5126,"count":{n},"type":"VEC3","min":{lo},"max":{hi}}},{{"bufferView":1,"componentType":5126,"count":{n},"type":"SCALAR"}},{{"bufferView":2,"componentType":5125,"count":{ni},"type":"SCALAR"}}"#
+            ),
+        )
+    };
     let json = format!(
         concat!(
             r#"{{"asset":{{"version":"2.0","generator":"Percy6Stars"}},"scene":0,"scenes":[{{"nodes":[0]}}],"#,
             r#""nodes":[{{"mesh":0,"name":{name}}}],"#,
-            r#""meshes":[{{"name":"guide_strands","primitives":[{{"attributes":{{"POSITION":0,"_RADIUS":1}},"indices":2,"mode":1}}]}}],"#,
-            r#""buffers":[{{"byteLength":{blen}}}],"#,
-            r#""bufferViews":[{{"buffer":0,"byteOffset":0,"byteLength":{plen},"target":34962}},"#,
-            r#"{{"buffer":0,"byteOffset":{woff},"byteLength":{wlen},"target":34962}},"#,
-            r#"{{"buffer":0,"byteOffset":{ioff},"byteLength":{ilen},"target":34963}}],"#,
-            r#""accessors":[{{"bufferView":0,"componentType":5126,"count":{n},"type":"VEC3","min":{lo},"max":{hi}}},"#,
-            r#"{{"bufferView":1,"componentType":5126,"count":{n},"type":"SCALAR"}},"#,
-            r#"{{"bufferView":2,"componentType":5125,"count":{ni},"type":"SCALAR"}}],"#,
+            r#""meshes":[{{"name":"guide_strands","primitives":[{primitives}]}}],"#,
+            r#""buffers":[{buffers}],"#,
+            r#""bufferViews":[{views}],"#,
+            r#""accessors":[{accessors}],"#,
             r#""extras":{{"strands":{s},"points_per_strand":{k},"root_triangles":{t}}}}}"#
         ),
         name = json_str(name),
-        blen = a4(bin.len()),
-        plen = w_off,
-        woff = w_off,
-        wlen = i_off - w_off,
-        ioff = i_off,
-        ilen = bin.len() - i_off,
-        n = pos.len(),
-        lo = lo,
-        hi = hi,
-        ni = idx.len(),
+        primitives = primitives,
+        buffers = buffers,
+        views = views,
+        accessors = accessors,
         s = g.strands,
         k = k,
         t = g.root_tris.len(),
@@ -1120,7 +1164,7 @@ pub fn groom_glb(g: &Groom, name: &str) -> Vec<u8> {
 /// Cloth as glTF: constraints as a LINES primitive and particles as a POINTS primitive
 /// (w as `_MASS`).
 pub fn cloth_glb(c: &Cloth, name: &str) -> Vec<u8> {
-    let pos: Vec<[f32; 3]> = c.particles.iter().map(|p| y_up([p[0], p[1], p[2]])).collect();
+    let pos: Vec<[f32; 3]> = c.particles.iter().map(|p| finite_vec3(y_up([p[0], p[1], p[2]]))).collect();
     let n = pos.len();
     let idx: Vec<u32> = c
         .edges
@@ -1131,36 +1175,60 @@ pub fn cloth_glb(c: &Cloth, name: &str) -> Vec<u8> {
     let mut bin = Vec::new();
     pos.iter().flatten().for_each(|f| bin.extend_from_slice(&f.to_le_bytes()));
     let w_off = bin.len();
-    c.particles.iter().for_each(|p| bin.extend_from_slice(&p[3].to_le_bytes()));
+    c.particles.iter().for_each(|p| bin.extend_from_slice(&finite_f32(p[3]).to_le_bytes()));
     let i_off = bin.len();
     idx.iter().for_each(|i| bin.extend_from_slice(&i.to_le_bytes()));
     let (lo, hi) = minmax(&pos);
+    let ni = idx.len();
+    let (primitives, buffers, views, accessors) = if n == 0 {
+        (String::new(), String::new(), String::new(), String::new())
+    } else if ni == 0 {
+        (
+            r#"{"attributes":{"POSITION":0,"_MASS":1},"mode":0}"#.to_string(),
+            format!(r#"{{"byteLength":{}}}"#, a4(bin.len())),
+            format!(
+                r#"{{"buffer":0,"byteOffset":0,"byteLength":{plen},"target":34962}},{{"buffer":0,"byteOffset":{woff},"byteLength":{wlen},"target":34962}}"#,
+                plen = w_off,
+                woff = w_off,
+                wlen = i_off - w_off,
+            ),
+            format!(
+                r#"{{"bufferView":0,"componentType":5126,"count":{n},"type":"VEC3","min":{lo},"max":{hi}}},{{"bufferView":1,"componentType":5126,"count":{n},"type":"SCALAR"}}"#
+            ),
+        )
+    } else {
+        (
+            r#"{"attributes":{"POSITION":0},"indices":2,"mode":1},{"attributes":{"POSITION":0,"_MASS":1},"mode":0}"#.to_string(),
+            format!(r#"{{"byteLength":{}}}"#, a4(bin.len())),
+            format!(
+                r#"{{"buffer":0,"byteOffset":0,"byteLength":{plen},"target":34962}},{{"buffer":0,"byteOffset":{woff},"byteLength":{wlen},"target":34962}},{{"buffer":0,"byteOffset":{ioff},"byteLength":{ilen},"target":34963}}"#,
+                plen = w_off,
+                woff = w_off,
+                wlen = i_off - w_off,
+                ioff = i_off,
+                ilen = bin.len() - i_off,
+            ),
+            format!(
+                r#"{{"bufferView":0,"componentType":5126,"count":{n},"type":"VEC3","min":{lo},"max":{hi}}},{{"bufferView":1,"componentType":5126,"count":{n},"type":"SCALAR"}},{{"bufferView":2,"componentType":5125,"count":{ni},"type":"SCALAR"}}"#
+            ),
+        )
+    };
     let json = format!(
         concat!(
             r#"{{"asset":{{"version":"2.0","generator":"Percy6Stars"}},"scene":0,"scenes":[{{"nodes":[0]}}],"#,
             r#""nodes":[{{"mesh":0,"name":{name}}}],"#,
-            r#""meshes":[{{"name":"cloth","primitives":[{{"attributes":{{"POSITION":0}},"indices":2,"mode":1}},"#,
-            r#"{{"attributes":{{"POSITION":0,"_MASS":1}},"mode":0}}]}}],"#,
-            r#""buffers":[{{"byteLength":{blen}}}],"#,
-            r#""bufferViews":[{{"buffer":0,"byteOffset":0,"byteLength":{plen},"target":34962}},"#,
-            r#"{{"buffer":0,"byteOffset":{woff},"byteLength":{wlen},"target":34962}},"#,
-            r#"{{"buffer":0,"byteOffset":{ioff},"byteLength":{ilen},"target":34963}}],"#,
-            r#""accessors":[{{"bufferView":0,"componentType":5126,"count":{n},"type":"VEC3","min":{lo},"max":{hi}}},"#,
-            r#"{{"bufferView":1,"componentType":5126,"count":{n},"type":"SCALAR"}},"#,
-            r#"{{"bufferView":2,"componentType":5125,"count":{ni},"type":"SCALAR"}}],"#,
+            r#""meshes":[{{"name":"cloth","primitives":[{primitives}]}}],"#,
+            r#""buffers":[{buffers}],"#,
+            r#""bufferViews":[{views}],"#,
+            r#""accessors":[{accessors}],"#,
             r#""extras":{{"particles":{n},"constraints":{m},"soft_body":{soft}}}}}"#
         ),
         name = json_str(name),
-        blen = a4(bin.len()),
-        plen = w_off,
-        woff = w_off,
-        wlen = i_off - w_off,
-        ioff = i_off,
-        ilen = (bin.len() - i_off).max(0),
+        primitives = primitives,
+        buffers = buffers,
+        views = views,
+        accessors = accessors,
         n = n,
-        lo = lo,
-        hi = hi,
-        ni = idx.len(),
         m = c.edges.len(),
         soft = c.soft,
     );
@@ -1435,8 +1503,28 @@ pub fn apply_head_delta(
     }
     let mut mesh = base.clone();
     mesh.verts[br.clone()].copy_from_slice(&applied);
+    mesh.normals = mesh
+        .tris
+        .iter()
+        .map(|t| {
+            let a = mesh.verts[t[0] as usize];
+            let b = mesh.verts[t[1] as usize];
+            let c = mesh.verts[t[2] as usize];
+            let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let nx = ab[1] * ac[2] - ab[2] * ac[1];
+            let ny = ab[2] * ac[0] - ab[0] * ac[2];
+            let nz = ab[0] * ac[1] - ab[1] * ac[0];
+            let len = (nx * nx + ny * ny + nz * nz).sqrt();
+            if len > 1e-12 {
+                [nx / len, ny / len, nz / len]
+            } else {
+                [0.0, 0.0, 1.0]
+            }
+        })
+        .collect();
     mesh.name = format!("{} + delta", base.name);
-    mesh.dirty = true;
+    mesh.invalidate_normals();
     Ok(AppliedDelta {
         mesh,
         matched_head: name,

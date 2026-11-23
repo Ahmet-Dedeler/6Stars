@@ -592,10 +592,16 @@ fn decode_opus(packets: &[&[u8]]) -> Option<(usize, Vec<i16>)> {
     let ch: usize = if (packets.first()?[0] & 0x04) != 0 { 2 } else { 1 };
     let mut dec = OpusDecoder::new(48_000, ch).ok()?;
     let mut pcm_f32 = vec![0.0f32; 5760 * 2];
-    let mut samples = Vec::with_capacity(packets.len() * 960 * ch);
+    let mut samples = Vec::with_capacity(
+        packets.len().saturating_mul(960 * ch).min(MAX_RESERVE_SAMPLES),
+    );
     for pkt in packets {
+        if samples.len() >= MAX_STREAM_SAMPLES {
+            break;
+        }
         if let Ok(n_per_ch) = dec.decode(pkt, 5760, &mut pcm_f32[..5760 * ch]) {
-            samples.extend(pcm_f32[..n_per_ch * ch].iter().map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16));
+            let take = (n_per_ch * ch).min(MAX_STREAM_SAMPLES.saturating_sub(samples.len()));
+            samples.extend(pcm_f32[..take].iter().map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16));
         }
     }
     (!samples.is_empty()).then_some((ch, samples))
@@ -647,13 +653,21 @@ fn decode_multichannel(data: &[u8], fmt: AwcChunk, body: AwcChunk) -> Vec<(usize
             let mut pcm_f32 = vec![0.0f32; 5760 * 2];
             let mut s: Vec<i16> = Vec::new();
             for (skip, pk) in segs {
-                let mut left = skip * ch;
+                if s.len() >= MAX_STREAM_SAMPLES {
+                    break;
+                }
+                let mut left = skip.saturating_mul(ch);
                 for pkt in pk {
+                    if s.len() >= MAX_STREAM_SAMPLES {
+                        break;
+                    }
                     if let Ok(n) = dec.decode(pkt, 5760, &mut pcm_f32[..5760 * ch]) {
                         let got = &pcm_f32[..n * ch];
                         let drop = left.min(got.len());
                         left -= drop;
-                        s.extend(got[drop..].iter().map(|&v| (v.clamp(-1.0, 1.0) * 32767.0) as i16));
+                        let tail = &got[drop..];
+                        let take = tail.len().min(MAX_STREAM_SAMPLES.saturating_sub(s.len()));
+                        s.extend(tail[..take].iter().map(|&v| (v.clamp(-1.0, 1.0) * 32767.0) as i16));
                     }
                 }
             }

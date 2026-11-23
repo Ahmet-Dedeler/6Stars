@@ -396,7 +396,7 @@ impl RelationIndex {
             }
         }
 
-        if e.kind == "AWC" {
+        if e.kind == "AWC" && e.rpf_name.eq_ignore_ascii_case("audio.rpf") {
             if let (Some(meta), Some(aid)) = (audio_meta.get(&e.offset), self.archive_id(&e.source_rpf)) {
                 for &j in self.dat_by_archive.get(&aid).map_or(&[][..], Vec::as_slice) {
                     push(&mut out, j, Rule::AudioCatalog, format!("catalogue that names bank 0x{:08x}", meta.bank_hash));

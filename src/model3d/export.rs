@@ -188,16 +188,16 @@ impl Mesh3D {
         let dir = path.parent().unwrap_or(Path::new("."));
         let mut mtl = BufWriter::new(File::create(dir.join(format!("{stem}.mtl")))?);
         writeln!(mtl, "# Percy6Stars material library for {}", self.name)?;
-        // every distinct texture is written once
-        let mut written: Vec<(*const Texture2D, String)> = Vec::new();
+        // every distinct (texture, keep_alpha) pair is written once
+        let mut written: Vec<(*const Texture2D, bool, String)> = Vec::new();
         let mut image_for = |tex: &Arc<Texture2D>, keep_alpha: bool, tag: &str| -> std::io::Result<String> {
             let ptr = Arc::as_ptr(tex);
-            if let Some((_, name)) = written.iter().find(|(p, _)| *p == ptr) {
+            if let Some((_, _, name)) = written.iter().find(|(p, a, _)| *p == ptr && *a == keep_alpha) {
                 return Ok(name.clone());
             }
             let name = format!("{stem}_{tag}{:02}.png", written.len());
             std::fs::write(dir.join(&name), encode_png(tex, keep_alpha)?)?;
-            written.push((ptr, name.clone()));
+            written.push((ptr, keep_alpha, name.clone()));
             Ok(name)
         };
         used_geoms.sort_unstable();

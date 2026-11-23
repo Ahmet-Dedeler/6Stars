@@ -16,8 +16,8 @@ export MACOSX_DEPLOYMENT_TARGET=11.0
 # exact binary, so every rebuild asks again.
 if [[ -z "${SIXSTARS_SIGN_IDENTITY:-}" ]]; then
   ids=$(security find-identity -v -p codesigning 2>/dev/null || true)
-  SIXSTARS_SIGN_IDENTITY=$(grep -o '"Developer ID Application: [^"]*"' <<<"$ids" | head -1 | tr -d '"')
-  [[ -n "$SIXSTARS_SIGN_IDENTITY" ]] || SIXSTARS_SIGN_IDENTITY=$(grep -o '"Apple Development: [^"]*"' <<<"$ids" | head -1 | tr -d '"')
+  SIXSTARS_SIGN_IDENTITY=$(grep -o '"Developer ID Application: [^"]*"' <<<"$ids" | head -1 | tr -d '"' || true)
+  [[ -n "$SIXSTARS_SIGN_IDENTITY" ]] || SIXSTARS_SIGN_IDENTITY=$(grep -o '"Apple Development: [^"]*"' <<<"$ids" | head -1 | tr -d '"' || true)
   [[ -n "$SIXSTARS_SIGN_IDENTITY" ]] || SIXSTARS_SIGN_IDENTITY=-
 fi
 export SIXSTARS_SIGN_IDENTITY
