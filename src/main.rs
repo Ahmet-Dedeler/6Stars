@@ -851,6 +851,8 @@ struct Rpf9App {
     export_busy: Arc<AtomicBool>,
     // the entry on screen is a psin file shown as xml
     psin_selected: bool,
+    // the entry that preview was decoded from; a ctrl-click moves `selected` without re-decoding
+    psin_entry: Option<RpfEntry>,
     export_cancel: Arc<AtomicBool>,
     mv_drawer_open: bool,
     mv_entries: Vec<(usize, ModelCat, String)>,
@@ -1061,6 +1063,7 @@ impl Rpf9App {
             mv_detail_job: None,
             export_busy: Arc::new(AtomicBool::new(false)),
             psin_selected: false,
+            psin_entry: None,
             export_cancel: Arc::new(AtomicBool::new(false)),
             mv_drawer_open: true,
             mv_entries: Vec::new(),
@@ -1286,6 +1289,7 @@ impl Rpf9App {
         self.tex_from_model = false;
         self.lod_keep_cam = None;
         self.psin_selected = false;
+        self.psin_entry = None;
         self.preview.clear();
         self.mesh3d = None;
         self.pedphys_view = None;
@@ -2526,6 +2530,7 @@ impl Rpf9App {
                             Ok(xml) => {
                                 self.preview = xml;
                                 self.psin_selected = true;
+                                self.psin_entry = Some(e.clone());
                             }
                             Err(_) => self.preview = psin::parse_psin(&data),
                         }
@@ -3909,7 +3914,7 @@ impl Rpf9App {
     }
 
     fn psin_export_xml(&self) {
-        let Some(e) = self.selected_entry() else { return };
+        let Some(e) = self.psin_entry.clone() else { return };
         let stem = safe_file_name(&e.name);
         let Some(out) = rfd::FileDialog::new().set_file_name(format!("{stem}.xml")).add_filter("XML", &["xml"]).save_file() else { return };
         let state = Arc::clone(&self.state);
@@ -3928,7 +3933,7 @@ impl Rpf9App {
 
     // patches a copy of the selected file with the values in the xml and saves it where the user picks
     fn psin_apply_xml(&self, xml: String) {
-        let Some(e) = self.selected_entry() else { return };
+        let Some(e) = self.psin_entry.clone() else { return };
         let res = read_entry_bytes(&e).map_err(|err| err.to_string()).and_then(|data| psin_xml::apply_xml(&data, &xml));
         let status = match res {
             Err(err) => format!("XML not applied: {err}"),
@@ -6576,7 +6581,10 @@ fn decode_audio_cli(rpf_path: &Path, out_dir: &Path, limit: usize) {
             pos += 16;
         }
         if limit > 0 && banks.len() >= limit { break; }
-        off += n.saturating_sub(64) as u64;
+        // the 64 byte overlap catches a header split across windows; a final short read
+        // has nothing after it, and not advancing would read it again forever
+        if n <= 64 { break; }
+        off += (n - 64) as u64;
         let _ = f.seek(SeekFrom::Start(off));
     }
     let mut total_wavs = 0usize;

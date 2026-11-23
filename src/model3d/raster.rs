@@ -732,6 +732,11 @@ fn rasterize(mesh: &mut Mesh3D, w: usize, h: usize, line_px: usize) {
                 draw_line_z(&mut color, &mut zbuf, w, h, p2, p0, wire_col, z_bias, line_px);
             }
         }
+        // explicit edges (OBJ `l` polylines) next to faces, depth tested against them
+        let col = Color32::from_rgb(72, 210, 255);
+        for &(a, b) in mesh.edges.iter().take(60_000) {
+            draw_line_z(&mut color, &mut zbuf, w, h, proj[a as usize], proj[b as usize], col, 0.0, line_px);
+        }
     } else if !mesh.edges.is_empty() {
         let col = Color32::from_rgb(72, 210, 255);
         for &(a, b) in mesh.edges.iter().take(60_000) {

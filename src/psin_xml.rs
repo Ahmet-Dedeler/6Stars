@@ -718,7 +718,7 @@ pub fn apply_xml(data: &[u8], xml: &str) -> Result<Applied, String> {
         let label = a.get("n").or(a.get("i")).cloned().unwrap_or_default();
         let pos = parse_int(o).and_then(|p| usize::try_from(p).ok()).ok_or_else(|| format!("{label}: bad offset {o}"))?;
         let bytes = encode(ty, v).map_err(|e| format!("{label} at {o}: {e}"))?;
-        if pos < lo || pos + bytes.len() > hi {
+        if pos < lo || pos.checked_add(bytes.len()).is_none_or(|end| end > hi) {
             return Err(format!("{label}: offset {o} is outside the data"));
         }
         if out[pos..pos + bytes.len()] != bytes[..] {

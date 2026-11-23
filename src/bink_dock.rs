@@ -31,7 +31,8 @@ pub fn player_path() -> Option<PathBuf> {
     {
         // never the working directory: it may be an untrusted dump folder with a planted exe
         if let Some(path) = std::env::var_os("PATH") {
-            dirs.extend(std::env::split_paths(&path));
+            // a relative PATH entry such as "." is the working directory again
+            dirs.extend(std::env::split_paths(&path).filter(|d| d.is_absolute()));
         }
         for key in ["ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA", "USERPROFILE"] {
             if let Some(base) = std::env::var_os(key) {
