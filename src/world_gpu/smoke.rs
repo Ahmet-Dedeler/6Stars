@@ -34,11 +34,7 @@ fn model() -> WorldBatchInput {
         .into_iter()
         .map(|c| {
             let mut material = crate::model3d::GeomMaterial::default();
-            material.texture = Some(Arc::new(Texture2D {
-                w: 1,
-                h: 1,
-                pixels: vec![eframe::egui::Color32::from_rgb(c[0], c[1], c[2])],
-            }));
+            material.texture = Some(Arc::new(Texture2D::new(1, 1, vec![eframe::egui::Color32::from_rgb(c[0], c[1], c[2])])));
             material
         })
         .collect();

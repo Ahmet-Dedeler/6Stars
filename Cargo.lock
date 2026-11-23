@@ -469,7 +469,7 @@ dependencies = [
 [[package]]
 name = "bink2"
 version = "0.1.0"
-source = "git+https://github.com/codingkoala/bink2-decoder?rev=277c4702b5ee5731bd3fd2af4f3cec631124b930#277c4702b5ee5731bd3fd2af4f3cec631124b930"
+source = "git+https://github.com/Ahmet-Dedeler/bink2-decoder?rev=e365f099acea6304ab32dabf221e720bfcc6ee65#e365f099acea6304ab32dabf221e720bfcc6ee65"
 
 [[package]]
 name = "bit-set"
@@ -2687,7 +2687,7 @@ dependencies = [
 
 [[package]]
 name = "rpf9_explorer"
-version = "1.12.0"
+version = "1.13.0"
 dependencies = [
  "bcpack-rs",
  "bink2",

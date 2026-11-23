@@ -119,6 +119,8 @@ fn decode(job: &Job) -> Result<(ColorImage, bool), String> {
         }
         _ => return Err("not a texture".into()),
     };
+    // decoded pixels are straight alpha; egui (and the box filter below) want premultiplied
+    let px = crate::tex::premultiplied_for_egui(&px);
     Ok((shrink(&px, w, h, job.max), reduced))
 }
 

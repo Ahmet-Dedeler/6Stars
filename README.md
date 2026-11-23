@@ -19,7 +19,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Rust-1.85%2B-orange?style=flat-square&logo=rust" alt="Rust" />
+  <img src="https://img.shields.io/badge/Rust-1.89%2B-orange?style=flat-square&logo=rust" alt="Rust" />
   <img src="https://img.shields.io/badge/Shaders-RDNA2%20GFX10.3%20%E2%86%92%20HLSL%20%2F%20SPIR--V-FF4FA3?style=flat-square" alt="Shaders" />
   <img src="https://img.shields.io/badge/Textures-DXGI%20%2B%20RDNA2%204KB%2F64KB-48D2FF?style=flat-square" alt="Textures" />
   <img src="https://img.shields.io/badge/3D-Model%20Viewer%20(11%20Categories)-FF55AF?style=flat-square" alt="3D" />
@@ -142,6 +142,10 @@ The demos are recorded from the real app, offscreen, by [`src/demo_capture.rs`](
 - **Vehicle builds and emergency lights** (upstream, by [clayeon](https://github.com/clayeon)): vehicles list the configurations the game ships for them, and choosing one adds its bumpers, light bars, liveries and other parts to the base model. **Advanced / Manual Parts** lets you tick single parts. Emergency vehicles get an **ELS** toggle that lights their siren emitters, with a **Flash** option that follows the game's own siren patterns.
 - **Texture layers and Texture Browser** (upstream, by [asm512](https://github.com/asm512)): the 3D view can apply a model's normal maps and dirt/dust overlays on top of its colour textures, each one switchable, and **Texture Browser** opens every texture a model uses as flat images with **Export All PNG**.
 - **Explorer multi-select** (upstream): Ctrl/Shift-click or drag a box to select several rows, then copy their names or export them together.
+- **Smooth model renderer and richer exports** (upstream 1.5, by [Pokeralho](https://github.com/Pokeralho)): the 3D view is smooth-shaded, texture-filtered and anti-aliased, with a **Smooth** toggle. **Export .OBJ** writes normals, a `.mtl` and the textures as PNG, and **Export .GLB** writes binary glTF with embedded textures. Our hair and cloth strands draw on the same renderer.
+- **Vehicle data panel, PSIN as XML, hashed-name recovery** (upstream 1.5.2): vehicles show their handling and metadata next to the model, `PSIN` files open as typed XML you can edit in place, and **Names** resolves hashed field names from the words found in the archives (extra word lists go in the `names` folder of the app's data directory).
+- **Faster scanning, search and textures** (upstream 1.5.0): archive scanning, the scan cache, search and BC texture decoding use every CPU core. `Percy6Stars --bench "<game folder>"` times them on your machine.
+- **World view fixes** (upstream 1.4.8, with [asm512](https://github.com/asm512)): corrected entity rotations, nearest-first streaming on a 200 m grid, capped world textures, a Water toggle, and background **Export All** with Cancel.
 - **Animation, PSO and resource decoders** (upstream): `crClipDictionary` animations with clip length, bone/track counts and a stickman preview, the binary `PSIN` PSO schema/instance decoder, `RSC9` tables and `phBound` boxes, cutscene `.cutc` cast/track names, and `DAT` audio metadata. They're listed under **Anim / PSO / RSC9**.
 - **SGD5 / DXBC shaders** (upstream): the Shaders tab can switch between the PS09 cache and SGD5 groups, and lifts their FSSM code through the same GFX10.3 path.
 - **AWC player:** waveform and loudness bars, auto-advance, loop, search and keyboard controls (upstream), playing through `afplay` on macOS, `waveOut` on Windows, and `pw-play` / `paplay` / `aplay` on Linux. Banks whose stream table carries multichannel music still decode per channel.
@@ -167,7 +171,7 @@ The demos are recorded from the real app, offscreen, by [`src/demo_capture.rs`](
 - **No runtime dependencies for audio, 3D, textures, UI, XML or PSO**
   - No Python, FFmpeg or external DLLs. `ADAT` (`.awc`) Opus streams decode with pure-Rust `rusty-opus` (RFC 6716). All crates are pinned in [`Cargo.lock`](Cargo.lock).
 - **Folder and single-archive scanning (`.rpf` and `.ttpf`)**
-  - Multi-threaded scanning, cached to `scan_cache_v10.tsv` in `%LOCALAPPDATA%\Percy6Stars` (Windows) or `~/Library/Application Support/Percy6Stars` (macOS). An existing PercyStar folder is moved over on first launch.
+  - Multi-threaded scanning, cached to `scan_cache_v11.tsv` in `%LOCALAPPDATA%\Percy6Stars` (Windows) or `~/Library/Application Support/Percy6Stars` (macOS). An existing PercyStar folder is moved over on first launch.
 - **In-app Bink 2 playback**
   - The Apple Silicon build includes the decoder and frame bridge. Windows docks RAD's native player for pause and seeking. The Windows loop toggle applies when you next open a video. Linux decodes video and Bink Audio itself with the Apache-2.0 `bink2` crate.
 - **CLI batch exporters (models, textures, RDNA2 shaders)**

@@ -45,6 +45,7 @@ pub struct DecodedTexture {
     pub mips: u8,
     pub dxgi: u8,
     pub fmt_name: &'static str,
+    // straight non premultiplied rgba kept raw see premultiplied_for_egui
     pub pixels: Vec<Color32>,
     pub raw_dds_payload: Vec<u8>,
     /// Full mip-0 size when only a smaller mip could be decoded (TTPF lower-mip fallback).
@@ -297,14 +298,173 @@ fn tonemap_u8(v: f32) -> u8 {
     (m.powf(1.0 / 2.2) * 255.0).clamp(0.0, 255.0) as u8
 }
 
+// stores straight rgba bytes untouched color32 constructors that take unmultiplied input would premultiply
+#[inline]
+fn straight(r: u8, g: u8, b: u8, a: u8) -> Color32 {
+    Color32::from_rgba_premultiplied(r, g, b, a)
+}
+
+// egui wants premultiplied texels decoded textures are straight
+pub fn premultiplied_for_egui(pixels: &[Color32]) -> Vec<Color32> {
+    pixels
+        .iter()
+        .map(|c| {
+            let [r, g, b, a] = c.to_array();
+            if a == 255 { *c } else { Color32::from_rgba_unmultiplied(r, g, b, a) }
+        })
+        .collect()
+}
+
+// splits a 4x4 block image into bands of whole block rows and decodes the bands on all cores
+// decode gets the band's blocks, the band height in pixels and the band's slice of the output
+fn par_block_rows<T: Send>(
+    lin: &[u8],
+    w: usize,
+    h: usize,
+    block_bytes: usize,
+    out: &mut [T],
+    decode: impl Fn(&[u8], usize, &mut [T]) -> Option<()> + Sync,
+) -> Option<()> {
+    let (bw, bh) = (w.div_ceil(4), h.div_ceil(4));
+    let need = bw.checked_mul(bh)?.checked_mul(block_bytes)?;
+    if w == 0 || lin.len() < need || out.len() < w * h {
+        return None;
+    }
+    let (lin, out) = (&lin[..need], &mut out[..w * h]);
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    // small images are not worth a thread
+    let rows = bh.div_ceil(cores).max(32);
+    if rows >= bh {
+        return decode(lin, h, out);
+    }
+    let decode = &decode;
+    std::thread::scope(|s| {
+        let bands: Vec<_> = lin
+            .chunks(rows * bw * block_bytes)
+            .zip(out.chunks_mut(rows * 4 * w))
+            .map(|(d, o)| s.spawn(move || decode(d, o.len() / w, o)))
+            .collect();
+        // join every band before answering so none outlives the borrow
+        bands.into_iter().map(|b| b.join().ok().flatten()).fold(Some(()), |a, b| a.and(b))
+    })
+}
+
+// walks 4x4 blocks row major put writes texel 0 to 15 of the current block cropping at the texture edge
+fn for_each_block(
+    lin: &[u8],
+    w: usize,
+    h: usize,
+    block_bytes: usize,
+    decode: impl Fn(&[u8], &mut dyn FnMut(usize, Color32)) + Sync,
+    pixels: &mut [Color32],
+) -> Option<()> {
+    par_block_rows(lin, w, h, block_bytes, pixels, |lin, h, pixels| {
+        let bw = w.div_ceil(4);
+        for (bi, blk) in lin.chunks_exact(block_bytes).enumerate() {
+            let (bx, by) = ((bi % bw) * 4, (bi / bw) * 4);
+            decode(blk, &mut |i, c| {
+                let (x, y) = (bx + (i & 3), by + (i >> 2));
+                if x < w && y < h {
+                    pixels[y * w + x] = c;
+                }
+            });
+        }
+        Some(())
+    })
+}
+
+// color block of bc2 and bc3 always four colors bc1 switches to three colors plus black when c0 <= c1
+fn color_block4(blk: &[u8]) -> [[u8; 3]; 16] {
+    let expand = |q: u16| {
+        let (r, g, b) = ((q >> 11) & 31, (q >> 5) & 63, q & 31);
+        [((r << 3) | (r >> 2)) as u16, ((g << 2) | (g >> 4)) as u16, ((b << 3) | (b >> 2)) as u16]
+    };
+    let (c0, c1) = (expand(u16::from_le_bytes([blk[0], blk[1]])), expand(u16::from_le_bytes([blk[2], blk[3]])));
+    let pal: [[u8; 3]; 4] = [
+        c0.map(|v| v as u8),
+        c1.map(|v| v as u8),
+        std::array::from_fn(|k| ((c0[k] * 2 + c1[k]) / 3) as u8),
+        std::array::from_fn(|k| ((c0[k] + c1[k] * 2) / 3) as u8),
+    ];
+    let idx = u32::from_le_bytes([blk[4], blk[5], blk[6], blk[7]]);
+    std::array::from_fn(|i| pal[((idx >> (2 * i)) & 3) as usize])
+}
+
+// single channel block of bc3 alpha bc4 and bc5 as bytes signed blocks map minus one to 0 and plus one to 255
+fn channel_block(blk: &[u8], signed: bool) -> [u8; 16] {
+    let mut pal = [0u8; 8];
+    if signed {
+        // snorm endpoints compare signed and minus 128 means minus 127
+        let (e0, e1) = ((blk[0] as i8).max(-127), (blk[1] as i8).max(-127));
+        let (f0, f1) = (e0 as f32 / 127.0, e1 as f32 / 127.0);
+        let mut v = [f0, f1, 0.0, 0.0, 0.0, 0.0, -1.0, 1.0];
+        let steps = if e0 > e1 { 7 } else { 5 };
+        for i in 1..steps {
+            v[i + 1] = (f0 * (steps - i) as f32 + f1 * i as f32) / steps as f32;
+        }
+        pal = v.map(|f| ((f * 0.5 + 0.5) * 255.0 + 0.5) as u8);
+    } else {
+        let (e0, e1) = (blk[0] as u16, blk[1] as u16);
+        pal[0] = blk[0];
+        pal[1] = blk[1];
+        let steps = if e0 > e1 { 7 } else { 5 };
+        for i in 1..steps {
+            pal[i as usize + 1] = ((e0 * (steps - i) + e1 * i) / steps) as u8;
+        }
+        if steps == 5 {
+            pal[6] = 0;
+            pal[7] = 255;
+        }
+    }
+    let bits = u64::from_le_bytes(blk[..8].try_into().unwrap()) >> 16;
+    std::array::from_fn(|i| pal[((bits >> (3 * i)) & 7) as usize])
+}
+
+// decodes to straight non premultiplied srgb rgba stored raw in the color32 container
+// see premultiplied_for_egui before handing the result to egui
 pub fn decode_linear_to_rgba(lin: &[u8], w: usize, h: usize, dxgi: u8) -> Option<Vec<Color32>> {
-    if matches!(dxgi, 71 | 72 | 77 | 78 | 80 | 81 | 83 | 84 | 95 | 96 | 98 | 99) {
+    if matches!(dxgi, 74 | 75 | 77 | 78) {
+        // bc2 explicit 4 bit alpha bc3 interpolated alpha both followed by a four color block
+        let mut pixels = vec![Color32::TRANSPARENT; w * h];
+        for_each_block(lin, w, h, 16, |blk, put| {
+            let rgb = color_block4(&blk[8..16]);
+            let alpha = if dxgi <= 75 {
+                let bits = u64::from_le_bytes(blk[..8].try_into().unwrap());
+                std::array::from_fn(|i| ((bits >> (4 * i)) & 0xF) as u8 * 17)
+            } else {
+                channel_block(&blk[..8], false)
+            };
+            for i in 0..16 {
+                put(i, straight(rgb[i][0], rgb[i][1], rgb[i][2], alpha[i]));
+            }
+        }, &mut pixels)?;
+        return Some(pixels);
+    }
+    if matches!(dxgi, 80 | 81 | 83 | 84) {
+        // one or two channel blocks signed formats keep the unorm byte layout the callers expect
+        let (signed, two) = (matches!(dxgi, 81 | 84), dxgi >= 83);
+        let mut pixels = vec![Color32::BLACK; w * h];
+        for_each_block(lin, w, h, if two { 16 } else { 8 }, |blk, put| {
+            let r = channel_block(&blk[..8], signed);
+            if !two {
+                for i in 0..16 {
+                    put(i, Color32::from_gray(r[i]));
+                }
+                return;
+            }
+            let g = channel_block(&blk[8..16], signed);
+            for i in 0..16 {
+                let (nx, ny) = (r[i] as f32 / 127.5 - 1.0, g[i] as f32 / 127.5 - 1.0);
+                let nz = (1.0 - nx * nx - ny * ny).max(0.0).sqrt();
+                put(i, Color32::from_rgb(r[i], g[i], ((nz * 0.5 + 0.5) * 255.0 + 0.5) as u8));
+            }
+        }, &mut pixels)?;
+        return Some(pixels);
+    }
+    if matches!(dxgi, 71 | 72 | 95 | 96 | 98 | 99) {
         let mut out_u32 = vec![0u32; w * h];
         let res = match dxgi {
-            71 | 72 => texture2ddecoder::decode_bc1a(lin, w, h, &mut out_u32),
-            77 | 78 => texture2ddecoder::decode_bc3(lin, w, h, &mut out_u32),
-            80 | 81 => texture2ddecoder::decode_bc4(lin, w, h, &mut out_u32),
-            83 | 84 => texture2ddecoder::decode_bc5(lin, w, h, &mut out_u32),
+            71 | 72 => par_block_rows(lin, w, h, 8, &mut out_u32, |d, bh, o| texture2ddecoder::decode_bc1a(d, w, bh, o).ok()),
             95 | 96 => {
                 // Work around texture2ddecoder 0.1.2 bug: BC6H mode 15 (0x0F, endpoint_bits=16)
                 // overflows `1i16 << 16` in debug builds. Convert mode-15 blocks to mode-3 (0x03)
@@ -315,73 +475,26 @@ pub fn decode_linear_to_rgba(lin: &[u8], w: usize, h: usize, dxgi: u8) -> Option
                         blk[0] = (blk[0] & !0x1F) | 0x03;
                     }
                 }
-                if dxgi == 95 {
-                    texture2ddecoder::decode_bc6_unsigned(&safe, w, h, &mut out_u32)
-                } else {
-                    texture2ddecoder::decode_bc6_signed(&safe, w, h, &mut out_u32)
-                }
+                par_block_rows(&safe, w, h, 16, &mut out_u32, |d, bh, o| {
+                    if dxgi == 95 {
+                        texture2ddecoder::decode_bc6_unsigned(d, w, bh, o).ok()
+                    } else {
+                        texture2ddecoder::decode_bc6_signed(d, w, bh, o).ok()
+                    }
+                })
             }
-            98 | 99 => texture2ddecoder::decode_bc7(lin, w, h, &mut out_u32),
+            98 | 99 => par_block_rows(lin, w, h, 16, &mut out_u32, |d, bh, o| texture2ddecoder::decode_bc7(d, w, bh, o).ok()),
             _ => unreachable!(),
         };
-        res.ok()?;
+        res?;
         let mut pixels = Vec::with_capacity(w * h);
-        if matches!(dxgi, 80 | 81 | 83 | 84) {
-            for px in out_u32 {
-                let r = ((px >> 16) & 0xFF) as u8;
-                let g = ((px >> 8) & 0xFF) as u8;
-                pixels.push(if dxgi <= 81 {
-                    Color32::from_gray(r)
-                } else {
-                    let (nx, ny) = (r as f32 / 127.5 - 1.0, g as f32 / 127.5 - 1.0);
-                    let nz = (1.0 - nx * nx - ny * ny).max(0.0).sqrt();
-                    Color32::from_rgb(r, g, ((nz * 0.5 + 0.5) * 255.0) as u8)
-                });
-            }
-            return Some(pixels);
-        }
         for px in out_u32 {
             // texture2ddecoder packs u32 as 0xAARRGGBB (BGRA little-endian)
             let b = (px & 0xFF) as u8;
             let g = ((px >> 8) & 0xFF) as u8;
             let r = ((px >> 16) & 0xFF) as u8;
             let a = ((px >> 24) & 0xFF) as u8;
-            pixels.push(Color32::from_rgba_unmultiplied(r, g, b, a));
-        }
-        return Some(pixels);
-    }
-    if matches!(dxgi, 74 | 75) {
-        // BC2 = 8-byte 4-bit explicit alpha + 8-byte BC1 color per 4x4 block
-        let bw = w.div_ceil(4);
-        let bh = h.div_ceil(4);
-        if lin.len() < bw * bh * 16 { return None; }
-        let mut bc1_only = Vec::with_capacity(bw * bh * 8);
-        for b in 0..bw * bh {
-            bc1_only.extend_from_slice(&lin[b * 16 + 8..b * 16 + 16]);
-        }
-        let mut out_u32 = vec![0u32; w * h];
-        texture2ddecoder::decode_bc1(&bc1_only, w, h, &mut out_u32).ok()?;
-        let mut pixels = vec![Color32::TRANSPARENT; w * h];
-        for by in 0..bh {
-            for bx in 0..bw {
-                let abits = ru64(lin, (by * bw + bx) * 16);
-                for py in 0..4 {
-                    let y = by * 4 + py;
-                    if y >= h { continue; }
-                    for px in 0..4 {
-                        let x = bx * 4 + px;
-                        if x >= w { continue; }
-                        let c = out_u32[y * w + x];
-                        let a4 = ((abits >> (4 * (py * 4 + px))) & 0xF) as u8;
-                        pixels[y * w + x] = Color32::from_rgba_unmultiplied(
-                            ((c >> 16) & 0xFF) as u8,
-                            ((c >> 8) & 0xFF) as u8,
-                            (c & 0xFF) as u8,
-                            a4 | (a4 << 4),
-                        );
-                    }
-                }
-            }
+            pixels.push(straight(r, g, b, a));
         }
         return Some(pixels);
     }
@@ -393,14 +506,14 @@ pub fn decode_linear_to_rgba(lin: &[u8], w: usize, h: usize, dxgi: u8) -> Option
                 let r = tonemap_u8(f16_to_f32(ru16(px, 0)));
                 let g = tonemap_u8(f16_to_f32(ru16(px, 2)));
                 let b = tonemap_u8(f16_to_f32(ru16(px, 4)));
-                let _a = (f16_to_f32(ru16(px, 6)).clamp(0.0, 1.0) * 255.0) as u8;
-                pixels.push(Color32::from_rgba_unmultiplied(r, g, b, 255));
+                // the alpha of this float format is not coverage upstream forces it opaque
+                pixels.push(straight(r, g, b, 255));
             }
         }
         11 => {
             if lin.len() < w * h * 8 { return None; }
             for px in lin[..w * h * 8].as_chunks::<8>().0 {
-                pixels.push(Color32::from_rgba_unmultiplied(px[1], px[3], px[5], px[7]));
+                pixels.push(straight(px[1], px[3], px[5], px[7]));
             }
         }
         24 => {
@@ -411,13 +524,13 @@ pub fn decode_linear_to_rgba(lin: &[u8], w: usize, h: usize, dxgi: u8) -> Option
                 let g = (((v >> 10) & 0x3FF) >> 2) as u8;
                 let b = (((v >> 20) & 0x3FF) >> 2) as u8;
                 let a = (((v >> 30) & 3) * 85) as u8;
-                pixels.push(Color32::from_rgba_unmultiplied(r, g, b, a));
+                pixels.push(straight(r, g, b, a));
             }
         }
         28 | 29 => {
             if lin.len() < w * h * 4 { return None; }
             for px in lin[..w * h * 4].as_chunks::<4>().0 {
-                pixels.push(Color32::from_rgba_unmultiplied(px[0], px[1], px[2], px[3]));
+                pixels.push(straight(px[0], px[1], px[2], px[3]));
             }
         }
         34 => {
@@ -438,7 +551,7 @@ pub fn decode_linear_to_rgba(lin: &[u8], w: usize, h: usize, dxgi: u8) -> Option
         87 | 91 => {
             if lin.len() < w * h * 4 { return None; }
             for px in lin[..w * h * 4].as_chunks::<4>().0 {
-                pixels.push(Color32::from_rgba_unmultiplied(px[2], px[1], px[0], px[3]));
+                pixels.push(straight(px[2], px[1], px[0], px[3]));
             }
         }
         49 => {
@@ -506,12 +619,16 @@ pub fn build_dds_dx10(w: usize, h: usize, dxgi: u8, lin: &[u8]) -> Vec<u8> {
 
 pub fn export_texture_png(tex: &DecodedTexture, path: &Path) -> Result<(), String> {
     let mut rgba = Vec::with_capacity(tex.w * tex.h * 4);
+    // pixels are already straight
     for c in &tex.pixels {
-        rgba.extend_from_slice(&c.to_srgba_unmultiplied());
+        rgba.extend_from_slice(&c.to_array());
     }
     image::save_buffer(path, &rgba, tex.w as u32, tex.h as u32, image::ColorType::Rgba8)
         .map_err(|e| format!("PNG save error: {e}"))
 }
+
+// decoded pixels one texture dictionary may produce
+const MAX_TXD_PIXELS: usize = 1 << 28;
 
 /// Extract ALL textures from a pgDictionary<grcTexture> inside virtual `v` + physical `p`.
 pub fn extract_txd_textures(v: &[u8], p: &[u8], dict_off: usize) -> Vec<DecodedTexture> {
@@ -572,6 +689,7 @@ fn extract_txd_textures_impl(v: &[u8], p: &[u8], dict_off: usize, thumbnail: boo
         raw_list.sort_by_key(|t| std::cmp::Reverse(t.3 * t.4));
     }
     let mut out = Vec::new();
+    let mut decoded_px = 0usize;
     for (poff, tp, name, w, h, dxgi, swiz, mips) in raw_list {
         if thumbnail && w * h > THUMBNAIL_PIXELS { continue; }
         let Some((fmt_name, is_bc, bpe)) = dxgi_info(dxgi) else { continue };
@@ -584,11 +702,16 @@ fn extract_txd_textures_impl(v: &[u8], p: &[u8], dict_off: usize, thumbnail: boo
             poff
         };
         if mip0_off >= p.len() { continue; }
+        // many entries may point at the same data stop before a crafted dictionary exhausts memory
+        decoded_px = decoded_px.saturating_add(w.saturating_mul(h));
+        if decoded_px > MAX_TXD_PIXELS { break; }
         let slice_end = (mip0_off + mip0_sz).min(p.len());
         let lin = if swiz == 0 {
             let ew = if is_bc { w.div_ceil(4) } else { w }.max(1);
             let eh = if is_bc { h.div_ceil(4) } else { h }.max(1);
             let need = ew * eh * bpe;
+            // an entry with no pixel data behind it would decode to a blank image
+            if p.len() - mip0_off < need.min(bpe * 16) { continue; }
             let mut b = vec![0u8; need];
             let n = (p.len() - mip0_off).min(need);
             b[..n].copy_from_slice(&p[mip0_off..mip0_off + n]);
@@ -621,10 +744,10 @@ pub fn to_model_tex(t: DecodedTexture) -> Texture2D {
     if t.dxgi == 65 {
         // The texture browser shows A8 as grayscale; models use it as opacity.
         for c in &mut pixels {
-            *c = Color32::from_white_alpha(c.r());
+            *c = straight(255, 255, 255, c.r());
         }
     }
-    Texture2D { w: t.w, h: t.h, pixels }
+    Texture2D::new(t.w, t.h, pixels)
 }
 
 /// Read RAGE9 resource virtual + physical buffers from RPF at `file_off` and decode all TXD textures.
@@ -759,7 +882,7 @@ pub fn probe_txd_header(c0: &[u8]) -> Option<(String, usize)> {
     let mut first_nm = format!("txd_{i_cnt}tex");
     if let Some(mut no) = vptr(ru64(c0, tp + 0x30)) {
         if no + 8 < c0.len() && c0[no..no + 8] == [0u8; 8] { no += 8; }
-        if let Some(rel) = c0[no..].iter().position(|&b| b == 0) {
+        if let Some(rel) = c0.get(no..).and_then(|t| t.iter().position(|&b| b == 0)) {
             if (2..96).contains(&rel) {
                 let s = String::from_utf8_lossy(&c0[no..no + rel]).into_owned();
                 if s.chars().all(|c| c.is_ascii_graphic()) {
@@ -889,6 +1012,7 @@ pub fn ttpf_index(path: &Path) -> Result<std::sync::Arc<TtpfIndex>, String> {
     f.read_exact(&mut hdr).map_err(|e| e.to_string())?;
     let n_chunks = ru32(&hdr, 4) as usize;
     let etpf_off = ru32(&hdr, 16) as u64 * 0x100;
+    let file_len = signature.0;
     if n_chunks > 1_000_000 || n_chunks as u64 * 8 + 24 > signature.0 {
         return Err("Invalid RDS5 chunk table size".into());
     }
@@ -904,7 +1028,8 @@ pub fn ttpf_index(path: &Path) -> Result<std::sync::Arc<TtpfIndex>, String> {
         let next_codec = ((lo >> 26) & 0xF) as u8;
         let r = (lo >> 30) as u64;
         let vend = (hi & 0x000F_FFFF) as u64 * 0x4000 + r * 0x1000;
-        if cend > prev_c && vend > vstart {
+        // a chunk that ends past the file cannot be read and would only size a huge buffer
+        if cend > prev_c && vend > vstart && cend <= file_len {
             chunks.push((prev_c, cend, vstart, vend - vstart, cur_codec));
             vstart = vend;
         }
@@ -997,10 +1122,36 @@ fn ttpf_chunk(path: &Path, file: &mut File, signature: ArchiveSignature, (cs, ce
     Ok(data)
 }
 
+// 16384 square at 16 bytes per texel
+const MAX_TEXTURE_BYTES: usize = 1 << 32;
+
+thread_local! {
+    // The archive this thread read last, kept open between reads. Decoded chunks are shared
+    // across threads in TTPF_CHUNKS above (upstream keeps a small per-thread chunk cache instead).
+    static LAST_TTPF_FILE: std::cell::RefCell<Option<(std::path::PathBuf, File)>> = const { std::cell::RefCell::new(None) };
+    // largest texture edge model decodes on this thread ask for, zero keeps full size
+    static TEX_DIM_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// makes model decodes on the calling thread load textures no larger than cap pixels per edge
+pub fn set_thread_texture_cap(cap: usize) {
+    TEX_DIM_CAP.with(|c| c.set(cap));
+}
+
 /// Read `len` bytes of the RDS5 virtual stream starting at `off`, inflating only overlapping chunks.
 pub fn ttpf_read_virtual(path: &Path, ix: &TtpfIndex, off: u64, len: usize) -> Result<Vec<u8>, String> {
-    let end = off + len as u64;
-    let mut f = File::open(path).map_err(|e| e.to_string())?;
+    let end = off.checked_add(len as u64).ok_or("Texture range overflows")?;
+    // nothing to read when the range starts past the stream and no texture is larger than this
+    let stream_end = ix.chunks.last().map_or(0, |c| c.2 + c.3);
+    if off >= stream_end || len > MAX_TEXTURE_BYTES {
+        return Err("Texture data lies outside the RDS5 stream".into());
+    }
+    // Reuse this thread's handle to the archive (idea from upstream v1.4.8): the world streamer
+    // and the gallery read many textures of one archive in a row.
+    let mut f = match LAST_TTPF_FILE.with(|slot| slot.borrow_mut().take()) {
+        Some((p, f)) if p.as_path() == path => f,
+        _ => File::open(path).map_err(|e| e.to_string())?,
+    };
     if archive_signature(&f)? != ix.signature {
         return Err("TTPF archive changed since it was indexed".into());
     }
@@ -1017,6 +1168,7 @@ pub fn ttpf_read_virtual(path: &Path, ix: &TtpfIndex, off: u64, len: usize) -> R
             covered += (s1 - s0) as usize;
         }
     }
+    LAST_TTPF_FILE.with(|slot| *slot.borrow_mut() = Some((path.to_path_buf(), f)));
     if covered == 0 {
         return Err("Texture data not found in zlib chunks (likely BCPack)".into());
     }
@@ -1267,6 +1419,52 @@ pub fn decode_ttpf_texture(path: &Path, tex_idx: usize) -> Result<DecodedTexture
 
 pub fn decode_ttpf_thumbnail(path: &Path, tex_idx: usize) -> Result<DecodedTexture, String> {
     decode_ttpf_with_budget(path, tex_idx, THUMBNAIL_PIXELS)
+}
+
+/// Like `decode_ttpf_texture`, but no edge exceeds `cap` pixels when `cap` is not zero (the
+/// world streamer asks for 128). Upstream v1.4.8 added this API with its own mip walk; here it
+/// sits on our mip layout: a stored mip that fits is read directly, and anything still too
+/// large (no usable mip, uncompressed formats) is decoded in full and box-filtered down.
+/// A shrunk result has no `raw_dds_payload`, since the payload no longer matches the pixels.
+pub fn decode_ttpf_texture_capped(path: &Path, tex_idx: usize, cap: usize) -> Result<DecodedTexture, String> {
+    if cap == 0 {
+        return decode_ttpf_texture(path, tex_idx);
+    }
+    let mut t = decode_ttpf_with_budget(path, tex_idx, cap.saturating_mul(cap))
+        .or_else(|_| decode_ttpf_texture(path, tex_idx))?;
+    if t.w.max(t.h) > cap && t.pixels.len() >= t.w * t.h {
+        let full = t.full_size.unwrap_or((t.w, t.h));
+        let step = t.w.max(t.h).div_ceil(cap);
+        let (nw, nh) = ((t.w / step).max(1), (t.h / step).max(1));
+        let mut shrunk = Vec::with_capacity(nw * nh);
+        for y in 0..nh {
+            for x in 0..nw {
+                // Average of the covered block. Texels are straight alpha, so colour is weighted
+                // by alpha: otherwise the colour stored under transparent texels bleeds into
+                // the edges of cutouts (upstream averages the channels unweighted).
+                let (mut sum, mut asum, mut n) = ([0u32; 3], 0u32, 0u32);
+                for yy in (y * step)..((y + 1) * step).min(t.h) {
+                    for xx in (x * step)..((x + 1) * step).min(t.w) {
+                        let [r, g, b, a] = t.pixels[yy * t.w + xx].to_array();
+                        let a = a as u32;
+                        sum[0] += r as u32 * a;
+                        sum[1] += g as u32 * a;
+                        sum[2] += b as u32 * a;
+                        asum += a;
+                        n += 1;
+                    }
+                }
+                let c = |v: u32| if asum == 0 { 0 } else { ((v + asum / 2) / asum) as u8 };
+                shrunk.push(straight(c(sum[0]), c(sum[1]), c(sum[2]), (asum / n.max(1)) as u8));
+            }
+        }
+        t.pixels = shrunk;
+        t.w = nw;
+        t.h = nh;
+        t.full_size = Some(full);
+        t.raw_dds_payload = Vec::new();
+    }
+    Ok(t)
 }
 
 fn decode_ttpf_with_budget(path: &Path, tex_idx: usize, max_pixels: usize) -> Result<DecodedTexture, String> {
@@ -1630,7 +1828,8 @@ impl TtpfHashHit {
 
     #[inline]
     pub fn is_normal_format(&self) -> bool {
-        matches!(self.dxgi, 80 | 81 | 83 | 84)
+        // bc5 only single channel bc4 holds masks and heights
+        matches!(self.dxgi, 83 | 84)
     }
 }
 
@@ -1639,8 +1838,10 @@ type TtpfHashIndex = std::sync::Arc<HashMap<u64, TtpfHashHit>>;
 static TTPF_HASH_INDEX: std::sync::OnceLock<std::sync::Mutex<HashMap<std::path::PathBuf, TtpfHashIndex>>> =
     std::sync::OnceLock::new();
 
-/// Cache by archive and descriptor, since different dumps can contain the same hashes.
-type TtpfTexCache = HashMap<(std::path::PathBuf, usize), Option<std::sync::Arc<Texture2D>>>;
+/// Decoded external textures. Keyed by archive and descriptor (different dumps can contain the
+/// same hashes) plus the size cap they were decoded with; emptied once it holds too many bytes.
+const TTPF_TEX_CACHE_BYTES: usize = 1 << 30;
+type TtpfTexCache = (HashMap<(std::path::PathBuf, usize, usize), Option<std::sync::Arc<Texture2D>>>, usize);
 static TTPF_TEX_CACHE: std::sync::OnceLock<std::sync::Mutex<TtpfTexCache>> = std::sync::OnceLock::new();
 
 fn collect_ttpf_files(dir: &Path, depth: usize, out: &mut Vec<std::path::PathBuf>) {
@@ -1764,24 +1965,31 @@ pub fn ttpf_hash_index_for_rpf(rpf_path: &Path) -> Option<std::sync::Arc<HashMap
 
 pub fn decode_ttpf_texture_cached(hit: &TtpfHashHit) -> Option<std::sync::Arc<Texture2D>> {
     let cache = TTPF_TEX_CACHE.get_or_init(Default::default);
-    let key = (hit.path.clone(), hit.tex_idx);
-    if let Some(entry) = cache.lock().unwrap().get(&key) {
+    let cap = TEX_DIM_CAP.with(|c| c.get());
+    let key = (hit.path.clone(), hit.tex_idx, cap);
+    if let Some(entry) = cache.lock().unwrap().0.get(&key) {
         return entry.clone();
     }
-    let decoded = decode_ttpf_texture(&hit.path, hit.tex_idx)
+    let decoded = decode_ttpf_texture_capped(&hit.path, hit.tex_idx, cap)
         .ok()
         .map(|t| std::sync::Arc::new(to_model_tex(t)));
+    let bytes = decoded.as_ref().map_or(0, |t| t.pixels.len() * 4);
     let mut g = cache.lock().unwrap();
-    if g.len() > 512 {
-        g.clear();
+    if g.1 + bytes > TTPF_TEX_CACHE_BYTES || g.0.len() > 8192 {
+        g.0.clear();
+        g.1 = 0;
     }
-    g.insert(key, decoded.clone());
+    if g.0.insert(key, decoded.clone()).is_none() {
+        g.1 += bytes;
+    }
     decoded
 }
 
 // =============================================================================
 // RBF0 (fwui UIObject) -> Readable XML Decoder
 // =============================================================================
+
+const RBF0_MAX_DEPTH: usize = 256;
 
 pub fn decode_rbf0(data: &[u8]) -> Option<String> {
     if data.len() < 8 || &data[..4] != b"RBF0" { return None; }
@@ -1857,6 +2065,8 @@ pub fn decode_rbf0(data: &[u8]) -> Option<String> {
             0x00 => {
                 if pos + 6 > n { break; }
                 pos += 6;
+                // closing re-indents every child so runaway nesting costs quadratic time and memory
+                if stack.len() >= RBF0_MAX_DEPTH { return None; }
                 stack.push((name, Vec::new(), Vec::new()));
             }
             0x10 => {
@@ -2057,11 +2267,13 @@ pub fn decode_navmesh_from_rpf(rpf_path: &Path, file_off: u64, fallback_name: &s
     let i_blks = read_split_blocks(0x80).ok_or("Missing index split array")?;
     let p_blks = read_split_blocks(0x98).ok_or("Missing poly split array")?;
 
+    // indices are 16 bit so more vertices can never be referenced overlapping blocks stop here
     let mut verts = Vec::new();
-    for (boff, cnt) in v_blks {
+    'verts: for (boff, cnt) in v_blks {
         for i in 0..cnt {
             let o = boff + i * 6;
             if o + 6 > v.len() { break; }
+            if verts.len() >= 65536 { break 'verts; }
             let vx = min_v[0] + (ru16(&v, o) as f32 / 65535.0) * ext[0];
             let vy = min_v[1] + (ru16(&v, o + 2) as f32 / 65535.0) * ext[1];
             let vz = min_v[2] + (ru16(&v, o + 4) as f32 / 65535.0) * ext[2];
@@ -2070,10 +2282,12 @@ pub fn decode_navmesh_from_rpf(rpf_path: &Path, file_off: u64, fallback_name: &s
     }
 
     let mut indices = Vec::new();
-    for (boff, cnt) in i_blks {
+    'indices: for (boff, cnt) in i_blks {
         for i in 0..cnt {
             let o = boff + i * 2;
             if o + 2 > v.len() { break; }
+            // more indices than the buffer has bytes means the blocks overlap
+            if indices.len() >= v.len() { break 'indices; }
             indices.push(ru16(&v, o) as u32);
         }
     }
@@ -2191,6 +2405,65 @@ pub fn decode_mhiu_heightmap(data: &[u8]) -> Option<DecodedTexture> {
 mod large_address_tests;
 
 #[cfg(test)]
+mod capped_decode_tests {
+    use super::*;
+
+    // mean absolute rgb difference between the small texture and the full one averaged down to its size
+    fn picture_diff(full: &DecodedTexture, small: &DecodedTexture) -> f32 {
+        let (sx, sy) = (full.w / small.w, full.h / small.h);
+        let mut total = 0.0f64;
+        for y in 0..small.h {
+            for x in 0..small.w {
+                let mut sum = [0.0f64; 3];
+                for yy in 0..sy {
+                    for xx in 0..sx {
+                        let p = full.pixels[(y * sy + yy) * full.w + x * sx + xx];
+                        sum[0] += p.r() as f64;
+                        sum[1] += p.g() as f64;
+                        sum[2] += p.b() as f64;
+                    }
+                }
+                let n = (sx * sy) as f64;
+                let q = small.pixels[y * small.w + x];
+                total += (sum[0] / n - q.r() as f64).abs() + (sum[1] / n - q.g() as f64).abs() + (sum[2] / n - q.b() as f64).abs();
+            }
+        }
+        (total / (small.w * small.h * 3) as f64) as f32
+    }
+
+    // a capped decode reads a stored mip level and must show the same picture as the full one
+    #[test]
+    fn capped_vehicle_textures_match_full_decodes() {
+        let Ok(rpf) = std::env::var("PERCYSTAR_LEVELS_RPF") else { return };
+        let Some(root) = Path::new(&rpf).parent() else { return };
+        let pool = root.join("data").join("ttdb").join("vehicles").join("ttdb_vehicles.ttpf");
+        if !pool.exists() {
+            return;
+        }
+        let ix = ttpf_index(&pool).expect("index");
+        let picks: Vec<usize> = ix.descs.iter().filter(|d| d.has_mips && d.w.max(d.h) >= 512).map(|d| d.idx).step_by(23).take(40).collect();
+        let (mut both, mut close, mut from_mip) = (0usize, 0usize, 0usize);
+        for idx in picks {
+            let (Ok(full), Ok(small)) = (decode_ttpf_texture(&pool, idx), decode_ttpf_texture_capped(&pool, idx, 128)) else { continue };
+            assert!(small.w.max(small.h) <= 128, "texture {idx} came back {}x{}", small.w, small.h);
+            both += 1;
+            // Percy6Stars: a stored mip keeps its payload; only the decode-and-shrink fallback drops it
+            from_mip += (small.full_size.is_some() && !small.raw_dds_payload.is_empty()) as usize;
+            let diff = picture_diff(&full, &small);
+            if diff < 12.0 {
+                close += 1;
+            } else {
+                eprintln!("texture {idx} {}x{} differs from its capped decode by {diff:.1} (mips {})", full.w, full.h, small.mips);
+            }
+        }
+        eprintln!("capped decode: {both} compared, {close} close, {from_mip} read from a stored mip");
+        assert!(both >= 10, "only {both} textures decoded both ways");
+        assert_eq!(close, both, "capped decodes differ from the full textures");
+        assert!(from_mip * 2 >= both, "stored mips were used for only {from_mip} of {both}");
+    }
+}
+
+#[cfg(test)]
 mod mhiu_tests {
     use super::*;
 
@@ -2238,6 +2511,105 @@ mod mhiu_tests {
         assert_eq!(tex.h, 4);
         assert_eq!(tex.pixels[0], Color32::from_rgb(16, 44, 92));
         assert_ne!(tex.pixels[5], Color32::from_rgb(16, 44, 92));
+    }
+
+    #[test]
+    fn bc3_color_block_is_always_four_color() {
+        // flat block c0 == c1 with every index 3 bc1 rules would decode it black
+        let mut blk = vec![255u8; 8];
+        blk.extend_from_slice(&0xF800u16.to_le_bytes());
+        blk.extend_from_slice(&0xF800u16.to_le_bytes());
+        blk.extend_from_slice(&[0xFF; 4]);
+        for dxgi in [77u8, 74] {
+            let px = decode_linear_to_rgba(&blk, 4, 4, dxgi).unwrap();
+            assert!(px.iter().all(|c| c.to_array() == [255, 0, 0, 255]), "dxgi {dxgi}: {:?}", px[0].to_array());
+        }
+        // c0 < c1 interpolates at thirds instead of the bc1 half mix and black
+        let mut blk = vec![255u8; 8];
+        blk.extend_from_slice(&0x0000u16.to_le_bytes());
+        blk.extend_from_slice(&0xFFFFu16.to_le_bytes());
+        blk.extend_from_slice(&[0b1110_0100, 0, 0, 0]);
+        let px = decode_linear_to_rgba(&blk, 4, 4, 77).unwrap();
+        let reds: Vec<u8> = px[..4].iter().map(|c| c.r()).collect();
+        assert_eq!(reds, [0, 255, 85, 170]);
+        // cropped sizes and short input
+        assert_eq!(decode_linear_to_rgba(&blk, 3, 2, 77).unwrap().len(), 6);
+        assert!(decode_linear_to_rgba(&blk[..15], 4, 4, 77).is_none());
+    }
+
+    #[test]
+    fn alpha_as_data_keeps_the_color_and_exports_unchanged() {
+        // bc3 texel with alpha zero and a strong color
+        let mut blk = vec![0u8; 8];
+        blk.extend_from_slice(&0x07E0u16.to_le_bytes());
+        blk.extend_from_slice(&0x07E0u16.to_le_bytes());
+        blk.extend_from_slice(&[0; 4]);
+        let px = decode_linear_to_rgba(&blk, 4, 4, 77).unwrap();
+        assert_eq!(px[0].to_array(), [0, 255, 0, 0], "color survives zero alpha");
+        let rgba8 = decode_linear_to_rgba(&[200, 100, 50, 3], 1, 1, 28).unwrap();
+        assert_eq!(rgba8[0].to_array(), [200, 100, 50, 3]);
+        // egui gets premultiplied texels opaque ones untouched
+        let up = premultiplied_for_egui(&[rgba8[0], px[0], Color32::from_rgb(9, 8, 7)]);
+        assert_eq!(up[1], Color32::TRANSPARENT);
+        assert_eq!(up[2], Color32::from_rgb(9, 8, 7));
+        assert_eq!(up[0], Color32::from_rgba_unmultiplied(200, 100, 50, 3));
+        // a8 becomes straight white with the value as coverage
+        let a8 = to_model_tex(DecodedTexture { name: String::new(), w: 1, h: 1, mips: 1, dxgi: 65, fmt_name: "A8", pixels: vec![Color32::from_gray(40)], raw_dds_payload: Vec::new(), full_size: None, reduced_note: None });
+        assert_eq!(a8.pixels[0].to_array(), [255, 255, 255, 40]);
+    }
+
+    #[test]
+    fn signed_bc4_and_bc5_decode_as_snorm() {
+        // endpoints plus one and minus one index 0 and 1
+        let blk = [0x7Fu8, 0x81, 0b0000_1000, 0, 0, 0, 0, 0];
+        let signed = channel_block(&blk, true);
+        assert_eq!((signed[0], signed[1]), (255, 0));
+        // read as unorm the same bytes are 127 and 129 which is what the old path produced
+        let unsigned = channel_block(&blk, false);
+        assert_eq!((unsigned[0], unsigned[1]), (127, 129));
+        // minus 128 clamps to minus one and e0 <= e1 selects the six value palette with the two extremes
+        let blk6 = [0x80u8, 0x00, 0b1111_0000, 0b0000_0011, 0, 0, 0, 0];
+        let v = channel_block(&blk6, true);
+        assert_eq!((v[0], v[1], v[2]), (0, 0, 255), "indices 0 6 7 1 -> {:?}", &v[..4]);
+        assert_eq!(v[3], 128, "zero maps to the middle");
+        // flat tangent space normal 0 0 1 through bc5 snorm
+        let flat = [0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let px = decode_linear_to_rgba(&flat, 4, 4, 84).unwrap();
+        assert_eq!(px[0].to_array(), [128, 128, 255, 255]);
+        // unorm bc4 matches the reference decoder
+        let mut reference = vec![0u32; 16];
+        let ublk = [200u8, 40, 0x88, 0xC6, 0xFA, 0x53, 0x1D, 0x77];
+        texture2ddecoder::decode_bc4(&ublk, 4, 4, &mut reference).unwrap();
+        let ours = decode_linear_to_rgba(&ublk, 4, 4, 80).unwrap();
+        for (o, r) in ours.iter().zip(&reference) {
+            assert_eq!(o.r() as u32, (r >> 16) & 0xFF);
+        }
+        let ublk2 = [40u8, 200, 0x88, 0xC6, 0xFA, 0x53, 0x1D, 0x77];
+        texture2ddecoder::decode_bc4(&ublk2, 4, 4, &mut reference).unwrap();
+        let ours = decode_linear_to_rgba(&ublk2, 4, 4, 80).unwrap();
+        for (o, r) in ours.iter().zip(&reference) {
+            assert_eq!(o.r() as u32, (r >> 16) & 0xFF);
+        }
+        // bc4 masks are not normal maps
+        let hit = |dxgi| TtpfHashHit { path: std::path::PathBuf::new(), tex_idx: 0, w: 4, h: 4, dxgi };
+        assert!(hit(83).is_normal_format() && hit(84).is_normal_format() && !hit(80).is_normal_format() && !hit(81).is_normal_format());
+    }
+
+    #[test]
+    fn rbf0_nesting_is_bounded() {
+        // descriptor 0 named a opened once then thousands of nested opens of it
+        let mut data = b"RBF0".to_vec();
+        data.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, b'a']);
+        data.extend_from_slice(&[0u8; 6]);
+        let shallow = decode_rbf0(&data).expect("one open element decodes");
+        assert!(shallow.contains("<a"), "{shallow}");
+        for _ in 0..20_000 {
+            data.extend_from_slice(&[0x00, 0x00]);
+            data.extend_from_slice(&[0u8; 6]);
+        }
+        let started = std::time::Instant::now();
+        assert!(decode_rbf0(&data).is_none(), "runaway nesting is rejected");
+        assert!(started.elapsed().as_secs() < 2);
     }
 
     #[test]
@@ -2644,31 +3016,15 @@ impl TexChannel {
     ];
 }
 
-/// Straight (not premultiplied) RGBA8 for formats that carry real alpha. `Color32` is
-/// premultiplied, so colour under alpha 0 is gone from `DecodedTexture::pixels`; the channel
-/// views re-decode the stored payload instead. `None` for formats without separate alpha
-/// (their `pixels` are opaque and lossless) or a payload that doesn't fit.
+/// Straight (not premultiplied) RGBA8 for formats that carry real alpha, decoded from the
+/// stored payload. Since upstream v1.4.8 `DecodedTexture::pixels` are straight as well, so this
+/// is the same data as `pixels`; it stays because the channel views take `[u8; 4]` texels.
+/// `None` for formats without separate alpha or a payload that doesn't fit.
 pub fn decode_linear_straight_rgba(lin: &[u8], w: usize, h: usize, dxgi: u8) -> Option<Vec<[u8; 4]>> {
-    let n = w.checked_mul(h)?;
-    match dxgi {
-        71 | 72 | 77 | 78 | 98 | 99 => {
-            let mut out = vec![0u32; n];
-            let res = match dxgi {
-                71 | 72 => texture2ddecoder::decode_bc1a(lin, w, h, &mut out),
-                77 | 78 => texture2ddecoder::decode_bc3(lin, w, h, &mut out),
-                _ => texture2ddecoder::decode_bc7(lin, w, h, &mut out),
-            };
-            res.ok()?;
-            // texture2ddecoder packs 0xAARRGGBB
-            Some(out.into_iter().map(|v| [(v >> 16) as u8, (v >> 8) as u8, v as u8, (v >> 24) as u8]).collect())
-        }
-        28 | 29 | 87 | 91 => {
-            let bytes = lin.get(..n * 4)?;
-            let bgra = matches!(dxgi, 87 | 91);
-            Some(bytes.chunks_exact(4).map(|p| if bgra { [p[2], p[1], p[0], p[3]] } else { [p[0], p[1], p[2], p[3]] }).collect())
-        }
-        _ => None,
+    if !matches!(dxgi, 71 | 72 | 77 | 78 | 98 | 99 | 28 | 29 | 87 | 91) {
+        return None;
     }
+    Some(decode_linear_to_rgba(lin, w, h, dxgi)?.iter().map(|p| p.to_array()).collect())
 }
 
 /// Pixels for the preview: an isolated channel as greyscale, or colour with alpha dropped.
@@ -2708,6 +3064,8 @@ mod channel_view_tests {
         assert_eq!(channel_view(px, TexChannel::A, false)[0], Color32::from_rgb(0, 0, 0));
         // colour hidden under alpha 0 comes back in the RGB view
         assert_eq!(channel_view(px, TexChannel::Rgb, false)[0], Color32::from_rgb(200, 100, 50));
+        // and the blended view shows nothing there
+        assert_eq!(channel_view(px, TexChannel::Rgba, false)[0], Color32::TRANSPARENT);
     }
 
     /// The re-decoded payload must line up with the displayed pixels (same mip, same layout).
@@ -2721,7 +3079,8 @@ mod channel_view_tests {
             let Some(raw) = decode_linear_straight_rgba(&t.raw_dds_payload, t.w, t.h, t.dxgi) else { continue };
             assert_eq!(raw.len(), t.pixels.len(), "#{idx} {}", t.fmt_name);
             for (r, p) in raw.iter().zip(&t.pixels) {
-                assert_eq!(Color32::from_rgba_unmultiplied(r[0], r[1], r[2], r[3]), *p, "#{idx} {}", t.fmt_name);
+                // decoded pixels are straight alpha (upstream v1.4.8), stored as-is in a Color32
+                assert_eq!(Color32::from_rgba_premultiplied(r[0], r[1], r[2], r[3]), *p, "#{idx} {}", t.fmt_name);
             }
             checked += 1;
             fmts.insert(t.fmt_name);

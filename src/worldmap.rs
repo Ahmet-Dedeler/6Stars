@@ -224,7 +224,7 @@ impl WorldMapData {
                 ));
             }
         }
-        let tex = Some(Texture2D { w: tw, h: th, pixels: tpix });
+        let tex = Some(Texture2D::new(tw, th, tpix));
 
         let tri_geom = vec![0u16; tris.len()];
         let mut m = Mesh3D::from_parts(
@@ -413,6 +413,16 @@ pub fn render_world_map_ui(
                     wm.gpu_launch = Some(rx);
                     wm.gpu_starting = true;
                     wm.status = "Starting GPU World...".into();
+                }
+                Err(e) => wm.status = e,
+            }
+        }
+        if ui.add_enabled(!wm.gpu_starting, egui::Button::new(egui::RichText::new("RF World View").strong())).on_hover_text("RageForge-inspired 3D World View with Time-of-Day presets, Water toggle (V), 700m–16km draw radius & PercyStar PBR/RT shaders").clicked() {
+            match crate::world_gpu::launch_world_gpu_process(common_rpf, levels_rpf, ctx.clone()) {
+                Ok(rx) => {
+                    wm.gpu_launch = Some(rx);
+                    wm.gpu_starting = true;
+                    wm.status = "Starting RF World View...".into();
                 }
                 Err(e) => wm.status = e,
             }

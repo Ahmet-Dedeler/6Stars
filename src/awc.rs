@@ -6,6 +6,10 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+// one minute up front and two hours of stereo at 48 khz at most per stream
+const MAX_RESERVE_SAMPLES: usize = 48_000 * 2 * 60;
+const MAX_STREAM_SAMPLES: usize = 48_000 * 2 * 7200;
+
 #[derive(Debug, Clone)]
 pub struct AwcDecodeResult {
     pub wavs: Vec<(u32, PathBuf)>,
@@ -474,7 +478,8 @@ fn decode_opus_chunk_into(
     if pcm_f32.len() < 5760 * ch {
         pcm_f32.resize(5760 * ch, 0.0);
     }
-    let need = packets.len() * 960 * ch;
+    // the packet count comes from the file so the reservation is only a bounded hint
+    let need = packets.len().saturating_mul(960 * ch).min(MAX_RESERVE_SAMPLES);
     if samples_i16.capacity() < need {
         samples_i16.reserve(need - samples_i16.capacity());
     }
@@ -483,6 +488,10 @@ fn decode_opus_chunk_into(
     let mut first_err: Option<String> = None;
 
     for pkt in &packets {
+        // a chunk of minimal packets would otherwise decode to tens of gigabytes
+        if samples_i16.len() >= MAX_STREAM_SAMPLES {
+            break;
+        }
         match dec.decode(pkt, 5760, &mut pcm_f32[..5760 * ch]) {
             Ok(n_per_ch) => {
                 ok_pkts += 1;

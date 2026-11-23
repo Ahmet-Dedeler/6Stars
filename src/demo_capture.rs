@@ -285,11 +285,7 @@ fn load_obj_with_atlas(dir: &Path, stem: &str, name: &str) -> Mesh3D {
         }
     }
     let img = image::open(dir.join(format!("{stem}.png"))).unwrap().to_rgba8();
-    let tex = Texture2D {
-        w: img.width() as usize,
-        h: img.height() as usize,
-        pixels: img.pixels().map(|p| Color32::from_rgb(p[0], p[1], p[2])).collect(),
-    };
+    let tex = Texture2D::new(img.width() as usize, img.height() as usize, img.pixels().map(|p| Color32::from_rgb(p[0], p[1], p[2])).collect());
     let n = tris.len();
     let mut m = Mesh3D::from_parts(
         name.to_string(),
