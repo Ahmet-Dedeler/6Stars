@@ -85,11 +85,16 @@ impl BinkNative {
         std::thread::Builder::new()
             .name("bink2-decode".into())
             .spawn(move || {
-                let res = std::fs::read(dir.path().join("clip.bk2"))
-                    .map_err(|e| format!("Read video clip: {e}"))
-                    .and_then(|data| play(Arc::new(data), &sh, &ctx, rx, volume, looping));
+                // A decoder panic on a damaged clip must still reach the panel as an error,
+                // not leave it on "Starting Bink decoder…" forever.
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    std::fs::read(dir.path().join("clip.bk2"))
+                        .map_err(|e| format!("Read video clip: {e}"))
+                        .and_then(|data| play(Arc::new(data), &sh, &ctx, rx, volume, looping))
+                }))
+                .unwrap_or_else(|_| Err("the decoder hit a bug on this clip".into()));
                 drop(dir); // keep the clip folder until playback ends
-                let mut s = sh.lock().unwrap();
+                let mut s = sh.lock().unwrap_or_else(|p| p.into_inner());
                 s.error = res.err();
                 s.exited = true;
                 ctx.request_repaint();

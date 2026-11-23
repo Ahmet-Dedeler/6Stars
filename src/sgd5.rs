@@ -4,6 +4,9 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+// largest shader blob accepted after inflating
+const MAX_SHADER_BYTES: usize = 64 << 20;
+
 const MAGIC: &[u8; 4] = b"SGD5";
 const COMPRESSED_MAGIC: u32 = 0x000D_DCE7;
 const STAGES: [(&str, &str); 6] = [
@@ -1176,8 +1179,13 @@ pub fn decompress_shader(file: &Sgd5File, shader: &Sgd5Shader) -> Result<Vec<u8>
         .data
         .get(shader.binary_offset + 12..shader.binary_offset + shader.compressed_size as usize)
         .ok_or_else(|| Sgd5Error(format!("{}: truncated compressed payload", shader.name)))?;
-    let mut decoder = DeflateDecoder::new(compressed);
-    let mut output = Vec::with_capacity(shader.uncompressed_size as usize);
+    // the size field is a file value bound it and the inflate so a bomb cannot exhaust memory
+    let expected = shader.uncompressed_size as usize;
+    if expected > MAX_SHADER_BYTES {
+        return Err(Sgd5Error(format!("{}: implausible uncompressed size {expected}", shader.name)));
+    }
+    let mut decoder = DeflateDecoder::new(compressed).take(expected as u64 + 1);
+    let mut output = Vec::with_capacity(expected);
     decoder
         .read_to_end(&mut output)
         .map_err(|error| Sgd5Error(format!("{}: DEFLATE error: {error}", shader.name)))?;

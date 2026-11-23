@@ -96,14 +96,15 @@ pub struct Ps09Cache {
 }
 
 fn rd32(b: &[u8], off: usize) -> u32 {
-    if off + 4 > b.len() {
+    // offsets are derived from file values the sum must not wrap
+    if off.checked_add(4).map_or(true, |end| end > b.len()) {
         return 0;
     }
     u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
 }
 
 fn rd64(b: &[u8], off: usize) -> u64 {
-    if off + 8 > b.len() {
+    if off.checked_add(8).map_or(true, |end| end > b.len()) {
         return 0;
     }
     u64::from_le_bytes([
@@ -161,13 +162,13 @@ fn parse_bindings(meta_slice: &[u8]) -> Vec<ResourceBinding> {
 /// Detect exact code base: normally `off_meta + meta_size`, but gracefully handles partial
 /// chunk dumps that dropped chunks before code start by checking shader[0..2] alignment.
 fn locate_code_base(data: &[u8], off_c3: usize, c3: u32, expected: usize) -> usize {
-    if expected + 16 <= data.len() && rd32(data, expected + 0x18) == 0xD580_0000 {
+    if expected.checked_add(0x1c).is_some_and(|end| end <= data.len()) && rd32(data, expected + 0x18) == 0xD580_0000 {
         return expected;
     }
     // Check aligned offsets near expected (e.g., -64KB if a chunk was missing in extracted dir)
     for delta in [0isize, -0x10000, 0x10000, -0x20000, 0x20000] {
-        let cand = (expected as isize + delta) as usize;
-        if cand + 0x28 <= data.len()
+        let Some(cand) = expected.checked_add_signed(delta) else { continue };
+        if cand.checked_add(0x28).is_some_and(|end| end <= data.len())
             && (rd32(data, cand + 0x18) == 0xD580_0000 || rd32(data, cand + 0x24) == 0xBFA0_0003)
         {
             return cand;
@@ -1460,6 +1461,18 @@ pub fn format_spirv_abi_summary(entry: &Ps09ShaderEntry, code: &[u8]) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn code_base_search_survives_offsets_near_the_address_space_end() {
+        // expected plus the probe deltas used to wrap and index far out of bounds
+        let data = vec![0u8; 128];
+        for expected in [0usize, 0xFFE4, 0x1_FFE4, usize::MAX - 8, usize::MAX] {
+            let _ = locate_code_base(&data, 0, 0, expected);
+        }
+        assert_eq!(rd32(&data, usize::MAX - 2), 0);
+        assert_eq!(rd64(&data, usize::MAX - 6), 0);
+        assert_eq!(rd32(&[1, 0, 0, 0], 0), 1);
+    }
 
     #[test]
     fn decodes_and_lifts_real_gfx103_tent_filter_snippet() {
