@@ -530,7 +530,7 @@ pub fn format_fssm_metadata(fssm: &FssmShader) -> String {
 }
 
 fn format_fssm_disasm(fssm: &FssmShader, source: &str) -> String {
-    let instructions = crate::rdna2::decode_gfx103(fssm.code(), 4000);
+    let instructions = crate::rdna2::decode_gfx103(fssm.code(), usize::MAX);
     let mut output = String::with_capacity(instructions.len() * 48 + 512);
     let _ = writeln!(
         output,

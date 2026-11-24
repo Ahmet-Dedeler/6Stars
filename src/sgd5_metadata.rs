@@ -259,13 +259,13 @@ fn write_member(
     table: &Sgd5ReflectionTable,
     member: &Sgd5MemberRecord,
 ) {
-    let (type_name, width) = value_type(member.value_type);
+    let (type_name, _) = value_type(member.value_type);
     let array = if member.array_size == 0 {
         String::new()
     } else {
         format!("[{}]", member.array_size)
     };
-    let extent = width.map(|width| width * member.array_size.max(1) as usize);
+    let extent = member.byte_size();
     let _ = writeln!(text, "    {}{} {} | type=0x{:02x} byte_offset={} byte_size={} name_hash=0x{:08x} secondary_hash=0x{:08x} parameter_key=0x{:016x}",
         type_name, array, name(file, member.name_hash, member.name.as_deref()), member.value_type,
         member.byte_offset, extent.map(|size| size.to_string()).unwrap_or_else(|| "unknown".into()), member.name_hash, member.secondary_hash, member.parameter_key());
@@ -312,7 +312,7 @@ fn write_resource(
     }
 }
 
-fn resource_kind(record: &Sgd5ResourceRecord) -> DescriptorKind {
+pub fn resource_kind(record: &Sgd5ResourceRecord) -> DescriptorKind {
     match (record.resource_type >> 4) & 3 {
         0 => DescriptorKind::Srv,
         1 => DescriptorKind::Uav,
@@ -331,7 +331,7 @@ fn binding_kind(binding_type: u16) -> Option<DescriptorKind> {
     }
 }
 
-fn format_root_location(location: RootBindingLocation) -> String {
+pub fn format_root_location(location: RootBindingLocation) -> String {
     match location {
         RootBindingLocation::DescriptorTable { parameter, descriptor_index } => format!("root_parameter={parameter} descriptor_index={descriptor_index} descriptor_byte_offset=0x{:x}", 32 * descriptor_index),
         RootBindingLocation::Constants { parameter, dword_count } => format!("root_parameter={parameter} root_constants={dword_count} dwords"),
@@ -406,13 +406,7 @@ fn resolve_binding_table<'a>(
     effect: &'a Sgd5Effect,
     selector: u8,
 ) -> Option<&'a Sgd5BindingTable> {
-    match effect.binding_list.entries.get(usize::from(selector))? {
-        Sgd5BindingListEntry::Inline(table) => Some(table),
-        Sgd5BindingListEntry::TableReference { table_hash, .. } => file
-            .binding_tables
-            .iter()
-            .find(|table| table.header.table_hash == *table_hash),
-    }
+    file.binding_table(effect, selector)
 }
 
 fn write_pass_bindings(
@@ -438,11 +432,7 @@ fn write_pass_bindings(
         return;
     };
     let stages = ["VS", "PS", "GS", "DS", "HS", "CS"];
-    let Some(owner) = file
-        .shaders
-        .iter()
-        .find(|candidate| candidate.stage == stages[stage] && candidate.index == *index)
-    else {
+    let Some(owner) = file.shader(stages[stage], *index) else {
         return;
     };
     let key = (owner.stage, owner.index);
@@ -460,7 +450,7 @@ fn write_pass_bindings(
         return;
     };
     let selectors: [u8; 4] = if stage == 5 {
-        owner.shader_metadata[88..92].try_into().unwrap()
+        owner.compute_binding_selectors().unwrap()
     } else {
         pass.binding_table_indices
     };
@@ -494,7 +484,7 @@ fn write_pass_bindings(
         let layout_matches = ranges.len() == table.entries.len()
             && table.entries.iter().all(|entry| {
                 ranges
-                    .get(usize::from(entry.binding_index))
+                    .get(entry.descriptor_index())
                     .is_some_and(|range| Some(range.kind) == binding_kind(entry.binding_type))
             });
         if !layout_matches {
@@ -505,7 +495,7 @@ fn write_pass_bindings(
             continue;
         }
         for entry in &table.entries {
-            let range = &ranges[usize::from(entry.binding_index)];
+            let range = &ranges[entry.descriptor_index()];
             if !shader.reflection.resources.iter().any(|record| {
                 record.name_hash == entry.name_hash
                     && record.register_space() as usize == space
@@ -523,9 +513,25 @@ fn write_pass_bindings(
                 space,
                 format_root_location(RootBindingLocation::DescriptorTable {
                     parameter,
-                    descriptor_index: usize::from(entry.binding_index)
+                    descriptor_index: entry.descriptor_index()
                 })
             );
+        }
+    }
+    for record in &shader.reflection.resources {
+        let kind = resource_kind(record);
+        let register = record.shader_register();
+        let space = record.register_space();
+        if let Some(location) = root.find_binding(kind, register, space) {
+            if !matches!(location, RootBindingLocation::DescriptorTable { .. }) {
+                let _ = writeln!(
+                    text,
+                    "      runtime {} -> {}{register} space{space} | {}",
+                    name(file, record.name_hash, record.name.as_deref()),
+                    kind.register_prefix(),
+                    format_root_location(location)
+                );
+            }
         }
     }
 }
@@ -665,7 +671,7 @@ fn write_effect_passes(
                     usage.srv_hashes.len(), usage.uav_hashes.len(), usage.sampler_hashes.len(), usage.cbv_hashes.len());
                 if let Some(binding) = usage.texture_handle_binding {
                     let _ = writeln!(text, "      texture_handle_binding=0x{binding:08x} | root_constant_dword={} fallback_cbv={}",
-                        if binding as u8 == 255 { "absent".into() } else { (binding & 127).to_string() }, binding < 256);
+                        if binding as u8 == 255 { "absent".into() } else { (binding & 255).to_string() }, binding < 256);
                 }
             }
             write_pass_bindings(text, file, effect, pass, shader, roots);
@@ -729,6 +735,14 @@ pub fn format_shader_metadata(file: &Sgd5File, shader: &Sgd5Shader) -> String {
     );
     let _ = writeln!(text, "Per-shader slots encode registers with resource-type bits 7/13; flags bits 6..7 encode register space. Effect material SRV slots index texture handles.");
     let _ = writeln!(text, "Both hashes support parameter lookup. Defaults initialize runtime CBV members; SGPR/VGPR assignments require ISA analysis.");
+    let (srvs, uavs, constants) = shader.root_argument_counts();
+    let _ = writeln!(text, "Shader root-argument counts: direct SRVs={srvs}, direct UAVs={uavs}, constant dwords={constants}");
+    if let Some(selectors) = shader.compute_binding_selectors() {
+        let _ = writeln!(
+            text,
+            "Compute binding selectors space0..3: {selectors:?} (255 absent)"
+        );
+    }
     text.push('\n');
     if let Some(inputs) = shader.vertex_inputs() {
         write_vertex_inputs(&mut text, &inputs, "Shader vertex-input metadata", "format");
@@ -772,6 +786,11 @@ pub fn format_shader_metadata(file: &Sgd5File, shader: &Sgd5Shader) -> String {
         write_compiled_binding(&mut text, resource, compiled_root.as_ref());
     }
     let mut roots = std::collections::HashMap::new();
+    text.push_str(&format_parameter_mapping(
+        file,
+        shader,
+        compiled_root.as_ref(),
+    ));
     roots.insert((shader.stage, shader.index), compiled_root);
     let referenced_members: HashSet<_> = shader
         .reflection
@@ -882,7 +901,7 @@ pub fn format_shader_metadata(file: &Sgd5File, shader: &Sgd5Shader) -> String {
         let _ = writeln!(
             text,
             "  effect string pool (includes confirmed technique names): {}",
-            effect.binding_list.strings.join(", ")
+            effect.strings.join(", ")
         );
         for resource in &effect.main_reflection.resources {
             let target = resource.offset + resource.member_data_offset as usize;
@@ -933,6 +952,147 @@ pub fn prepend_comments(metadata: &str, prefix: &str, output: String) -> String 
     text.push('\n');
     text.push_str(&output);
     text
+}
+
+/// Exact logical parameter/register/root mapping. ISA register allocation is kept separate.
+pub fn format_parameter_mapping(
+    file: &Sgd5File,
+    shader: &Sgd5Shader,
+    root: Option<&CompactRootSignature>,
+) -> String {
+    let mut text = String::from(
+        "Parameter mapping: resource identity -> compiled register/space -> compiled shader root location\n",
+    );
+    for record in &shader.reflection.resources {
+        let kind = resource_kind(record);
+        let register = record.shader_register();
+        let space = record.register_space();
+        let location = root.and_then(|root| root.find_binding(kind, register, space));
+        let _ = writeln!(
+            text,
+            "  {} [hash=0x{:08x}, alternate=0x{:08x}] -> {}{register}, space{space} -> {}",
+            name(file, record.name_hash, record.name.as_deref()),
+            record.name_hash,
+            record.secondary_hash,
+            kind.register_prefix(),
+            location
+                .map(format_root_location)
+                .unwrap_or_else(|| "root unavailable".into())
+        );
+        if record.member_count != 0 {
+            for index in 0..usize::from(record.member_count) {
+                let target = record.offset + usize::from(record.member_data_offset) + index * 24;
+                if let Some(member) = member_at(&shader.reflection, target) {
+                    let _ = writeln!(
+                        text,
+                        "    {} {} -> parent byte offset {} ({} bytes)",
+                        value_type(member.value_type).0,
+                        name(file, member.name_hash, member.name.as_deref()),
+                        member.byte_offset,
+                        member
+                            .byte_size()
+                            .map(|size| size.to_string())
+                            .unwrap_or_else(|| "unknown".into())
+                    );
+                }
+            }
+        }
+    }
+    text
+}
+
+pub fn format_pass_metadata(file: &Sgd5File, effect_index: usize, pass_index: usize) -> String {
+    let Some(effect) = file.effects.get(effect_index) else {
+        return String::new();
+    };
+    let Some(pass) = effect.metadata.passes.get(pass_index) else {
+        return String::new();
+    };
+    let mut text = format!(
+        "Selected context: effect {} / pass {pass_index}\n",
+        effect.name
+    );
+    let _ = writeln!(
+        text,
+        "  state_flags=0x{:02x} | material_texture_handles={}",
+        pass.state_flags, effect.binding_list.texture_handle_count
+    );
+    if let Some(usage) = &pass.resource_usage {
+        for (label, hashes) in [
+            ("SRV", &usage.srv_hashes),
+            ("UAV", &usage.uav_hashes),
+            ("sampler", &usage.sampler_hashes),
+            ("CBV", &usage.cbv_hashes),
+        ] {
+            let _ = writeln!(
+                text,
+                "  logical {label} usage: {}",
+                hashes
+                    .iter()
+                    .map(|hash| format!("{} [0x{hash:08x}]", name(file, *hash, None)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        if let Some(binding) = usage.texture_handle_binding {
+            let destination = if binding as u8 == 255 {
+                "absent".into()
+            } else {
+                (binding & 255).to_string()
+            };
+            let _ = writeln!(text, "  material handle-array control=0x{binding:08x}: root-constant dword={destination}, CBV fallback={}", binding < 256);
+        }
+    }
+    let mut roots = std::collections::HashMap::new();
+    for stage in 0..6 {
+        if let Some(shader) = file.pass_shader(effect, pass, stage) {
+            let _ = writeln!(text, "  {}#{} {}:", shader.stage, shader.index, shader.name);
+            write_pass_bindings(&mut text, file, effect, pass, shader, &mut roots);
+        }
+    }
+    for record in &effect.main_reflection.resources {
+        if resource_kind(record) == DescriptorKind::Srv
+            && record.flags & 0xc0 == 0x80
+            && record.slot < effect.binding_list.texture_handle_count
+        {
+            let _ = writeln!(
+                text,
+                "  material texture {} [0x{:08x}] -> texture_handles[{}] -> descriptor-heap index",
+                name(file, record.name_hash, record.name.as_deref()),
+                record.name_hash,
+                record.slot
+            );
+        }
+    }
+    text
+}
+
+pub fn format_auxiliary_value(
+    file: &Sgd5File,
+    table: &Sgd5ReflectionTable,
+    record: &crate::sgd5::Sgd5AuxiliaryRecord,
+) -> String {
+    match record.value_kind() {
+        0 => format!("{} (0x{:08x})", record.data, record.data),
+        1 => format!("{}", f32::from_bits(record.data)),
+        2 => {
+            let value = record
+                .offset
+                .checked_add(record.data as usize)
+                .filter(|start| *start >= table.offset + 4 && *start < table.default_values_offset)
+                .and_then(|start| file.data.get(start..table.default_values_offset))
+                .and_then(|bytes| {
+                    bytes
+                        .iter()
+                        .position(|b| *b == 0)
+                        .map(|end| String::from_utf8_lossy(&bytes[..end]).into_owned())
+                });
+            value
+                .map(|v| format!("{v:?}"))
+                .unwrap_or_else(|| format!("unresolved string +0x{:x}", record.data))
+        }
+        _ => format!("unknown kind: 0x{:08x}", record.data),
+    }
 }
 
 #[cfg(test)]

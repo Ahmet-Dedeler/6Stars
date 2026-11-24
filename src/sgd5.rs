@@ -10,7 +10,7 @@ const COMPRESSED_MAGIC: u32 = 0x000D_DCE7;
 const TABLE_REFERENCE: u32 = 0x8000_0000;
 const REFLECTION_RECORD_SIZE: usize = 24;
 const MAX_SHADER_BYTES: u32 = 64 << 20;
-const STAGES: [(&str, &str); 6] = [
+pub const STAGES: [(&str, &str); 6] = [
     ("VS", "vs"),
     ("PS", "ps"),
     ("GS", "gs"),
@@ -41,6 +41,19 @@ pub struct Sgd5Shader {
 }
 
 impl Sgd5Shader {
+    pub fn root_argument_counts(&self) -> (u8, u8, u8) {
+        let word = u64::from_le_bytes(self.shader_metadata[8..16].try_into().unwrap());
+        (
+            ((word >> 53) & 7) as u8,
+            ((word >> 47) & 7) as u8,
+            ((word >> 58) & 15) as u8,
+        )
+    }
+
+    pub fn compute_binding_selectors(&self) -> Option<[u8; 4]> {
+        (self.stage == "CS").then(|| self.shader_metadata[88..92].try_into().unwrap())
+    }
+
     pub fn vertex_inputs(&self) -> Option<Sgd5VertexInputMetadata> {
         (self.stage == "VS")
             .then(|| Sgd5VertexInputMetadata::from_bytes(&self.shader_metadata[..0x48]))
@@ -125,6 +138,13 @@ pub struct Sgd5BindingEntry {
     pub name: Option<String>,
 }
 
+impl Sgd5BindingEntry {
+    /// The runtime binding converter retains the low ten bits as descriptor index.
+    pub fn descriptor_index(&self) -> usize {
+        usize::from(self.binding_index & 0x03ff)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Sgd5BindingTableHeader {
     pub entry_count: u16,
@@ -203,6 +223,19 @@ pub struct Sgd5MemberRecord {
 }
 
 impl Sgd5MemberRecord {
+    pub fn byte_size(&self) -> Option<usize> {
+        let width = match self.value_type {
+            0 | 1 | 5 | 9 => 4,
+            2 | 6 | 10 => 8,
+            3 | 7 | 11 => 12,
+            4 | 8 | 12 => 16,
+            13 => 48,
+            14 => 64,
+            _ => return None,
+        };
+        Some(width * usize::from(self.array_size.max(1)))
+    }
+
     pub fn parameter_key(&self) -> u64 {
         u64::from(self.name_hash) | (u64::from(self.secondary_hash) << 32)
     }
@@ -213,6 +246,15 @@ pub struct Sgd5AuxiliaryRecord {
     pub offset: usize,
     pub hash: u32,
     pub data: u32,
+}
+
+impl Sgd5AuxiliaryRecord {
+    pub fn value_kind(&self) -> u8 {
+        (self.hash & 3) as u8
+    }
+    pub fn name_hash30(&self) -> u32 {
+        self.hash >> 2
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -243,8 +285,6 @@ pub struct Sgd5BindingList {
     /// Number of u32 material texture handles, padded to a multiple of four.
     pub texture_handle_count: u8,
     pub entries: Vec<Sgd5BindingListEntry>,
-    pub string_pool: Vec<u8>,
-    pub strings: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -387,6 +427,9 @@ pub struct Sgd5Effect {
     pub main_reflection: Sgd5ReflectionTable,
     pub property_reflection: Sgd5ReflectionTable,
     pub binding_list: Sgd5BindingList,
+    /// Effect-owned pool addressed by technique records, independent of the binding list.
+    pub string_pool: Vec<u8>,
+    pub strings: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -406,6 +449,55 @@ pub struct Sgd5File {
 }
 
 impl Sgd5File {
+    pub fn shader_position(&self, stage: &str, index: u32) -> Option<usize> {
+        let stage = STAGES.iter().position(|s| s.0 == stage)?;
+        self.shaders
+            .binary_search_by_key(&(stage, index), |shader| {
+                (
+                    STAGES.iter().position(|s| s.0 == shader.stage).unwrap_or(6),
+                    shader.index,
+                )
+            })
+            .ok()
+    }
+
+    pub fn shader(&self, stage: &str, index: u32) -> Option<&Sgd5Shader> {
+        self.shaders.get(self.shader_position(stage, index)?)
+    }
+
+    pub fn pass_shader(
+        &self,
+        effect: &Sgd5Effect,
+        pass: &Sgd5Pass,
+        stage: usize,
+    ) -> Option<&Sgd5Shader> {
+        let slot = pass.shader_slots.get(stage)?.checked_sub(1)?;
+        let index = *effect.stage_indices.get(stage)?.get(usize::from(slot))?;
+        self.shader(STAGES.get(stage)?.0, index)
+    }
+
+    pub fn binding_table<'a>(
+        &'a self,
+        effect: &'a Sgd5Effect,
+        selector: u8,
+    ) -> Option<&'a Sgd5BindingTable> {
+        self.binding_table_at(effect, usize::from(selector))
+    }
+
+    pub fn binding_table_at<'a>(
+        &'a self,
+        effect: &'a Sgd5Effect,
+        index: usize,
+    ) -> Option<&'a Sgd5BindingTable> {
+        match effect.binding_list.entries.get(index)? {
+            Sgd5BindingListEntry::Inline(table) => Some(table),
+            Sgd5BindingListEntry::TableReference { table_hash, .. } => self
+                .binding_tables
+                .iter()
+                .find(|t| t.header.table_hash == *table_hash),
+        }
+    }
+
     pub fn resolve_name(&self, hash: u32) -> Option<&str> {
         self.hash_names.get(&hash).map(String::as_str)
     }
@@ -730,7 +822,107 @@ fn parse_reflection_table(reader: &mut Reader<'_>) -> Result<Sgd5ReflectionTable
         .map(|name| (joaat_lower(name), name.clone()))
         .collect();
     resolve_reflection_names(&mut table, &names);
+    validate_reflection_links(&table, section.data)?;
     Ok(table)
+}
+
+fn validate_reflection_links(table: &Sgd5ReflectionTable, data: &[u8]) -> Result<(), Sgd5Error> {
+    let resource_start = table.offset + 12;
+    let member_start = resource_start + table.resources.len() * 24;
+    let auxiliary_start = member_start + table.members.len() * 24;
+    let pool_start = auxiliary_start + table.auxiliary_records.len() * 8;
+    let table_end = table.offset + 4 + table.size as usize;
+    let link =
+        |offset: usize, relative: u16, count: u8, start: usize, length: usize, width: usize| {
+            if count == 0 {
+                return Ok(());
+            }
+            let valid = relative != 0
+                && offset
+                    .checked_add(usize::from(relative))
+                    .is_some_and(|target| {
+                        target >= start
+                            && (target - start) % width == 0
+                            && target
+                                .checked_add(usize::from(count) * width)
+                                .is_some_and(|end| end <= start + length * width)
+                    });
+            if valid {
+                Ok(())
+            } else {
+                Err(Sgd5Error(format!(
+                    "invalid reflection record link at 0x{offset:x}"
+                )))
+            }
+        };
+    for record in &table.resources {
+        link(
+            record.offset,
+            record.member_data_offset,
+            record.member_count,
+            member_start,
+            table.members.len(),
+            24,
+        )?;
+        link(
+            record.offset,
+            record.auxiliary_data_offset,
+            record.auxiliary_record_count,
+            auxiliary_start,
+            table.auxiliary_records.len(),
+            8,
+        )?;
+        if record.name_string_offset != 0 {
+            let target = record.offset + usize::from(record.name_string_offset);
+            if target < pool_start
+                || target >= table.default_values_offset
+                || !data[target..table.default_values_offset].contains(&0)
+            {
+                return Err(Sgd5Error(format!(
+                    "invalid resource name link at 0x{:x}",
+                    record.offset
+                )));
+            }
+        }
+    }
+    for member in &table.members {
+        link(
+            member.offset,
+            member.auxiliary_data_offset,
+            member.auxiliary_record_count,
+            auxiliary_start,
+            table.auxiliary_records.len(),
+            8,
+        )?;
+        if member.default_value_offset != 0 {
+            let target = member.offset + usize::from(member.default_value_offset);
+            if member
+                .byte_size()
+                .is_some_and(|size| target.checked_add(size).is_none_or(|end| end > table_end))
+            {
+                return Err(Sgd5Error(format!(
+                    "truncated member default data at 0x{:x}",
+                    member.offset
+                )));
+            }
+        }
+    }
+    for record in &table.auxiliary_records {
+        if record.value_kind() == 2 {
+            let target = record.offset.checked_add(record.data as usize);
+            if !target.is_some_and(|target| {
+                target >= pool_start
+                    && target < table.default_values_offset
+                    && data[target..table.default_values_offset].contains(&0)
+            }) {
+                return Err(Sgd5Error(format!(
+                    "invalid auxiliary string link at 0x{:x}",
+                    record.offset
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_binding_table(reader: &mut Reader<'_>) -> Result<Sgd5BindingTable, Sgd5Error> {
@@ -971,7 +1163,9 @@ fn parse_effect_metadata(reader: &mut Reader<'_>) -> Result<Sgd5EffectMetadata, 
             .offset
             .checked_add(pass.usage_data_offset as usize)
             .and_then(|offset| offset.checked_add(4))
-            .filter(|offset| *offset >= usage_start && *offset < usage_end)
+            .filter(|offset| {
+                *offset >= usage_start && *offset < usage_end && (*offset - usage_start) % 4 == 0
+            })
             .ok_or_else(|| {
                 Sgd5Error(format!("invalid pass usage offset at 0x{:x}", pass.offset))
             })?;
@@ -1038,15 +1232,10 @@ fn parse_binding_list(reader: &mut Reader<'_>) -> Result<Sgd5BindingList, Sgd5Er
             entries.push(Sgd5BindingListEntry::Inline(parse_binding_table(reader)?));
         }
     }
-    let strings_size = reader.u32()? as usize;
-    let string_pool = reader.take(strings_size)?.to_vec();
-    let strings = parse_nul_pool(&string_pool)?;
     Ok(Sgd5BindingList {
         offset,
         texture_handle_count,
         entries,
-        string_pool,
-        strings,
     })
 }
 
@@ -1076,6 +1265,9 @@ fn parse_effect(reader: &mut Reader<'_>, stage_counts: &[u32; 6]) -> Result<Sgd5
     let main_reflection = parse_reflection_table(reader)?;
     let property_reflection = parse_reflection_table(reader)?;
     let binding_list = parse_binding_list(reader)?;
+    let strings_size = reader.u32()? as usize;
+    let string_pool = reader.take(strings_size)?.to_vec();
+    let strings = parse_nul_pool(&string_pool)?;
     if binding_list.texture_handle_count != 0 {
         for pass in &mut metadata.passes {
             if let Some(usage) = &mut pass.resource_usage {
@@ -1094,8 +1286,7 @@ fn parse_effect(reader: &mut Reader<'_>, stage_counts: &[u32; 6]) -> Result<Sgd5
         }
     }
     for technique in &mut metadata.techniques {
-        let pool = binding_list
-            .string_pool
+        let pool = string_pool
             .get(technique.name_string_offset as usize..)
             .ok_or_else(|| Sgd5Error(format!("effect {name}: invalid technique name offset")))?;
         let end = pool
@@ -1159,6 +1350,8 @@ fn parse_effect(reader: &mut Reader<'_>, stage_counts: &[u32; 6]) -> Result<Sgd5
         main_reflection,
         property_reflection,
         binding_list,
+        string_pool,
+        strings,
     })
 }
 
@@ -1182,11 +1375,9 @@ fn build_hash_names(
                     _ => None,
                 }),
         );
-    let strings = tables.flat_map(|table| table.strings.iter()).chain(
-        effects
-            .iter()
-            .flat_map(|effect| effect.binding_list.strings.iter()),
-    );
+    let strings = tables
+        .flat_map(|table| table.strings.iter())
+        .chain(effects.iter().flat_map(|effect| effect.strings.iter()));
     strings
         .map(|name| (joaat_lower(name), name.clone()))
         .collect()
@@ -1270,6 +1461,30 @@ fn parse_sgd5_data(path: &Path, data: &[u8]) -> Result<Sgd5File, Sgd5Error> {
     }
 
     let hash_names = build_hash_names(&shared_reflection, &shaders, &effects);
+    let compute_selectors: HashMap<_, _> = shaders
+        .iter()
+        .filter_map(|shader| {
+            shader
+                .compute_binding_selectors()
+                .map(|selectors| (shader.index, selectors))
+        })
+        .collect();
+    for effect in &effects {
+        for pass in &effect.metadata.passes {
+            if let Some(slot) = pass.shader_slots[5].checked_sub(1) {
+                let index = effect.stage_indices[5][usize::from(slot)];
+                for selector in compute_selectors[&index] {
+                    if selector != 255 && usize::from(selector) >= effect.binding_list.entries.len()
+                    {
+                        return Err(Sgd5Error(format!(
+                            "effect {}: compute shader {index} references an invalid binding table",
+                            effect.name
+                        )));
+                    }
+                }
+            }
+        }
+    }
     resolve_reflection_names(&mut shared_reflection, &hash_names);
     let mut table_hashes = HashMap::new();
     for (index, table) in binding_tables.iter_mut().enumerate() {
@@ -1583,6 +1798,20 @@ mod tests {
         assert_eq!(table.default_value_data[4..], 0xdead_beefu32.to_le_bytes());
         assert_eq!(table.string_pool, pool);
         assert_eq!(reader.u32().unwrap(), 0x1122_3344);
+        // A record link into a neighbouring section must be rejected at parse time.
+        for (field, value) in [(7 + 4 + 8 + 6, 25u16), (7 + 4 + 8 + 14, 49)] {
+            let mut invalid = data.clone();
+            invalid[field..field + 2].copy_from_slice(&value.to_le_bytes());
+            let mut reader = Reader::new(&invalid);
+            reader.take(7).unwrap();
+            assert!(parse_reflection_table(&mut reader).is_err());
+        }
+        let mut invalid = data.clone();
+        // A float4 default cannot fit in the eight-byte tail.
+        invalid[7 + 4 + 8 + 24] = 12;
+        let mut reader = Reader::new(&invalid);
+        reader.take(7).unwrap();
+        assert!(parse_reflection_table(&mut reader).is_err());
     }
 
     #[test]
@@ -1666,11 +1895,17 @@ mod tests {
         data.extend(binding_table(1));
         data.extend_from_slice(&TABLE_REFERENCE.to_le_bytes());
         data.extend_from_slice(&0xaabb_ccddu32.to_le_bytes());
-        data.extend_from_slice(&0u32.to_le_bytes());
         for length in 0..data.len() {
             assert!(parse_binding_list(&mut Reader::new(&data[..length])).is_err());
         }
         assert!(parse_binding_list(&mut Reader::new(&data)).is_ok());
+        // The effect's pool-size word belongs to the enclosing effect, not this list.
+        let list_end = data.len();
+        data.extend_from_slice(&7u32.to_le_bytes());
+        let mut reader = Reader::new(&data);
+        parse_binding_list(&mut reader).unwrap();
+        assert_eq!(reader.position, list_end);
+        assert_eq!(reader.u32().unwrap(), 7);
     }
 
     #[test]

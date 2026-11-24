@@ -4,6 +4,16 @@ SGD5 contains compiled shaders plus an effect database describing how the engine
 
 The current [C-style serialized layout](SGD5-layout.md) documents record widths, field order, offset bases, and conditional table forms.
 
+## Browser and shader views
+
+The SGD5 browser follows effect → technique → pass → shader. Search keeps matching ancestors visible and supports effect/technique/shader names, shader indices and SGA hashes, with a stage filter. Each effect also exposes its complete declared variant library; archive shared reflection, shared binding tables, and the complete shader library remain directly accessible. Passes outside techniques and shaderless passes are retained.
+
+Effect inspection shows material reflection, member packing/default bytes, typed `proplst` properties, vertex-input summaries, binding layouts, the effect-owned string pool, and render/sampler state libraries. Pass inspection shows selected stage shaders, active rasterizer/depth/blend states, per-space layouts, and verified parameter bindings. Compute uses the selected CS shader's metadata selectors rather than graphics pass selectors.
+
+Shader selection retains its effect, technique, and pass context. The Parameters tab maps resource identities to compiled registers/spaces and root locations, plus parent-member byte offsets and the selected runtime layout. ASM/HLSL exports include the same metadata and selected pass context. Runtime mappings distinguish descriptor indices, direct roots, constants, static samplers, and material texture handles; they do not assign speculative names to ISA registers. Unsupported FSSM programs can still be inspected through metadata and exported as DXBC.
+
+Navigation, decompressed programs, metadata, and rendered shader text are cached. Disassembly and lifted HLSL consume the complete decoded program through code-end padding, without the former 4,000-instruction preview cap. The parser validates reflection member/auxiliary/string links, known default-value extents, aligned pass usage links, and selected compute layout selectors while retaining unresolved fields.
+
 ## What the parts provide
 
 | Part | Observed contents | Likely engine role |

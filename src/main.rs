@@ -16,6 +16,7 @@ mod psin_xml;
 mod rsc9;
 mod sgd5;
 mod sgd5_metadata;
+mod sgd5_view;
 mod world_gpu;
 mod worldmap;
 mod model3d;
@@ -908,12 +909,7 @@ struct Rpf9App {
     sh_source: ShaderSource,
     sgd5_job: Arc<Mutex<Sgd5JobState>>,
     sgd5_cache: Option<Arc<Vec<sgd5::Sgd5File>>>,
-    sgd5_group: usize,
-    sgd5_stage_filter: Option<&'static str>,
-    sgd5_search: String,
-    sgd5_selected: Option<usize>,
-    sgd5_show_metadata: bool,
-    sgd5_cached_text: (Option<(usize, usize, ShaderViewMode, bool)>, String),
+    sgd5_browser: sgd5_view::Sgd5Browser,
 }
 
 fn sgd5_stage(stage: &str) -> ShaderStage {
@@ -944,12 +940,11 @@ fn sgd5_ps09_entry(shader: &sgd5::Sgd5Shader, fssm: &dxbc::FssmShader) -> Ps09Sh
         sga_hash: Some(shader.sga_hash),
         has_rt: false,
         has_ngg: false,
-        insn_count: u32::try_from(rdna2::decode_gfx103(fssm.code(), 4000).len()).unwrap_or(0),
+        insn_count: u32::try_from(rdna2::decode_gfx103(fssm.code(), usize::MAX).len()).unwrap_or(0),
     }
 }
 
-fn sgd5_shader_text(file: &sgd5::Sgd5File, shader: &sgd5::Sgd5Shader, entry: &Ps09ShaderEntry, code: &[u8], mode: ShaderViewMode) -> String {
-    let metadata = sgd5_metadata::format_shader_metadata(file, shader);
+fn sgd5_shader_text(metadata: &str, entry: &Ps09ShaderEntry, code: &[u8], mode: ShaderViewMode) -> String {
     match mode {
         ShaderViewMode::Asm => sgd5_metadata::prepend_comments(&metadata, ";", format_gfx103_disasm(entry, code)),
         ShaderViewMode::Hlsl => sgd5_metadata::prepend_comments(&metadata, "//", lift_to_hlsl(entry, code)),
@@ -1080,12 +1075,7 @@ impl Rpf9App {
             sh_source: ShaderSource::Ps09,
             sgd5_job: Arc::new(Mutex::new(Sgd5JobState::default())),
             sgd5_cache: None,
-            sgd5_group: 0,
-            sgd5_stage_filter: None,
-            sgd5_search: String::new(),
-            sgd5_selected: None,
-            sgd5_show_metadata: false,
-            sgd5_cached_text: (None, String::new()),
+            sgd5_browser: sgd5_view::Sgd5Browser::default(),
         };
         psin::seed_names();
         if let Some(dir) = names_dir() {
@@ -3075,9 +3065,7 @@ impl Rpf9App {
     fn poll_sgd5_cache(&mut self) {
         let files = self.sgd5_job.lock().unwrap().files.take();
         if let Some(files) = files {
-            self.sgd5_group = 0;
-            self.sgd5_selected = Some(0);
-            self.sgd5_cached_text = (None, String::new());
+            self.sgd5_browser.reset();
             self.sgd5_cache = Some(files);
             if self.sh_cache.is_none() {
                 self.sh_source = ShaderSource::Sgd5;
@@ -3105,7 +3093,7 @@ impl Rpf9App {
                 ui.horizontal_wrapped(|ui| {
                     for (source, label) in [
                         (ShaderSource::Ps09, "PS09 Runtime Cache"),
-                        (ShaderSource::Sgd5, "SGD5 DXBC Groups"),
+                        (ShaderSource::Sgd5, "SGD5 Effects"),
                     ] {
                         let active = self.sh_source == source;
                         let button = egui::Button::new(
@@ -3199,119 +3187,9 @@ impl Rpf9App {
                     );
                 }
                 if self.sh_source == ShaderSource::Sgd5 {
-                if let Some(files) = self.sgd5_cache.clone() {
-                    ui.add_space(6.0);
-                    ui.horizontal_wrapped(|ui| {
-                        for group_index in 0..files.len() {
-                            let label = format!("Group {group_index}");
-                            let active = self.sgd5_group == group_index;
-                            let button = egui::Button::new(
-                                RichText::new(label)
-                                    .size(11.5)
-                                    .strong()
-                                    .color(if active { Color32::BLACK } else { Color32::from_rgb(225, 215, 240) }),
-                            )
-                            .fill(if active { Color32::from_rgb(255, 168, 28) } else { Color32::from_rgb(38, 24, 58) });
-                            if ui.add(button).clicked() {
-                                self.sgd5_group = group_index;
-                                self.sgd5_selected = Some(0);
-                                self.sgd5_cached_text = (None, String::new());
-                                self.sh_source = ShaderSource::Sgd5;
-                            }
-                        }
-                    });
-                    let group = &files[self.sgd5_group.min(files.len() - 1)];
-                    let mut stage_counts = std::collections::BTreeMap::new();
-                    for shader in &group.shaders {
-                        *stage_counts.entry(shader.stage).or_insert(0usize) += 1;
+                    if let Some(files) = self.sgd5_cache.clone() {
+                        self.sgd5_browser.show_navigation(ui, &files);
                     }
-                    ui.horizontal_wrapped(|ui| {
-                        let options = [
-                            (None, "All"),
-                            (Some("VS"), "VS"),
-                            (Some("PS"), "PS"),
-                            (Some("GS"), "GS"),
-                            (Some("DS"), "DS"),
-                            (Some("HS"), "HS"),
-                            (Some("CS"), "CS"),
-                        ];
-                        for (option, label) in options {
-                            let count = option.map_or(group.shaders.len(), |stage| {
-                                stage_counts.get(stage).copied().unwrap_or(0)
-                            });
-                            let color = option.map_or(
-                                Color32::from_rgb(225, 215, 240),
-                                sgd5_stage_color,
-                            );
-                            let active = self.sgd5_stage_filter == option;
-                            let button = egui::Button::new(
-                                RichText::new(format!("{label} ({count})"))
-                                    .size(11.0)
-                                    .strong()
-                                    .color(if active { Color32::BLACK } else { color }),
-                            )
-                            .fill(if active { color } else { Color32::from_rgb(36, 22, 54) });
-                            if ui.add(button).clicked() {
-                                self.sgd5_stage_filter = option;
-                                self.sgd5_selected = None;
-                                self.sh_source = ShaderSource::Sgd5;
-                            }
-                        }
-                    });
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.sgd5_search)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("Filter SGD5 shaders by name, SGA hash, or stage..."),
-                    );
-                    let query = self.sgd5_search.trim().to_ascii_lowercase();
-                    let filtered: Vec<usize> = group
-                        .shaders
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, shader)| {
-                            self.sgd5_stage_filter
-                                .is_none_or(|stage| shader.stage == stage)
-                                && (query.is_empty()
-                                    || shader.name.to_ascii_lowercase().contains(&query)
-                                    || format!("0x{:016x}", shader.sga_hash).contains(&query)
-                                    || group.effect_names_for_shader(shader.stage, shader.index)
-                                        .iter()
-                                        .any(|name| name.to_ascii_lowercase().contains(&query)))
-                        })
-                        .map(|(index, _)| index)
-                        .collect();
-                    ui.label(format!("{} shaders", filtered.len()));
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show_rows(ui, 20.0, filtered.len(), |ui, range| {
-                            for index in filtered[range].iter().copied() {
-                                let shader = &group.shaders[index];
-                                let selected = self.sgd5_selected == Some(index);
-                                let color = sgd5_stage_color(shader.stage);
-                                let effects = group.effect_names_for_shader(shader.stage, shader.index);
-                                let label = format!(
-                                    "[{}] #{:05} {} {:5}B{}",
-                                    shader.stage,
-                                    shader.index,
-                                    shader.name,
-                                    shader.archive.decompressed_size,
-                                    if effects.is_empty() { String::new() }
-                                    else { format!(" · {}", effects.join(", ")) }
-                                );
-                                let button = egui::Button::new(
-                                    RichText::new(label)
-                                        .monospace()
-                                        .size(11.0)
-                                        .color(if selected { Color32::BLACK } else { color }),
-                                )
-                                .fill(if selected { color } else { Color32::from_rgb(24, 15, 36) });
-                                if ui.add(button).clicked() {
-                                    self.sgd5_selected = Some(index);
-                                    self.sh_source = ShaderSource::Sgd5;
-                                }
-                            }
-                        });
-                }
                 }
                 if self.sh_source == ShaderSource::Ps09 {
                 if !self.sh_status.is_empty() {
@@ -3455,7 +3333,7 @@ impl Rpf9App {
                     ui.horizontal_wrapped(|ui| {
                         for (source, label) in [
                             (ShaderSource::Ps09, "PS09 Runtime Cache"),
-                            (ShaderSource::Sgd5, "SGD5 DXBC Groups"),
+                            (ShaderSource::Sgd5, "SGD5 Effects"),
                         ] {
                             let active = self.sh_source == source;
                             let button = egui::Button::new(
@@ -3482,160 +3360,10 @@ impl Rpf9App {
                 }
 
                 if self.sh_source == ShaderSource::Sgd5 {
-                if let Some(files) = self.sgd5_cache.clone() {
-                    let group_index = self.sgd5_group.min(files.len() - 1);
-                    if let Some(shader_index) = self.sgd5_selected {
-                        let file = &files[group_index];
-                        if let Some(shader) = file.shaders.get(shader_index) {
-                            let effect_names = file.effect_names_for_shader(shader.stage, shader.index);
-                            ui.horizontal(|ui| {
-                                if ui.selectable_label(!self.sgd5_show_metadata, "Shader").clicked() {
-                                    self.sgd5_show_metadata = false;
-                                }
-                                if ui.selectable_label(self.sgd5_show_metadata, "Metadata").clicked() {
-                                    self.sgd5_show_metadata = true;
-                                }
-                                if ui.button("Export metadata").clicked() {
-                                    if let Some(path) = rfd::FileDialog::new()
-                                        .set_file_name(format!("sgd5_{}_{}.metadata.txt", shader.stage, shader.index))
-                                        .save_file()
-                                    {
-                                        let _ = fs::write(path, sgd5_metadata::format_shader_metadata(file, shader));
-                                    }
-                                }
-                            });
-                            if self.sgd5_show_metadata {
-                                let key = Some((group_index, shader_index, self.sh_mode, true));
-                                if self.sgd5_cached_text.0 != key {
-                                    self.sgd5_cached_text = (key, sgd5_metadata::format_shader_metadata(file, shader));
-                                }
-                                egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-                                    ui.add(egui::TextEdit::multiline(&mut self.sgd5_cached_text.1.as_str())
-                                        .font(egui::TextStyle::Monospace).desired_width(f32::INFINITY));
-                                });
-                                return;
-                            }
-                            match sgd5::decompress_shader(file, shader) {
-                                Ok(blob) => match dxbc::extract_fssm(&blob) {
-                                    Ok(fssm) => {
-                                        let code = fssm.code().to_vec();
-                                        let entry = sgd5_ps09_entry(shader, &fssm);
-                                        let stem = format!(
-                                            "sgd5_{:05}_{}_{}",
-                                            shader.index,
-                                            shader.stage.to_lowercase(),
-                                            shader.name.replace(['/', '\\', ':'], "_")
-                                        );
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "SGD5 group {} · {} · {} · {} code bytes",
-                                                    group_index,
-                                                    shader.stage,
-                                                    shader.name,
-                                                    code.len()
-                                                ))
-                                                .strong()
-                                                .size(13.0)
-                                                .color(Color32::from_rgb(255, 168, 28)),
-                                            );
-                                            if !effect_names.is_empty() {
-                                                ui.label(
-                                                    RichText::new(format!("Effects: {}", effect_names.join(", ")))
-                                                        .size(11.0)
-                                                        .color(Color32::from_rgb(120, 220, 255)),
-                                                );
-                                            }
-                                            ui.separator();
-                                            for (mode, label) in [
-                                                (ShaderViewMode::Asm, "GFX10.3 ASM"),
-                                                (ShaderViewMode::Hlsl, "Lifted HLSL (SM 6.6)"),
-                                                (ShaderViewMode::SpirvAbi, "SPIR-V 1.5 / SGPR ABI"),
-                                            ] {
-                                                let active = self.sh_mode == mode;
-                                                let button = egui::Button::new(
-                                                    RichText::new(label)
-                                                        .size(12.0)
-                                                        .strong()
-                                                        .color(if active { Color32::BLACK } else { Color32::from_rgb(225, 215, 240) }),
-                                                )
-                                                .fill(if active { Color32::from_rgb(255, 168, 28) } else { Color32::from_rgb(38, 24, 58) });
-                                                if ui.add(button).clicked() {
-                                                    self.sh_mode = mode;
-                                                }
-                                            }
-                                            ui.separator();
-                                            if ui.button("Export .dxbc").clicked() {
-                                                if let Some(path) = rfd::FileDialog::new()
-                                                    .set_file_name(format!("{stem}.dxbc"))
-                                                    .save_file()
-                                                {
-                                                    let _ = fs::write(&path, &blob);
-                                                }
-                                            }
-                                            if ui.button("Export .asm").clicked() {
-                                                if let Some(path) = rfd::FileDialog::new()
-                                                    .set_file_name(format!("{stem}.asm"))
-                                                    .save_file()
-                                                {
-                                                    let _ = fs::write(&path, sgd5_shader_text(file, shader, &entry, &code, ShaderViewMode::Asm));
-                                                }
-                                            }
-                                            if ui.button("Export .hlsl").clicked() {
-                                                if let Some(path) = rfd::FileDialog::new()
-                                                    .set_file_name(format!("{stem}.hlsl"))
-                                                    .save_file()
-                                                {
-                                                    let _ = fs::write(&path, sgd5_shader_text(file, shader, &entry, &code, ShaderViewMode::Hlsl));
-                                                }
-                                            }
-                                            if ui.button("Export .spv").clicked() {
-                                                if let Some(path) = rfd::FileDialog::new()
-                                                    .set_file_name(format!("{stem}.spv"))
-                                                    .save_file()
-                                                {
-                                                    let _ = fs::write(&path, lift_to_spirv(&entry, &code));
-                                                }
-                                            }
-                                        });
-                                        ui.add_space(8.0);
-                                        let key = Some((group_index, shader_index, self.sh_mode, false));
-                                        if self.sgd5_cached_text.0 != key {
-                                            let text = sgd5_shader_text(file, shader, &entry, &code, self.sh_mode);
-                                            self.sgd5_cached_text = (key, text);
-                                        }
-                                        egui::ScrollArea::both()
-                                            .auto_shrink([false, false])
-                                            .show(ui, |ui| {
-                                                ui.add(
-                                                    egui::TextEdit::multiline(
-                                                        &mut self.sgd5_cached_text.1.as_str(),
-                                                    )
-                                                    .font(egui::TextStyle::Monospace)
-                                                    .desired_width(f32::INFINITY),
-                                                );
-                                            });
-                                        return;
-                                    }
-                                    Err(error) => {
-                                        ui.label(
-                                            RichText::new(format!("FSSM extraction failed: {error}"))
-                                                .color(Color32::from_rgb(255, 100, 120)),
-                                        );
-                                        return;
-                                    }
-                                },
-                                Err(error) => {
-                                    ui.label(
-                                        RichText::new(format!("DXBC decompression failed: {error}"))
-                                            .color(Color32::from_rgb(255, 100, 120)),
-                                    );
-                                    return;
-                                }
-                            }
-                        }
+                    if let Some(files) = self.sgd5_cache.clone() {
+                        self.sgd5_browser.show_content(ui, &files, &mut self.sh_mode);
+                        return;
                     }
-                }
                 }
                 if self.sh_source == ShaderSource::Ps09 {
                 if let (Some(ref cache), Some(sel_idx)) = (&self.sh_cache, self.sh_selected) {
@@ -6953,15 +6681,31 @@ mod tests {
         assert_eq!(entry.stage, ShaderStage::Vertex);
         assert_eq!(entry.sga_hash, Some(shader.sga_hash));
         assert!(entry.resource_names.is_empty());
-        let hlsl = sgd5_shader_text(&file, &shader, &entry, fssm.code(), ShaderViewMode::Hlsl);
+        let metadata = sgd5_metadata::format_shader_metadata(&file, &shader);
+        let hlsl = sgd5_shader_text(&metadata, &entry, fssm.code(), ShaderViewMode::Hlsl);
         assert!(hlsl.contains("metadata_slot=19"));
         assert!(hlsl.contains("DensityMap"));
         assert!(!hlsl.contains("register(t19)"));
         assert!(!hlsl.contains("Texture2D<float4> DensityMap"));
-        let asm = sgd5_shader_text(&file, &shader, &entry, fssm.code(), ShaderViewMode::Asm);
+        let asm = sgd5_shader_text(&metadata, &entry, fssm.code(), ShaderViewMode::Asm);
         assert!(asm.contains("SGA Hash:"));
         assert!(!asm.contains("SGD5 Bindings"));
         assert_eq!(entry.insn_count, 2);
+        let mut mapped_shader = shader.clone();
+        mapped_shader.reflection.resources[0].resource_type |= 0x0080;
+        mapped_shader.reflection.resources[0].flags = 0x40;
+        let root = dxbc::CompactRootSignature {
+            flags: 0, unknown: 0, padding: vec![], static_samplers: vec![],
+            parameters: vec![dxbc::RootParameter::Descriptor { kind: dxbc::DescriptorKind::Srv, register: 275, space: 1, unknown_bits: 0 }],
+        };
+        let mapping = sgd5_metadata::format_parameter_mapping(&file, &mapped_shader, Some(&root));
+        assert!(mapping.contains("DensityMap"));
+        assert!(mapping.contains("t275, space1"));
+        assert!(mapping.contains("root_parameter=0 direct root descriptor"));
+        assert!(!mapping.contains("member_should_not_bind"));
+        let binding = sgd5::Sgd5BindingEntry { name_hash: 0, binding_type: 2, binding_index: 0x8405, name: None };
+        assert_eq!(binding.descriptor_index(), 5);
+        assert_eq!(binding.binding_index, 0x8405);
         assert!(lift_to_hlsl(&entry, fssm.code()).contains("VSMain"));
         assert_eq!(
             &lift_to_spirv(&entry, fssm.code())[..4],

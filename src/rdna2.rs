@@ -967,7 +967,7 @@ pub fn decode_gfx103(code: &[u8], max_insns: usize) -> Vec<DecodedInsn> {
 }
 
 pub fn format_gfx103_disasm(entry: &Ps09ShaderEntry, code: &[u8]) -> String {
-    let insns = decode_gfx103(code, 4000);
+    let insns = decode_gfx103(code, usize::MAX);
     let mut s = String::with_capacity(insns.len() * 48 + 512);
     let hash_kind = if entry.sga_hash.is_some() { "SGA" } else { "PSO" };
     let _ = writeln!(
@@ -1048,7 +1048,7 @@ pub fn format_gfx103_disasm(entry: &Ps09ShaderEntry, code: &[u8]) -> String {
 // =============================================================================
 
 pub fn lift_to_hlsl(entry: &Ps09ShaderEntry, code: &[u8]) -> String {
-    let insns = decode_gfx103(code, 4000);
+    let insns = decode_gfx103(code, usize::MAX);
     let mut s = String::with_capacity(insns.len() * 44 + 1024);
     let _ = writeln!(s, "// ============================================================================");
     let _ = writeln!(s, "// PercyStar Clean-Room GFX10.3 (RDNA2) -> HLSL SM 6.6 Lifted Shader");
@@ -1592,5 +1592,17 @@ mod tests {
         let spv = lift_to_spirv(&entry, &bytes);
         assert!(spv.len() >= 20 && spv.len().is_multiple_of(4));
         assert_eq!(u32::from_le_bytes([spv[0], spv[1], spv[2], spv[3]]), 0x0723_0203);
+    }
+
+    #[test]
+    fn shader_outputs_include_instructions_beyond_the_old_preview_limit() {
+        let mut bytes = Vec::new();
+        for _ in 0..4096 { bytes.extend_from_slice(&0xbf800000u32.to_le_bytes()); }
+        bytes.extend_from_slice(&0x7e0a5411u32.to_le_bytes()); // v_rcp_f32 v5, s17
+        bytes.extend_from_slice(&0xbf810000u32.to_le_bytes());
+        let entry = Ps09ShaderEntry { index: 0, code_offset: 0, code_size: bytes.len() as u32, stage: ShaderStage::Pixel,
+            num_threads: None, rsrc1: None, rsrc2: None, bindings: vec![], resource_names: vec![], pso_hash: 0, sga_hash: Some(0), has_rt: false, has_ngg: false, insn_count: 4098 };
+        assert!(format_gfx103_disasm(&entry, &bytes).contains("+4000:"));
+        assert!(lift_to_hlsl(&entry, &bytes).contains("rcp("));
     }
 }

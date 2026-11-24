@@ -76,7 +76,7 @@ struct sized_reflection_table {
 struct binding_entry {                    // 0x08 bytes
     u32 name_hash;
     u16 binding_type;                     // low byte kind; high byte shape/flags; see notes
-    u16 binding_index;
+    u16 binding_index;                    // runtime descriptor index = binding_index & 0x03FF
 };
 
 struct binding_table {
