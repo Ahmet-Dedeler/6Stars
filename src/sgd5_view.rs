@@ -6,6 +6,8 @@ use crate::{egui, ShaderViewMode};
 use egui::{RichText, Ui};
 use std::fmt::Write as _;
 
+const METADATA_LABEL_COLOR: egui::Color32 = egui::Color32::from_rgb(120, 220, 255);
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 enum Selection {
     #[default]
@@ -453,7 +455,7 @@ impl Sgd5Browser {
         egui::ScrollArea::both().id_salt(("sgd5_inspector", self.selection)).auto_shrink([false, false]).show(ui, |ui| {
             match self.selection {
                 Selection::Group => {
-                    ui.heading("SGD5 archive");
+                    ui.heading(RichText::new("SGD5 archive").color(METADATA_LABEL_COLOR));
                     info(ui, "Group hash", format!("0x{:016x}", file.group_hash));
                     info(ui, "Effects / shaders", format!("{} / {}", file.effects.len(), file.shaders.len()));
                     info(ui, "Shared binding tables", file.binding_tables.len());
@@ -468,7 +470,7 @@ impl Sgd5Browser {
                 Selection::Effect(index) => effect_overview(ui, file, index),
                 Selection::Technique { effect, technique } => {
                     if let Some(entry) = file.effects.get(effect).and_then(|e| e.metadata.techniques.get(technique)) {
-                        ui.heading(entry.name.as_deref().unwrap_or("Unnamed technique"));
+                        ui.heading(RichText::new(entry.name.as_deref().unwrap_or("Unnamed technique")).color(METADATA_LABEL_COLOR));
                         info(ui, "First pass", entry.first_pass);
                         info(ui, "Pass count", entry.pass_count);
                         for pass in usize::from(entry.first_pass)..usize::from(entry.first_pass) + usize::from(entry.pass_count) {
@@ -557,10 +559,13 @@ impl Sgd5Browser {
         let Some(shader) = file.shaders.get(shader_index) else {
             return;
         };
-        ui.heading(format!(
-            "{} #{} · {}",
-            shader.stage, shader.index, shader.name
-        ));
+        ui.heading(
+            RichText::new(format!(
+                "{} #{} · {}",
+                shader.stage, shader.index, shader.name
+            ))
+            .color(METADATA_LABEL_COLOR),
+        );
         if effect.is_none() {
             let effects = file.effect_names_for_shader(shader.stage, shader.index);
             if !effects.is_empty() {
@@ -715,7 +720,7 @@ impl Sgd5Browser {
 
 fn info(ui: &mut Ui, label: &str, value: impl std::fmt::Display) {
     ui.horizontal(|ui| {
-        ui.strong(label);
+        ui.label(RichText::new(label).strong().color(METADATA_LABEL_COLOR));
         ui.label(value.to_string());
     });
 }
@@ -751,7 +756,7 @@ fn effect_overview(ui: &mut Ui, file: &Sgd5File, index: usize) {
     let Some(effect) = file.effects.get(index) else {
         return;
     };
-    ui.heading(&effect.name);
+    ui.heading(RichText::new(&effect.name).color(METADATA_LABEL_COLOR));
     info(
         ui,
         "Runtime data allocation",
@@ -915,7 +920,7 @@ fn pass_overview(ui: &mut Ui, file: &Sgd5File, effect_index: usize, pass_index: 
     let Some(pass) = effect.metadata.passes.get(pass_index) else {
         return;
     };
-    ui.heading(format!("Pass {pass_index}"));
+    ui.heading(RichText::new(format!("Pass {pass_index}")).color(METADATA_LABEL_COLOR));
     for stage in 0..6 {
         if let Some(shader) = file.pass_shader(effect, pass, stage) {
             info(
