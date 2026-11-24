@@ -3,6 +3,7 @@ mod audio_player;
 mod awc;
 mod bink2;
 mod bink2_container;
+mod content_search;
 mod boot;
 mod dat;
 mod dxbc;
@@ -10,6 +11,7 @@ mod mapdata;
 mod meta7a;
 mod names;
 mod psin;
+mod psin_tree;
 mod psin_xml;
 mod rsc9;
 mod sgd5;
@@ -870,7 +872,16 @@ struct Rpf9App {
     export_busy: Arc<AtomicBool>,
     // the entry on screen is a psin file shown as xml
     psin_selected: bool,
+    // tree view of the selected psin file and whether its xml text is shown instead
+    psin_tree: Option<psin_tree::PsinTree>,
+    psin_as_text: bool,
     export_cancel: Arc<AtomicBool>,
+    // the search box looks inside readable files instead of at names
+    content_mode: bool,
+    content: content_search::ContentSearch,
+    content_seen_gen: u64,
+    // last edit of the search box, the content search starts once typing pauses
+    content_edit_at: Option<Instant>,
     mv_drawer_open: bool,
     mv_entries: Vec<(usize, ModelCat, String)>,
     mv_counts: [usize; 10],
@@ -1038,7 +1049,13 @@ impl Rpf9App {
             lod_keep_cam: None,
             export_busy: Arc::new(AtomicBool::new(false)),
             psin_selected: false,
+            psin_tree: None,
+            psin_as_text: false,
             export_cancel: Arc::new(AtomicBool::new(false)),
+            content_mode: false,
+            content: content_search::ContentSearch::default(),
+            content_seen_gen: 0,
+            content_edit_at: None,
             mv_drawer_open: true,
             mv_entries: Vec::new(),
             mv_counts: [0; 10],
@@ -1151,6 +1168,7 @@ impl Rpf9App {
         self.tex_from_model = false;
         self.lod_keep_cam = None;
         self.psin_selected = false;
+        self.psin_tree = None;
         self.preview.clear();
         self.last_dock_rect = [0; 4];
         self.mesh3d = None;
@@ -1260,6 +1278,7 @@ impl Rpf9App {
     }
 
     fn bump_gen(&self) -> u64 {
+        self.content.cancel();
         let mut g = self.watch_gen.lock().unwrap();
         *g += 1;
         *g
@@ -2376,6 +2395,7 @@ impl Rpf9App {
                             Ok(xml) => {
                                 self.preview = xml;
                                 self.psin_selected = true;
+                                self.psin_tree = psin_tree::PsinTree::new(data.clone()).ok();
                             }
                             Err(_) => self.preview = psin::parse_psin(&data),
                         }
@@ -2418,8 +2438,29 @@ impl Rpf9App {
         }
     }
 
+    // searches the text of every readable entry for the words in the search box
+    fn start_content_search(&mut self) {
+        self.content_edit_at = None;
+        let list: Vec<(usize, RpfEntry)> = {
+            let st = self.state.lock().unwrap();
+            st.entries.iter().enumerate().filter(|(_, e)| content_search::KINDS.contains(&e.kind)).map(|(i, e)| (i, e.clone())).collect()
+        };
+        self.content.start(&self.filter, list);
+        self.view_key = None;
+    }
+
     // throtled view rebuilder runs 4x a sec during live scans
     fn refresh_view(&mut self) {
+        if self.content_mode {
+            let (gen, running) = {
+                let h = self.content.hits();
+                (h.gen, h.running)
+            };
+            if gen != self.content_seen_gen && (!running || self.last_rebuild.elapsed() > Duration::from_millis(300)) {
+                self.content_seen_gen = gen;
+                self.view_key = None;
+            }
+        }
         let ver = self.state.lock().unwrap().ver;
         let key = (ver, self.filter.clone(), self.category.clone(), self.selected_rpf.clone(), self.vehicles_only, self.audio_named);
         if self.view_sort != self.sort_mode {
@@ -2467,6 +2508,8 @@ impl Rpf9App {
         let (inc, exc): (Vec<&str>, Vec<&str>) = q.split_whitespace().partition(|t| !t.starts_with('-'));
         let exc: Vec<&str> = exc.iter().map(|t| &t[1..]).filter(|t| !t.is_empty()).collect();
         let all_rpf = self.selected_rpf == "All RPFs";
+        let content_hits = (self.content_mode && !inc.is_empty()).then(|| self.content.hits());
+        let found = content_hits.as_ref().map(|h| &h.found);
         let (entries, hay, category, vehicles_only, selected_rpf) = (&st.entries, &self.hay, &self.category, self.vehicles_only, &self.selected_rpf);
         let mut view: Vec<usize> = par_filter(entries.len().min(hay.len()), |i| {
                 let e = &entries[i];
@@ -2484,11 +2527,13 @@ impl Rpf9App {
                     Category::Binary => e.kind == "ZLIB",
                 };
                 let h = &hay[i];
-                cat_ok
-                    && (all_rpf || e.rpf_name == *selected_rpf)
-                    && inc.iter().all(|t| h.contains(t))
-                    && !exc.iter().any(|t| h.contains(t))
+                let text_ok = match found {
+                    Some(found) => found.contains_key(&i),
+                    None => inc.iter().all(|t| h.contains(t)) && !exc.iter().any(|t| h.contains(t)),
+                };
+                cat_ok && (all_rpf || e.rpf_name == *selected_rpf) && text_ok
             });
+        drop(content_hits);
         match self.sort_mode {
             SortMode::Relevance => {
                 if let Some(first) = inc.first() {
@@ -3677,11 +3722,32 @@ impl Rpf9App {
     // export, edit and name tools for the psin file on screen
     fn psin_tools_ui(&mut self, ui: &mut egui::Ui) {
         let complete = !self.preview.contains(PSIN_CUT_MARK);
+        let tree = self.psin_tree.is_some() && !self.psin_as_text;
         ui.horizontal(|ui| {
+            if self.psin_tree.is_some() {
+                ui.selectable_value(&mut self.psin_as_text, false, "Tree").on_hover_text("Blocks and fields as a collapsible tree, values are edited in place");
+                ui.selectable_value(&mut self.psin_as_text, true, "XML text").on_hover_text("The same values as one editable XML text");
+                ui.separator();
+            }
             if ui.button("Export XML…").on_hover_text("Save the whole file as editable XML").clicked() {
                 self.psin_export_xml();
             }
-            if ui
+            if tree {
+                let (edits, invalid) = self.psin_tree.as_ref().map_or((0, 0), |t| (t.edit_count(), t.invalid_edits()));
+                if ui
+                    .add_enabled(edits > 0 && invalid == 0, egui::Button::new(format!("Save {edits} edit(s)…")))
+                    .on_hover_text("Write the edited values into a patched copy of the file")
+                    .on_disabled_hover_text(if invalid > 0 { "Some edited values are not valid for their type" } else { "Nothing is edited yet" })
+                    .clicked()
+                {
+                    self.psin_save_tree();
+                }
+                if edits > 0 && ui.button("Discard edits").clicked() {
+                    if let Some(t) = self.psin_tree.as_mut() {
+                        t.clear_edits();
+                    }
+                }
+            } else if ui
                 .add_enabled(complete, egui::Button::new("Save edits shown here…"))
                 .on_hover_text("Write the values edited in the text below into a patched copy of the file")
                 .on_disabled_hover_text("The view is cut short for this file: export the XML, edit it, then use Apply XML file")
@@ -3736,9 +3802,19 @@ impl Rpf9App {
     fn psin_apply_xml(&self, xml: String) {
         let Some(e) = self.selected_entry() else { return };
         let res = read_entry_bytes(&e).map_err(|err| err.to_string()).and_then(|data| psin_xml::apply_xml(&data, &xml));
+        self.psin_save_patched(&e, res);
+    }
+
+    // saves a copy of the selected file with the edits made in the tree view
+    fn psin_save_tree(&self) {
+        let (Some(e), Some(tree)) = (self.selected_entry(), self.psin_tree.as_ref()) else { return };
+        self.psin_save_patched(&e, tree.patched());
+    }
+
+    fn psin_save_patched(&self, e: &RpfEntry, res: Result<psin_xml::Applied, String>) {
         let status = match res {
-            Err(err) => format!("XML not applied: {err}"),
-            Ok(done) if done.changes.is_empty() => "The XML has the same values as the file, nothing to save".to_string(),
+            Err(err) => format!("Edits not applied: {err}"),
+            Ok(done) if done.changes.is_empty() => "The values are the same as in the file, nothing to save".to_string(),
             Ok(done) => {
                 let name = format!("{}.patched.psin", safe_file_name(e.name.trim_end_matches(".psin")));
                 match rfd::FileDialog::new().set_file_name(name).save_file() {
@@ -3849,6 +3925,19 @@ impl Rpf9App {
             } else if e.kind == "TTPF" {
                 if let Ok(t) = decode_ttpf_texture(&e.source_rpf, e.tracks as usize) {
                     if export_texture_png(&t, &out_dir.join(format!("{}.png", safe_file_name(&t.name)))).is_ok() {
+                        ok += 1;
+                    }
+                }
+            } else if e.kind == "GXT" {
+                // text tables go out as readable utf8 text, the raw file when they do not decode
+                if let Ok(data) = read_entry_bytes(&e) {
+                    let stem = e.name.strip_suffix(".gxt").unwrap_or(&e.name);
+                    let stem = if is_folder { format!("{}_{stem}", e.rpf_name.trim_end_matches(".rpf")) } else { stem.to_string() };
+                    let written = match decode_0drpz_text(&data) {
+                        Some(txt) => fs::write(out_dir.join(safe_file_name(&format!("{stem}.txt"))), txt),
+                        None => fs::write(out_dir.join(safe_file_name(&format!("{stem}.gxt"))), &data),
+                    };
+                    if written.is_ok() {
                         ok += 1;
                     }
                 }
@@ -5294,6 +5383,14 @@ impl eframe::App for Rpf9App {
             self.category = Category::Audio;
             self.filter = q;
         }
+        if self.content_mode {
+            if self.content_edit_at.is_some_and(|t| t.elapsed() > Duration::from_millis(450)) {
+                self.start_content_search();
+            }
+            if self.content_edit_at.is_some() || self.content.hits().running {
+                ctx.request_repaint_after(Duration::from_millis(150));
+            }
+        }
 
         egui::TopBottomPanel::top("top").frame(egui::Frame::new().fill(Color32::from_rgb(24, 14, 36)).inner_margin(10.0)).show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -5440,12 +5537,38 @@ impl eframe::App for Rpf9App {
                             }
                         }
                     }
-                    let r = ui.add(egui::TextEdit::singleline(&mut self.filter).desired_width(250.0).hint_text("Search (Ctrl+F) · words AND · -exclude"));
+                    let hint = if self.content_mode { "Search inside files · words AND · -exclude" } else { "Search (Ctrl+F) · words AND · -exclude" };
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.filter).desired_width(250.0).hint_text(hint));
                     if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
                         r.request_focus();
                     }
                     if r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                         self.filter.clear();
+                        if self.content_mode {
+                            self.content_edit_at = Some(Instant::now());
+                        }
+                    }
+                    if self.content_mode {
+                        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            self.start_content_search();
+                        } else if r.changed() {
+                            self.content_edit_at = Some(Instant::now());
+                        }
+                    }
+                    let in_files = egui::Button::new(
+                        RichText::new("In files").strong().color(if self.content_mode { Color32::BLACK } else { Color32::from_rgb(255, 225, 95) }),
+                    )
+                    .fill(if self.content_mode { Color32::from_rgb(255, 225, 95) } else { Color32::from_rgb(38, 24, 56) });
+                    let tip = format!("Search the text inside {} files instead of file names", content_search::KINDS.join(", "));
+                    if ui.add(in_files).on_hover_text(tip).clicked() {
+                        self.content_mode = !self.content_mode;
+                        if self.content_mode {
+                            self.start_content_search();
+                        } else {
+                            self.content_edit_at = None;
+                            self.content.cancel();
+                            self.view_key = None;
+                        }
                     }
                 });
             });
@@ -5608,11 +5731,19 @@ impl eframe::App for Rpf9App {
             }
             ui.horizontal(|ui| {
                 let n_sel = self.multi_selected.len();
-                let res_lbl = if n_sel > 1 {
+                let mut res_lbl = if n_sel > 1 {
                     format!("{} results ({n_sel} selected)", self.view.len())
                 } else {
                     format!("{} results", self.view.len())
                 };
+                if self.content_mode && !self.filter.trim().is_empty() {
+                    let h = self.content.hits();
+                    if h.running {
+                        res_lbl += &format!(" · searching inside files {}/{}", h.scanned, h.total);
+                    } else {
+                        res_lbl += &format!(" · inside {} files", h.total);
+                    }
+                }
                 ui.label(RichText::new(res_lbl).size(11.0).color(Color32::from_rgb(110, 118, 134)));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     sort_combo(ui, "explorer_sort_combo", &mut self.sort_mode);
@@ -5647,7 +5778,13 @@ impl eframe::App for Rpf9App {
                     let st = self.state.lock().unwrap();
                     self.view[range].iter().filter_map(|&i| st.entries.get(i).map(|e| (i, e.clone()))).collect()
                 };
-                for (idx, e) in &rows {
+                let snippets: Vec<Option<String>> = if self.content_mode {
+                    let h = self.content.hits();
+                    rows.iter().map(|(i, _)| h.found.get(i).cloned()).collect()
+                } else {
+                    vec![None; rows.len()]
+                };
+                for ((idx, e), snippet) in rows.iter().zip(snippets) {
                     let w = ui.available_width();
                     let row_alloc = ui.allocate_ui_with_layout(egui::vec2(w, ROW_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.set_height(ROW_H);
@@ -5660,7 +5797,11 @@ impl eframe::App for Rpf9App {
                             format!("{}  ({})", dname, sz_s)
                         };
                         let is_sel = self.selected == Some(*idx) || self.multi_selected.contains(idx);
-                        let resp = ui.selectable_label(is_sel, RichText::new(label).size(12.5));
+                        let mut resp = ui.selectable_label(is_sel, RichText::new(label).size(12.5));
+                        if let Some(snippet) = snippet.filter(|s| !s.is_empty()) {
+                            ui.label(RichText::new(&snippet).size(11.0).color(Color32::from_rgb(150, 156, 170)));
+                            resp = resp.on_hover_text(snippet);
+                        }
                         if is_sel && scroll_to_sel && self.selected == Some(*idx) {
                             resp.scroll_to_me(Some(egui::Align::Center));
                         }
@@ -5870,9 +6011,14 @@ impl eframe::App for Rpf9App {
                 if self.psin_selected {
                     self.psin_tools_ui(ui);
                 }
-                egui::ScrollArea::both().show(ui, |ui| {
-                    ui.add(egui::TextEdit::multiline(&mut self.preview).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY));
-                });
+                match self.psin_tree.as_mut().filter(|_| self.psin_selected && !self.psin_as_text) {
+                    Some(tree) => tree.ui(ui),
+                    None => {
+                        egui::ScrollArea::both().show(ui, |ui| {
+                            ui.add(egui::TextEdit::multiline(&mut self.preview).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY));
+                        });
+                    }
+                }
             }
         });
         } // end Explorer tab
@@ -6883,6 +7029,19 @@ mod tests {
         assert!(tex::probe_gxt_snippet(&gxt).is_some());
         let txt = decode_0drpz_text(&gxt).expect("unicode gxt should decode");
         assert!(txt.contains("彩色字幕") && txt.contains("Привет мир") && txt.contains("한국어 자막") && txt.contains("日本語テキスト"));
+
+        // small table: two strings in a pool past the bitmap end, reached only through a {u32, len, ptr} record
+        let mut small = vec![0u8; 0xC0];
+        small[0x08..0x10].copy_from_slice(&0x5000_0080u64.to_le_bytes());
+        small[0x10..0x15].copy_from_slice(b"0DRPz");
+        small[0x60..0x64].copy_from_slice(b"O\x80\x80\x80");
+        let pool = "Open the door\0テスト文字列\0".as_bytes();
+        small[0xA0..0xA4].copy_from_slice(&0x10u32.to_le_bytes());
+        small[0xA4..0xA8].copy_from_slice(&(pool.len() as u32).to_le_bytes());
+        small[0xA8..0xB0].copy_from_slice(&0x5000_00C0u64.to_le_bytes());
+        small.extend_from_slice(pool);
+        let txt = decode_0drpz_text(&small).expect("small pooled gxt should decode");
+        assert!(txt.contains("(2 strings)") && txt.contains("Open the door") && txt.contains("テスト文字列"));
     }
 
     /// Writes sample PNGs from a big .ttpf so decode quality can be eyeballed:
