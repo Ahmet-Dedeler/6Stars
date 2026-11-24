@@ -66,6 +66,14 @@
 
 ---
 
+## What's New (v1.6.0)
+
+- **World Viewer memory & smoothness** (PR #52 by @asm512): Idle models are evicted from VRAM, and meshes are prepared off the render thread, so large flights no longer stall or run out of memory.
+- **PSIN tree view** (PR #51 by @asm512): Collapsible tree view with in-place edits.
+- **GXT export & in-file search** (PR #54 by @asm512, closes #50): Export GXT UI/text tables as readable text and search inside file contents from the Explorer.
+- **GXT small-table fix** (PR #56 by @Snorps37, closes #55): Small text tables now decode through their string pool records (about 2,300 tables that failed before).
+- **ADAT audio fix** (PR #57 by @worstgirlinamerica, closes #48): Misaligned ADAT stream tables are recovered when the forward scan misses streams.
+
 ## What's New (v1.5.0) — Speed Release
 
 Every hot path was timed on a real GTA VI build (Ryzen 5 3600XT, 16 GB RAM, game on a 7200 rpm HDD), then made faster without changing a single result. Best of 3 runs, warm files, same machine, back to back:
@@ -284,10 +292,11 @@ Optional external tools are only loaded from trusted locations: `binkplay.exe` n
 - **Code & Research Contributors:**
   - [@Pokeralho](https://github.com/Pokeralho) (`Luis F.`, PR #42) — Smooth-shaded trilinear visibility-buffer 3D model renderer (`raster.rs`, `shading.rs`, `texture.rs`), OBJ+MTL+PNG & binary glTF 2.0 (`.glb`) export (`export.rs`), straight-alpha & BC2/BC3/BC4/BC5 decoder fixes, CLI/drag-and-drop path opening, Linux build fix, parser/updater security hardening, and headless viewport/siren tests.
   - [@clayeon](https://github.com/clayeon) (PR #34) — Emergency lights with siren sequencer timing, modular fragment/roofbar composition, and `packs.rpf` `0x7a` authored vehicle configurations.
-  - [@worstgirlinamerica](https://github.com/worstgirlinamerica) (PRs #30, #31, #32, #33) — `scripts/build_linux.sh`, AWC superblock directory & stereo channel fix in `awc_extract.py`, `cfg(windows)` gating, and explicit `f32` literal fix.
+  - [@Snorps37](https://github.com/Snorps37) (PR #56, Issue #55) — GXT small-table decoding through string pool records.
+  - [@worstgirlinamerica](https://github.com/worstgirlinamerica) (PRs #30, #31, #32, #33, #57) — ADAT misaligned stream-table recovery, `scripts/build_linux.sh`, AWC superblock directory & stereo channel fix in `awc_extract.py`, `cfg(windows)` gating, and explicit `f32` literal fix.
   - [@Xyzstk](https://github.com/Xyzstk) (PRs #8, #29) — `SGD5` shader-group parser, `DXBC`/`FSSM` extraction, and reflection resource naming.
   - [@techfoundrynz](https://github.com/techfoundrynz) (PRs #12, #13, #21–#28) — `>4 GiB` TTPF addressing, format 99 `float3` meshlets, world-scale MHIU terrain in GPU World, north-up 2D map & heightmap alignment, Model Viewer sidebar stability, window/taskbar icons, startup feedback, and `Cargo.lock` sync.
-  - [@asm512](https://github.com/asm512) (PRs #19, #43) — In-file & sibling vehicle LOD switching (`Hi`/`Mid`/`Low`, `LOD0`–`LOD3`), per-texture material layers + Texture Browser, stale-decode & streamer-hole fixes, 1024m cell batching, mip-capped TTPF reads, and background export with cancel.
+  - [@asm512](https://github.com/asm512) (PRs #19, #43, #45, #47, #51, #52, #54) — World Viewer model eviction & off-thread mesh prep, PSIN tree view, GXT text export & in-file search, PSIN typed XML, vehicle data panel, in-file & sibling vehicle LOD switching (`Hi`/`Mid`/`Low`, `LOD0`–`LOD3`), per-texture material layers + Texture Browser, stale-decode & streamer-hole fixes, 1024m cell batching, mip-capped TTPF reads, and background export with cancel.
   - `@igvcc` (Discord) — `Bink2` container parser (`bink2_container.rs`), `BCPack` Row-3 base-seed fallback (`tex.rs`, optimized to 16×16 swatch), and `--decode-audio` / `--decode-navmesh` batch CLI extractors.
   - [@nullbrik](https://github.com/nullbrik) ([RageForge](https://github.com/nullbrik/RageForge)) — Clean-room UX inspiration for `RF World View` (Time-of-Day presets, Water toggle, 700m–16km draw radius presets, and `C`-down flight controls).
   - [@GamingChelsea](https://github.com/GamingChelsea) (PRs #10, #18) — `audio.rpf` DAT metadata catalog & AWC auto-naming, AWC decode diagnostics, superblock stream splitting, and waveform audio player foundation.
@@ -295,7 +304,7 @@ Optional external tools are only loaded from trusted locations: `binkplay.exe` n
   - [@paryzius](https://github.com/paryzius) ([ttpf-viewer](https://github.com/paryzius/ttpf-viewer)) — `.ttpf` reduced-mip fallback for unreadable mip 0 chunks.
   - [@holdmysocks](https://github.com/holdmysocks) ([SixNG](https://github.com/holdmysocks/SixNG)) — `0DRPz` (`0x7a`) map placement schema for world entity streaming.
 - **Bug Reports & Feature Suggestions (Issues):**
-  - [@YellowMaker](https://github.com/YellowMaker) (#20 — 2D world map orientation), [@adamjuankili](https://github.com/adamjuankili) (#17 — GPU World `m_vb` VRAM crash), [@crexlight](https://github.com/crexlight) (#16 — police dispatch `.awc` sample rate), [@Bluredguy](https://github.com/Bluredguy) (#15 — `binkplay.exe` path lookup), [@rbence05](https://github.com/rbence05) (#14 — PSIN placed scene assembly), [@kotelkonrad](https://github.com/kotelkonrad) (#11 — keyboard/arrow navigation across Explorer, models, audio & video), [@CedarCoder1](https://github.com/CedarCoder1) (#5 — copy file names & paths), [@Mrsuss60](https://github.com/Mrsuss60) (#4 — sort by name & size), [@adastmin1](https://github.com/adastmin1) (#2, #3 — multi-language & audio/text feedback).
+  - [@YellowMaker](https://github.com/YellowMaker) (#20 — 2D world map orientation, #50 — GXT text export), [@crexlight](https://github.com/crexlight) (#48 — ADAT u16 stream tables), [@adamjuankili](https://github.com/adamjuankili) (#17 — GPU World `m_vb` VRAM crash), [@crexlight](https://github.com/crexlight) (#16 — police dispatch `.awc` sample rate), [@Bluredguy](https://github.com/Bluredguy) (#15 — `binkplay.exe` path lookup), [@rbence05](https://github.com/rbence05) (#14 — PSIN placed scene assembly), [@kotelkonrad](https://github.com/kotelkonrad) (#11 — keyboard/arrow navigation across Explorer, models, audio & video), [@CedarCoder1](https://github.com/CedarCoder1) (#5 — copy file names & paths), [@Mrsuss60](https://github.com/Mrsuss60) (#4 — sort by name & size), [@adastmin1](https://github.com/adastmin1) (#2, #3 — multi-language & audio/text feedback).
 
 ---
 
