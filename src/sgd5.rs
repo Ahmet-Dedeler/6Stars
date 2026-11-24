@@ -31,12 +31,90 @@ pub struct Sgd5Shader {
     pub stage: &'static str,
     pub index: u32,
     pub name: String,
-    pub wave_size: u8,
+    /// Serialized shader-version/profile code, not the compiled wave size.
+    pub shader_version: u8,
     pub archive: Sgd5ShaderArchive,
     pub sga_hash: u64,
-    /// Opaque data historically called the root signature; its encoding is still unresolved.
-    pub root_signature_data: [u8; 0x90],
+    /// Engine shader metadata. Compiled root signatures are stored in DXBC PRIV.
+    pub shader_metadata: [u8; 0x90],
     pub reflection: Sgd5ReflectionTable,
+}
+
+impl Sgd5Shader {
+    pub fn vertex_inputs(&self) -> Option<Sgd5VertexInputMetadata> {
+        (self.stage == "VS")
+            .then(|| Sgd5VertexInputMetadata::from_bytes(&self.shader_metadata[..0x48]))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Sgd5VertexInputMetadata {
+    /// One bit per input slot; slots 0..27 cover seven semantics with four indices each.
+    pub attribute_mask: u64,
+    /// Includes system inputs, format encoding, shader mode and root-argument fields.
+    pub shader_flags: u64,
+    pub attribute_formats: [u8; 52],
+    pub reserved_44: u32,
+}
+
+impl Sgd5VertexInputMetadata {
+    fn from_bytes(data: &[u8]) -> Self {
+        Self {
+            attribute_mask: u64::from_le_bytes(data[..8].try_into().unwrap()),
+            shader_flags: u64::from_le_bytes(data[8..16].try_into().unwrap()),
+            attribute_formats: data[16..68].try_into().unwrap(),
+            reserved_44: u32::from_le_bytes(data[68..72].try_into().unwrap()),
+        }
+    }
+
+    pub fn semantic(slot: usize) -> Option<(&'static str, u8)> {
+        const SEMANTICS: [&str; 7] = [
+            "POSITION",
+            "NORMAL",
+            "TANGENT",
+            "BINORMAL",
+            "BLENDWEIGHT",
+            "BLENDINDICES",
+            "COLOR",
+        ];
+        match slot {
+            0..=27 => Some((SEMANTICS[slot / 4], (slot % 4) as u8)),
+            28..=51 => Some(("TEXCOORD", (slot - 28) as u8)),
+            _ => None,
+        }
+    }
+
+    pub fn uses_vertex_id(&self) -> bool {
+        self.shader_flags & 8 != 0
+    }
+    pub fn uses_instance_id(&self) -> bool {
+        self.shader_flags & 2 != 0
+    }
+    pub fn compact_formats(&self) -> bool {
+        self.shader_flags & (1 << 52) != 0
+    }
+
+    /// Normalizes the executable's compact format codes to DXGI_FORMAT values.
+    /// The compact byte's high nibble is retained without assigning it a meaning.
+    pub fn dxgi_format(&self, slot: usize) -> Option<u8> {
+        let raw = *self.attribute_formats.get(slot)?;
+        if !self.compact_formats() {
+            return (raw != 0).then_some(raw);
+        }
+        const FORMATS: [u8; 13] = [41, 16, 6, 2, 30, 28, 24, 38, 34, 12, 10, 3, 17];
+        usize::from(raw & 15)
+            .checked_sub(1)
+            .and_then(|index| FORMATS.get(index).copied())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Sgd5EffectHeader {
+    /// Aggregate VS masks/flags. Format interpretation follows the matching VS layout;
+    /// its serialized merge rule and direct runtime consumer remain unconfirmed.
+    pub vertex_inputs: Sgd5VertexInputMetadata,
+    /// An additional mask in the same semantic-slot numbering; its selection policy is unconfirmed.
+    pub attribute_mask_48: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -73,7 +151,7 @@ pub struct Sgd5BindingTable {
 pub struct Sgd5ResourceRecord {
     pub offset: usize,
     pub resource_type: u16,
-    /// Low-byte index; its relationship to HLSL registers remains unconfirmed.
+    /// Shader register low byte in per-shader reflection; material SRV handle index in effect reflection.
     pub slot: u8,
     pub auxiliary_record_count: u8,
     pub member_count: u8,
@@ -87,6 +165,24 @@ pub struct Sgd5ResourceRecord {
     pub name_hash: u32,
     pub secondary_hash: u32,
     pub name: Option<String>,
+}
+
+impl Sgd5ResourceRecord {
+    /// Only use for per-shader reflection; effect slots have different semantics.
+    pub fn shader_register(&self) -> u32 {
+        u32::from(self.slot)
+            | (u32::from(self.resource_type & 0x0080) << 1)
+            | (u32::from(self.resource_type & 0x2000) >> 4)
+    }
+
+    pub fn register_space(&self) -> u8 {
+        self.flags >> 6
+    }
+
+    /// The effect runtime carries this pair as one 64-bit parameter identity.
+    pub fn parameter_key(&self) -> u64 {
+        u64::from(self.name_hash) | (u64::from(self.secondary_hash) << 32)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -104,6 +200,12 @@ pub struct Sgd5MemberRecord {
     pub name_hash: u32,
     pub secondary_hash: u32,
     pub name: Option<String>,
+}
+
+impl Sgd5MemberRecord {
+    pub fn parameter_key(&self) -> u64 {
+        u64::from(self.name_hash) | (u64::from(self.secondary_hash) << 32)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -130,17 +232,147 @@ pub struct Sgd5ReflectionTable {
 }
 
 #[derive(Clone, Debug)]
-pub enum Sgd5PropertyEntry {
+pub enum Sgd5BindingListEntry {
     TableReference { offset: usize, table_hash: u32 },
     Inline(Sgd5BindingTable),
 }
 
 #[derive(Clone, Debug)]
-pub struct Sgd5PropertyList {
+pub struct Sgd5BindingList {
     pub offset: usize,
-    pub flags: u16,
-    pub entries: Vec<Sgd5PropertyEntry>,
+    /// Number of u32 material texture handles, padded to a multiple of four.
+    pub texture_handle_count: u8,
+    pub entries: Vec<Sgd5BindingListEntry>,
+    pub string_pool: Vec<u8>,
     pub strings: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Sgd5RasterizerState {
+    pub offset: usize,
+    pub fill_mode: u8,
+    pub cull_mode: u8,
+    pub front_counter_clockwise: u8,
+    pub depth_bias: i8,
+    pub depth_bias_clamp: f32,
+    pub slope_scaled_depth_bias: f32,
+    pub depth_clip_enable: u8,
+    pub unknown_0d: u8,
+    pub forced_sample_count: u8,
+    pub flags: u8,
+}
+
+#[derive(Clone, Debug)]
+pub struct Sgd5StencilFace {
+    pub fail_op: u8,
+    pub depth_fail_op: u8,
+    pub pass_op: u8,
+    pub comparison_func: u8,
+}
+
+#[derive(Clone, Debug)]
+pub struct Sgd5DepthStencilState {
+    pub offset: usize,
+    pub depth_enable: u8,
+    pub depth_write_mask: u8,
+    pub depth_comparison_func: u8,
+    pub stencil_enable: u8,
+    pub stencil_read_mask: u8,
+    pub stencil_write_mask: u8,
+    pub front_face: Sgd5StencilFace,
+    pub back_face: Sgd5StencilFace,
+    pub unknown_0e: u8,
+    pub flags_0f: u8,
+    pub unknown_tail: [u8; 8],
+}
+
+#[derive(Clone, Debug)]
+pub struct Sgd5RenderTargetBlendState {
+    pub blend_enable: u8,
+    pub source_blend: u8,
+    pub destination_blend: u8,
+    pub blend_op: u8,
+    pub source_blend_alpha: u8,
+    pub destination_blend_alpha: u8,
+    pub blend_op_alpha: u8,
+    pub write_mask: u8,
+}
+
+#[derive(Clone, Debug)]
+pub struct Sgd5BlendState {
+    pub offset: usize,
+    pub alpha_to_coverage_enable: u8,
+    pub independent_blend_enable: u8,
+    pub unknown_02: u16,
+    pub render_targets: [Sgd5RenderTargetBlendState; 8],
+}
+
+#[derive(Clone, Debug)]
+pub struct Sgd5SamplerState {
+    pub offset: usize,
+    /// Serialized sampler descriptor; its packed filter fields remain provisional.
+    pub data: [u8; 36],
+}
+
+#[derive(Clone, Debug)]
+pub struct Sgd5Technique {
+    pub offset: usize,
+    pub name_string_offset: u16,
+    pub first_pass: u16,
+    pub pass_count: u8,
+    pub name: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Sgd5PassResourceUsage {
+    pub offset: usize,
+    pub srv_hashes: Vec<u32>,
+    pub uav_hashes: Vec<u32>,
+    pub sampler_hashes: Vec<u32>,
+    pub cbv_hashes: Vec<u32>,
+    /// Present when the effect has a texture-handle array. Low byte selects a
+    /// flattened root-constant dword; 0xFF has no root-constant destination.
+    pub texture_handle_binding: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Sgd5Pass {
+    pub offset: usize,
+    /// Zero means absent; other values are one-based slots in the effect's stage arrays.
+    pub shader_slots: [u8; 6],
+    pub rasterizer_state_index: u8,
+    pub depth_stencil_state_index: u8,
+    pub blend_state_index: u8,
+    pub unknown_09: u8,
+    pub state_flags: u8,
+    pub unknown_0b: [u8; 5],
+    /// Relative to the in-memory pass record; add four for the on-disk lookup-size prefix.
+    pub usage_data_offset: u16,
+    /// Binding-list selectors for register spaces 0..3; 0xFF means absent.
+    pub binding_table_indices: [u8; 4],
+    pub unknown_16: u16,
+    pub resource_usage: Option<Sgd5PassResourceUsage>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Sgd5EffectMetadata {
+    pub offset: usize,
+    pub header: Sgd5EffectHeader,
+    pub rasterizer_states: Vec<Sgd5RasterizerState>,
+    pub depth_stencil_states: Vec<Sgd5DepthStencilState>,
+    pub blend_states: Vec<Sgd5BlendState>,
+    pub sampler_states: Vec<Sgd5SamplerState>,
+    pub techniques: Vec<Sgd5Technique>,
+    pub passes: Vec<Sgd5Pass>,
+    /// Preserved because the per-pass lists do not yet explain every trailing word.
+    pub pass_lookup_words: Vec<u32>,
+}
+
+#[derive(Clone, Debug)]
+pub enum Sgd5ReflectionSource {
+    Shared,
+    Inline(Sgd5ReflectionTable),
+    Absent,
 }
 
 #[derive(Clone, Debug)]
@@ -150,10 +382,11 @@ pub struct Sgd5Effect {
     pub stage_indices: [Vec<u32>; 6],
     pub payload_offset: usize,
     pub payload_end: usize,
-    pub metadata: Vec<u8>,
+    pub metadata: Sgd5EffectMetadata,
+    pub shared_reflection_source: Sgd5ReflectionSource,
     pub main_reflection: Sgd5ReflectionTable,
-    pub secondary_reflection: Sgd5ReflectionTable,
-    pub property_list: Sgd5PropertyList,
+    pub property_reflection: Sgd5ReflectionTable,
+    pub binding_list: Sgd5BindingList,
 }
 
 #[derive(Clone, Debug)]
@@ -576,85 +809,243 @@ fn parse_shader(
     index: u32,
 ) -> Result<Sgd5Shader, Sgd5Error> {
     let name = reader.name("shader")?;
-    let wave_size = reader.u8()?;
+    let shader_version = reader.u8()?;
     let archive_size = reader.u32()?;
     let archive = parse_shader_archive(reader, archive_size)?;
     let sga_hash = reader.u64()?;
-    let root_signature_data = reader.array()?;
+    let shader_metadata = reader.array()?;
     let reflection = parse_reflection_table(reader)?;
     Ok(Sgd5Shader {
         stage,
         index,
         name,
-        wave_size,
+        shader_version,
         archive,
         sga_hash,
-        root_signature_data,
+        shader_metadata,
         reflection,
     })
 }
 
-fn parse_effect_metadata(reader: &mut Reader<'_>) -> Result<Vec<u8>, Sgd5Error> {
-    let start = reader.position;
-    let base = reader.take(0x5c)?;
-    let extension_count = u32::from_le_bytes(base[0x50..0x54].try_into().unwrap()) as usize;
-    reader.require_records(extension_count, 0x10)?;
-    let mut tail = u32::from_le_bytes(base[0x58..0x5c].try_into().unwrap());
-    for _ in 0..extension_count {
-        let extension = reader.take(0x10)?;
-        if extension[..4] != [0; 4] || extension[4..8] != [1, 1, 0, 0] {
-            return Err(Sgd5Error(format!(
-                "invalid effect extension at 0x{:x}",
-                reader.position - 0x10
-            )));
-        }
-        tail = u32::from_le_bytes(extension[0x0c..0x10].try_into().unwrap());
+fn read_counted_records<'a, T>(
+    reader: &mut Reader<'a>,
+    width: usize,
+    mut parse: impl FnMut(&mut Reader<'a>) -> Result<T, Sgd5Error>,
+) -> Result<Vec<T>, Sgd5Error> {
+    let count = reader.u32()? as usize;
+    reader.require_records(count, width)?;
+    let mut records = Vec::with_capacity(count);
+    for _ in 0..count {
+        records.push(parse(reader)?);
     }
-    while tail >> 16 != 0 {
-        let continuation = reader.take(0x18)?;
-        tail = u32::from_le_bytes(continuation[0x14..0x18].try_into().unwrap());
-    }
-    if tail != 0 && tail & 0xff00 == 0 {
-        let size = reader.require_records((tail & 0xff) as usize, 0x44)?;
-        reader.take(size)?;
-    }
-    for width in [0x24, 4, 0x18, 4] {
-        let count = reader.u32()? as usize;
-        let size = reader.require_records(count, width)?;
-        reader.take(size)?;
-    }
-    let end = reader.position;
-    if reader.u32()? != TABLE_REFERENCE {
-        return Err(Sgd5Error(format!("missing reflection marker at 0x{end:x}")));
-    }
-    Ok(reader.data[start..end].to_vec())
+    Ok(records)
 }
 
-fn parse_property_list(reader: &mut Reader<'_>) -> Result<Sgd5PropertyList, Sgd5Error> {
+fn parse_rasterizer_state(reader: &mut Reader<'_>) -> Result<Sgd5RasterizerState, Sgd5Error> {
     let offset = reader.position;
-    let count = reader.u16()?;
-    let flags = reader.u16()?;
-    reader.require_records(count as usize, 8)?;
-    let mut entries = Vec::with_capacity(count as usize);
+    let data: [u8; 16] = reader.array()?;
+    Ok(Sgd5RasterizerState {
+        offset,
+        fill_mode: data[0],
+        cull_mode: data[1],
+        front_counter_clockwise: data[2],
+        depth_bias: data[3] as i8,
+        depth_bias_clamp: f32::from_le_bytes(data[4..8].try_into().unwrap()),
+        slope_scaled_depth_bias: f32::from_le_bytes(data[8..12].try_into().unwrap()),
+        depth_clip_enable: data[12],
+        unknown_0d: data[13],
+        forced_sample_count: data[14],
+        flags: data[15],
+    })
+}
+
+fn parse_depth_stencil_state(reader: &mut Reader<'_>) -> Result<Sgd5DepthStencilState, Sgd5Error> {
+    let offset = reader.position;
+    let data: [u8; 24] = reader.array()?;
+    let face = |start| Sgd5StencilFace {
+        fail_op: data[start],
+        depth_fail_op: data[start + 1],
+        pass_op: data[start + 2],
+        comparison_func: data[start + 3],
+    };
+    Ok(Sgd5DepthStencilState {
+        offset,
+        depth_enable: data[0],
+        depth_write_mask: data[1],
+        depth_comparison_func: data[2],
+        stencil_enable: data[3],
+        stencil_read_mask: data[4],
+        stencil_write_mask: data[5],
+        front_face: face(6),
+        back_face: face(10),
+        unknown_0e: data[14],
+        flags_0f: data[15],
+        unknown_tail: data[16..].try_into().unwrap(),
+    })
+}
+
+fn parse_blend_state(reader: &mut Reader<'_>) -> Result<Sgd5BlendState, Sgd5Error> {
+    let offset = reader.position;
+    let data: [u8; 68] = reader.array()?;
+    Ok(Sgd5BlendState {
+        offset,
+        alpha_to_coverage_enable: data[0],
+        independent_blend_enable: data[1],
+        unknown_02: u16::from_le_bytes(data[2..4].try_into().unwrap()),
+        render_targets: std::array::from_fn(|index| {
+            let start = 4 + index * 8;
+            Sgd5RenderTargetBlendState {
+                blend_enable: data[start],
+                source_blend: data[start + 1],
+                destination_blend: data[start + 2],
+                blend_op: data[start + 3],
+                source_blend_alpha: data[start + 4],
+                destination_blend_alpha: data[start + 5],
+                blend_op_alpha: data[start + 6],
+                write_mask: data[start + 7],
+            }
+        }),
+    })
+}
+
+fn parse_pass(reader: &mut Reader<'_>) -> Result<Sgd5Pass, Sgd5Error> {
+    let offset = reader.position;
+    let data: [u8; 24] = reader.array()?;
+    Ok(Sgd5Pass {
+        offset,
+        shader_slots: data[..6].try_into().unwrap(),
+        rasterizer_state_index: data[6],
+        depth_stencil_state_index: data[7],
+        blend_state_index: data[8],
+        unknown_09: data[9],
+        state_flags: data[10],
+        unknown_0b: data[11..16].try_into().unwrap(),
+        usage_data_offset: u16::from_le_bytes(data[16..18].try_into().unwrap()),
+        binding_table_indices: data[18..22].try_into().unwrap(),
+        unknown_16: u16::from_le_bytes(data[22..24].try_into().unwrap()),
+        resource_usage: None,
+    })
+}
+
+fn parse_effect_metadata(reader: &mut Reader<'_>) -> Result<Sgd5EffectMetadata, Sgd5Error> {
+    let offset = reader.position;
+    let header = Sgd5EffectHeader {
+        vertex_inputs: Sgd5VertexInputMetadata::from_bytes(reader.take(0x48)?),
+        attribute_mask_48: reader.u64()?,
+    };
+    let rasterizer_states = read_counted_records(reader, 16, parse_rasterizer_state)?;
+    let depth_stencil_states = read_counted_records(reader, 24, parse_depth_stencil_state)?;
+    let blend_states = read_counted_records(reader, 68, parse_blend_state)?;
+    let sampler_states = read_counted_records(reader, 36, |reader| {
+        Ok(Sgd5SamplerState {
+            offset: reader.position,
+            data: reader.array()?,
+        })
+    })?;
+    let techniques = read_counted_records(reader, 4, |reader| {
+        let offset = reader.position;
+        let packed = reader.u32()?;
+        Ok(Sgd5Technique {
+            offset,
+            name_string_offset: (packed & 0x7fff) as u16,
+            first_pass: ((packed >> 15) & 0x1ff) as u16,
+            pass_count: (packed >> 24) as u8,
+            name: None,
+        })
+    })?;
+    let mut passes = read_counted_records(reader, 24, parse_pass)?;
+    let count = reader.u32()? as usize;
+    reader.require_records(count, 4)?;
+    let usage_start = reader.position;
+    let mut pass_lookup_words = Vec::with_capacity(count);
+    for _ in 0..count {
+        pass_lookup_words.push(reader.u32()?);
+    }
+    let usage_end = reader.position;
+    for pass in &mut passes {
+        if pass.usage_data_offset == 0 {
+            continue;
+        }
+        // The loader omits the lookup table's u32 count from its in-memory buffer.
+        let target = pass
+            .offset
+            .checked_add(pass.usage_data_offset as usize)
+            .and_then(|offset| offset.checked_add(4))
+            .filter(|offset| *offset >= usage_start && *offset < usage_end)
+            .ok_or_else(|| {
+                Sgd5Error(format!("invalid pass usage offset at 0x{:x}", pass.offset))
+            })?;
+        let mut usage = Reader {
+            data: reader.data,
+            position: target,
+            end: usage_end,
+        };
+        pass.resource_usage = Some(Sgd5PassResourceUsage {
+            offset: target,
+            srv_hashes: read_counted_records(&mut usage, 4, |reader| reader.u32())?,
+            uav_hashes: read_counted_records(&mut usage, 4, |reader| reader.u32())?,
+            sampler_hashes: read_counted_records(&mut usage, 4, |reader| reader.u32())?,
+            cbv_hashes: read_counted_records(&mut usage, 4, |reader| reader.u32())?,
+            texture_handle_binding: None,
+        });
+    }
+    Ok(Sgd5EffectMetadata {
+        offset,
+        header,
+        rasterizer_states,
+        depth_stencil_states,
+        blend_states,
+        sampler_states,
+        techniques,
+        passes,
+        pass_lookup_words,
+    })
+}
+
+fn parse_reflection_source(reader: &mut Reader<'_>) -> Result<Sgd5ReflectionSource, Sgd5Error> {
+    match reader.peek_u32()? {
+        TABLE_REFERENCE => {
+            reader.u32()?;
+            Ok(Sgd5ReflectionSource::Shared)
+        }
+        0 => {
+            reader.u32()?;
+            Ok(Sgd5ReflectionSource::Absent)
+        }
+        _ => Ok(Sgd5ReflectionSource::Inline(parse_reflection_table(
+            reader,
+        )?)),
+    }
+}
+
+fn parse_binding_list(reader: &mut Reader<'_>) -> Result<Sgd5BindingList, Sgd5Error> {
+    let offset = reader.position;
+    let packed_count = reader.u32()?;
+    let count = (packed_count & 0x00ff_ffff) as usize;
+    let texture_handle_count = (packed_count >> 24) as u8;
+    reader.require_records(count, 8)?;
+    let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
         let entry_offset = reader.position;
         let marker = reader.peek_u32()?;
         if marker == TABLE_REFERENCE {
             reader.u32()?;
-            entries.push(Sgd5PropertyEntry::TableReference {
+            entries.push(Sgd5BindingListEntry::TableReference {
                 offset: entry_offset,
                 table_hash: reader.u32()?,
             });
         } else {
-            entries.push(Sgd5PropertyEntry::Inline(parse_binding_table(reader)?));
+            entries.push(Sgd5BindingListEntry::Inline(parse_binding_table(reader)?));
         }
     }
     let strings_size = reader.u32()? as usize;
-    let strings = parse_nul_pool(reader.take(strings_size)?)?;
-    Ok(Sgd5PropertyList {
+    let string_pool = reader.take(strings_size)?.to_vec();
+    let strings = parse_nul_pool(&string_pool)?;
+    Ok(Sgd5BindingList {
         offset,
-        flags,
+        texture_handle_count,
         entries,
+        string_pool,
         strings,
     })
 }
@@ -679,10 +1070,84 @@ fn parse_effect(reader: &mut Reader<'_>, stage_counts: &[u32; 6]) -> Result<Sgd5
         }
     }
     let payload_offset = reader.position;
-    let metadata = parse_effect_metadata(reader)?;
+    let mut metadata = parse_effect_metadata(reader)?;
+    let lookup_end = reader.position;
+    let shared_reflection_source = parse_reflection_source(reader)?;
     let main_reflection = parse_reflection_table(reader)?;
-    let secondary_reflection = parse_reflection_table(reader)?;
-    let property_list = parse_property_list(reader)?;
+    let property_reflection = parse_reflection_table(reader)?;
+    let binding_list = parse_binding_list(reader)?;
+    if binding_list.texture_handle_count != 0 {
+        for pass in &mut metadata.passes {
+            if let Some(usage) = &mut pass.resource_usage {
+                let words = usage.srv_hashes.len()
+                    + usage.uav_hashes.len()
+                    + usage.sampler_hashes.len()
+                    + usage.cbv_hashes.len();
+                let position = usage.offset + 16 + 4 * words;
+                let mut tail = Reader {
+                    data: reader.data,
+                    position,
+                    end: lookup_end,
+                };
+                usage.texture_handle_binding = Some(tail.u32()?);
+            }
+        }
+    }
+    for technique in &mut metadata.techniques {
+        let pool = binding_list
+            .string_pool
+            .get(technique.name_string_offset as usize..)
+            .ok_or_else(|| Sgd5Error(format!("effect {name}: invalid technique name offset")))?;
+        let end = pool
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or_else(|| Sgd5Error(format!("effect {name}: unterminated technique name")))?;
+        technique.name = Some(
+            std::str::from_utf8(&pool[..end])
+                .map_err(|_| Sgd5Error(format!("effect {name}: invalid technique name")))?
+                .to_string(),
+        );
+        if technique.first_pass as usize + technique.pass_count as usize > metadata.passes.len() {
+            return Err(Sgd5Error(format!(
+                "effect {name}: technique pass range exceeds pass table"
+            )));
+        }
+    }
+    for pass in &metadata.passes {
+        for (stage, slot) in pass.shader_slots.iter().enumerate() {
+            if *slot as usize > stage_indices[stage].len() {
+                return Err(Sgd5Error(format!(
+                    "effect {name}: pass references an invalid shader slot"
+                )));
+            }
+        }
+        for slot in pass.binding_table_indices {
+            if slot != 0xff && slot as usize >= binding_list.entries.len() {
+                return Err(Sgd5Error(format!(
+                    "effect {name}: pass references an invalid binding table"
+                )));
+            }
+        }
+        for (flag, index, count) in [
+            (
+                1,
+                pass.rasterizer_state_index,
+                metadata.rasterizer_states.len(),
+            ),
+            (
+                2,
+                pass.depth_stencil_state_index,
+                metadata.depth_stencil_states.len(),
+            ),
+            (4, pass.blend_state_index, metadata.blend_states.len()),
+        ] {
+            if pass.state_flags & flag != 0 && index as usize >= count {
+                return Err(Sgd5Error(format!(
+                    "effect {name}: pass references an invalid render state"
+                )));
+            }
+        }
+    }
     Ok(Sgd5Effect {
         name,
         data_buffer_size,
@@ -690,9 +1155,10 @@ fn parse_effect(reader: &mut Reader<'_>, stage_counts: &[u32; 6]) -> Result<Sgd5
         payload_offset,
         payload_end: reader.position,
         metadata,
+        shared_reflection_source,
         main_reflection,
-        secondary_reflection,
-        property_list,
+        property_reflection,
+        binding_list,
     })
 }
 
@@ -706,12 +1172,20 @@ fn build_hash_names(
         .chain(
             effects
                 .iter()
-                .flat_map(|effect| [&effect.main_reflection, &effect.secondary_reflection]),
+                .flat_map(|effect| [&effect.main_reflection, &effect.property_reflection]),
+        )
+        .chain(
+            effects
+                .iter()
+                .filter_map(|effect| match &effect.shared_reflection_source {
+                    Sgd5ReflectionSource::Inline(table) => Some(table),
+                    _ => None,
+                }),
         );
     let strings = tables.flat_map(|table| table.strings.iter()).chain(
         effects
             .iter()
-            .flat_map(|effect| effect.property_list.strings.iter()),
+            .flat_map(|effect| effect.binding_list.strings.iter()),
     );
     strings
         .map(|name| (joaat_lower(name), name.clone()))
@@ -811,12 +1285,15 @@ fn parse_sgd5_data(path: &Path, data: &[u8]) -> Result<Sgd5File, Sgd5Error> {
         resolve_binding_names(table, &hash_names);
     }
     for effect in &mut effects {
+        if let Sgd5ReflectionSource::Inline(table) = &mut effect.shared_reflection_source {
+            resolve_reflection_names(table, &hash_names);
+        }
         resolve_reflection_names(&mut effect.main_reflection, &hash_names);
-        resolve_reflection_names(&mut effect.secondary_reflection, &hash_names);
-        for property in &mut effect.property_list.entries {
+        resolve_reflection_names(&mut effect.property_reflection, &hash_names);
+        for property in &mut effect.binding_list.entries {
             match property {
-                Sgd5PropertyEntry::Inline(table) => resolve_binding_names(table, &hash_names),
-                Sgd5PropertyEntry::TableReference { table_hash, .. } => {
+                Sgd5BindingListEntry::Inline(table) => resolve_binding_names(table, &hash_names),
+                Sgd5BindingListEntry::TableReference { table_hash, .. } => {
                     if !table_hashes.contains_key(table_hash) {
                         return Err(Sgd5Error(format!(
                             "effect {}: unknown binding table hash {table_hash:08x}",
@@ -938,7 +1415,7 @@ fn extract_sgd5_file(
     });
 
     let mut manifest = String::from(
-        "index,stage,name,wave_size,archive_size,decompressed_size,sga_hash,resources,members,auxiliary_records,filename\n",
+        "index,stage,name,shader_version,archive_size,decompressed_size,sga_hash,resources,members,auxiliary_records,filename\n",
     );
     for shader in selected {
         let blob = decompress_shader(file, shader)?;
@@ -956,7 +1433,7 @@ fn extract_sgd5_file(
             shader.index,
             shader.stage,
             shader.name,
-            shader.wave_size,
+            shader.shader_version,
             shader.archive.archive_size,
             shader.archive.decompressed_size,
             shader.sga_hash,
@@ -1109,7 +1586,7 @@ mod tests {
     }
 
     #[test]
-    fn property_tables_use_the_same_binding_model_and_u16_count() {
+    fn binding_tables_keep_u16_counts_and_binding_lists_use_u24_counts() {
         let inline = binding_table(257);
         let table = parse_binding_table(&mut Reader::new(&inline)).unwrap();
         assert_eq!(table.hash, 0x1122_3344_5566_7788);
@@ -1117,24 +1594,38 @@ mod tests {
         assert_eq!(table.entries.len(), 257);
         assert_eq!(table.entries[256].binding_index, 256);
         assert_eq!(table.entries[0].binding_type, 0x0102);
-        let mut data = vec![2, 0, 0x12, 0x34];
+        let mut data = vec![2, 0, 0, 0x34];
         data.extend_from_slice(&TABLE_REFERENCE.to_le_bytes());
         data.extend_from_slice(&table.header.table_hash.to_le_bytes());
         data.extend(inline);
         data.extend_from_slice(&0u32.to_le_bytes());
-        let list = parse_property_list(&mut Reader::new(&data)).unwrap();
-        assert_eq!(list.flags, 0x3412);
+        let list = parse_binding_list(&mut Reader::new(&data)).unwrap();
+        assert_eq!(list.texture_handle_count, 0x34);
         assert!(matches!(
             list.entries[0],
-            Sgd5PropertyEntry::TableReference {
+            Sgd5BindingListEntry::TableReference {
                 table_hash: 0xaabb_ccdd,
                 ..
             }
         ));
-        let Sgd5PropertyEntry::Inline(table) = &list.entries[1] else {
+        let Sgd5BindingListEntry::Inline(table) = &list.entries[1] else {
             panic!("missing inline table")
         };
         assert_eq!(table.entries.len(), 257);
+    }
+
+    #[test]
+    fn binding_list_count_does_not_drop_bit_16() {
+        let count = 0x10000u32;
+        let mut data = (count | 0xa500_0000).to_le_bytes().to_vec();
+        for _ in 0..count {
+            data.extend_from_slice(&TABLE_REFERENCE.to_le_bytes());
+            data.extend_from_slice(&0x1234_5678u32.to_le_bytes());
+        }
+        data.extend_from_slice(&0u32.to_le_bytes());
+        let list = parse_binding_list(&mut Reader::new(&data)).unwrap();
+        assert_eq!(list.texture_handle_count, 0xa5);
+        assert_eq!(list.entries.len(), count as usize);
     }
 
     #[test]
@@ -1170,39 +1661,123 @@ mod tests {
     }
 
     #[test]
-    fn property_list_truncation_never_reads_past_the_input() {
+    fn binding_list_truncation_never_reads_past_the_input() {
         let mut data = vec![2, 0, 0, 0];
         data.extend(binding_table(1));
         data.extend_from_slice(&TABLE_REFERENCE.to_le_bytes());
         data.extend_from_slice(&0xaabb_ccddu32.to_le_bytes());
         data.extend_from_slice(&0u32.to_le_bytes());
         for length in 0..data.len() {
-            assert!(parse_property_list(&mut Reader::new(&data[..length])).is_err());
+            assert!(parse_binding_list(&mut Reader::new(&data[..length])).is_err());
         }
-        assert!(parse_property_list(&mut Reader::new(&data)).is_ok());
+        assert!(parse_binding_list(&mut Reader::new(&data)).is_ok());
     }
 
     #[test]
-    fn effect_metadata_walks_extensions_continuations_and_state_chunks() {
-        let mut data = vec![0; 0x5c];
-        data[0x50..0x54].copy_from_slice(&1u32.to_le_bytes());
-        let mut extension = [0; 0x10];
-        extension[4..8].copy_from_slice(&[1, 1, 0, 0]);
-        extension[0x0c..0x10].copy_from_slice(&0x0001_0000u32.to_le_bytes());
-        data.extend_from_slice(&extension);
-        let mut continuation = [0; 0x18];
-        continuation[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
-        data.extend_from_slice(&continuation);
-        data.extend_from_slice(&[0; 0x44]);
-        data.extend_from_slice(&[0; 16]);
-        let metadata_size = data.len();
+    fn effect_metadata_reads_counted_states_and_pass_relative_usage() {
+        let mut data = vec![0; 0x50];
+        for width in [16, 24, 68, 36] {
+            data.extend_from_slice(&1u32.to_le_bytes());
+            let start = data.len();
+            data.resize(start + width, 0);
+            if width == 16 {
+                data[start] = 3;
+                data[start + 3] = 0xfe;
+            }
+            if width == 68 {
+                data[start + 4 + 7] = 0xf;
+            }
+        }
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&0x0100_0001u32.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        let pass_start = data.len();
+        data.extend_from_slice(&[0; 24]);
+        data[pass_start + 16..pass_start + 18].copy_from_slice(&24u16.to_le_bytes());
+        data.extend_from_slice(&5u32.to_le_bytes());
+        for word in [1u32, 0x1234_5678, 0, 0, 0] {
+            data.extend_from_slice(&word.to_le_bytes());
+        }
+        let end = data.len();
         data.extend_from_slice(&TABLE_REFERENCE.to_le_bytes());
         let mut reader = Reader::new(&data);
+        let metadata = parse_effect_metadata(&mut reader).unwrap();
+        assert_eq!(reader.position, end);
+        assert_eq!(reader.u32().unwrap(), TABLE_REFERENCE);
+        assert_eq!(metadata.rasterizer_states[0].fill_mode, 3);
+        assert_eq!(metadata.rasterizer_states[0].depth_bias, -2);
+        assert_eq!(metadata.depth_stencil_states.len(), 1);
+        assert_eq!(metadata.blend_states[0].render_targets[0].write_mask, 0xf);
+        assert_eq!(metadata.sampler_states.len(), 1);
+        assert_eq!(metadata.techniques[0].pass_count, 1);
         assert_eq!(
-            parse_effect_metadata(&mut reader).unwrap().len(),
-            metadata_size
+            metadata.passes[0]
+                .resource_usage
+                .as_ref()
+                .unwrap()
+                .srv_hashes,
+            [0x1234_5678]
         );
-        assert_eq!(reader.remaining(), 0);
+        data[pass_start + 16..pass_start + 18].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(parse_effect_metadata(&mut Reader::new(&data)).is_err());
+    }
+
+    #[test]
+    fn effect_header_decodes_vertex_inputs_and_preserves_unknown_fields() {
+        let mask = (1u64 << 0) | (1 << 4) | (1 << 24) | (1 << 33);
+        let flags = (1u64 << 52) | 8 | 2;
+        let mut data = vec![0; 0x50 + 7 * 4];
+        data[..8].copy_from_slice(&mask.to_le_bytes());
+        data[8..16].copy_from_slice(&flags.to_le_bytes());
+        for (slot, value) in [(0, 0xa3), (4, 0x91), (24, 0xf6), (33, 0x72)] {
+            data[16 + slot] = value;
+        }
+        data[68..72].copy_from_slice(&0x1122_3344u32.to_le_bytes());
+        let extra_mask = (1u64 << 0) | (1 << 28) | (1 << 60);
+        data[72..80].copy_from_slice(&extra_mask.to_le_bytes());
+        let metadata = parse_effect_metadata(&mut Reader::new(&data)).unwrap();
+        let inputs = &metadata.header.vertex_inputs;
+        assert_eq!(inputs.attribute_mask, mask);
+        assert!(inputs.uses_vertex_id() && inputs.uses_instance_id());
+        assert_eq!(inputs.dxgi_format(0), Some(6));
+        assert_eq!(inputs.dxgi_format(4), Some(41));
+        assert_eq!(inputs.dxgi_format(24), Some(28));
+        assert_eq!(inputs.dxgi_format(33), Some(16));
+        assert_eq!(inputs.attribute_formats[24], 0xf6);
+        assert_eq!(inputs.reserved_44, 0x1122_3344);
+        assert_eq!(metadata.header.attribute_mask_48, extra_mask);
+        assert_eq!(Sgd5VertexInputMetadata::semantic(33), Some(("TEXCOORD", 5)));
+        assert_eq!(
+            Sgd5VertexInputMetadata::semantic(51),
+            Some(("TEXCOORD", 23))
+        );
+        assert_eq!(Sgd5VertexInputMetadata::semantic(52), None);
+        let mut direct = inputs.clone();
+        direct.shader_flags = 0;
+        direct.attribute_formats[0] = 6;
+        direct.attribute_formats[33] = 16;
+        assert_eq!(direct.dxgi_format(0), Some(6));
+        assert_eq!(direct.dxgi_format(33), Some(16));
+        assert_eq!(direct.dxgi_format(52), None);
+    }
+
+    #[test]
+    fn reflection_sources_support_shared_inline_and_absent_tables() {
+        let data = TABLE_REFERENCE.to_le_bytes();
+        assert!(matches!(
+            parse_reflection_source(&mut Reader::new(&data)).unwrap(),
+            Sgd5ReflectionSource::Shared
+        ));
+        let data = 0u32.to_le_bytes();
+        assert!(matches!(
+            parse_reflection_source(&mut Reader::new(&data)).unwrap(),
+            Sgd5ReflectionSource::Absent
+        ));
+        let data = empty_reflection();
+        assert!(matches!(
+            parse_reflection_source(&mut Reader::new(&data)).unwrap(),
+            Sgd5ReflectionSource::Inline(_)
+        ));
     }
 
     #[test]
@@ -1228,7 +1803,7 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].data.len(), expected_size);
         assert_eq!(files[0].shaders.len(), 1);
-        assert_eq!(files[0].shaders[0].root_signature_data, [0; 0x90]);
+        assert_eq!(files[0].shaders[0].shader_metadata, [0; 0x90]);
     }
 
     #[test]
@@ -1262,13 +1837,15 @@ mod tests {
         let mut auxiliary_count = 0;
         let mut table_count = 0;
         let mut member_link_count = 0;
+        let mut engine_counts = [0usize; 9];
         for file in &files {
-            let tables =
-                std::iter::once(&file.shared_reflection)
-                    .chain(file.shaders.iter().map(|shader| &shader.reflection))
-                    .chain(file.effects.iter().flat_map(|effect| {
-                        [&effect.main_reflection, &effect.secondary_reflection]
-                    }));
+            let tables = std::iter::once(&file.shared_reflection)
+                .chain(file.shaders.iter().map(|shader| &shader.reflection))
+                .chain(
+                    file.effects
+                        .iter()
+                        .flat_map(|effect| [&effect.main_reflection, &effect.property_reflection]),
+                );
             for table in tables {
                 table_count += 1;
                 let mut linked_auxiliary_count = 0;
@@ -1326,22 +1903,68 @@ mod tests {
                     let metadata = crate::sgd5_metadata::format_shader_metadata(file, shader);
                     assert!(metadata.contains("DXBC input/output signatures"));
                     assert!(!metadata.contains("DXBC signatures unavailable"));
-                    assert!(metadata.contains("Binding tables"));
+                    assert!(metadata.contains("Binding table inventory"));
                 }
             }
             for effect in &file.effects {
-                assert_eq!(effect.secondary_reflection.resource_count, 1);
+                let inputs = &effect.metadata.header.vertex_inputs;
+                let mut mask_union = 0;
+                let mut flag_union = 0;
+                for index in &effect.stage_indices[0] {
+                    let shader = file
+                        .shaders
+                        .iter()
+                        .find(|shader| shader.stage == "VS" && shader.index == *index)
+                        .unwrap();
+                    let input = shader.vertex_inputs().unwrap();
+                    mask_union |= input.attribute_mask;
+                    flag_union |= input.shader_flags;
+                }
+                assert_eq!(inputs.attribute_mask, mask_union, "{}", effect.name);
+                assert_eq!(inputs.shader_flags, flag_union, "{}", effect.name);
+                let format_mask = inputs
+                    .attribute_formats
+                    .iter()
+                    .enumerate()
+                    .fold(0u64, |mask, (slot, value)| {
+                        mask | (u64::from(*value != 0) << slot)
+                    });
+                assert_eq!(inputs.attribute_mask, format_mask, "{}", effect.name);
+                assert_eq!(inputs.reserved_44, 0);
+                assert_eq!(effect.metadata.header.attribute_mask_48 >> 52, 0);
+                assert!(matches!(
+                    effect.shared_reflection_source,
+                    Sgd5ReflectionSource::Shared
+                ));
+                for (sum, value) in engine_counts[..6].iter_mut().zip([
+                    effect.metadata.rasterizer_states.len(),
+                    effect.metadata.depth_stencil_states.len(),
+                    effect.metadata.blend_states.len(),
+                    effect.metadata.sampler_states.len(),
+                    effect.metadata.techniques.len(),
+                    effect.metadata.passes.len(),
+                ]) {
+                    *sum += value;
+                }
+                for pass in &effect.metadata.passes {
+                    let usage = pass.resource_usage.as_ref().unwrap();
+                    engine_counts[6] += usage.srv_hashes.len();
+                    engine_counts[7] += usage.uav_hashes.len();
+                    engine_counts[8] += usage.cbv_hashes.len();
+                    assert!(usage.sampler_hashes.is_empty());
+                }
+                assert_eq!(effect.property_reflection.resource_count, 1);
                 assert_eq!(
-                    effect.secondary_reflection.resources[0].name_hash,
+                    effect.property_reflection.resources[0].name_hash,
                     0xe435_592b
                 );
-                assert!(effect.secondary_reflection.default_value_data.is_empty());
+                assert!(effect.property_reflection.default_value_data.is_empty());
                 auxiliary_count += effect.main_reflection.auxiliary_records.len();
                 reference_count += effect
-                    .property_list
+                    .binding_list
                     .entries
                     .iter()
-                    .filter(|entry| matches!(entry, Sgd5PropertyEntry::TableReference { .. }))
+                    .filter(|entry| matches!(entry, Sgd5BindingListEntry::TableReference { .. }))
                     .count();
             }
         }
@@ -1349,5 +1972,9 @@ mod tests {
         assert_eq!(auxiliary_count, 5_605);
         assert_eq!(table_count, 28_369);
         assert_eq!(member_link_count, 94_397);
+        assert_eq!(
+            engine_counts,
+            [64, 124, 398, 10_650, 25_037, 28_798, 354_283, 12_297, 81_510]
+        );
     }
 }

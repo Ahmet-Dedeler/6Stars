@@ -440,7 +440,7 @@ pub enum InsnKind {
     AluFma { dst: u16, src0: String, src1: String },
     AluUnary { op: &'static str, dst: u16, src0: String },
     Mov { dst: String, src: String },
-    SmemLoad { op: &'static str, sdst: u16, sbase: u16, offset: u32, count: u8 },
+    SmemLoad { op: &'static str, sdst: u16, sbase: u16, offset: u32, soffset: Option<u16>, count: u8 },
     ImageOp { op: &'static str, vdata: u16, vaddr: u16, srsrc: u16, ssamp: u16, dmask: u8, is_rt: bool },
     Export { target: String, v: [u8; 4], en: u8, done: bool },
     Interp { op: &'static str, vdst: u16, attr: u8, chan: char },
@@ -698,11 +698,12 @@ pub fn decode_gfx103(code: &[u8], max_insns: usize) -> Vec<DecodedInsn> {
                 15 => "s_and_b64",
                 16 => "s_or_b32",
                 18 => "s_xor_b32",
-                28 => "s_lshl_b32",
-                30 => "s_lshr_b32",
-                32 => "s_ashr_i32",
-                36 => "s_mul_i32",
-                40 => "s_cselect_b32",
+                28 => "s_xnor_b32",
+                30 => "s_lshl_b32",
+                32 => "s_lshr_b32",
+                34 => "s_ashr_i32",
+                38 => "s_mul_i32",
+                10 => "s_cselect_b32",
                 46 => "s_lshl1_add_u32",
                 47 => "s_lshl2_add_u32",
                 48 => "s_lshl3_add_u32",
@@ -717,6 +718,10 @@ pub fn decode_gfx103(code: &[u8], max_insns: usize) -> Vec<DecodedInsn> {
             let sdata = ((w0 >> 6) & 0x7F) as u16;
             let sbase = ((w0 & 0x3F) * 2) as u16;
             let off = w1 & 0x1F_FFFF;
+            // GFX10 SMEM adds this scalar register to the immediate byte offset.
+            // Encoding 125 is null (immediate only), not s125.
+            let scalar_offset = ((w1 >> 25) & 0x7f) as u16;
+            let soffset = (scalar_offset != 125).then_some(scalar_offset);
             let (mn, cnt) = match op {
                 0 => ("s_load_dword", 1),
                 1 => ("s_load_dwordx2", 2),
@@ -730,12 +735,17 @@ pub fn decode_gfx103(code: &[u8], max_insns: usize) -> Vec<DecodedInsn> {
                 12 => ("s_buffer_load_dwordx16", 16),
                 _ => ("smem_op", 1),
             };
-            let ops = if cnt > 1 {
-                format!("s[{}:{}], s[{}:{}], 0x{off:x}", sdata, sdata + cnt as u16 - 1, sbase, sbase + 1)
-            } else {
-                format!("s{sdata}, s[{}:{}], 0x{off:x}", sbase, sbase + 1)
+            let offset_operand = match soffset {
+                Some(register) => format!("{} offset:0x{off:x}", fmt_src(u32::from(register))),
+                None => format!("0x{off:x}"),
             };
-            (mn.to_string(), ops, InsnKind::SmemLoad { op: mn, sdst: sdata, sbase, offset: off, count: cnt })
+            let base_end = sbase + if (8..=12).contains(&op) { 3 } else { 1 };
+            let ops = if cnt > 1 {
+                format!("s[{}:{}], s[{}:{}], {offset_operand}", sdata, sdata + cnt as u16 - 1, sbase, base_end)
+            } else {
+                format!("s{sdata}, s[{}:{}], {offset_operand}", sbase, base_end)
+            };
+            (mn.to_string(), ops, InsnKind::SmemLoad { op: mn, sdst: sdata, sbase, offset: off, soffset, count: cnt })
         } else if enc6 == 0x3E {
             let tgt = (w0 >> 4) & 0x3F;
             let en = (w0 & 0xF) as u8;
@@ -1176,12 +1186,16 @@ pub fn lift_to_hlsl(entry: &Ps09ShaderEntry, code: &[u8]) -> String {
                 };
                 let _ = writeln!(s, "    v{dst} = {fn_nm}({src0});");
             }
-            InsnKind::SmemLoad { op, sdst, sbase, offset, count } => {
+            InsnKind::SmemLoad { op, sdst, sbase, offset, soffset, count } => {
+                let address_offset = match soffset {
+                    Some(register) => format!("{} + 0x{offset:x}", fmt_src(u32::from(*register))),
+                    None => format!("0x{offset:x}"),
+                };
+                let base_end = sbase + if op.starts_with("s_buffer_") { 3 } else { 1 };
                 let _ = writeln!(
                     s,
-                    "    // {op}: s[{sdst}..{}] = LoadCB(s[{sbase}:{}], 0x{offset:x});",
+                    "    // {op}: s[{sdst}..{}] = ScalarLoad(s[{sbase}:{base_end}], {address_offset});",
                     sdst + (*count as u16).saturating_sub(1),
-                    sbase + 1
                 );
             }
             InsnKind::ImageOp { op, vdata, vaddr, srsrc, ssamp, dmask, is_rt } => {
@@ -1470,6 +1484,33 @@ pub fn format_spirv_abi_summary(entry: &Ps09ShaderEntry, code: &[u8]) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scalar_loads_preserve_register_offsets_and_descriptor_widths() {
+        let words = [
+            0xf4000000u32 | (8 << 18) | (6 << 6), 14 << 25,
+            0xf4000000 | (3 << 18) | (20 << 6) | 36, (13 << 25) | 32,
+            0xf4000000 | (2 << 18) | (36 << 6) | 22, (125 << 25) | 160,
+        ];
+        let bytes: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let instructions = decode_gfx103(&bytes, 3);
+        assert_eq!(instructions[0].operands, "s6, s[0:3], s14 offset:0x0");
+        assert_eq!(instructions[1].operands, "s[20:27], s[72:73], s13 offset:0x20");
+        assert_eq!(instructions[2].operands, "s[36:39], s[44:45], 0xa0");
+        assert!(matches!(instructions[0].kind, InsnKind::SmemLoad { soffset: Some(14), .. }));
+        assert!(matches!(instructions[2].kind, InsnKind::SmemLoad { soffset: None, .. }));
+    }
+
+    #[test]
+    fn scalar_shifts_use_gfx103_opcodes() {
+        let words = [0x80000000u32 | (30 << 23) | (13 << 16) | (133 << 8) | 4,
+            0x80000000 | (32 << 23) | (2 << 16) | (133 << 8) | 6];
+        let bytes: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let instructions = decode_gfx103(&bytes, 2);
+        assert_eq!(instructions[0].mnemonic, "s_lshl_b32");
+        assert_eq!(instructions[0].operands, "s13, s4, 5");
+        assert_eq!(instructions[1].mnemonic, "s_lshr_b32");
+    }
 
     #[test]
     fn literal_nops_prefetch_and_calls_keep_program_offsets() {

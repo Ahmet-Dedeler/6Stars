@@ -212,6 +212,8 @@ What changed:
 
   FSSM extraction follows the active program descriptor and its declared range instead of searching for an instruction marker. Program metadata shows the payload size, stage-pointer field, complete program range, and compiler hash embedded in leading no-ops, with a DXBC `HASH` comparison. Disassembly retains those no-ops and instructions before prefetch, and continues past early `s_endpgm` instructions to the code-end padding.
 
+  Executable analysis now supports explicit SGD5 state, technique, and pass tables. Metadata shows the techniques and passes using the selected shader, their render states and binding layouts, and per-pass resource usage. The shader's serialized profile byte is named `shader_version`; compiled wave size comes from FSSM metadata. Effect binding lists use a 24-bit count and 8-bit flags, and the shared-reflection selector is parsed explicitly.
+
 ---
 
 ## Project Layout

@@ -1,12 +1,14 @@
+use crate::dxbc::{CompactRootSignature, DescriptorKind, RootBindingLocation, RootParameter};
 use crate::sgd5::{
-    Sgd5BindingTable, Sgd5File, Sgd5MemberRecord, Sgd5PropertyEntry, Sgd5ReflectionTable,
-    Sgd5ResourceRecord, Sgd5Shader,
+    Sgd5BindingListEntry, Sgd5BindingTable, Sgd5Effect, Sgd5File, Sgd5MemberRecord, Sgd5Pass,
+    Sgd5ReflectionSource, Sgd5ReflectionTable, Sgd5ResourceRecord, Sgd5Shader,
+    Sgd5VertexInputMetadata,
 };
 use std::collections::HashSet;
 use std::fmt::Write as _;
 
 pub fn resource_type_name(resource_type: u16) -> &'static str {
-    match resource_type & !0x80 {
+    match resource_type & !0x2080 {
         0x0002 => "Texture1D",
         0x0102 => "Texture2D",
         0x0142 => "Texture2DArray",
@@ -48,6 +50,81 @@ fn value_type(value_type: u8) -> (&'static str, Option<usize>) {
         13 => ("float4x3", Some(48)),
         14 => ("float4x4", Some(64)),
         _ => ("unknown value type", None),
+    }
+}
+
+fn vertex_format_name(format: u8) -> &'static str {
+    match format {
+        2 => "R32G32B32A32_FLOAT",
+        3 => "R32G32B32A32_UINT",
+        4 => "R32G32B32A32_SINT",
+        6 => "R32G32B32_FLOAT",
+        7 => "R32G32B32_UINT",
+        8 => "R32G32B32_SINT",
+        10 => "R16G16B16A16_FLOAT",
+        11 => "R16G16B16A16_UNORM",
+        12 => "R16G16B16A16_UINT",
+        13 => "R16G16B16A16_SNORM",
+        14 => "R16G16B16A16_SINT",
+        16 => "R32G32_FLOAT",
+        17 => "R32G32_UINT",
+        18 => "R32G32_SINT",
+        24 => "R10G10B10A2_UNORM",
+        25 => "R10G10B10A2_UINT",
+        26 => "R11G11B10_FLOAT",
+        28 => "R8G8B8A8_UNORM",
+        30 => "R8G8B8A8_UINT",
+        31 => "R8G8B8A8_SNORM",
+        32 => "R8G8B8A8_SINT",
+        34 => "R16G16_FLOAT",
+        35 => "R16G16_UNORM",
+        36 => "R16G16_UINT",
+        37 => "R16G16_SNORM",
+        38 => "R16G16_SINT",
+        40 => "R32_TYPELESS",
+        41 => "R32_FLOAT",
+        42 => "R32_UINT",
+        43 => "R32_SINT",
+        _ => "unresolved DXGI format",
+    }
+}
+
+fn input_mask_names(mask: u64) -> String {
+    (0..52)
+        .filter(|slot| mask & (1 << slot) != 0)
+        .filter_map(|slot| {
+            let (semantic, index) = Sgd5VertexInputMetadata::semantic(slot)?;
+            Some(format!("{semantic}{index}"))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn write_vertex_inputs(
+    text: &mut String,
+    inputs: &Sgd5VertexInputMetadata,
+    label: &str,
+    format_label: &str,
+) {
+    let _ = writeln!(text, "{label}: mask=0x{:016x} flags=0x{:016x} VertexID={} InstanceID={} compact_formats={} reserved_44=0x{:08x}",
+        inputs.attribute_mask, inputs.shader_flags, inputs.uses_vertex_id(), inputs.uses_instance_id(), inputs.compact_formats(), inputs.reserved_44);
+    for slot in 0..52 {
+        if inputs.attribute_mask & (1 << slot) == 0 {
+            continue;
+        }
+        let (semantic, index) = Sgd5VertexInputMetadata::semantic(slot).unwrap();
+        let format = inputs.dxgi_format(slot);
+        let _ = writeln!(
+            text,
+            "  {semantic}{index}: semantic_slot={slot} {format_label}={} DXGI={} raw=0x{:02x}",
+            format
+                .map(vertex_format_name)
+                .unwrap_or("unresolved format"),
+            format
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unresolved".into()),
+            inputs.attribute_formats[slot]
+        );
     }
 }
 
@@ -189,9 +266,9 @@ fn write_member(
         format!("[{}]", member.array_size)
     };
     let extent = width.map(|width| width * member.array_size.max(1) as usize);
-    let _ = writeln!(text, "    {}{} {} | type=0x{:02x} byte_offset={} byte_size={} name_hash=0x{:08x} secondary_hash=0x{:08x}",
+    let _ = writeln!(text, "    {}{} {} | type=0x{:02x} byte_offset={} byte_size={} name_hash=0x{:08x} secondary_hash=0x{:08x} parameter_key=0x{:016x}",
         type_name, array, name(file, member.name_hash, member.name.as_deref()), member.value_type,
-        member.byte_offset, extent.map(|size| size.to_string()).unwrap_or_else(|| "unknown".into()), member.name_hash, member.secondary_hash);
+        member.byte_offset, extent.map(|size| size.to_string()).unwrap_or_else(|| "unknown".into()), member.name_hash, member.secondary_hash, member.parameter_key());
     if member.default_value_offset != 0 {
         let target = member.offset + member.default_value_offset as usize;
         let table_end = table.offset + 4 + table.size as usize;
@@ -221,9 +298,9 @@ fn write_resource(
     table: &Sgd5ReflectionTable,
     record: &Sgd5ResourceRecord,
 ) {
-    let _ = writeln!(text, "  {} {} | type=0x{:04x} metadata_slot={} flags=0x{:02x} name_hash=0x{:08x} secondary_hash=0x{:08x} cbuffer_bytes={} members={} auxiliary_records={}",
+    let _ = writeln!(text, "  {} {} | type=0x{:04x} metadata_slot={} flags=0x{:02x} name_hash=0x{:08x} secondary_hash=0x{:08x} parameter_key=0x{:016x} cbuffer_bytes={} members={} auxiliary_records={}",
         resource_type_name(record.resource_type), name(file, record.name_hash, record.name.as_deref()),
-        record.resource_type, record.slot, record.flags, record.name_hash, record.secondary_hash,
+        record.resource_type, record.slot, record.flags, record.name_hash, record.secondary_hash, record.parameter_key(),
         record.cbuffer_size, record.member_count, record.auxiliary_record_count);
     if record.member_count != 0 {
         let start = record.offset + record.member_data_offset as usize;
@@ -231,6 +308,367 @@ fn write_resource(
             if let Some(member) = member_at(table, start + index * 24) {
                 write_member(text, file, table, member);
             }
+        }
+    }
+}
+
+fn resource_kind(record: &Sgd5ResourceRecord) -> DescriptorKind {
+    match (record.resource_type >> 4) & 3 {
+        0 => DescriptorKind::Srv,
+        1 => DescriptorKind::Uav,
+        2 => DescriptorKind::Sampler,
+        _ => DescriptorKind::Cbv,
+    }
+}
+
+fn binding_kind(binding_type: u16) -> Option<DescriptorKind> {
+    match binding_type & 255 {
+        1 | 2 | 5 | 7 | 14 => Some(DescriptorKind::Srv),
+        4 | 6 | 8 | 12 => Some(DescriptorKind::Uav),
+        3 => Some(DescriptorKind::Sampler),
+        0 => Some(DescriptorKind::Cbv),
+        _ => None,
+    }
+}
+
+fn format_root_location(location: RootBindingLocation) -> String {
+    match location {
+        RootBindingLocation::DescriptorTable { parameter, descriptor_index } => format!("root_parameter={parameter} descriptor_index={descriptor_index} descriptor_byte_offset=0x{:x}", 32 * descriptor_index),
+        RootBindingLocation::Constants { parameter, dword_count } => format!("root_parameter={parameter} root_constants={dword_count} dwords"),
+        RootBindingLocation::RootDescriptor { parameter } => format!("root_parameter={parameter} direct root descriptor"),
+        RootBindingLocation::StaticSampler { index } => format!("static_sampler={index}"),
+    }
+}
+
+fn write_compiled_binding(
+    text: &mut String,
+    record: &Sgd5ResourceRecord,
+    root: Option<&CompactRootSignature>,
+) {
+    let kind = resource_kind(record);
+    let register = record.shader_register();
+    let space = record.register_space();
+    let location = root.and_then(|root| root.find_binding(kind, register, space));
+    let _ = writeln!(
+        text,
+        "    shader_binding={}{} space{} | {}",
+        kind.register_prefix(),
+        register,
+        space,
+        location
+            .map(format_root_location)
+            .unwrap_or_else(|| "compiled root binding unavailable".into())
+    );
+}
+
+fn write_root_signature(text: &mut String, root: &CompactRootSignature) {
+    let _ = writeln!(text, "Compiled PRIV root signature (D3D version 1.1): flags=0x{:04x} unknown=0x{:04x} parameters={} static_samplers={}", root.flags, root.unknown, root.parameters.len(), root.static_samplers.len());
+    let _ = writeln!(
+        text,
+        "  direct_heap_indexing: resources={} samplers={} | padding_bytes={}",
+        root.flags & 0x400 != 0,
+        root.flags & 0x800 != 0,
+        root.padding.len()
+    );
+    for (index, parameter) in root.parameters.iter().enumerate() {
+        match parameter {
+            RootParameter::DescriptorTable { space, ranges } => {
+                let _ = writeln!(text, "  root[{index}] descriptor table space{space}: {} descriptors, 32 bytes per descriptor", ranges.len());
+            }
+            RootParameter::Constants {
+                register,
+                dword_count,
+            } => {
+                let _ = writeln!(
+                    text,
+                    "  root[{index}] constants b{register} space0: {dword_count} dwords"
+                );
+            }
+            RootParameter::Descriptor {
+                kind,
+                register,
+                space,
+                unknown_bits,
+            } => {
+                let _ = writeln!(text, "  root[{index}] direct {}{register} space{space}: unknown_bits=0x{unknown_bits:02x}", kind.register_prefix());
+            }
+        }
+    }
+    for (index, sampler) in root.static_samplers.iter().enumerate() {
+        let _ = writeln!(text, "  sampler[{index}] s{} space{} filter=0x{:04x} address={}/{}/{} anisotropy={} comparison={} border={} mip_bias={} LOD={}..{}",
+            sampler.register, sampler.space, sampler.filter, sampler.address_u, sampler.address_v, sampler.address_w,
+            sampler.max_anisotropy, sampler.comparison, sampler.border_color, sampler.mip_bias, sampler.min_lod, sampler.max_lod);
+    }
+}
+
+fn resolve_binding_table<'a>(
+    file: &'a Sgd5File,
+    effect: &'a Sgd5Effect,
+    selector: u8,
+) -> Option<&'a Sgd5BindingTable> {
+    match effect.binding_list.entries.get(usize::from(selector))? {
+        Sgd5BindingListEntry::Inline(table) => Some(table),
+        Sgd5BindingListEntry::TableReference { table_hash, .. } => file
+            .binding_tables
+            .iter()
+            .find(|table| table.header.table_hash == *table_hash),
+    }
+}
+
+fn write_pass_bindings(
+    text: &mut String,
+    file: &Sgd5File,
+    effect: &Sgd5Effect,
+    pass: &Sgd5Pass,
+    shader: &Sgd5Shader,
+    roots: &mut std::collections::HashMap<(&'static str, u32), Option<CompactRootSignature>>,
+) {
+    let selected_stage = if pass.shader_slots[5] != 0 {
+        Some(5)
+    } else {
+        (0..5).rev().find(|stage| pass.shader_slots[*stage] != 0)
+    };
+    let Some(stage) = selected_stage else {
+        return;
+    };
+    let Some(index) = pass.shader_slots[stage]
+        .checked_sub(1)
+        .and_then(|slot| effect.stage_indices[stage].get(usize::from(slot)))
+    else {
+        return;
+    };
+    let stages = ["VS", "PS", "GS", "DS", "HS", "CS"];
+    let Some(owner) = file
+        .shaders
+        .iter()
+        .find(|candidate| candidate.stage == stages[stage] && candidate.index == *index)
+    else {
+        return;
+    };
+    let key = (owner.stage, owner.index);
+    let root = roots.entry(key).or_insert_with(|| {
+        crate::sgd5::decompress_shader(file, owner)
+            .ok()
+            .and_then(|blob| crate::dxbc::extract_compact_root_signature(&blob).ok())
+    });
+    let Some(root) = root else {
+        let _ = writeln!(
+            text,
+            "      compiled root unavailable for {}#{}",
+            owner.stage, owner.index
+        );
+        return;
+    };
+    let selectors: [u8; 4] = if stage == 5 {
+        owner.shader_metadata[88..92].try_into().unwrap()
+    } else {
+        pass.binding_table_indices
+    };
+    let _ = writeln!(
+        text,
+        "      runtime root: {}#{} | space0..3 binding selectors={selectors:?}",
+        owner.stage, owner.index
+    );
+    for (space, selector) in selectors
+        .into_iter()
+        .enumerate()
+        .filter(|(_, selector)| *selector != 255)
+    {
+        let Some(table) = resolve_binding_table(file, effect, selector) else {
+            continue;
+        };
+        let Some((parameter, ranges)) =
+            root.parameters
+                .iter()
+                .enumerate()
+                .find_map(|(index, entry)| match entry {
+                    RootParameter::DescriptorTable {
+                        space: root_space,
+                        ranges,
+                    } if usize::from(*root_space) == space => Some((index, ranges)),
+                    _ => None,
+                })
+        else {
+            continue;
+        };
+        let layout_matches = ranges.len() == table.entries.len()
+            && table.entries.iter().all(|entry| {
+                ranges
+                    .get(usize::from(entry.binding_index))
+                    .is_some_and(|range| Some(range.kind) == binding_kind(entry.binding_type))
+            });
+        if !layout_matches {
+            let _ = writeln!(
+                text,
+                "      table[{selector}] space{space}: layout does not match compiled root"
+            );
+            continue;
+        }
+        for entry in &table.entries {
+            let range = &ranges[usize::from(entry.binding_index)];
+            if !shader.reflection.resources.iter().any(|record| {
+                record.name_hash == entry.name_hash
+                    && record.register_space() as usize == space
+                    && resource_kind(record) == range.kind
+                    && record.shader_register() == range.register
+            }) {
+                continue;
+            }
+            let _ = writeln!(
+                text,
+                "      table[{selector}] {} -> {}{} space{} | {}",
+                name(file, entry.name_hash, entry.name.as_deref()),
+                range.kind.register_prefix(),
+                range.register,
+                space,
+                format_root_location(RootBindingLocation::DescriptorTable {
+                    parameter,
+                    descriptor_index: usize::from(entry.binding_index)
+                })
+            );
+        }
+    }
+}
+
+fn pass_uses_shader(
+    effect: &Sgd5Effect,
+    pass: &Sgd5Pass,
+    shader: &Sgd5Shader,
+    stage: usize,
+) -> bool {
+    pass.shader_slots[stage]
+        .checked_sub(1)
+        .and_then(|slot| effect.stage_indices[stage].get(slot as usize))
+        == Some(&shader.index)
+}
+
+fn write_effect_passes(
+    text: &mut String,
+    effect: &Sgd5Effect,
+    shader: &Sgd5Shader,
+    stage: usize,
+    shader_hashes: &HashSet<u32>,
+    file: &Sgd5File,
+    roots: &mut std::collections::HashMap<(&'static str, u32), Option<CompactRootSignature>>,
+) {
+    let metadata = &effect.metadata;
+    let _ = writeln!(
+        text,
+        "  states: rasterizer={} depth_stencil={} blend={} sampler={} | techniques={} passes={}",
+        metadata.rasterizer_states.len(),
+        metadata.depth_stencil_states.len(),
+        metadata.blend_states.len(),
+        metadata.sampler_states.len(),
+        metadata.techniques.len(),
+        metadata.passes.len()
+    );
+    let source = match effect.shared_reflection_source {
+        Sgd5ReflectionSource::Shared => "archive shared reflection",
+        Sgd5ReflectionSource::Inline(_) => "inline reflection",
+        Sgd5ReflectionSource::Absent => "absent",
+    };
+    let _ = writeln!(text, "  effect reflection source: {source}");
+    write_vertex_inputs(
+        text,
+        &metadata.header.vertex_inputs,
+        "  Effect vertex-input summary",
+        "format_candidate",
+    );
+    let _ = writeln!(text, "  Aggregate formats use the inferred VS encoding; their merge rule and direct runtime consumer are unconfirmed.");
+    let _ = writeln!(
+        text,
+        "  additional_attribute_mask_48=0x{:016x}: {} (selection policy unconfirmed)",
+        metadata.header.attribute_mask_48,
+        input_mask_names(metadata.header.attribute_mask_48)
+    );
+    for technique in &metadata.techniques {
+        let start = technique.first_pass as usize;
+        let end = start + technique.pass_count as usize;
+        let Some(passes) = metadata.passes.get(start..end) else {
+            continue;
+        };
+        if !passes
+            .iter()
+            .any(|pass| pass_uses_shader(effect, pass, shader, stage))
+        {
+            continue;
+        }
+        let _ = writeln!(
+            text,
+            "  technique {}: first_pass={} pass_count={}",
+            technique.name.as_deref().unwrap_or("unresolved"),
+            technique.first_pass,
+            technique.pass_count
+        );
+        for (local_index, pass) in passes.iter().enumerate() {
+            if !pass_uses_shader(effect, pass, shader, stage) {
+                continue;
+            }
+            let selections = ["VS", "PS", "GS", "DS", "HS", "CS"]
+                .iter()
+                .enumerate()
+                .filter_map(|(stage, name)| {
+                    let slot = pass.shader_slots[stage].checked_sub(1)? as usize;
+                    Some(format!("{name}#{}", effect.stage_indices[stage].get(slot)?))
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let _ = writeln!(
+                text,
+                "    pass[{}] {selections} | binding_table_indices={:?} state_flags=0x{:02x}",
+                start + local_index,
+                pass.binding_table_indices,
+                pass.state_flags
+            );
+            if pass.state_flags & 1 != 0 {
+                if let Some(state) = metadata
+                    .rasterizer_states
+                    .get(pass.rasterizer_state_index as usize)
+                {
+                    let _ = writeln!(text, "      rasterizer[{}] fill={} cull={} front_ccw={} depth_bias={} clamp={} slope_bias={} depth_clip={} forced_samples={} flags=0x{:02x}",
+                        pass.rasterizer_state_index, state.fill_mode, state.cull_mode, state.front_counter_clockwise,
+                        state.depth_bias, state.depth_bias_clamp, state.slope_scaled_depth_bias, state.depth_clip_enable,
+                        state.forced_sample_count, state.flags);
+                }
+            }
+            if pass.state_flags & 2 != 0 {
+                if let Some(state) = metadata
+                    .depth_stencil_states
+                    .get(pass.depth_stencil_state_index as usize)
+                {
+                    let _ = writeln!(text, "      depth_stencil[{}] depth_enable={} write_mask={} comparison={} stencil_enable={} stencil_masks={:02x}/{:02x}",
+                        pass.depth_stencil_state_index, state.depth_enable, state.depth_write_mask,
+                        state.depth_comparison_func, state.stencil_enable, state.stencil_read_mask, state.stencil_write_mask);
+                }
+            }
+            if pass.state_flags & 4 != 0 {
+                if let Some(state) = metadata.blend_states.get(pass.blend_state_index as usize) {
+                    let target = &state.render_targets[0];
+                    let _ = writeln!(text, "      blend[{}] alpha_to_coverage={} independent={} RT0_enable={} RT0_write_mask=0x{:x}",
+                        pass.blend_state_index, state.alpha_to_coverage_enable, state.independent_blend_enable,
+                        target.blend_enable, target.write_mask);
+                }
+            }
+            if let Some(usage) = &pass.resource_usage {
+                let groups = [
+                    &usage.srv_hashes,
+                    &usage.uav_hashes,
+                    &usage.sampler_hashes,
+                    &usage.cbv_hashes,
+                ];
+                let matching = groups
+                    .iter()
+                    .flat_map(|group| group.iter())
+                    .filter(|hash| shader_hashes.contains(hash))
+                    .count();
+                let _ = writeln!(text, "      logical resource usage: SRV={} UAV={} sampler={} CBV={} matching_shader_hashes={matching}",
+                    usage.srv_hashes.len(), usage.uav_hashes.len(), usage.sampler_hashes.len(), usage.cbv_hashes.len());
+                if let Some(binding) = usage.texture_handle_binding {
+                    let _ = writeln!(text, "      texture_handle_binding=0x{binding:08x} | root_constant_dword={} fallback_cbv={}",
+                        if binding as u8 == 255 { "absent".into() } else { (binding & 127).to_string() }, binding < 256);
+                }
+            }
+            write_pass_bindings(text, file, effect, pass, shader, roots);
         }
     }
 }
@@ -277,8 +715,8 @@ pub fn format_shader_metadata(file: &Sgd5File, shader: &Sgd5Shader) -> String {
     );
     let _ = writeln!(
         text,
-        "Group hash: 0x{:016x} | SGA hash: 0x{:016x} | wave-size byte: {}",
-        file.group_hash, shader.sga_hash, shader.wave_size
+        "Group hash: 0x{:016x} | SGA hash: 0x{:016x} | shader-version byte: {}",
+        file.group_hash, shader.sga_hash, shader.shader_version
     );
     let _ = writeln!(
         text,
@@ -289,11 +727,24 @@ pub fn format_shader_metadata(file: &Sgd5File, shader: &Sgd5Shader) -> String {
         text,
         "Resource types describe SGD5 metadata; texture/buffer element types are not inferred."
     );
-    let _ = writeln!(text, "Metadata slots and binding-table indices have no confirmed mapping to ISA descriptors or HLSL registers.");
-    let _ = writeln!(text, "Secondary hashes and the 144-byte shader metadata remain opaque. Default bytes are initialization data candidates.");
+    let _ = writeln!(text, "Per-shader slots encode registers with resource-type bits 7/13; flags bits 6..7 encode register space. Effect material SRV slots index texture handles.");
+    let _ = writeln!(text, "Both hashes support parameter lookup. Defaults initialize runtime CBV members; SGPR/VGPR assignments require ISA analysis.");
     text.push('\n');
+    if let Some(inputs) = shader.vertex_inputs() {
+        write_vertex_inputs(&mut text, &inputs, "Shader vertex-input metadata", "format");
+    }
+    let mut compiled_root = None;
     match crate::sgd5::decompress_shader(file, shader) {
         Ok(blob) => {
+            match crate::dxbc::extract_compact_root_signature(&blob) {
+                Ok(root) => {
+                    write_root_signature(&mut text, &root);
+                    compiled_root = Some(root);
+                }
+                Err(error) => {
+                    let _ = writeln!(text, "Compiled root signature unavailable: {error}");
+                }
+            }
             match format_dxbc_signatures(&blob) {
                 Ok(signatures) => text.push_str(&signatures),
                 Err(error) => {
@@ -318,7 +769,10 @@ pub fn format_shader_metadata(file: &Sgd5File, shader: &Sgd5Shader) -> String {
     );
     for resource in &shader.reflection.resources {
         write_resource(&mut text, file, &shader.reflection, resource);
+        write_compiled_binding(&mut text, resource, compiled_root.as_ref());
     }
+    let mut roots = std::collections::HashMap::new();
+    roots.insert((shader.stage, shader.index), compiled_root);
     let referenced_members: HashSet<_> = shader
         .reflection
         .resources
@@ -399,6 +853,17 @@ pub fn format_shader_metadata(file: &Sgd5File, shader: &Sgd5Shader) -> String {
             .collect::<Vec<_>>()
             .join(" ");
         let _ = writeln!(text, "  stage shader references: {stage_counts}");
+        if let Some(stage) = stage_index {
+            write_effect_passes(
+                &mut text,
+                effect,
+                shader,
+                stage,
+                &shader_hashes,
+                file,
+                &mut roots,
+            );
+        }
         let _ = writeln!(
             text,
             "  reflection: {} resources, {} members, {} auxiliary records; {} default bytes",
@@ -409,15 +874,15 @@ pub fn format_shader_metadata(file: &Sgd5File, shader: &Sgd5Shader) -> String {
         );
         let _ = writeln!(
             text,
-            "  secondary reflection: {} resources, {} members, {} auxiliary records",
-            effect.secondary_reflection.resources.len(),
-            effect.secondary_reflection.members.len(),
-            effect.secondary_reflection.auxiliary_records.len()
+            "  property reflection (proplst): {} resources, {} members, {} auxiliary records",
+            effect.property_reflection.resources.len(),
+            effect.property_reflection.members.len(),
+            effect.property_reflection.auxiliary_records.len()
         );
         let _ = writeln!(
             text,
-            "  effect string pool (technique/pass-name candidates): {}",
-            effect.property_list.strings.join(", ")
+            "  effect string pool (includes confirmed technique names): {}",
+            effect.binding_list.strings.join(", ")
         );
         for resource in &effect.main_reflection.resources {
             let target = resource.offset + resource.member_data_offset as usize;
@@ -431,14 +896,14 @@ pub fn format_shader_metadata(file: &Sgd5File, shader: &Sgd5Shader) -> String {
         }
         let _ = writeln!(
             text,
-            "  Binding tables (hash matches indicate shared identity, not register assignment):"
+            "  Binding table inventory (selected pass mappings shown above):"
         );
-        for (index, property) in effect.property_list.entries.iter().enumerate() {
+        for (index, property) in effect.binding_list.entries.iter().enumerate() {
             match property {
-                Sgd5PropertyEntry::Inline(table) => {
+                Sgd5BindingListEntry::Inline(table) => {
                     write_binding_table(&mut text, index, table, "inline", &shader_hashes, file)
                 }
-                Sgd5PropertyEntry::TableReference { table_hash, .. } => {
+                Sgd5BindingListEntry::TableReference { table_hash, .. } => {
                     if let Some(table) = file
                         .binding_tables
                         .iter()
@@ -479,7 +944,148 @@ mod tests {
         assert_eq!(resource_type_name(0x0182), "Texture2D");
         assert_eq!(resource_type_name(0x04b0), "ConstantBuffer");
         assert_eq!(resource_type_name(0x048e), "Buffer subtype 0x0e");
+        assert_eq!(resource_type_name(0x2485), "StructuredBuffer");
         assert_eq!(value_type(0x0f).1, None);
+    }
+
+    #[test]
+    #[ignore = "requires PERCY_SGD5_SAMPLE pointing to the analysis archive"]
+    fn archive_roots_match_shader_registers_and_selected_binding_tables() {
+        let path = std::path::PathBuf::from(
+            std::env::var_os("PERCY_SGD5_SAMPLE").expect("set PERCY_SGD5_SAMPLE"),
+        );
+        let files = crate::sgd5::load_sgd5(&path).unwrap();
+        let mut counts = [0usize; 5];
+        for file in &files {
+            let mut roots = std::collections::HashMap::new();
+            for shader in &file.shaders {
+                let blob = crate::sgd5::decompress_shader(file, shader).unwrap();
+                let root = crate::dxbc::extract_compact_root_signature(&blob).unwrap();
+                if shader.stage == "CS" {
+                    assert!(
+                        crate::dxbc::extract_fssm(&blob)
+                            .unwrap()
+                            .compute_metadata()
+                            .is_some(),
+                        "{}",
+                        shader.name
+                    );
+                }
+                for record in &shader.reflection.resources {
+                    assert!(
+                        root.find_binding(
+                            resource_kind(record),
+                            record.shader_register(),
+                            record.register_space()
+                        )
+                        .is_some(),
+                        "{} hash={:08x}",
+                        shader.name,
+                        record.name_hash
+                    );
+                    counts[1] += 1;
+                    counts[2] += usize::from(record.resource_type & 0x2080 != 0);
+                }
+                let word = u64::from_le_bytes(shader.shader_metadata[8..16].try_into().unwrap());
+                let constants: u64 = root
+                    .parameters
+                    .iter()
+                    .map(|p| match p {
+                        RootParameter::Constants { dword_count, .. } => u64::from(*dword_count),
+                        _ => 0,
+                    })
+                    .sum();
+                let direct_count = |kind| {
+                    root.parameters.iter().filter(|p| matches!(p, RootParameter::Descriptor { kind: k, .. } if *k == kind)).count() as u64
+                };
+                assert_eq!(constants, (word >> 58) & 15);
+                assert_eq!(direct_count(DescriptorKind::Srv), (word >> 53) & 7);
+                assert_eq!(direct_count(DescriptorKind::Uav), (word >> 47) & 7);
+                roots.insert((shader.stage, shader.index), root);
+                counts[0] += 1;
+            }
+            for effect in &file.effects {
+                for pass in &effect.metadata.passes {
+                    let stage = if pass.shader_slots[5] != 0 {
+                        Some(5)
+                    } else {
+                        (0..5).rev().find(|s| pass.shader_slots[*s] != 0)
+                    };
+                    let Some(stage) = stage else {
+                        continue;
+                    };
+                    let index =
+                        effect.stage_indices[stage][usize::from(pass.shader_slots[stage] - 1)];
+                    let stage_name = ["VS", "PS", "GS", "DS", "HS", "CS"][stage];
+                    let shader = file
+                        .shaders
+                        .iter()
+                        .find(|s| s.stage == stage_name && s.index == index)
+                        .unwrap();
+                    let root = &roots[&(shader.stage, index)];
+                    let selectors: [u8; 4] = if stage == 5 {
+                        shader.shader_metadata[88..92].try_into().unwrap()
+                    } else {
+                        pass.binding_table_indices
+                    };
+                    for (space, selector) in
+                        selectors.into_iter().enumerate().filter(|(_, s)| *s != 255)
+                    {
+                        let table = resolve_binding_table(file, effect, selector).unwrap();
+                        let ranges = root
+                            .parameters
+                            .iter()
+                            .find_map(|p| match p {
+                                RootParameter::DescriptorTable { space: s, ranges }
+                                    if usize::from(*s) == space =>
+                                {
+                                    Some(ranges)
+                                }
+                                _ => None,
+                            })
+                            .unwrap();
+                        assert_eq!(
+                            ranges.len(),
+                            table.entries.len(),
+                            "{} space{space}",
+                            effect.name
+                        );
+                        for entry in &table.entries {
+                            let range = &ranges[usize::from(entry.binding_index)];
+                            assert_eq!(Some(range.kind), binding_kind(entry.binding_type));
+                            counts[4] += 1;
+                        }
+                        counts[3] += 1;
+                    }
+                    let usage = pass.resource_usage.as_ref().unwrap();
+                    assert_eq!(
+                        usage.texture_handle_binding.is_some(),
+                        effect.binding_list.texture_handle_count != 0
+                    );
+                    if let Some(binding) = usage.texture_handle_binding {
+                        assert!(matches!(binding, 0x100 | 0x101 | 0x102 | 0x104 | 0x1ff));
+                        if binding as u8 != 255 {
+                            let total: u32 = root
+                                .parameters
+                                .iter()
+                                .map(|p| match p {
+                                    RootParameter::Constants { dword_count, .. } => {
+                                        u32::from(*dword_count)
+                                    }
+                                    _ => 0,
+                                })
+                                .sum();
+                            assert!(
+                                (binding & 127) < total,
+                                "{} binding={binding:x}",
+                                effect.name
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(counts, [26_503, 413_468, 59_560, 76_603, 5_274_062]);
     }
 
     #[test]

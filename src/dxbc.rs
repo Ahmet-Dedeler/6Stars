@@ -1,4 +1,7 @@
 use flate2::read::ZlibDecoder;
+#[path = "dxbc/compact_root.rs"]
+mod compact_root;
+pub use compact_root::{extract_compact_root_signature, CompactRootSignature, DescriptorKind, RootBindingLocation, RootParameter};
 use std::ffi::c_void;
 use std::fmt::Write as _;
 use std::io::Read;
@@ -97,7 +100,39 @@ pub struct FssmShader {
     pub dxbc_hash_match: Option<bool>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct FssmComputeMetadata {
+    pub rsrc2: u32,
+    pub user_sgpr_count: u8,
+    pub num_threads: [u16; 3],
+}
+
 impl FssmShader {
+    pub fn compute_metadata(&self) -> Option<FssmComputeMetadata> {
+        if self.stage_pointer_offset != 0x70 { return None; }
+        // This FSSM layout has the Scarlett compute state at descriptor+0x70.
+        // The shorter retail layout used by some tools puts it at +0x30.
+        let descriptor_end = self.stage_descriptor_offset.checked_add(0x88)?;
+        if descriptor_end > self.code_offset { return None; }
+        let rsrc2 = read_u32(&self.data, self.stage_descriptor_offset + 0x78).ok()?;
+        let mut num_threads = [0u16; 3];
+        for (index, value) in num_threads.iter_mut().enumerate() {
+            let count = read_u32(&self.data, self.stage_descriptor_offset + 0x7c + index * 4).ok()?;
+            if !(1..=1024).contains(&count) { return None; }
+            *value = count as u16;
+        }
+        if num_threads.iter().map(|value| u32::from(*value)).product::<u32>() > 1024 { return None; }
+        Some(FssmComputeMetadata { rsrc2, user_sgpr_count: ((rsrc2 >> 1) & 31) as u8, num_threads })
+    }
+    pub fn compiled_wave_size(&self) -> Option<u8> {
+        // The flags are in metadata, so never interpret program bytes at this offset.
+        if self.code_offset < 0xd8 {
+            return None;
+        }
+        let flags = read_u32(&self.data, 0xd4).ok()?;
+        Some(if flags & 0x20 != 0 { 32 } else { 64 })
+    }
+
     pub fn code(&self) -> &[u8] {
         self.code_offset
             .checked_add(self.code_size)
@@ -467,6 +502,15 @@ pub fn format_fssm_metadata(fssm: &FssmShader) -> String {
     let mut text = format!("FSSM program metadata\n  version_field=0x{:08x} payload_bytes={}\n  stage_pointer_field=payload+0x{:x} descriptor_file_offset=0x{:x}\n  declared_program_file_offset=0x{:x} program_bytes={} (includes compiler no-ops and allocation padding)\n",
         fssm.version, fssm.payload_size, fssm.stage_pointer_offset.saturating_sub(FSSM_PAYLOAD_BASE),
         fssm.stage_descriptor_offset, fssm.code_offset, fssm.code_size);
+    if let Some(wave_size) = fssm.compiled_wave_size() {
+        let _ = writeln!(
+            text,
+            "  compiled_wave_size={wave_size} (FSSM flags at file+0xd4)"
+        );
+    }
+    if let Some(compute) = fssm.compute_metadata() {
+        let _ = writeln!(text, "  numthreads={:?} compute_rsrc2=0x{:08x} user_sgprs={}", compute.num_threads, compute.rsrc2, compute.user_sgpr_count);
+    }
     if let Some(hash) = fssm.compiler_hash {
         let hash = hash
             .iter()
@@ -673,9 +717,53 @@ mod tests {
         assert_eq!(shader.code_offset, 0xd0);
         assert_eq!(shader.code_size, 16);
         assert_eq!(shader.compiler_hash, None);
+        assert_eq!(shader.compiled_wave_size(), None);
         let instructions = crate::rdna2::decode_gfx103(shader.code(), 10);
         assert_eq!(instructions.len(), 4);
         assert_eq!(instructions[2].mnemonic, "s_endpgm");
+    }
+
+    #[test]
+    fn compiled_wave_size_comes_from_metadata_before_the_program() {
+        let mut data = synthetic_fssm(&fingerprint_program());
+        data.splice(0xd0..0xd0, [0; 32]);
+        data[0xc0..0xc8].copy_from_slice(&0xd0u64.to_le_bytes());
+        let size = data.len() as u64 - 16;
+        data[8..16].copy_from_slice(&size.to_le_bytes());
+        data[0xd4] = 0x20;
+        assert_eq!(
+            parse_fssm(data.clone()).unwrap().compiled_wave_size(),
+            Some(32)
+        );
+        data[0xd4] = 0;
+        assert_eq!(parse_fssm(data).unwrap().compiled_wave_size(), Some(64));
+    }
+
+    #[test]
+    fn compute_metadata_reads_descriptor_fields_and_bounds_thread_counts() {
+        let mut data = synthetic_fssm(&[0xbf810000]);
+        data.splice(0xd0..0xd0, [0; 128]);
+        data[0x58..0x60].copy_from_slice(&FSSM_EMPTY_STAGE.to_le_bytes());
+        data[0x70..0x78].copy_from_slice(&0xb0u64.to_le_bytes());
+        data[0xc0..0xc8].copy_from_slice(&0x140u64.to_le_bytes());
+        data[0x138..0x13c].copy_from_slice(&(13u32 << 1).to_le_bytes());
+        for (offset, value) in [(0x13c, 8u32), (0x140, 8), (0x144, 1)] {
+            data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let size = data.len() as u64 - 16;
+        data[8..16].copy_from_slice(&size.to_le_bytes());
+        let mut shader = parse_fssm(data).unwrap();
+        let metadata = shader.compute_metadata().unwrap();
+        assert_eq!(metadata.user_sgpr_count, 13);
+        assert_eq!(metadata.num_threads, [8, 8, 1]);
+        shader.data[0x13c..0x140].copy_from_slice(&1024u32.to_le_bytes());
+        assert!(shader.compute_metadata().is_none());
+        shader.data[0x13c..0x140].copy_from_slice(&0u32.to_le_bytes());
+        assert!(shader.compute_metadata().is_none());
+        shader.data.truncate(0x140);
+        assert!(shader.compute_metadata().is_none());
+        shader.stage_pointer_offset = 0x40;
+        assert!(shader.compute_metadata().is_none());
     }
 
     #[test]

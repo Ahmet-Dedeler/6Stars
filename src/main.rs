@@ -918,14 +918,15 @@ fn sgd5_stage(stage: &str) -> ShaderStage {
 }
 
 fn sgd5_ps09_entry(shader: &sgd5::Sgd5Shader, fssm: &dxbc::FssmShader) -> Ps09ShaderEntry {
+    let compute = fssm.compute_metadata();
     Ps09ShaderEntry {
         index: shader.index,
         code_offset: u32::try_from(fssm.code_offset).unwrap_or(0),
         code_size: u32::try_from(fssm.code_size).unwrap_or(0),
         stage: sgd5_stage(shader.stage),
-        num_threads: None,
+        num_threads: compute.map(|metadata| metadata.num_threads),
         rsrc1: None,
-        rsrc2: None,
+        rsrc2: compute.map(|metadata| metadata.rsrc2),
         bindings: Vec::new(),
         resource_names: Vec::new(),
         pso_hash: 0,
@@ -6728,14 +6729,14 @@ mod tests {
             stage: "VS",
             index: 7,
             name: "synthetic_vertex".into(),
-            wave_size: 32,
+            shader_version: 50,
             archive: sgd5::Sgd5ShaderArchive {
                 offset: 0,
                 archive_size: 8,
                 decompressed_size: 8,
             },
             sga_hash: 0x0123_4567_89ab_cdef,
-            root_signature_data: [0; 0x90],
+            shader_metadata: [0; 0x90],
             reflection: sgd5::Sgd5ReflectionTable {
                 resource_count: 1,
                 resources: vec![sgd5::Sgd5ResourceRecord {
