@@ -202,8 +202,8 @@ What changed:
   - **No Python, no FFmpeg, no external DLLs required** — `ADAT` (`.awc`) Opus streams decode natively via pure-Rust `rusty-opus` (RFC 6716). All crates pinned in [`Cargo.lock`](Cargo.lock).
 - **Whole-Folder & Single-Archive Scanning (`.rpf` & `.ttpf`)**
   - Multi-threaded live scanning cached to `%LOCALAPPDATA%\PercyStar\scan_cache_v8.tsv`.
-- **Docked D3D11 Bink2 Video Player (Optional `binkplay.exe`)**
-  - Docks RAD `binkplay.exe` (`/NoBorder /DrawD3D11 /L`) directly into the inspector pane. Run [`scripts/setup_deps.ps1`](scripts/setup_deps.ps1) if needed.
+- **Docked D3D11 Bink2 Video Player (Optional `radvideo64.exe` / `binkplay.exe`)**
+  - Plays clips with RAD Video Tools' `radvideo64.exe binkplay <clip>` when available, falling back to `binkplay.exe`, and docks the player window directly into the inspector pane. Run [`scripts/setup_deps.ps1`](scripts/setup_deps.ps1) if needed.
 - **CLI Batch Exporters (Models, Textures & RDNA2 Shaders)**
   ```powershell
   PercyStar.exe --extract-vehicles "<path-to-levels.rpf>" "<output-dir>"
@@ -233,7 +233,7 @@ PercyStar/
 ├── promo/                  # HyperFrames source for the promo video
 ├── scripts/
 │   ├── build_macos.sh      # Universal macOS (.app / .zip) build helper
-│   ├── setup_deps.ps1      # Optional RAD Video Tools (binkplay.exe) setup
+│   ├── setup_deps.ps1      # Optional RAD Video Tools (radvideo64.exe / binkplay.exe) setup
 │   ├── awc_extract.py      # Standalone CLI ADAT (.awc) Opus -> .wav helper
 │   └── rpf9_carve.py       # Standalone CLI RPF9 carver
 ├── docs/
@@ -282,7 +282,7 @@ Compiled standalone binary: `target/release/PercyStar.exe`. `scripts/build_linux
 PercyStar is completely free and open-source. If it's helped your research or saved you time and you'd ever like to kindly support ongoing R&D, server/hardware costs, and late-night builds, **[sponsoring via GitHub Sponsors](https://github.com/sponsors/rpatty-dev)** is always deeply appreciated — no pressure at all, starring the repo or sharing test reports helps just as much!
 
 
-Optional external tools are only loaded from trusted locations: `binkplay.exe` next to `PercyStar.exe`, on `PATH`, in the RAD install folders or from `BINKPLAY_PATH`; `dxcompiler.dll` next to `PercyStar.exe`, in `System32` or from `DXCOMPILER_DLL`; `bink2w64.dll` next to `PercyStar.exe` or from `BINK2_DLL`. They are never picked up from the working directory or from the folder of an opened file.
+Optional external tools are only loaded from trusted locations: `radvideo64.exe` (preferred, run as `radvideo64.exe binkplay <clip>`) next to `PercyStar.exe`, on `PATH`, in the RAD install folders or from `RADVIDEO64_PATH`; `binkplay.exe` next to `PercyStar.exe`, on `PATH`, in the RAD install folders or from `BINKPLAY_PATH`; `dxcompiler.dll` next to `PercyStar.exe`, in `System32` or from `DXCOMPILER_DLL`; `bink2w64.dll` next to `PercyStar.exe` or from `BINK2_DLL`. They are never picked up from the working directory or from the folder of an opened file.
 
 ---
 

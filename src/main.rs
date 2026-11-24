@@ -158,6 +158,40 @@ pub fn find_binkplay() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(r"C:\Program Files (x86)\RADVideo\binkplay.exe"))
 }
 
+/// Locates RAD Video Tools' `radvideo64.exe`, preferred over `binkplay.exe`
+/// because it can play a clip via its `binkplay` subcommand.
+pub fn find_radvideo64() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("RADVIDEO64_PATH") {
+        let pb = PathBuf::from(p.trim().trim_matches('"'));
+        if pb.is_file() {
+            return Some(pb);
+        }
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("radvideo64.exe"));
+            candidates.push(dir.join("tools").join("radvideo64.exe"));
+        }
+    }
+    // never the working directory it may be an untrusted dump folder
+    if let Some(path_os) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_os) {
+            candidates.push(dir.join("radvideo64.exe"));
+        }
+    }
+    for env_key in ["ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA", "USERPROFILE"] {
+        if let Ok(base) = std::env::var(env_key) {
+            let b = PathBuf::from(base);
+            candidates.push(b.join("RADVideo").join("radvideo64.exe"));
+            candidates.push(b.join("RAD Video Tools").join("radvideo64.exe"));
+        }
+    }
+    candidates.push(PathBuf::from(r"C:\Program Files (x86)\RADVideo\radvideo64.exe"));
+    candidates.push(PathBuf::from(r"C:\Program Files\RADVideo\radvideo64.exe"));
+    candidates.into_iter().find(|p| p.is_file())
+}
+
 pub fn stop_wav() {
     unsafe { PlaySoundW(std::ptr::null(), 0, 0); }
 }
@@ -193,6 +227,8 @@ pub fn find_binkplay() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("binkplay"))
 }
 
+pub fn find_radvideo64() -> Option<PathBuf> { None }
+
 pub fn stop_wav() {
     if let Some(mut c) = WAV_PROC.lock().unwrap().take() {
         let _ = c.kill();
@@ -200,7 +236,38 @@ pub fn stop_wav() {
     }
 }
 }
-use plat::{active_window, dock_child_hwnd, find_binkplay, find_hwnd_for_pid, move_window, stop_wav};
+use plat::{active_window, dock_child_hwnd, find_binkplay, find_hwnd_for_pid, find_radvideo64, move_window, stop_wav};
+
+/// Resolved Bink video player. RAD Video Tools' `radvideo64.exe` is preferred
+/// and invoked as `radvideo64.exe binkplay <clip>`; legacy `binkplay.exe` is
+/// only used when `radvideo64.exe` cannot be found.
+pub struct BinkLauncher {
+    pub exe: PathBuf,
+    pub via_radvideo: bool,
+}
+
+impl BinkLauncher {
+    /// Builds a command that opens `clip` in the resolved player.
+    pub fn command(&self, clip: &Path) -> Command {
+        let mut cmd = Command::new(&self.exe);
+        if self.via_radvideo {
+            cmd.arg("binkplay");
+        }
+        cmd.arg(clip);
+        cmd
+    }
+
+    pub fn label(&self) -> &'static str {
+        if self.via_radvideo { "RADVideo64 BinkPlay" } else { "D3D11 BinkPlay" }
+    }
+}
+
+pub fn find_bink_launcher() -> BinkLauncher {
+    if let Some(exe) = find_radvideo64() {
+        return BinkLauncher { exe, via_radvideo: true };
+    }
+    BinkLauncher { exe: find_binkplay(), via_radvideo: false }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum AppTab {
@@ -2350,23 +2417,20 @@ impl Rpf9App {
                     return;
                 }
             }
-            let bink_path = find_binkplay();
-            match Command::new(&bink_path)
-                .arg(&bk2_p)
-                .spawn()
-            {
+            let launcher = find_bink_launcher();
+            match launcher.command(&bk2_p).spawn() {
                 Ok(child) => {
                     let pid = child.id();
                     self.bink_proc = Some(child);
                     let mut m = self.media.lock().unwrap();
                     m.bink_child_pid = Some(pid);
                     m.bink_clip = Some(bk2_p);
-                    m.status = format!("Playing {} (D3D11 BinkPlay)", e.name);
+                    m.status = format!("Playing {} ({})", e.name, launcher.label());
                 }
                 Err(err) => {
                     self.media.lock().unwrap().status = format!(
-                        "binkplay.exe error ({}): {err} — place binkplay.exe next to PercyStar.exe, add RADVideo to PATH, or set BINKPLAY_PATH",
-                        bink_path.display()
+                        "bink player error ({}): {err} — install RAD Video Tools (radvideo64.exe), place binkplay.exe next to PercyStar.exe, add RADVideo to PATH, or set RADVIDEO64_PATH / BINKPLAY_PATH",
+                        launcher.exe.display()
                     );
                 }
             }
@@ -5906,7 +5970,7 @@ impl eframe::App for Rpf9App {
                     if ui.button("Pop-out").clicked() {
                         if let Some(cp) = bink_clip_opt {
                             self.stop_bink_player();
-                            let _ = Command::new(find_binkplay()).arg(&cp).spawn();
+                            let _ = find_bink_launcher().command(&cp).spawn();
                         }
                     }
                 });
