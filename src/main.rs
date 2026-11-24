@@ -224,8 +224,8 @@ enum ShaderViewMode {
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum ShaderSource {
     #[default]
-    Ps09,
     Sgd5,
+    Ps09,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
@@ -624,6 +624,7 @@ struct UpdateState {
 #[derive(Default)]
 struct Sgd5JobState {
     running: bool,
+    failed: bool,
     status: String,
     files: Option<Arc<Vec<sgd5::Sgd5File>>>,
 }
@@ -1072,7 +1073,7 @@ impl Rpf9App {
             sh_selected: None,
             sh_mode: ShaderViewMode::Asm,
             sh_cached_text: (None, String::new()),
-            sh_source: ShaderSource::Ps09,
+            sh_source: ShaderSource::Sgd5,
             sgd5_job: Arc::new(Mutex::new(Sgd5JobState::default())),
             sgd5_cache: None,
             sgd5_browser: sgd5_view::Sgd5Browser::default(),
@@ -2962,6 +2963,7 @@ impl Rpf9App {
                     cache.header.compute_pso_count,
                 );
                 self.sh_cache = Some(cache);
+                self.sh_source = ShaderSource::Ps09;
                 self.sh_selected = Some(0);
                 self.sh_cached_text = (None, String::new());
                 self.sh_status = st_msg;
@@ -2992,6 +2994,7 @@ impl Rpf9App {
             }
             job.running = true;
             job.status = format!("Extracting SGD5 from {}...", input.display());
+            job.failed = false;
         }
 
         let job_state = self.sgd5_job.clone();
@@ -3019,6 +3022,7 @@ impl Rpf9App {
                 let mut job = job_state.lock().unwrap();
                 job.running = false;
                 job.status = status;
+                job.failed = files.is_none();
                 job.files = files;
             }
             ctx.request_repaint();
@@ -3033,6 +3037,7 @@ impl Rpf9App {
             }
             job.running = true;
             job.status = format!("Loading SGD5 from {}...", input.display());
+            job.failed = false;
         }
         self.sh_source = ShaderSource::Sgd5;
 
@@ -3056,6 +3061,7 @@ impl Rpf9App {
                 let mut job = job_state.lock().unwrap();
                 job.running = false;
                 job.status = status;
+                job.failed = files.is_none();
                 job.files = files;
             }
             ctx.request_repaint();
@@ -3063,13 +3069,18 @@ impl Rpf9App {
     }
 
     fn poll_sgd5_cache(&mut self) {
-        let files = self.sgd5_job.lock().unwrap().files.take();
+        let (files, failed) = {
+            let mut job = self.sgd5_job.lock().unwrap();
+            (job.files.take(), std::mem::take(&mut job.failed))
+        };
         if let Some(files) = files {
             self.sgd5_browser.reset();
             self.sgd5_cache = Some(files);
             if self.sh_cache.is_none() {
                 self.sh_source = ShaderSource::Sgd5;
             }
+        } else if failed && self.sgd5_cache.is_none() && self.sh_cache.is_some() {
+            self.sh_source = ShaderSource::Ps09;
         }
     }
 
@@ -3092,8 +3103,8 @@ impl Rpf9App {
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
                     for (source, label) in [
-                        (ShaderSource::Ps09, "PS09 Runtime Cache"),
                         (ShaderSource::Sgd5, "SGD5 Effects"),
+                        (ShaderSource::Ps09, "PS09 Runtime Cache"),
                     ] {
                         let active = self.sh_source == source;
                         let button = egui::Button::new(
@@ -3125,14 +3136,13 @@ impl Rpf9App {
                             self.load_ps09_path(&lp);
                         }
                     }
-                    if ui.button("Open shaders.rpf (PS09 + SGD5)").clicked() {
+                    if ui.button("Open shaders.rpf (SGD5 + PS09)").clicked() {
                         if let Some(p) = rfd::FileDialog::new()
                             .add_filter("RAGE 9 Shaders", &["rpf"])
                             .pick_file()
                         {
                             self.load_ps09_path(&p);
                             self.spawn_sgd5_load(ctx.clone(), p);
-                            self.sh_source = ShaderSource::Ps09;
                         }
                     }
                     if ui.button("Open PS09 .ps09").clicked() {
@@ -3332,8 +3342,8 @@ impl Rpf9App {
                 if self.sh_cache.is_some() && self.sgd5_cache.is_some() {
                     ui.horizontal_wrapped(|ui| {
                         for (source, label) in [
-                            (ShaderSource::Ps09, "PS09 Runtime Cache"),
                             (ShaderSource::Sgd5, "SGD5 Effects"),
+                            (ShaderSource::Ps09, "PS09 Runtime Cache"),
                         ] {
                             let active = self.sh_source == source;
                             let button = egui::Button::new(
