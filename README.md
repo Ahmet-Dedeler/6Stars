@@ -1,3 +1,6 @@
+> [!NOTE]
+> **Development slowed for the time being** — currently working on **[PercyScarlett](https://github.com/rpatty-dev/PercyScarlett)** to get VI working on PC.
+
 <p align="center">
   <img src="assets/logo.png" alt="PercyStar Logo" width="140" />
 </p>
