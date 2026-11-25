@@ -358,7 +358,9 @@ impl Navigation {
 struct PreparedShader {
     shader: usize,
     blob: Result<Vec<u8>, String>,
-    program: Result<dxbc::FssmShader, String>,
+    programs: Result<Vec<dxbc::FssmShader>, String>,
+    native_metadata: Vec<Result<dxbc::FssmNativeMetadata, String>>,
+    native_mappings: Vec<String>,
     root: Option<CompactRootSignature>,
     metadata: String,
 }
@@ -373,6 +375,7 @@ pub struct Sgd5Browser {
     prepared: Option<PreparedShader>,
     text: Option<(Selection, ShaderViewMode, usize, String)>,
     shader_tab: usize,
+    program_index: usize,
     status: String,
 }
 
@@ -578,22 +581,81 @@ impl Sgd5Browser {
             .is_none_or(|prepared| prepared.shader != shader_index)
         {
             let blob = sgd5::decompress_shader(file, shader).map_err(|e| e.to_string());
-            let program = blob
+            let programs = blob
                 .as_ref()
                 .map_err(Clone::clone)
-                .and_then(|blob| dxbc::extract_fssm(blob));
+                .and_then(|blob| dxbc::extract_fssm_programs(blob));
+            let native_metadata: Vec<Result<dxbc::FssmNativeMetadata, String>> = programs
+                .as_ref()
+                .map(|programs| {
+                    programs
+                        .iter()
+                        .map(dxbc::FssmShader::native_metadata)
+                        .collect()
+                })
+                .unwrap_or_default();
             let root = blob
                 .as_ref()
                 .ok()
                 .and_then(|blob| dxbc::extract_compact_root_signature(blob).ok());
+            let native_mappings = native_metadata
+                .iter()
+                .map(|native: &Result<dxbc::FssmNativeMetadata, String>| {
+                    root.as_ref()
+                        .zip(native.as_ref().ok())
+                        .map(|(root, native)| {
+                            metadata::format_native_parameter_mapping(file, shader, root, native)
+                        })
+                        .unwrap_or_default()
+                })
+                .collect();
+            let default_program = programs
+                .as_ref()
+                .ok()
+                .and_then(|programs| {
+                    programs.iter().position(|program| {
+                        matches!(
+                            (shader.stage, program.hardware_stage()),
+                            ("VS", dxbc::NativeStage::Vs)
+                                | ("PS", dxbc::NativeStage::Ps)
+                                | ("GS", dxbc::NativeStage::Gs)
+                                | ("CS", dxbc::NativeStage::Compute)
+                        )
+                    })
+                })
+                .unwrap_or(0);
             self.prepared = Some(PreparedShader {
                 shader: shader_index,
                 blob,
-                program,
+                programs,
+                native_metadata,
+                native_mappings,
                 root,
                 metadata: metadata::format_shader_metadata(file, shader),
             });
             self.text = None;
+            self.program_index = default_program;
+        }
+        if let Ok(programs) = &self.prepared.as_ref().unwrap().programs {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new("Native program")
+                        .strong()
+                        .color(METADATA_LABEL_COLOR),
+                );
+                for (index, program) in programs.iter().enumerate() {
+                    if ui
+                        .selectable_value(
+                            &mut self.program_index,
+                            index,
+                            format!("{} #{}", program.hardware_stage().tag(), index),
+                        )
+                        .changed()
+                    {
+                        self.text = None;
+                    }
+                }
+            });
         }
         ui.horizontal_wrapped(|ui| {
             for (index, label) in ["Shader", "Parameters", "Metadata"].into_iter().enumerate() {
@@ -611,6 +673,15 @@ impl Sgd5Browser {
             }
         });
         let prepared = self.prepared.as_ref().unwrap();
+        let program = prepared
+            .programs
+            .as_ref()
+            .ok()
+            .and_then(|programs| programs.get(self.program_index));
+        let native = prepared
+            .native_metadata
+            .get(self.program_index)
+            .and_then(|result| result.as_ref().ok());
         let context = || {
             effect
                 .zip(pass)
@@ -622,14 +693,20 @@ impl Sgd5Browser {
                 *selection != self.selection || *tab != self.shader_tab
             }) {
                 let text = if self.shader_tab == 1 {
-                    metadata::format_parameter_mapping(file, shader, prepared.root.as_ref())
-                        + &context()
+                    let mut text =
+                        metadata::format_parameter_mapping(file, shader, prepared.root.as_ref());
+                    if let Some((root, native)) = prepared.root.as_ref().zip(native) {
+                        text.push_str(&metadata::format_native_parameter_mapping(
+                            file, shader, root, native,
+                        ));
+                    }
+                    text + &context()
                 } else {
                     prepared.metadata.clone()
                 };
                 self.text = Some((self.selection, *mode, self.shader_tab, text));
             }
-        } else if prepared.program.is_ok() {
+        } else if program.is_some() {
             if self
                 .text
                 .as_ref()
@@ -637,7 +714,7 @@ impl Sgd5Browser {
                     *selection != self.selection || *cached_mode != *mode || *tab != 0
                 })
             {
-                let mut text = shader_text(prepared, shader, *mode);
+                let mut text = shader_text(prepared, shader, *mode, self.program_index);
                 let context = context();
                 if !context.is_empty() {
                     text = metadata::prepend_comments(
@@ -656,7 +733,12 @@ impl Sgd5Browser {
             // Metadata remains reachable when a compiled container has no supported FSSM program.
             ui.colored_label(
                 egui::Color32::LIGHT_RED,
-                prepared.program.as_ref().unwrap_err(),
+                prepared
+                    .programs
+                    .as_ref()
+                    .err()
+                    .map(String::as_str)
+                    .unwrap_or("Native program unavailable"),
             );
             return;
         }
@@ -666,6 +748,7 @@ impl Sgd5Browser {
             shader.stage.to_lowercase(),
             shader.index
         );
+        let native_stem = format!("{stem}_native{}", self.program_index);
         ui.horizontal_wrapped(|ui| {
             if ui.button("Export DXBC").clicked() {
                 if let Ok(blob) = &prepared.blob {
@@ -674,10 +757,10 @@ impl Sgd5Browser {
             }
             if ui.button("Export displayed text").clicked() {
                 if let Some((_, _, _, text)) = &self.text {
-                    self.status = save(&format!("{stem}.txt"), text.as_bytes());
+                    self.status = save(&format!("{native_stem}.txt"), text.as_bytes());
                 }
             }
-            if let Ok(program) = &prepared.program {
+            if let Some(program) = program {
                 for (label, extension, output_mode) in [
                     ("Export ASM", "asm", ShaderViewMode::Asm),
                     ("Export HLSL", "hlsl", ShaderViewMode::Hlsl),
@@ -690,15 +773,15 @@ impl Sgd5Browser {
                             } else {
                                 "//"
                             },
-                            shader_text(prepared, shader, output_mode),
+                            shader_text(prepared, shader, output_mode, self.program_index),
                         );
-                        self.status = save(&format!("{stem}.{extension}"), text.as_bytes());
+                        self.status = save(&format!("{native_stem}.{extension}"), text.as_bytes());
                     }
                 }
                 if ui.button("Export SPIR-V").clicked() {
                     let entry = crate::sgd5_ps09_entry(shader, program);
                     self.status = save(
-                        &format!("{stem}.spv"),
+                        &format!("{native_stem}.spv"),
                         &crate::lift_to_spirv(&entry, program.code()),
                     );
                 }
@@ -728,12 +811,28 @@ fn shader_text(
     prepared: &PreparedShader,
     shader: &sgd5::Sgd5Shader,
     mode: ShaderViewMode,
+    program_index: usize,
 ) -> String {
-    let Ok(program) = &prepared.program else {
+    let Some(program) = prepared
+        .programs
+        .as_ref()
+        .ok()
+        .and_then(|programs| programs.get(program_index))
+    else {
         return prepared.metadata.clone();
     };
     let entry = crate::sgd5_ps09_entry(shader, program);
-    crate::sgd5_shader_text(&prepared.metadata, &entry, program.code(), mode)
+    let mapping = prepared
+        .native_mappings
+        .get(program_index)
+        .map(String::as_str)
+        .unwrap_or_default();
+    crate::sgd5_shader_text(
+        &format!("{}{mapping}", prepared.metadata),
+        &entry,
+        program.code(),
+        mode,
+    )
 }
 fn text_view(ui: &mut Ui, text: &str) {
     ui.add(
@@ -893,10 +992,32 @@ fn effect_overview(ui: &mut Ui, file: &Sgd5File, index: usize) {
             });
         }
         for (index, state) in effect.metadata.sampler_states.iter().enumerate() {
-            egui::CollapsingHeader::new(format!("Sampler {index} (packed fields unresolved)"))
-                .show(ui, |ui| {
-                    ui.monospace(format!("{:02x?}", state.data));
-                });
+            egui::CollapsingHeader::new(format!("Sampler {index}")).show(ui, |ui| {
+                let desc = state.descriptor();
+                info(
+                    ui,
+                    "Preset / address U,V,W",
+                    format!("{} / {:?}", desc.preset_index, desc.address_modes),
+                );
+                info(
+                    ui,
+                    "LOD bias / min / max",
+                    format!(
+                        "{} / {} / {}",
+                        desc.mip_lod_bias, desc.min_lod, desc.max_lod
+                    ),
+                );
+                info(ui, "Border color", format!("{:?}", desc.border_color));
+                info(
+                    ui,
+                    "Filter / comparison bits / max anisotropy",
+                    format!(
+                        "0x{:04x} / 0x{:02x} / {}",
+                        desc.filter_bits, desc.comparison_bits, desc.max_anisotropy
+                    ),
+                );
+                ui.monospace(format!("{:02x?}", state.data));
+            });
         }
     });
     egui::CollapsingHeader::new("Raw effect lookup words").show(ui, |ui| {
@@ -953,6 +1074,9 @@ fn pass_overview(ui: &mut Ui, file: &Sgd5File, effect_index: usize, pass_index: 
         }
     }
     info(ui, "State flags", format!("0x{:02x}", pass.state_flags));
+    if let Some(reference) = pass.selected_stencil_reference() {
+        info(ui, "Stencil reference", reference);
+    }
     if pass.state_flags & 1 != 0 {
         if let Some(state) = effect
             .metadata
@@ -1107,16 +1231,22 @@ fn rasterizer(ui: &mut Ui, state: &sgd5::Sgd5RasterizerState) {
     );
     info(
         ui,
-        "Depth clip / forced samples",
-        format!(
-            "{} / {}",
-            state.depth_clip_enable, state.forced_sample_count
-        ),
+        "Depth clip / multisample",
+        format!("{} / {}", state.depth_clip_enable, state.multisample_enable),
     );
     info(
         ui,
         "Flags / unknown byte",
         format!("0x{:02x} / 0x{:02x}", state.flags, state.unknown_0d),
+    );
+    info(
+        ui,
+        "Antialiased lines / conservative rasterization",
+        format!(
+            "{} / {}",
+            state.antialiased_line_enable(),
+            state.conservative_rasterization()
+        ),
     );
 }
 
@@ -1152,10 +1282,10 @@ fn depth_stencil(ui: &mut Ui, state: &sgd5::Sgd5DepthStencilState) {
     }
     info(
         ui,
-        "Flags / unknown fields",
+        "Depth bounds test / unknown fields",
         format!(
             "0x{:02x} / 0x{:02x} / {:02x?}",
-            state.flags_0f, state.unknown_0e, state.unknown_tail
+            state.depth_bounds_test_enable, state.unknown_0e, state.unknown_tail
         ),
     );
 }
@@ -1216,7 +1346,7 @@ mod tests {
                 rasterizer_state_index: 0,
                 depth_stencil_state_index: 0,
                 blend_state_index: 0,
-                unknown_09: 0,
+                stencil_reference: 0,
                 state_flags: 0,
                 unknown_0b: [0; 5],
                 usage_data_offset: 0,
@@ -1445,6 +1575,16 @@ mod tests {
         assert!(text.contains("Selected context: effect cable"));
         assert!(text.contains("texture_handles["));
         assert!(text.contains("descriptor_byte_offset="));
+        assert!(text.contains("Compiler resource usage (PS, verified against PRIV)"));
+        assert!(
+            text.contains("s[15..15]")
+                || browser
+                    .prepared
+                    .as_ref()
+                    .unwrap()
+                    .metadata
+                    .contains("s[15..15]")
+        );
         browser.shader_tab = 0;
         for value in [ShaderViewMode::Asm, ShaderViewMode::Hlsl] {
             mode = value;
@@ -1457,5 +1597,81 @@ mod tests {
             assert!(text.contains("Parameter mapping:"));
             assert!(text.contains("texture_handles["));
         }
+        let alternate_shader = file
+            .shaders
+            .iter()
+            .position(|shader| shader.name.starts_with("VS_VoxelizeGeneric_"))
+            .unwrap();
+        browser.selection = Selection::Shader {
+            shader: alternate_shader,
+            effect: None,
+            technique: None,
+            pass: None,
+        };
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default()
+                .show(ctx, |ui| browser.show_content(ui, &files, &mut mode));
+        });
+        assert_eq!(
+            browser
+                .prepared
+                .as_ref()
+                .unwrap()
+                .programs
+                .as_ref()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            browser
+                .prepared
+                .as_ref()
+                .unwrap()
+                .programs
+                .as_ref()
+                .unwrap()[browser.program_index]
+                .hardware_stage(),
+            dxbc::NativeStage::Vs
+        );
+        let es_index = browser
+            .prepared
+            .as_ref()
+            .unwrap()
+            .programs
+            .as_ref()
+            .unwrap()
+            .iter()
+            .position(|program| program.hardware_stage() == dxbc::NativeStage::Es)
+            .unwrap();
+        browser.program_index = es_index;
+        browser.text = None;
+        mode = ShaderViewMode::Asm;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default()
+                .show(ctx, |ui| browser.show_content(ui, &files, &mut mode));
+        });
+        assert!(
+            browser
+                .text
+                .as_ref()
+                .unwrap()
+                .3
+                .contains("Compiler resource usage (ES"),
+            "selected={} mapping={:?}",
+            browser.program_index,
+            browser.prepared.as_ref().unwrap().native_mappings
+        );
+        assert_eq!(
+            browser
+                .prepared
+                .as_ref()
+                .unwrap()
+                .programs
+                .as_ref()
+                .unwrap()[es_index]
+                .hardware_stage(),
+            dxbc::NativeStage::Es
+        );
     }
 }

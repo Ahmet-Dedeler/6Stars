@@ -14,6 +14,10 @@ Shader selection retains its effect, technique, and pass context. The Parameters
 
 Navigation, decompressed programs, metadata, and rendered shader text are cached. Disassembly and lifted HLSL consume the complete decoded program through code-end padding, without the former 4,000-instruction preview cap. The parser validates reflection member/auxiliary/string links, known default-value extents, aligned pass usage links, and selected compute layout selectors while retaining unresolved fields.
 
+The shader inspector also enumerates every XDAT/XBCH native variant, displays its actual hardware stage, and defaults to a matching VS/PS/GS/CS variant when available. Compiled metadata includes VGPR/SGPR counts, wave size, LDS, mesh limits, fetch/interpolation/output maps, and pixel export alternatives. Parameters and shader-text exports join compiler resource usage to original `PRIV` bindings and reflection names, with compiler user-data/SGPR locations and structured-buffer stride information. Unresolved joins remain explicit; original instructions are never patched for inspection. See [FSSM.md](FSSM.md) for field layouts and validation.
+
+Pass byte +9 is the stencil reference; flag bits 6/7 supply depth/blend index bit 8. Rasterizer byte +14 is multisample enable, and bits 0/1 of +15 select antialiased lines/conservative rasterization. Depth/stencil +15 enables depth-bounds testing. Sampler inspection decodes addresses, bias/LOD bounds, border color, preset index, anisotropy and retained filter/comparison bits. These fields were checked through the executable's state-expansion path. Runtime effect allocation sizes are also recomputed and validated.
+
 ## What the parts provide
 
 | Part | Observed contents | Likely engine role |

@@ -1,7 +1,15 @@
 use flate2::read::ZlibDecoder;
 #[path = "dxbc/compact_root.rs"]
 mod compact_root;
-pub use compact_root::{extract_compact_root_signature, CompactRootSignature, DescriptorKind, RootBindingLocation, RootParameter};
+pub use compact_root::{
+    extract_compact_root_signature, CompactRootSignature, DescriptorKind, RootBindingLocation,
+    RootParameter,
+};
+#[path = "dxbc/fssm.rs"]
+mod fssm;
+pub use fssm::{format_native_metadata, format_user_data, FssmNativeMetadata, NativeStage};
+#[cfg(test)]
+use fssm::{NativeRootType, NativeStageIo};
 use std::ffi::c_void;
 use std::fmt::Write as _;
 use std::io::Read;
@@ -69,8 +77,15 @@ struct DxcBuffer {
 }
 
 pub fn disassemble(data: &[u8]) -> String {
-    if let Ok(fssm) = extract_fssm(data) {
-        return format_fssm_disasm(&fssm, "DXBC / FSSM");
+    if let Ok(programs) = extract_fssm_programs(data) {
+        return programs
+            .iter()
+            .enumerate()
+            .map(|(index, program)| {
+                format_fssm_disasm(program, &format!("DXBC / FSSM variant {index}"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
     }
 
     match disassemble_with_dxc(data) {
@@ -107,29 +122,68 @@ pub struct FssmComputeMetadata {
     pub num_threads: [u16; 3],
 }
 
+impl FssmComputeMetadata {
+    pub fn group_id_sgprs(&self) -> [Option<u8>; 3] {
+        let mut next = self.user_sgpr_count;
+        std::array::from_fn(|axis| {
+            if self.rsrc2 & (1 << (7 + axis)) == 0 {
+                return None;
+            }
+            let result = next;
+            next += 1;
+            Some(result)
+        })
+    }
+    pub fn thread_id_vgpr_count(&self) -> u8 {
+        ((self.rsrc2 >> 11) & 3) as u8 + 1
+    }
+    pub fn lds_allocation_bytes(&self) -> u32 {
+        ((self.rsrc2 >> 15) & 0x1ff) * 512
+    }
+}
+
 impl FssmShader {
     pub fn compute_metadata(&self) -> Option<FssmComputeMetadata> {
-        if self.stage_pointer_offset != 0x70 { return None; }
+        if self.stage_pointer_offset != 0x70 {
+            return None;
+        }
         // This FSSM layout has the Scarlett compute state at descriptor+0x70.
         // The shorter retail layout used by some tools puts it at +0x30.
         let descriptor_end = self.stage_descriptor_offset.checked_add(0x88)?;
-        if descriptor_end > self.code_offset { return None; }
+        if descriptor_end > self.code_offset {
+            return None;
+        }
         let rsrc2 = read_u32(&self.data, self.stage_descriptor_offset + 0x78).ok()?;
         let mut num_threads = [0u16; 3];
         for (index, value) in num_threads.iter_mut().enumerate() {
-            let count = read_u32(&self.data, self.stage_descriptor_offset + 0x7c + index * 4).ok()?;
-            if !(1..=1024).contains(&count) { return None; }
+            let count =
+                read_u32(&self.data, self.stage_descriptor_offset + 0x7c + index * 4).ok()?;
+            if !(1..=1024).contains(&count) {
+                return None;
+            }
             *value = count as u16;
         }
-        if num_threads.iter().map(|value| u32::from(*value)).product::<u32>() > 1024 { return None; }
-        Some(FssmComputeMetadata { rsrc2, user_sgpr_count: ((rsrc2 >> 1) & 31) as u8, num_threads })
+        if num_threads
+            .iter()
+            .map(|value| u32::from(*value))
+            .product::<u32>()
+            > 1024
+        {
+            return None;
+        }
+        Some(FssmComputeMetadata {
+            rsrc2,
+            user_sgpr_count: ((rsrc2 >> 1) & 31) as u8,
+            num_threads,
+        })
     }
     pub fn compiled_wave_size(&self) -> Option<u8> {
         // The flags are in metadata, so never interpret program bytes at this offset.
-        if self.code_offset < 0xd8 {
+        let offset = self.stage_descriptor_offset.checked_add(0x14)?;
+        if offset.checked_add(4)? > self.code_offset {
             return None;
         }
-        let flags = read_u32(&self.data, 0xd4).ok()?;
+        let flags = read_u32(&self.data, offset).ok()?;
         Some(if flags & 0x20 != 0 { 32 } else { 64 })
     }
 
@@ -245,31 +299,62 @@ pub fn parse_fssm(data: Vec<u8>) -> Result<FssmShader, String> {
     })
 }
 
+/// Compatibility helper for callers that explicitly want the first variant.
 pub fn extract_fssm(data: &[u8]) -> Result<FssmShader, String> {
+    extract_fssm_programs(data)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "no native FSSM programs".into())
+}
+
+/// Enumerate native XDAT entries in order, including alternate VS/ES programs.
+pub fn extract_fssm_programs(data: &[u8]) -> Result<Vec<FssmShader>, String> {
     if data.get(..4) == Some(FSSM_MAGIC) {
-        return parse_fssm(data.to_vec());
+        return Ok(vec![parse_fssm(data.to_vec())?]);
     }
     let payload = find_dxil_payload(data)?;
-
-    // probe common nobc zlib offsets first before scanning 0x60..0xc0
-    let scan_end = payload.len().min(0xC0).saturating_sub(2);
-    for offset in [0x64usize, 0xA0].into_iter().chain(0x60..=scan_end) {
-        if offset > scan_end || !is_zlib_header(&payload[offset..offset + 2]) {
+    if payload.get(0x18..0x1c) != Some(b"XDAT") {
+        return Err("DXIL payload has no XDAT native index".into());
+    }
+    let count = read_u32(payload, 0x1c)? as usize;
+    let end = count
+        .checked_mul(12)
+        .and_then(|n| n.checked_add(0x24))
+        .ok_or("XDAT table size overflow")?;
+    payload.get(0x24..end).ok_or("truncated XDAT table")?;
+    let mut programs = Vec::new();
+    for index in 0..count {
+        let entry = 0x24 + index * 12;
+        if read_u32(payload, entry)? != 0x0d {
             continue;
         }
-
-        // bounded inflate a shader never comes close to this
+        let offset = read_u32(payload, entry + 4)? as usize;
+        let size = read_u32(payload, entry + 8)? as usize;
+        let blob = payload
+            .get(offset..offset.checked_add(size).ok_or("XDAT blob overflow")?)
+            .ok_or("XDAT blob outside DXIL payload")?;
+        if blob.get(..4) != Some(b"XBCH") || read_u32(blob, 4)? != 3 {
+            return Err("unsupported XBCH native header".into());
+        }
+        let packed_size =
+            usize::try_from(read_u64(blob, 8)?).map_err(|_| "XBCH packed size overflow")?;
+        let unpacked_size =
+            usize::try_from(read_u64(blob, 16)?).map_err(|_| "XBCH unpacked size overflow")?;
+        if unpacked_size > MAX_FSSM_BYTES {
+            return Err("XBCH exceeds 64 MiB".into());
+        }
+        let packed_end = packed_size
+            .checked_add(0x18)
+            .ok_or("XBCH stream extent overflow")?;
+        let stream = blob.get(0x18..packed_end).ok_or("truncated XBCH stream")?;
         let mut decompressed = Vec::new();
-        if ZlibDecoder::new(&payload[offset..])
-            .take(MAX_FSSM_BYTES as u64 + 1)
+        ZlibDecoder::new(stream)
+            .take(unpacked_size as u64 + 1)
             .read_to_end(&mut decompressed)
-            .is_err()
-            || decompressed.len() < 4
-            || &decompressed[..4] != FSSM_MAGIC
-        {
-            continue;
+            .map_err(|error| format!("XBCH inflate failed: {error}"))?;
+        if decompressed.len() != unpacked_size {
+            return Err("XBCH unpacked size mismatch".into());
         }
-
         let mut shader = parse_fssm(decompressed)?;
         if let (Some(hash), Ok(Some(chunk))) =
             (shader.compiler_hash, find_dxbc_chunk(data, b"HASH"))
@@ -278,10 +363,12 @@ pub fn extract_fssm(data: &[u8]) -> Result<FssmShader, String> {
                 shader.dxbc_hash_match = Some(digest == hash);
             }
         }
-        return Ok(shader);
+        programs.push(shader);
     }
-
-    Err("DXIL payload does not contain a zlib FSSM stream".into())
+    if programs.is_empty() {
+        return Err("XDAT has no native FSSM entries".into());
+    }
+    Ok(programs)
 }
 
 #[cfg(windows)]
@@ -490,14 +577,6 @@ fn find_dxil_payload(data: &[u8]) -> Result<&[u8], String> {
     find_dxbc_chunk(data, b"DXIL")?.ok_or_else(|| "DXBC container has no valid DXIL chunk".into())
 }
 
-fn is_zlib_header(header: &[u8]) -> bool {
-    header.len() == 2
-        && header[0] & 0x0f == 8
-        && header[0] >> 4 <= 7
-        && header[1] & 0x20 == 0
-        && (u16::from(header[0]) << 8 | u16::from(header[1])) % 31 == 0
-}
-
 pub fn format_fssm_metadata(fssm: &FssmShader) -> String {
     let mut text = format!("FSSM program metadata\n  version_field=0x{:08x} payload_bytes={}\n  stage_pointer_field=payload+0x{:x} descriptor_file_offset=0x{:x}\n  declared_program_file_offset=0x{:x} program_bytes={} (includes compiler no-ops and allocation padding)\n",
         fssm.version, fssm.payload_size, fssm.stage_pointer_offset.saturating_sub(FSSM_PAYLOAD_BASE),
@@ -505,11 +584,15 @@ pub fn format_fssm_metadata(fssm: &FssmShader) -> String {
     if let Some(wave_size) = fssm.compiled_wave_size() {
         let _ = writeln!(
             text,
-            "  compiled_wave_size={wave_size} (FSSM flags at file+0xd4)"
+            "  compiled_wave_size={wave_size} (stage descriptor+0x14)"
         );
     }
     if let Some(compute) = fssm.compute_metadata() {
-        let _ = writeln!(text, "  numthreads={:?} compute_rsrc2=0x{:08x} user_sgprs={}", compute.num_threads, compute.rsrc2, compute.user_sgpr_count);
+        let _ = writeln!(
+            text,
+            "  numthreads={:?} compute_rsrc2=0x{:08x} user_sgprs={}",
+            compute.num_threads, compute.rsrc2, compute.user_sgpr_count
+        );
     }
     if let Some(hash) = fssm.compiler_hash {
         let hash = hash
@@ -525,6 +608,12 @@ pub fn format_fssm_metadata(fssm: &FssmShader) -> String {
             text,
             "  compiler_hash_embedded_in_noops={hash} DXBC_HASH_match={matches}"
         );
+    }
+    match fssm.native_metadata() {
+        Ok(metadata) => text.push_str(&format_native_metadata(&metadata)),
+        Err(error) => {
+            let _ = writeln!(text, "  Native metadata unavailable: {error}");
+        }
     }
     text
 }
@@ -650,6 +739,60 @@ mod tests {
         ]
     }
 
+    fn indexed_dxbc(blobs: &[Vec<u8>]) -> Vec<u8> {
+        let mut payload = vec![0; 0x24 + blobs.len() * 12];
+        payload[0x18..0x1c].copy_from_slice(b"XDAT");
+        payload[0x1c..0x20].copy_from_slice(&(blobs.len() as u32).to_le_bytes());
+        for (index, blob) in blobs.iter().enumerate() {
+            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+            encoder.write_all(blob).unwrap();
+            let packed = encoder.finish().unwrap();
+            let offset = payload.len() as u32;
+            let entry = 0x24 + index * 12;
+            payload[entry..entry + 4].copy_from_slice(&13u32.to_le_bytes());
+            payload[entry + 4..entry + 8].copy_from_slice(&offset.to_le_bytes());
+            payload[entry + 8..entry + 12]
+                .copy_from_slice(&(packed.len() as u32 + 24).to_le_bytes());
+            payload.extend_from_slice(b"XBCH");
+            payload.extend_from_slice(&3u32.to_le_bytes());
+            payload.extend_from_slice(&(packed.len() as u64).to_le_bytes());
+            payload.extend_from_slice(&(blob.len() as u64).to_le_bytes());
+            payload.extend_from_slice(&packed);
+        }
+        let mut data = vec![0; 0x24];
+        data[..4].copy_from_slice(b"DXBC");
+        data[0x1c..0x20].copy_from_slice(&1u32.to_le_bytes());
+        data[0x20..0x24].copy_from_slice(&0x24u32.to_le_bytes());
+        data.extend_from_slice(b"DXIL");
+        data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        data.extend(payload);
+        let size = data.len() as u32;
+        data[0x18..0x1c].copy_from_slice(&size.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn indexed_extraction_keeps_variants_and_rejects_corrupt_declared_streams() {
+        let first = synthetic_fssm(&[0xbf810000]);
+        let mut second = synthetic_fssm(&[0xbf800001, 0xbf810000]);
+        second[0x58..0x60].copy_from_slice(&FSSM_EMPTY_STAGE.to_le_bytes());
+        second[0x28..0x30].copy_from_slice(&0xb0u64.to_le_bytes());
+        let data = indexed_dxbc(&[first, second]);
+        let programs = extract_fssm_programs(&data).unwrap();
+        assert_eq!(programs.len(), 2);
+        assert_eq!(programs[1].hardware_stage(), NativeStage::Es);
+        assert_eq!(programs[1].code_size, 8);
+        assert!(disassemble(&data).contains("variant 1"));
+        let mut truncated = data.clone();
+        // First entry's native blob points outside the declared DXIL part.
+        truncated[0x2c + 0x28..0x2c + 0x2c].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(extract_fssm_programs(&truncated).is_err());
+        let mut invalid_size = data;
+        let blob_at = 0x2c + 0x24 + 24;
+        invalid_size[blob_at + 16..blob_at + 24].copy_from_slice(&1u64.to_le_bytes());
+        assert!(extract_fssm_programs(&invalid_size).is_err());
+    }
+
     #[test]
     fn inspects_dxbc_chunk_table() {
         let mut data = vec![0u8; 0x24];
@@ -670,11 +813,20 @@ mod tests {
         let fssm = synthetic_fssm(&fingerprint_program());
         let hash = parse_fssm(fssm.clone()).unwrap().compiler_hash.unwrap();
 
-        let mut payload = vec![0u8; 0x7c];
-        payload[..4].copy_from_slice(b"XBCH");
+        let mut payload = vec![0u8; 0x40];
+        payload[0x18..0x1c].copy_from_slice(b"XDAT");
+        payload[0x1c..0x20].copy_from_slice(&1u32.to_le_bytes());
+        payload[0x24..0x28].copy_from_slice(&13u32.to_le_bytes());
+        payload[0x28..0x2c].copy_from_slice(&0x40u32.to_le_bytes());
         let mut compressor = ZlibEncoder::new(Vec::new(), Compression::fast());
         compressor.write_all(&fssm).unwrap();
-        payload.extend_from_slice(&compressor.finish().unwrap());
+        let compressed = compressor.finish().unwrap();
+        payload[0x2c..0x30].copy_from_slice(&(compressed.len() as u32 + 24).to_le_bytes());
+        payload.extend_from_slice(b"XBCH");
+        payload.extend_from_slice(&3u32.to_le_bytes());
+        payload.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
+        payload.extend_from_slice(&(fssm.len() as u64).to_le_bytes());
+        payload.extend_from_slice(&compressed);
 
         let mut data = vec![0u8; 0x28];
         data[..4].copy_from_slice(DXBC_MAGIC);
@@ -781,6 +933,71 @@ mod tests {
         let mut invalid = data.clone();
         invalid[0x20..0x28].copy_from_slice(&0xb0u64.to_le_bytes());
         assert!(parse_fssm(invalid).unwrap_err().contains("multiple active"));
+    }
+
+    #[test]
+    #[ignore = "requires PERCY_SGD5_SAMPLE pointing to the analysis archive"]
+    fn archive_native_variants_metadata_and_priv_joins() {
+        let path = std::env::var_os("PERCY_SGD5_SAMPLE").expect("set PERCY_SGD5_SAMPLE");
+        let files = crate::sgd5::load_sgd5(std::path::Path::new(&path)).unwrap();
+        let (mut shaders, mut programs, mut alternate, mut used, mut layouts) = (0, 0, 0, 0, 0);
+        let (mut table_joins, mut compute_programs) = (0, 0);
+        for file in &files {
+            for shader in &file.shaders {
+                let blob = crate::sgd5::decompress_shader(file, shader).unwrap();
+                let root = extract_compact_root_signature(&blob).unwrap();
+                let variants = extract_fssm_programs(&blob).unwrap();
+                shaders += 1;
+                alternate += usize::from(variants.len() == 2);
+                for program in &variants {
+                    let native = program.native_metadata().unwrap_or_else(|error| {
+                        panic!(
+                            "{} {}: {error}",
+                            shader.name,
+                            program.hardware_stage().tag()
+                        )
+                    });
+                    assert_eq!(program.dxbc_hash_match, Some(true), "{}", shader.name);
+                    programs += 1;
+                    layouts += native.root_layout.len();
+                    for resource in &native.used_resources {
+                        if resource.root_type == NativeRootType::Table {
+                            table_joins += 1;
+                            let (kind, register, space, _) =
+                                resource.binding(&root).unwrap_or_else(|| {
+                                    panic!("{}: unresolved {resource:?}", shader.name)
+                                });
+                            assert!(
+                                shader.reflection.resources.iter().any(|record| {
+                                    crate::sgd5_metadata::resource_kind(record) == kind
+                                        && record.shader_register() == register
+                                        && record.register_space() == space
+                                }),
+                                "{}: missing reflected {}{register} space{space}",
+                                shader.name,
+                                kind.register_prefix()
+                            );
+                        }
+                        used += 1;
+                    }
+                    if let NativeStageIo::Compute(compute) = native.io {
+                        compute_programs += 1;
+                        let psv = find_dxbc_chunk(&blob, b"PSV0").unwrap().unwrap();
+                        for (axis, dimension) in compute.num_threads.iter().enumerate() {
+                            assert_eq!(
+                                u32::from(*dimension),
+                                read_u32(psv, 40 + axis * 4).unwrap()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            (shaders, programs, alternate, layouts, used),
+            (26_503, 26_698, 195, 5_214_262, 445_625)
+        );
+        assert_eq!((table_joins, compute_programs), (385_337, 2_689));
     }
 
     #[test]

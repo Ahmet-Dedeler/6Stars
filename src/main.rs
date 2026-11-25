@@ -931,7 +931,15 @@ fn sgd5_ps09_entry(shader: &sgd5::Sgd5Shader, fssm: &dxbc::FssmShader) -> Ps09Sh
         index: shader.index,
         code_offset: u32::try_from(fssm.code_offset).unwrap_or(0),
         code_size: u32::try_from(fssm.code_size).unwrap_or(0),
-        stage: sgd5_stage(shader.stage),
+        stage: match fssm.hardware_stage() {
+            dxbc::NativeStage::Mesh => ShaderStage::MeshNgg,
+            dxbc::NativeStage::Compute => ShaderStage::Compute,
+            dxbc::NativeStage::Ps => ShaderStage::Pixel,
+            dxbc::NativeStage::Vs | dxbc::NativeStage::Es | dxbc::NativeStage::Ls => ShaderStage::Vertex,
+            dxbc::NativeStage::Gs => ShaderStage::Geometry,
+            dxbc::NativeStage::Hs => ShaderStage::Hull,
+            dxbc::NativeStage::Unknown(_) => sgd5_stage(shader.stage),
+        },
         num_threads: compute.map(|metadata| metadata.num_threads),
         rsrc1: None,
         rsrc2: compute.map(|metadata| metadata.rsrc2),
@@ -940,7 +948,7 @@ fn sgd5_ps09_entry(shader: &sgd5::Sgd5Shader, fssm: &dxbc::FssmShader) -> Ps09Sh
         pso_hash: 0,
         sga_hash: Some(shader.sga_hash),
         has_rt: false,
-        has_ngg: false,
+        has_ngg: fssm.hardware_stage() == dxbc::NativeStage::Mesh,
         insn_count: u32::try_from(rdna2::decode_gfx103(fssm.code(), usize::MAX).len()).unwrap_or(0),
     }
 }

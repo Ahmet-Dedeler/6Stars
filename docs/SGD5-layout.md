@@ -166,8 +166,8 @@ struct rasterizer_state {                 // 0x10 bytes
     f32 slope_scaled_depth_bias;
     u8 depth_clip_enable;
     u8 unknown_0d;
-    u8 forced_sample_count;
-    u8 flags;
+    u8 multisample_enable;
+    u8 flags;                           // bit 0 antialiased lines; bit 1 conservative rasterization
 };
 
 struct stencil_face {                     // 0x04 bytes
@@ -187,7 +187,7 @@ struct depth_stencil_state {              // 0x18 bytes
     struct stencil_face front_face;
     struct stencil_face back_face;
     u8 unknown_0e;
-    u8 flags_0f;
+    u8 depth_bounds_test_enable;
     u8 unknown_tail[8];
 };
 
@@ -210,7 +210,17 @@ struct blend_state {                     // 0x44 bytes
 };
 
 struct sampler_state {                   // 0x24 bytes
-    u8 data[0x24];                       // packed sampler descriptor; fields unresolved
+    u8 preset_index;
+    u8 address_u;
+    u8 address_v;
+    u8 address_w;
+    f32 mip_lod_bias;
+    u8 comparison_bits;                 // low five bits consumed as comparison; retain upper bits
+    u8 max_anisotropy;
+    u16 filter_bits;                    // packed encoding retained
+    f32 border_color[4];
+    f32 min_lod;
+    f32 max_lod;
 };
 
 // ---------- Techniques, passes, and usage ----------
@@ -225,10 +235,11 @@ struct pass {                            // 0x18 bytes
     u8 shader_slots[6];                  // +0x00: VS, PS, GS, DS, HS, CS
                                          // zero absent; otherwise one-based effect-array slot
     u8 rasterizer_state_index;           // +0x06: zero-based when enabled
-    u8 depth_stencil_state_index;        // +0x07
-    u8 blend_state_index;                // +0x08
-    u8 unknown_09;                       // +0x09
+    u8 depth_stencil_state_index_low;    // +0x07: state_flags bit 6 supplies index bit 8
+    u8 blend_state_index_low;            // +0x08: state_flags bit 7 supplies index bit 8
+    u8 stencil_reference;               // +0x09: applied when state_flags bit 3 is set
     u8 state_flags;                      // +0x0A: bits 0/1/2 enable rasterizer/depth/blend
+                                         // bit 3 enables stencil reference; bits 4/5 remain unresolved
     u8 unknown_0b[5];                    // +0x0B
     u16 usage_data_offset;               // +0x10: see address rule below; zero means absent
     u8 binding_table_indices[4];         // +0x12: binding-list indices for spaces0..3; 0xFF absent
@@ -333,6 +344,10 @@ Reflection member, name, default-value, and auxiliary offsets are relative to th
 There are no serialized string/default-data lengths inside a reflection table. The current parser separates its trailing bytes at the earliest nonzero member default-value target; without such a target, it treats the entire tail as string-pool bytes. The tail's total length is `size - 8 - 24 * resource_count - 24 * member_count - 8 * auxiliary_record_count`. Default data should remain raw bytes until interpreted using the member type and layout; it is not uniformly a float array. Member names can be resolved by hash from available string pools rather than assigning `reserved_08` a name-offset meaning.
 
 For a pass with a nonzero usage link, the serialized target is `pass_file_offset + usage_data_offset + 4`. The extra four bytes account for the lookup-array count omitted from the engine's copied in-memory buffer. The four counted hash lists are views into the stored lookup words, which must still be retained in full.
+
+The effect's `data_buffer_size` is checked against the loader's runtime allocation: six shader pointer arrays (including their terminators), 8 bytes per technique, 32 bytes per pass, all lookup words, copied reflection tables, an aligned binding-pointer array plus inline binding tables, and the string pool. Render/sampler states are interned separately. Serialized depth/blend index bytes are combined with their flag high bits before lookup; the executable then remaps local state indices to global interned state IDs.
+
+Native shader variants, compiler root/usage tables, and stage-specific metadata are documented in [FSSM.md](FSSM.md). The SGD5 stage library and actual compiled hardware stage are distinct; many VS-library entries are mesh shaders, and 195 VS containers carry both VS and ES variants.
 
 Vertex semantic slots 0..27 are four indices each of POSITION, NORMAL, TANGENT, BINORMAL, BLENDWEIGHT, BLENDINDICES, and COLOR, in that order. Slots 28..51 are TEXCOORD0..23. These are semantic slots, not D3D vertex-buffer input slots or signature registers. With `shader_flags` bit 52 clear, per-VS format bytes are DXGI_FORMAT values. With it set, low-nibble codes 1..13 map to DXGI values `{41,16,6,2,30,28,24,38,34,12,10,3,17}`; the high nibble remains unresolved. Other flag bits are retained, including previously decoded root-argument fields.
 

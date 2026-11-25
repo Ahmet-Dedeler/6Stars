@@ -631,10 +631,10 @@ fn write_effect_passes(
                     .rasterizer_states
                     .get(pass.rasterizer_state_index as usize)
                 {
-                    let _ = writeln!(text, "      rasterizer[{}] fill={} cull={} front_ccw={} depth_bias={} clamp={} slope_bias={} depth_clip={} forced_samples={} flags=0x{:02x}",
+                    let _ = writeln!(text, "      rasterizer[{}] fill={} cull={} front_ccw={} depth_bias={} clamp={} slope_bias={} depth_clip={} multisample={} flags=0x{:02x}",
                         pass.rasterizer_state_index, state.fill_mode, state.cull_mode, state.front_counter_clockwise,
                         state.depth_bias, state.depth_bias_clamp, state.slope_scaled_depth_bias, state.depth_clip_enable,
-                        state.forced_sample_count, state.flags);
+                        state.multisample_enable, state.flags);
                 }
             }
             if pass.state_flags & 2 != 0 {
@@ -642,9 +642,10 @@ fn write_effect_passes(
                     .depth_stencil_states
                     .get(pass.depth_stencil_state_index as usize)
                 {
-                    let _ = writeln!(text, "      depth_stencil[{}] depth_enable={} write_mask={} comparison={} stencil_enable={} stencil_masks={:02x}/{:02x}",
+                    let _ = writeln!(text, "      depth_stencil[{}] depth_enable={} write_mask={} comparison={} stencil_enable={} stencil_masks={:02x}/{:02x} depth_bounds={}",
                         pass.depth_stencil_state_index, state.depth_enable, state.depth_write_mask,
-                        state.depth_comparison_func, state.stencil_enable, state.stencil_read_mask, state.stencil_write_mask);
+                        state.depth_comparison_func, state.stencil_enable, state.stencil_read_mask, state.stencil_write_mask,
+                        state.depth_bounds_test_enable);
                 }
             }
             if pass.state_flags & 4 != 0 {
@@ -654,6 +655,9 @@ fn write_effect_passes(
                         pass.blend_state_index, state.alpha_to_coverage_enable, state.independent_blend_enable,
                         target.blend_enable, target.write_mask);
                 }
+            }
+            if let Some(reference) = pass.selected_stencil_reference() {
+                let _ = writeln!(text, "      stencil_reference={reference}");
             }
             if let Some(usage) = &pass.resource_usage {
                 let groups = [
@@ -676,6 +680,12 @@ fn write_effect_passes(
             }
             write_pass_bindings(text, file, effect, pass, shader, roots);
         }
+    }
+    for (index, sampler) in metadata.sampler_states.iter().enumerate() {
+        let descriptor = sampler.descriptor();
+        let _ = writeln!(text, "  sampler[{index}] preset={} addressUVW={:?} lod_bias={} min_lod={} max_lod={} border={:?} filter_bits=0x{:04x} comparison_bits=0x{:02x} max_anisotropy={}",
+            descriptor.preset_index, descriptor.address_modes, descriptor.mip_lod_bias, descriptor.min_lod,
+            descriptor.max_lod, descriptor.border_color, descriptor.filter_bits, descriptor.comparison_bits, descriptor.max_anisotropy);
     }
 }
 
@@ -765,8 +775,15 @@ pub fn format_shader_metadata(file: &Sgd5File, shader: &Sgd5Shader) -> String {
                     let _ = writeln!(text, "DXBC signatures unavailable: {error}");
                 }
             }
-            match crate::dxbc::extract_fssm(&blob) {
-                Ok(program) => text.push_str(&crate::dxbc::format_fssm_metadata(&program)),
+            match crate::dxbc::extract_fssm_programs(&blob) {
+                Ok(programs) => {
+                    let _ = writeln!(text, "Native program variants: {}", programs.len());
+                    for (index, program) in programs.iter().enumerate() {
+                        let _ =
+                            writeln!(text, "Variant {index} ({})", program.hardware_stage().tag());
+                        text.push_str(&crate::dxbc::format_fssm_metadata(program));
+                    }
+                }
                 Err(error) => {
                     let _ = writeln!(text, "FSSM program metadata unavailable: {error}");
                 }
@@ -998,6 +1015,63 @@ pub fn format_parameter_mapping(
             }
         }
     }
+    text
+}
+
+pub fn format_native_parameter_mapping(
+    file: &Sgd5File,
+    shader: &Sgd5Shader,
+    root: &CompactRootSignature,
+    native: &crate::dxbc::FssmNativeMetadata,
+) -> String {
+    let mut text = format!(
+        "\nCompiler resource usage ({}, verified against PRIV):\n",
+        native.stage.tag()
+    );
+    for usage in &native.used_resources {
+        let Some((kind, register, space, location)) = usage.binding(root) else {
+            let _ = writeln!(
+                text,
+                "  unresolved kind={} register={} {:?} slot={} (raw compiler record preserved)",
+                usage.resource_kind_raw,
+                usage.lower_bound_register,
+                usage.root_type,
+                usage.root_slot
+            );
+            continue;
+        };
+        let resource = shader.reflection.resources.iter().find(|record| {
+            resource_kind(record) == kind
+                && record.shader_register() == register
+                && record.register_space() == space
+        });
+        let label = resource
+            .map(|record| name(file, record.name_hash, record.name.as_deref()))
+            .unwrap_or_else(|| "unnamed compiled resource".into());
+        let input = if kind == DescriptorKind::Sampler {
+            format!("compiler sampler slot {} (static)", usage.root_slot)
+        } else {
+            let width = native
+                .root_layout
+                .iter()
+                .find(|p| {
+                    p.root_type == usage.root_type
+                        && p.root_slot == usage.root_slot
+                        && p.base_register == register
+                        && p.table_offset_dwords == usage.table_offset_dwords
+                })
+                .map(|p| p.user_sgpr_count);
+            width
+                .map(|width| {
+                    crate::dxbc::format_user_data(native.stage, usage.first_user_data_dword, width)
+                })
+                .unwrap_or_else(|| format!("compiler user-data {}", usage.first_user_data_dword))
+        };
+        let _ = writeln!(text, "  {label} -> {}{register}, space{space} -> {} -> {input}; table bytes={}, descriptor={} dwords, stride={}",
+            kind.register_prefix(), format_root_location(location), u64::from(usage.table_offset_dwords) * 4,
+            usage.descriptor_dword_count, usage.stride);
+    }
+    text.push_str("Compiler inputs describe the entry ABI; individual instruction uses still require data-flow analysis.\n");
     text
 }
 

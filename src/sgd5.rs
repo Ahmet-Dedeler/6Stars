@@ -298,8 +298,17 @@ pub struct Sgd5RasterizerState {
     pub slope_scaled_depth_bias: f32,
     pub depth_clip_enable: u8,
     pub unknown_0d: u8,
-    pub forced_sample_count: u8,
+    pub multisample_enable: u8,
     pub flags: u8,
+}
+
+impl Sgd5RasterizerState {
+    pub fn antialiased_line_enable(&self) -> bool {
+        self.flags & 1 != 0
+    }
+    pub fn conservative_rasterization(&self) -> bool {
+        self.flags & 2 != 0
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -322,7 +331,7 @@ pub struct Sgd5DepthStencilState {
     pub front_face: Sgd5StencilFace,
     pub back_face: Sgd5StencilFace,
     pub unknown_0e: u8,
-    pub flags_0f: u8,
+    pub depth_bounds_test_enable: u8,
     pub unknown_tail: [u8; 8],
 }
 
@@ -350,8 +359,38 @@ pub struct Sgd5BlendState {
 #[derive(Clone, Debug)]
 pub struct Sgd5SamplerState {
     pub offset: usize,
-    /// Serialized sampler descriptor; its packed filter fields remain provisional.
+    /// Serialized sampler descriptor; filter bits remain available without guessing their meaning.
     pub data: [u8; 36],
+}
+
+#[derive(Clone, Debug)]
+pub struct Sgd5SamplerDescriptor {
+    pub preset_index: u8,
+    pub address_modes: [u8; 3],
+    pub mip_lod_bias: f32,
+    pub comparison_bits: u8,
+    pub max_anisotropy: u8,
+    pub filter_bits: u16,
+    pub border_color: [f32; 4],
+    pub min_lod: f32,
+    pub max_lod: f32,
+}
+
+impl Sgd5SamplerState {
+    pub fn descriptor(&self) -> Sgd5SamplerDescriptor {
+        let f = |at| f32::from_le_bytes(self.data[at..at + 4].try_into().unwrap());
+        Sgd5SamplerDescriptor {
+            preset_index: self.data[0],
+            address_modes: self.data[1..4].try_into().unwrap(),
+            mip_lod_bias: f(4),
+            comparison_bits: self.data[8],
+            max_anisotropy: self.data[9],
+            filter_bits: u16::from_le_bytes(self.data[10..12].try_into().unwrap()),
+            border_color: std::array::from_fn(|i| f(12 + i * 4)),
+            min_lod: f(28),
+            max_lod: f(32),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -381,9 +420,10 @@ pub struct Sgd5Pass {
     /// Zero means absent; other values are one-based slots in the effect's stage arrays.
     pub shader_slots: [u8; 6],
     pub rasterizer_state_index: u8,
-    pub depth_stencil_state_index: u8,
-    pub blend_state_index: u8,
-    pub unknown_09: u8,
+    /// Nine-bit indices include the high bits carried by state_flags bits 6/7.
+    pub depth_stencil_state_index: u16,
+    pub blend_state_index: u16,
+    pub stencil_reference: u8,
     pub state_flags: u8,
     pub unknown_0b: [u8; 5],
     /// Relative to the in-memory pass record; add four for the on-disk lookup-size prefix.
@@ -392,6 +432,12 @@ pub struct Sgd5Pass {
     pub binding_table_indices: [u8; 4],
     pub unknown_16: u16,
     pub resource_usage: Option<Sgd5PassResourceUsage>,
+}
+
+impl Sgd5Pass {
+    pub fn selected_stencil_reference(&self) -> Option<u8> {
+        (self.state_flags & 8 != 0).then_some(self.stencil_reference)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -430,6 +476,35 @@ pub struct Sgd5Effect {
     /// Effect-owned pool addressed by technique records, independent of the binding list.
     pub string_pool: Vec<u8>,
     pub strings: Vec<String>,
+}
+
+impl Sgd5Effect {
+    /// Bytes in the reader's copied/relocated data buffer. Interned render
+    /// states and the fixed runtime effect object are allocated separately.
+    pub fn runtime_data_size(&self) -> Option<u32> {
+        let mut size = 0usize;
+        for indices in &self.stage_indices {
+            size = size.checked_add(indices.len().checked_add(1)?.checked_mul(8)?)?;
+        }
+        size = size.checked_add(self.metadata.techniques.len().checked_mul(8)?)?;
+        size = size.checked_add(self.metadata.passes.len().checked_mul(32)?)?;
+        size = size.checked_add(self.metadata.pass_lookup_words.len().checked_mul(4)?)?;
+        if let Sgd5ReflectionSource::Inline(table) = &self.shared_reflection_source {
+            size = size.checked_add(table.size as usize)?;
+        }
+        size = size.checked_add(self.main_reflection.size as usize)?;
+        size = size.checked_add(self.property_reflection.size as usize)?;
+        if !self.binding_list.entries.is_empty() {
+            size = size.checked_add(7)? & !7;
+            size = size.checked_add(self.binding_list.entries.len().checked_mul(8)?)?;
+        }
+        for entry in &self.binding_list.entries {
+            if let Sgd5BindingListEntry::Inline(table) = entry {
+                size = size.checked_add(table.size as usize)?;
+            }
+        }
+        u32::try_from(size.checked_add(self.string_pool.len())?).ok()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1046,7 +1121,7 @@ fn parse_rasterizer_state(reader: &mut Reader<'_>) -> Result<Sgd5RasterizerState
         slope_scaled_depth_bias: f32::from_le_bytes(data[8..12].try_into().unwrap()),
         depth_clip_enable: data[12],
         unknown_0d: data[13],
-        forced_sample_count: data[14],
+        multisample_enable: data[14],
         flags: data[15],
     })
 }
@@ -1071,7 +1146,7 @@ fn parse_depth_stencil_state(reader: &mut Reader<'_>) -> Result<Sgd5DepthStencil
         front_face: face(6),
         back_face: face(10),
         unknown_0e: data[14],
-        flags_0f: data[15],
+        depth_bounds_test_enable: data[15],
         unknown_tail: data[16..].try_into().unwrap(),
     })
 }
@@ -1107,9 +1182,9 @@ fn parse_pass(reader: &mut Reader<'_>) -> Result<Sgd5Pass, Sgd5Error> {
         offset,
         shader_slots: data[..6].try_into().unwrap(),
         rasterizer_state_index: data[6],
-        depth_stencil_state_index: data[7],
-        blend_state_index: data[8],
-        unknown_09: data[9],
+        depth_stencil_state_index: u16::from(data[7]) | (u16::from(data[10] & 0x40) << 2),
+        blend_state_index: u16::from(data[8]) | (u16::from(data[10] & 0x80) << 1),
+        stencil_reference: data[9],
         state_flags: data[10],
         unknown_0b: data[11..16].try_into().unwrap(),
         usage_data_offset: u16::from_le_bytes(data[16..18].try_into().unwrap()),
@@ -1322,7 +1397,7 @@ fn parse_effect(reader: &mut Reader<'_>, stage_counts: &[u32; 6]) -> Result<Sgd5
         for (flag, index, count) in [
             (
                 1,
-                pass.rasterizer_state_index,
+                u16::from(pass.rasterizer_state_index),
                 metadata.rasterizer_states.len(),
             ),
             (
@@ -1339,7 +1414,7 @@ fn parse_effect(reader: &mut Reader<'_>, stage_counts: &[u32; 6]) -> Result<Sgd5
             }
         }
     }
-    Ok(Sgd5Effect {
+    let effect = Sgd5Effect {
         name,
         data_buffer_size,
         stage_indices,
@@ -1352,7 +1427,14 @@ fn parse_effect(reader: &mut Reader<'_>, stage_counts: &[u32; 6]) -> Result<Sgd5
         binding_list,
         string_pool,
         strings,
-    })
+    };
+    if effect.runtime_data_size() != Some(data_buffer_size) {
+        return Err(Sgd5Error(format!(
+            "effect {}: runtime allocation size {data_buffer_size} does not match parsed layout",
+            effect.name
+        )));
+    }
+    Ok(effect)
 }
 
 fn build_hash_names(
@@ -1703,6 +1785,64 @@ pub fn extract_sgd5(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pass_state_indices_include_high_bits_and_stencil_reference_is_conditional() {
+        let mut data = [0u8; 24];
+        data[7] = 3;
+        data[8] = 9;
+        data[9] = 131;
+        data[10] = 0xce;
+        let pass = parse_pass(&mut Reader::new(&data)).unwrap();
+        assert_eq!(pass.depth_stencil_state_index, 259);
+        assert_eq!(pass.blend_state_index, 265);
+        assert_eq!(pass.selected_stencil_reference(), Some(131));
+        data[10] &= !8;
+        assert_eq!(
+            parse_pass(&mut Reader::new(&data))
+                .unwrap()
+                .selected_stencil_reference(),
+            None
+        );
+    }
+
+    #[test]
+    fn state_fields_follow_executable_expansion_offsets() {
+        let mut rasterizer = [0u8; 16];
+        rasterizer[14] = 1;
+        rasterizer[15] = 3;
+        let state = parse_rasterizer_state(&mut Reader::new(&rasterizer)).unwrap();
+        assert_eq!(state.multisample_enable, 1);
+        assert!(state.antialiased_line_enable() && state.conservative_rasterization());
+        let mut depth = [0u8; 24];
+        depth[15] = 1;
+        assert_eq!(
+            parse_depth_stencil_state(&mut Reader::new(&depth))
+                .unwrap()
+                .depth_bounds_test_enable,
+            1
+        );
+        let mut sampler = Sgd5SamplerState {
+            offset: 0,
+            data: [0; 36],
+        };
+        sampler.data[1..4].copy_from_slice(&[1, 2, 3]);
+        sampler.data[4..8].copy_from_slice(&(-0.5f32).to_le_bytes());
+        sampler.data[10..12].copy_from_slice(&0x55u16.to_le_bytes());
+        sampler.data[28..32].copy_from_slice(&2f32.to_le_bytes());
+        sampler.data[32..36].copy_from_slice(&8f32.to_le_bytes());
+        let desc = sampler.descriptor();
+        assert_eq!(desc.address_modes, [1, 2, 3]);
+        assert_eq!(
+            (
+                desc.mip_lod_bias,
+                desc.filter_bits,
+                desc.min_lod,
+                desc.max_lod
+            ),
+            (-0.5, 0x55, 2.0, 8.0)
+        );
+    }
 
     fn empty_reflection() -> Vec<u8> {
         let mut data = 9u32.to_le_bytes().to_vec();
