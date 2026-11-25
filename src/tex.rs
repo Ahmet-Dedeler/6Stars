@@ -26,7 +26,7 @@ fn rf32(b: &[u8], o: usize) -> f32 {
     f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
 }
 #[inline]
-fn vptr(q: u64) -> Option<usize> {
+pub(crate) fn vptr(q: u64) -> Option<usize> {
     (0x5000_0000..0x5800_0000).contains(&q).then(|| (q - 0x5000_0000) as usize)
 }
 #[inline]
@@ -1673,7 +1673,7 @@ fn gxt_pool_strings(data: &[u8]) -> Vec<String> {
 
 // A typed zldbmt resource stores one reference per row. The referenced strings
 // may be empty, repeated, or outside the range scanned by the legacy heuristic.
-fn gxt_row_descriptor(data: &[u8]) -> Option<usize> {
+pub(crate) fn gxt_row_descriptor(data: &[u8]) -> Option<usize> {
     if data.len() < 0x60 || &data[0x10..0x15] != b"0DRPz" {
         return None;
     }
@@ -1682,7 +1682,7 @@ fn gxt_row_descriptor(data: &[u8]) -> Option<usize> {
     (ru32(descriptor, 0) == 0xa847_8889).then_some(offset)
 }
 
-fn gxt_referenced_rows(data: &[u8], descriptor: usize) -> Option<Vec<&str>> {
+pub(crate) fn gxt_referenced_rows(data: &[u8], descriptor: usize) -> Option<Vec<&str>> {
     let row_bytes = ru32(data, descriptor + 4) as usize;
     let row_start = vptr(ru64(data, descriptor + 8))?;
     if row_bytes % 16 != 0 {

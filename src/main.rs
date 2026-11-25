@@ -7,6 +7,7 @@ mod content_search;
 mod boot;
 mod dat;
 mod dxbc;
+mod gxt_scan;
 mod mapdata;
 mod meta7a;
 mod names;
@@ -5165,11 +5166,68 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
         }
     }
 
+    if sz > 512 * 1024 * 1024 && magic == "9FPR" {
+        let mut last_gib = u64::MAX;
+        gxt_scan::scan_archive(path, |bytes| {
+            let gib = bytes / (1024 * 1024 * 1024);
+            if gib != last_gib {
+                if let Some(st) = progress_state {
+                    st.lock().unwrap().status = format!("Scanning GXT {:.2} / {:.2} GB", bytes as f64 / 1e9, sz as f64 / 1e9);
+                }
+                last_gib = gib;
+            }
+        }, |table| {
+            found.push(RpfEntry {
+                source_rpf: path.clone(),
+                rpf_name: rname.clone(),
+                name: format!("gxt_{:012x}.gxt", table.offset),
+                kind: "GXT",
+                offset: table.offset,
+                comp_size: table.chunks.iter().map(|&(_, size)| size).sum(),
+                raw_size: table.raw_size,
+                tracks: 0,
+                chunks: table.chunks,
+            });
+            Ok(())
+        })?;
+    }
+
     if rname.eq_ignore_ascii_case("audio.rpf") {
         enrich_audio_rpf_entries(path, sz, &mut found);
     }
 
     Ok((hdr_info, found))
+}
+
+#[cfg(test)]
+#[test]
+fn large_rpf_gxt_reaches_normal_entry_reader() -> std::io::Result<()> {
+    struct Scratch(PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let scratch = Scratch(std::env::temp_dir().join(format!("percystar-gxt-{}-{timestamp}.rpf", std::process::id())));
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&scratch.0)?;
+    file.write_all(b"9FPR")?;
+    let offset = 513 * 1024 * 1024 + 16;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut zlib = flate2::write::ZlibEncoder::new(file, flate2::Compression::default());
+    let raw = gxt_scan::tests::resource();
+    zlib.write_all(&raw)?;
+    drop(zlib.finish()?);
+
+    let (_, entries) = scan_single_rpf(&scratch.0, None)?;
+    let matches: Vec<_> = entries.iter().filter(|entry| entry.kind == "GXT").collect();
+    let [entry] = matches.as_slice() else { panic!("expected one indexed GXT") };
+    assert_eq!(entry.offset, offset);
+    let payload = read_entry_bytes(entry)?;
+    assert_eq!(payload, raw);
+    assert_eq!(decode_0drpz_text(&payload).as_deref(), Some("=== RAGE9 Text Table (2 strings) ===\n\n!\n"));
+    Ok(())
 }
 
 // lowercase search text per entry, index matches entries
@@ -6412,6 +6470,18 @@ fn disassemble_dxbc_cli(src: &Path, output: Option<&PathBuf>) {
 }
 
 fn main() -> eframe::Result<()> {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().is_some_and(|arg| arg == "--scan-gxt") {
+        let Some(path) = args.next().filter(|_| args.next().is_none()) else {
+            eprintln!("Usage: PercyStar --scan-gxt <archive.rpf>");
+            std::process::exit(2);
+        };
+        if let Err(error) = gxt_scan::report(Path::new(&path)) {
+            eprintln!("GXT scan failed: {error}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     // remove leftover old exe from previous self update
     if let Ok(cur) = std::env::current_exe() {
         let _ = fs::remove_file(cur.with_extension("exe.old"));
