@@ -167,7 +167,7 @@ What changed:
   - Z-up articulated 3D stick-man rig with Play/Pause + timeline scrubber driven by decoded `crClipDictionary` durations, track counts, and clip hashes.
 
 - **`SGD5` Shader-Group & `DXBC` / `NOBC` / `FSSM` RDNA2 Pipeline**
-  - Fast `0x1000`-aligned `SGD5` page scanner (`src/sgd5.rs`) + `NOBC` zlib fast-path (`0x64` / `0xA0`) + `OnceLock`-cached `dxcompiler.dll` lookup (`src/dxbc.rs`) feeding directly into the GFX10.3 RDNA2 → HLSL / SPIR-V lifter.
+  - Fast `0x1000`-aligned `SGD5` page scanner (`src/sgd5.rs`), indexed XDAT/XBCH native-program extraction, and `OnceLock`-cached `dxcompiler.dll` lookup (`src/dxbc.rs`) feeding the GFX10.3 RDNA2 disassembler and experimental HLSL / SPIR-V lifter.
 - **Full `PSIN` Binary PSO Schema, Enum & Instance Decoder (`src/psin.rs`)**
   - Decodes `PSIN` instance tables (`pppppppp`-delimited, 16-byte aligned payloads), `LSCH` 32-byte struct headers & 16-byte field descriptors, `LENM` enum tables, and resolves JOAAT field/struct/enum hashes across `3,900+` binary PSO configs (`script.rpf`, `story000_script.rpf`, `data.rpf`).
 - **`crClipDictionary` (`ANIM`) Decoder (`src/anim.rs`)**
@@ -214,6 +214,16 @@ What changed:
   PercyStar.exe --disassemble-dxbc "<path-to-shader.dxbc>" ["<output.asm>"]
   ```
   The Shaders tab is source-driven: opening a raw `shaders.rpf` loads the PS09 runtime cache and every SGD5 group, while separate buttons load a PS09 cache, zlib directory, or SGD5 `.bin`. Selecting either source or any shader switches the browser and viewer to that dataset. Both sources support GFX10.3 disassembly plus experimental HLSL and SPIR-V lifting; SGD5 extraction gives each group its own output folder and `sgd5_index.csv`. GTA `Wrapped`/`NOBC` shaders are unwrapped to their zlib `FSSM` payload before RDNA2 decoding.
+
+  SGD5 uses one reflection-table parser for shared metadata, individual shaders, and both effect tables. Its sections are named `resources`, `members`, and provisional `auxiliary_records`; members describe CBV contents or Buffer element metadata. Resource records expose byte-sized slot, auxiliary count, member count, and flags fields. Member records expose separate value-type and auxiliary-count bytes. Observed-zero words are retained as reserved fields, and default-data offsets are interpreted only on members. Descriptor tables and inline property tables share the `Sgd5BindingTable` model; property references resolve through the table's 32-bit hash. Auxiliary/default bytes are retained alongside typed property values and known member extents. The second reflection hash remains independent, and the 144-byte engine shader metadata is retained with decoded fields. CSV manifests use `archive_size`, `decompressed_size`, `resources`, `members`, and `auxiliary_records` columns.
+
+  Run parser regressions with `cargo test sgd5`. To validate the analysis archive, set `PERCY_SGD5_SAMPLE` to its path and run `cargo test sample_archive_uses_common_tables_and_decompresses_each_stage -- --ignored`.
+
+  The SGD5 viewer has a **Metadata** view and text export with compiled DXBC input/output signatures, resource hashes and types, member packing/default bytes, shared reflection matches, effect ownership, and resolved binding-table references. ASM/HLSL exports include that metadata as comments. Parameter inspection distinguishes effect material slots from compiled shader registers and root indices, using reflection and `PRIV` to establish binding identities. See [the SGD5 format notes](docs/SGD5.md) for what is confirmed and what remains inferred.
+
+  FSSM extraction follows the XDAT/XBCH index and validates compressed/uncompressed sizes, then uses the active program descriptor's declared range. The explorer makes every native variant selectable, displays its actual hardware stage, and exports the selected program. Metadata includes compiler root/resource tables, user-data/SGPR locations joined to original `PRIV` bindings and reflection names, register counts, wave/LDS configuration, stage I/O, mesh limits, and pixel export alternatives. Disassembly retains compiler no-ops and instructions before prefetch, and continues past early `s_endpgm` instructions to the code-end padding. See [native compiler metadata](docs/FSSM.md) for layouts, verified archive counts, and regression commands.
+
+  Executable analysis now supports explicit SGD5 state, technique, and pass tables. The SGD5 browser follows effect → technique → pass → shader, with separate variant libraries and shared archive tables. Inspect material parameters, typed `proplst` properties, vertex inputs, render states, and selected binding layouts. Shader Parameters, ASM, and lifted HLSL show verified resource/register/root mappings and the selected pass context. The shader's serialized profile byte is named `shader_version`; compiled wave size comes from FSSM metadata. Effect binding lists use a 24-bit count and an 8-bit texture-handle count, and the shared-reflection selector is parsed explicitly. See [the serialized layout](docs/SGD5-layout.md) and [runtime pipeline](docs/SGD5-pipeline.md).
 
 ---
 
