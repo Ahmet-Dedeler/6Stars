@@ -29,7 +29,7 @@ fn rf32(b: &[u8], o: usize) -> f32 {
     f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
 }
 #[inline]
-fn vptr(q: u64) -> Option<usize> {
+pub(crate) fn vptr(q: u64) -> Option<usize> {
     (0x5000_0000..0x5800_0000).contains(&q).then(|| (q - 0x5000_0000) as usize)
 }
 #[inline]
@@ -2206,6 +2206,149 @@ pub fn probe_gxt_snippet(head: &[u8]) -> Option<String> {
     None
 }
 
+// follow {u32, u32 len, u64 ptr} records to null-terminated utf8 string pools,
+// which hold the text of small tables and can sit after the bitmap region
+fn gxt_pool_strings(data: &[u8]) -> Vec<String> {
+    let mut pools: Vec<(usize, Vec<String>)> = Vec::new();
+    let mut o = 0x60;
+    while o + 16 <= data.len() {
+        let len = ru32(data, o + 4) as usize;
+        let ptr = ru64(data, o + 8);
+        o += 8;
+        if !(2..=1 << 20).contains(&len) || !(0x5000_0000..0x5000_0000 + data.len() as u64).contains(&ptr) {
+            continue;
+        }
+        let a = (ptr - 0x5000_0000) as usize;
+        let Some(b) = data.get(a..a + len) else { continue };
+        if b[len - 1] != 0 || pools.iter().any(|(pa, _)| *pa == a) {
+            continue;
+        }
+        let mut segs = Vec::new();
+        let mut valid = true;
+        for raw in b[..len - 1].split(|&c| c == 0).filter(|r| !r.is_empty()) {
+            match std::str::from_utf8(raw) {
+                Ok(s) if s.chars().all(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t')) => segs.push(s.trim().to_string()),
+                _ => {
+                    valid = false;
+                    break;
+                }
+            }
+        }
+        if valid && segs.iter().any(|s| s.chars().any(char::is_alphabetic)) {
+            pools.push((a, segs));
+        }
+    }
+    pools.sort_by_key(|(a, _)| *a);
+    pools.into_iter().flat_map(|(_, s)| s).filter(|s| !s.is_empty()).collect()
+}
+
+// A typed zldbmt resource stores one reference per row. The referenced strings
+// may be empty, repeated, or outside the range scanned by the legacy heuristic.
+pub(crate) fn gxt_row_descriptor(data: &[u8]) -> Option<usize> {
+    if data.len() < 0x60 || &data[0x10..0x15] != b"0DRPz" {
+        return None;
+    }
+    let offset = vptr(ru64(data, 0x38))?;
+    let descriptor = data.get(offset..offset + 16)?;
+    (ru32(descriptor, 0) == 0xa847_8889).then_some(offset)
+}
+
+pub(crate) fn gxt_referenced_rows(data: &[u8], descriptor: usize) -> Option<Vec<&str>> {
+    let row_bytes = ru32(data, descriptor + 4) as usize;
+    let row_start = vptr(ru64(data, descriptor + 8))?;
+    if row_bytes % 16 != 0 {
+        return None;
+    }
+    let rows = data.get(row_start..row_start.checked_add(row_bytes)?)?;
+    let mut strings = Vec::with_capacity(rows.len() / 16);
+    for row in rows.chunks_exact(16) {
+        let reference = ru64(row, 8);
+        let page = (reference & 0x000f_ffff) as usize;
+        let offset = usize::try_from(reference >> 20).ok()?;
+        let page_descriptor = descriptor + page.checked_sub(1)? * 16;
+        let page_descriptor = data.get(page_descriptor..page_descriptor + 16)?;
+        if ru32(page_descriptor, 0) != 0x10 {
+            return None;
+        }
+        let pool_start = vptr(ru64(page_descriptor, 8))?;
+        let pool_bytes = ru32(page_descriptor, 4) as usize;
+        let pool = data.get(pool_start..pool_start.checked_add(pool_bytes)?)?;
+        let remaining = pool.get(offset..)?;
+        let end = remaining.iter().position(|&byte| byte == 0)?;
+        strings.push(std::str::from_utf8(&remaining[..end]).ok()?);
+    }
+    Some(strings)
+}
+
+#[cfg(test)]
+mod gxt_row_tests {
+    use super::*;
+
+    fn table() -> Vec<u8> {
+        let mut data = vec![0; 0xf0];
+        data[0x10..0x15].copy_from_slice(b"0DRPz");
+        data[0x38..0x40].copy_from_slice(&0x5000_0060u64.to_le_bytes());
+        data[0x60..0x64].copy_from_slice(&0xa847_8889u32.to_le_bytes());
+        data[0x64..0x68].copy_from_slice(&64u32.to_le_bytes());
+        data[0x68..0x70].copy_from_slice(&0x5000_00a0u64.to_le_bytes());
+        let pool = b"!\0\0  A  \0unused\0";
+        data[0x90..0x94].copy_from_slice(&0x10u32.to_le_bytes());
+        data[0x94..0x98].copy_from_slice(&(pool.len() as u32).to_le_bytes());
+        data[0x98..0xa0].copy_from_slice(&0x5000_00f0u64.to_le_bytes());
+        for (index, offset) in [0u64, 2, 0, 3].into_iter().enumerate() {
+            let at = 0xa8 + index * 16;
+            data[at..at + 8].copy_from_slice(&((offset << 20) | 4).to_le_bytes());
+        }
+        data.extend_from_slice(pool);
+        data
+    }
+
+    #[test]
+    fn preserves_every_referenced_row_including_blanks_and_repeats() {
+        assert_eq!(decode_0drpz_text(&table()).as_deref(),
+                   Some("=== RAGE9 Text Table (4 strings) ===\n\n!\n\n!\n  A  "));
+    }
+
+    #[test]
+    fn preserves_an_all_empty_table() {
+        let mut data = table();
+        for index in 0..4 {
+            let at = 0xa8 + index * 16;
+            data[at..at + 8].copy_from_slice(&((2u64 << 20) | 4).to_le_bytes());
+        }
+        assert_eq!(
+            decode_0drpz_text(&data).as_deref(),
+            Some("=== RAGE9 Text Table (4 strings) ===\n\n\n\n\n")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_typed_references() {
+        let mut wrong_page = table();
+        wrong_page[0x90..0x94].copy_from_slice(&0x11u32.to_le_bytes());
+        assert!(decode_0drpz_text(&wrong_page).is_none());
+
+        let mut bad_offset = table();
+        bad_offset[0xa8..0xb0].copy_from_slice(&((60u64 << 20) | 4).to_le_bytes());
+        assert!(decode_0drpz_text(&bad_offset).is_none());
+
+        let mut truncated = table();
+        truncated.pop();
+        assert!(decode_0drpz_text(&truncated).is_none());
+
+        let mut bad_utf8 = table();
+        bad_utf8[0xf0] = 0x80;
+        assert!(decode_0drpz_text(&bad_utf8).is_none());
+    }
+
+    #[test]
+    fn keeps_legacy_decoding_for_untyped_payloads() {
+        let data = b"First line\0Second line\0Third line\0";
+        assert_eq!(decode_0drpz_text(data).as_deref(),
+                   Some("=== RAGE9 Text Table (3 strings) ===\n\nFirst line\nSecond line\nThird line"));
+    }
+}
+
 /// Extract clean readable UTF-8 strings from a RAGE9 `0DRPz` localization/text table
 /// (or standalone null-terminated string pool chunk in `data.rpf`).
 pub fn decode_0drpz_text(data: &[u8]) -> Option<String> {
@@ -2216,6 +2359,10 @@ pub fn decode_0drpz_text(data: &[u8]) -> Option<String> {
 /// entries already known to be text tables (GXT); keep 3 when probing arbitrary binaries so
 /// stray byte runs don't pass as text.
 pub fn decode_0drpz_text_min(data: &[u8], min_lines: usize) -> Option<String> {
+    if let Some(descriptor) = gxt_row_descriptor(data) {
+        let rows = gxt_referenced_rows(data, descriptor)?;
+        return Some(format!("=== RAGE9 Text Table ({} strings) ===\n\n{}", rows.len(), rows.join("\n")));
+    }
     let start = if data.len() >= 0x60 && &data[0x10..0x15] == b"0DRPz" { 0x60 } else { 0 };
     let end = if start == 0x60 {
         let bmap = ru64(data, 8);
@@ -2245,10 +2392,20 @@ pub fn decode_0drpz_text_min(data: &[u8], min_lines: usize) -> Option<String> {
             if lines.len() >= 6000 { break; }
         }
     }
-    if lines.len() < min_lines.max(1) {
-        return None;
+    let pooled = if start == 0x60 { gxt_pool_strings(data) } else { Vec::new() };
+    let need = min_lines.max(1);
+    if lines.len() < need {
+        // small tables hold only one or two strings, so trust the pointed-to pools alone
+        if pooled.is_empty() {
+            return None;
+        }
+        lines = pooled;
+    } else {
+        // pools can sit past the scanned range, so add any string the scan missed
+        let seen: std::collections::HashSet<String> = lines.iter().cloned().collect();
+        lines.extend(pooled.into_iter().filter(|s| !seen.contains(s)));
     }
-    let header = format!("=== Text Table ({} strings) ===\n\n", lines.len());
+    let header = format!("=== RAGE9 Text Table ({} strings) ===\n\n", lines.len());
     Some(header + &lines.join("\n"))
 }
 // =============================================================================

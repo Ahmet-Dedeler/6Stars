@@ -11,11 +11,20 @@ use tempfile::TempDir;
 #[cfg(windows)]
 use std::time::{Duration, Instant};
 
-/// Finds RAD's player. Order: `BINKPLAY_PATH`, next to the exe (or `tools/`), the working
-/// directory, `PATH`, then the usual RAD Video Tools install folders (upstream fix for
-/// rpatty-dev/PercyStar#15, where a missing player surfaced as "os error 3").
+/// Finds RAD's player. On Windows, prefers `radvideo64.exe` (via `RADVIDEO64_PATH`, next to the
+/// exe, `PATH`, or RAD install folders) for faster 64-bit playback, falling back to `binkplay.exe`
+/// (`BINKPLAY_PATH`, next to the exe, `PATH`, or RAD install folders).
 pub fn player_path() -> Option<PathBuf> {
-    let name = if cfg!(windows) { "binkplay.exe" } else { "binkplay" };
+    #[cfg(windows)]
+    for env_key in ["RADVIDEO64_PATH", "BINKPLAY_PATH"] {
+        if let Some(p) = std::env::var_os(env_key) {
+            let p = PathBuf::from(p.to_string_lossy().trim().trim_matches('"'));
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    #[cfg(not(windows))]
     if let Some(p) = std::env::var_os("BINKPLAY_PATH") {
         let p = PathBuf::from(p.to_string_lossy().trim().trim_matches('"'));
         if p.is_file() {
@@ -41,14 +50,23 @@ pub fn player_path() -> Option<PathBuf> {
                 dirs.push(base.join("RAD Video Tools"));
             }
         }
+        dirs.push(PathBuf::from(r"C:\Program Files (x86)\RADVideo"));
+        dirs.push(PathBuf::from(r"C:\Program Files\RADVideo"));
+        for name in ["radvideo64.exe", "binkplay.exe"] {
+            if let Some(found) = dirs.iter().map(|d| d.join(name)).find(|p| p.is_file()) {
+                return Some(found);
+            }
+        }
+        return None;
     }
-    if let Some(found) = dirs.into_iter().map(|d| d.join(name)).find(|p| p.is_file()) {
-        return Some(found);
-    }
-    #[cfg(windows)]
-    return None;
     #[cfg(not(windows))]
-    Some(PathBuf::from(name))
+    {
+        let name = "binkplay";
+        if let Some(found) = dirs.into_iter().map(|d| d.join(name)).find(|p| p.is_file()) {
+            return Some(found);
+        }
+        Some(PathBuf::from(name))
+    }
 }
 
 pub struct BinkDock {
@@ -72,7 +90,15 @@ pub struct BinkDock {
 impl BinkDock {
     pub fn spawn(player: &Path, dir: TempDir, title: String, _volume: f32, looping: bool) -> Result<Self, String> {
         let mut cmd = Command::new(player);
-        cmd.current_dir(dir.path()).arg("clip.bk2");
+        cmd.current_dir(dir.path());
+        if player
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("radvideo64.exe"))
+        {
+            cmd.arg("binkplay");
+        }
+        cmd.arg("clip.bk2");
         #[cfg(windows)]
         let audio_track = crate::video_clip::first_audio_track(&dir.path().join("clip.bk2"));
         #[cfg(windows)]
